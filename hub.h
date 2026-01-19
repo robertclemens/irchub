@@ -1,0 +1,164 @@
+#ifndef HUB_H
+#define HUB_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/rsa.h>
+#include <openssl/pem.h>
+#include <time.h>
+#include <errno.h>
+#include <fcntl.h>
+
+#define HUB_CONFIG_FILE ".irchub.cnf"
+#define MAX_CLIENTS 100
+#define MAX_BOTS 100
+#define MAX_PEERS 10
+#define MAX_BUFFER 16384
+#define SALT_SIZE 8
+#define GCM_IV_LEN 12
+#define GCM_TAG_LEN 16
+#define HEADER_SIZE 4
+#define MAX_PENDING_BOTS 10
+
+// Timeout Settings
+#define PING_INTERVAL 60
+#define CLIENT_TIMEOUT 180
+#define CONNECT_TIMEOUT 5
+#define PEER_RECONNECT_INTERVAL 120
+
+// Protocol Commands
+#define CMD_PING 0x01
+#define CMD_CONFIG_PUSH 0x02
+#define CMD_CONFIG_PULL 0x03
+#define CMD_CONFIG_DATA 0x04
+#define CMD_UPDATE_PUBKEY 0x05
+#define CMD_PEER_SYNC     0x06
+#define CMD_MESH_STATE 0x07
+
+#define CMD_ADMIN_AUTH          0x10
+#define CMD_ADMIN_LIST_FULL     0x11
+#define CMD_ADMIN_ADD           0x12
+#define CMD_ADMIN_DEL           0x13
+#define CMD_ADMIN_REGEN_KEYS    0x14
+#define CMD_ADMIN_LIST_SUMMARY  0x15
+#define CMD_ADMIN_GET_PENDING   0x16
+#define CMD_ADMIN_APPROVE       0x17
+#define CMD_ADMIN_ADD_PEER      0x18
+#define CMD_ADMIN_LIST_PEERS    0x19
+#define CMD_ADMIN_DEL_PEER      0x1A
+#define CMD_ADMIN_GET_PUBKEY    0x1B
+#define CMD_ADMIN_SET_PRIVKEY   0x1C
+#define CMD_ADMIN_GET_PRIVKEY   0x1D // [NEW] Export Private
+#define CMD_ADMIN_SET_PUBKEY    0x1E // [NEW] Import Public
+#define CMD_ADMIN_SYNC_MESH     0x1F
+#define MESH_ANTI_ENTROPY_INTERVAL 300
+#define MAX_BOT_ENTRIES 64
+
+typedef struct {
+    char key[32];
+    char value[1024];
+    time_t timestamp;
+} config_entry_t;
+
+typedef struct {
+    char uuid[64];
+    config_entry_t entries[MAX_BOT_ENTRIES];
+    int entry_count;
+    bool is_active;
+    time_t last_sync_time;
+} bot_config_t;
+
+typedef struct {
+    char uuid[64];
+    char nick[32];
+    char ip[64];
+    time_t last_attempt;
+} pending_bot_t;
+
+typedef struct {
+    char ip[64];
+    int port;
+    bool connected;
+    int fd;
+    int remote_connected_count;
+    int remote_total_peers;
+    time_t last_mesh_report;
+    char last_gossip[1024]; // [NEW] Stores full peer list from gossip
+} hub_peer_config_t;
+
+typedef enum { CLIENT_BOT, CLIENT_ADMIN, CLIENT_HUB } client_type_t;
+
+typedef struct {
+    int fd;
+    char ip[64];
+    char id[64];
+    unsigned char session_key[32];
+    bool authenticated;
+    client_type_t type;
+    time_t last_seen;
+    unsigned char recv_buf[MAX_BUFFER];
+    int recv_len;
+} hub_client_t;
+
+typedef struct {
+    int listen_fd;
+    int port;
+    char admin_password[128];
+    char config_pass[128];
+
+    char *private_key_pem;
+    char *public_key_pem;
+    RSA *priv_key;
+
+    hub_client_t *clients[MAX_CLIENTS];
+    int client_count;
+
+    bot_config_t bots[MAX_BOTS];
+    int bot_count;
+
+    hub_peer_config_t peers[MAX_PEERS];
+    int peer_count;
+
+    pending_bot_t pending[MAX_PENDING_BOTS];
+    int pending_head;
+    int pending_count;
+
+    volatile bool running;
+} hub_state_t;
+
+// --- Prototypes ---
+void hub_log(const char *format, ...);
+bool hub_config_load(hub_state_t *state, const char *password);
+void hub_config_write(hub_state_t *state);
+
+RSA *load_private_key_from_memory(const char *pem_data);
+bool hub_crypto_generate_keypair(char **priv_pem_out, char **pub_pem_out);
+int rsa_private_decrypt(RSA *rsa, const unsigned char *enc, int enc_len, unsigned char *dec);
+int aes_gcm_decrypt(const unsigned char *input, int input_len,
+                    const unsigned char *key, unsigned char *output, unsigned char *tag);
+int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
+                    const unsigned char *key, unsigned char *output, unsigned char *tag);
+
+void hub_storage_init(void);
+bool hub_storage_update_entry(hub_state_t *state, const char *uuid, const char *key, const char *value, time_t ts);
+bool hub_storage_delete(hub_state_t *state, const char *uuid);
+int hub_storage_get_full_list(hub_state_t *state, char *buffer, int max_len);
+int hub_storage_get_summary_list(hub_state_t *state, char *buffer, int max_len);
+
+void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len);
+void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload, int exclude_fd);
+
+bool hub_handle_client_data(hub_state_t *state, hub_client_t *client);
+void hub_disconnect_client(hub_state_t *state, hub_client_t *c);
+void hub_broadcast_mesh_state(hub_state_t *state); // [NEW]
+
+char *base64_encode(const unsigned char *input, int length);
+unsigned char *base64_decode(const char *input, int *out_len);
+
+#endif
