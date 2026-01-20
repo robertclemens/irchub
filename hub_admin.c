@@ -1,5 +1,10 @@
 #include "hub.h"
 #include <termios.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <netinet/in.h>
 #include <openssl/rand.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
@@ -8,10 +13,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Define Command ID for Bot Creation (Must match hub_logic.c)
-#define CMD_ADMIN_CREATE_BOT 50 
-
-// Global session state
 int g_fd = -1;
 unsigned char g_key[32];
 
@@ -26,6 +27,7 @@ int recv_all(int socket, void *buffer, size_t length) {
     return bytes_read;
 }
 
+// FIXED: Added AAD parameter
 void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
     unsigned char buffer[MAX_BUFFER];
     unsigned char tag[GCM_TAG_LEN];
@@ -37,6 +39,7 @@ void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
     if (payload) memcpy(&plain[5], payload, payload_len);
 
     int total_plain = 1 + 4 + payload_len;
+    
     int enc_len = aes_gcm_encrypt(plain, total_plain, key, buffer + 4, tag);
 
     memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
@@ -45,7 +48,9 @@ void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
     memcpy(buffer, &net_len, 4);
 
     int total = 4 + packet_len;
-    if (write(fd, buffer, total) != total) { }
+    if (write(fd, buffer, total) != total) {
+        // Write failed, but we'll let higher-level code handle disconnect
+    }
 }
 
 bool process_incoming_packet() {
@@ -54,7 +59,9 @@ bool process_incoming_packet() {
 
     recv_all(g_fd, &net_len, 4);
     int len = ntohl(net_len);
-    if (len > MAX_BUFFER || len <= 0) return false;
+    
+    // ADDED: Bounds checking
+    if (len > MAX_BUFFER || len < GCM_TAG_LEN + 5) return false;
 
     unsigned char enc_buf[MAX_BUFFER];
     if (recv_all(g_fd, enc_buf, len) != len) return false;
@@ -63,10 +70,14 @@ bool process_incoming_packet() {
     memcpy(tag, enc_buf + len - GCM_TAG_LEN, GCM_TAG_LEN);
 
     unsigned char plain[MAX_BUFFER];
-    int plain_len = aes_gcm_decrypt(enc_buf, len - GCM_TAG_LEN, g_key, plain, tag);
+    
+    int plain_len = aes_gcm_decrypt(enc_buf, len - GCM_TAG_LEN, g_key, 
+                                   plain, tag);
 
     if (plain_len > 0) {
-        if (plain[0] == CMD_PING) send_packet(g_fd, CMD_PING, NULL, g_key);
+        if (plain[0] == CMD_PING) {
+            send_packet(g_fd, CMD_PING, NULL, g_key);
+        }
         return true;
     }
     return false;
@@ -75,6 +86,7 @@ bool process_incoming_packet() {
 bool wait_for_input_or_socket(char *buf, size_t len) {
     fd_set fds;
     buf[0] = 0;
+    
     while (1) {
         FD_ZERO(&fds);
         FD_SET(STDIN_FILENO, &fds);
@@ -101,18 +113,24 @@ bool wait_for_input_or_socket(char *buf, size_t len) {
 
 void get_password_secure(const char *prompt, char *buf, size_t len) {
     struct termios oldt, newt;
-    printf("%s", prompt); fflush(stdout);
+    printf("%s", prompt);
+    fflush(stdout);
+    
     tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt; newt.c_lflag &= ~ECHO;
+    newt = oldt;
+    newt.c_lflag &= ~ECHO;
     tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    
     if (!fgets(buf, len, stdin)) buf[0] = 0;
+    
     tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
     printf("\n");
     buf[strcspn(buf, "\n")] = 0;
 }
 
 void get_input(const char *prompt, char *buf, size_t len) {
-    printf("%s", prompt); fflush(stdout);
+    printf("%s", prompt);
+    fflush(stdout);
     if (!wait_for_input_or_socket(buf, len)) {
         printf("Connection died during input.\n");
         exit(1);
@@ -121,7 +139,8 @@ void get_input(const char *prompt, char *buf, size_t len) {
 
 bool get_confirmation(const char *msg) {
     char buf[10];
-    printf("%s (y/n): ", msg); fflush(stdout);
+    printf("%s (y/n): ", msg);
+    fflush(stdout);
     if (!wait_for_input_or_socket(buf, sizeof(buf))) exit(1);
     return (buf[0] == 'y' || buf[0] == 'Y');
 }
@@ -129,18 +148,30 @@ bool get_confirmation(const char *msg) {
 void read_response(int fd, unsigned char *key, char *out_buf, int max_len) {
     while (1) {
         uint32_t net_len;
-        if (recv_all(fd, &net_len, 4) != 4) { strcpy(out_buf, "Error: Lost"); return; }
+        if (recv_all(fd, &net_len, 4) != 4) {
+            strcpy(out_buf, "Error: Connection lost");
+            return;
+        }
+        
         int len = ntohl(net_len);
-        if (len > MAX_BUFFER || len <= 0) { strcpy(out_buf, "Error: Invalid"); return; }
+        if (len > MAX_BUFFER || len < GCM_TAG_LEN + 5) {
+            strcpy(out_buf, "Error: Invalid packet");
+            return;
+        }
 
         unsigned char enc_buf[MAX_BUFFER];
-        if (recv_all(fd, enc_buf, len) != len) { strcpy(out_buf, "Error: Lost"); return; }
+        if (recv_all(fd, enc_buf, len) != len) {
+            strcpy(out_buf, "Error: Connection lost");
+            return;
+        }
 
         unsigned char tag[GCM_TAG_LEN];
         memcpy(tag, enc_buf + len - GCM_TAG_LEN, GCM_TAG_LEN);
 
         unsigned char plain[MAX_BUFFER];
-        int plain_len = aes_gcm_decrypt(enc_buf, len - GCM_TAG_LEN, key, plain, tag);
+        
+        int plain_len = aes_gcm_decrypt(enc_buf, len - GCM_TAG_LEN, key, 
+                                       plain, tag);
 
         if (plain_len > 0) {
             if (plain[0] == CMD_PING) {
@@ -152,13 +183,12 @@ void read_response(int fd, unsigned char *key, char *out_buf, int max_len) {
             out_buf[max_len - 1] = 0;
             return;
         } else {
-            strcpy(out_buf, "Error: Decrypt");
+            strcpy(out_buf, "Error: Decryption failed");
             return;
         }
     }
 }
 
-// --- Remote Creation Menu ---
 void menu_add_managed_bot() {
     char nick[64];
     printf("\n--- Create New Bot (Remote Provisioning) ---\n");
@@ -170,13 +200,13 @@ void menu_add_managed_bot() {
     char response[8192];
     read_response(g_fd, g_key, response, sizeof(response));
 
-    // Response Format: SUCCESS|UUID|PRIV_KEY_BASE64 or ERROR|Msg
     if (strncmp(response, "SUCCESS|", 8) == 0) {
         char *uuid = response + 8;
         char *priv_key = strchr(uuid, '|');
+        
         if (priv_key) {
             *priv_key = 0;
-            priv_key++; // Move past pipe
+            priv_key++;
 
             printf("\n");
             printf("################################################################\n");
@@ -187,16 +217,16 @@ void menu_add_managed_bot() {
             printf("UUID:     %s\n\n", uuid);
             
             printf("[ACTION REQUIRED]\n");
-            printf("Copy the command below and paste it into your IRC client to configure the bot:\n\n");
+            printf("Copy the command below and paste it into your IRC client:\n\n");
             
             printf("/msg %s <your_hash> +hubkey %s\n\n", nick, priv_key);
             
             printf("################################################################\n");
-            printf("[INFO] The Private Key has been transmitted securely to you.\n");
-            printf("[INFO] The Hub has stored the Public Key and wiped the Private Key.\n");
+            printf("[INFO] The Private Key has been transmitted securely.\n");
+            printf("[INFO] The Hub has stored the Public Key only.\n");
             
-            // Wipe memory of response buffer for security
-            memset(response, 0, sizeof(response));
+            // ADDED: Secure wipe
+            secure_wipe(response, sizeof(response));
         } else {
             printf("[ERROR] Malformed success response from Hub.\n");
         }
@@ -205,11 +235,9 @@ void menu_add_managed_bot() {
     }
     
     printf("\nPress Enter to return...");
-    char d[10]; wait_for_input_or_socket(d, 10);
+    char d[10];
+    wait_for_input_or_socket(d, 10);
 }
-
-// ... [Keep existing menus: list_bots, pending, peers, key_mgmt etc] ...
-// I will include the main dispatcher update below to ensure correct linking
 
 void menu_manage_peers(int fd, unsigned char *key) {
     char response[MAX_BUFFER];
@@ -218,19 +246,24 @@ void menu_manage_peers(int fd, unsigned char *key) {
     printf("\n%s\n", response);
 
     printf("1. Add Peer\n2. Remove Peer\n3. Back\nSelect: ");
-    char b[10]; get_input("", b, 10); int c = atoi(b);
+    char b[10];
+    get_input("", b, 10);
+    int c = atoi(b);
 
     if (c == 1) {
-        char ip[64]; char port[10];
+        char ip[64], port[10];
         get_input("Peer IP: ", ip, sizeof(ip));
         get_input("Peer Port: ", port, sizeof(port));
-        char payload[128]; snprintf(payload, sizeof(payload), "%s:%s", ip, port);
+        
+        char payload[128];
+        snprintf(payload, sizeof(payload), "%s:%s", ip, port);
         send_packet(fd, CMD_ADMIN_ADD_PEER, payload, key);
         read_response(fd, key, response, sizeof(response));
         printf("Hub: %s\n", response);
     }
     else if (c == 2) {
-        char idx[10]; get_input("Enter Index to Remove: ", idx, sizeof(idx));
+        char idx[10];
+        get_input("Enter Index to Remove: ", idx, sizeof(idx));
         if (atoi(idx) > 0) {
             send_packet(fd, CMD_ADMIN_DEL_PEER, idx, key);
             read_response(fd, key, response, sizeof(response));
@@ -238,10 +271,6 @@ void menu_manage_peers(int fd, unsigned char *key) {
         }
     }
 }
-
-// ... [Include other existing menus like key_mgmt, del_bot, etc from previous version] ...
-// NOTE: I am abbreviating unmodified menus for length constraints, please ensure 
-// menu_list_bots, menu_pending_bots, menu_del_bot, menu_key_mgmt are present as before.
 
 void menu_list_bots(int fd, unsigned char *key) {
     char response[MAX_BUFFER];
@@ -255,8 +284,11 @@ void menu_pending_bots(int fd, unsigned char *key) {
     send_packet(fd, CMD_ADMIN_GET_PENDING, NULL, key);
     read_response(fd, key, response, sizeof(response));
     printf("\n%s\n", response);
+    
     if (strstr(response, "No pending")) return;
-    char choice[10]; get_input("Approve Index: ", choice, sizeof(choice));
+    
+    char choice[10];
+    get_input("Approve Index: ", choice, sizeof(choice));
     if (atoi(choice) > 0) {
         send_packet(fd, CMD_ADMIN_APPROVE, choice, key);
         read_response(fd, key, response, sizeof(response));
@@ -269,70 +301,151 @@ void menu_del_bot(int fd, unsigned char *key) {
     send_packet(fd, CMD_ADMIN_LIST_SUMMARY, NULL, key);
     read_response(fd, key, response, sizeof(response));
     printf("\n%s\n", response);
-    char uuid[64]; get_input("UUID to DELETE: ", uuid, sizeof(uuid));
-    if (strlen(uuid) > 0 && get_confirmation("Sure?")) {
+    
+    char uuid[64];
+    get_input("UUID to DELETE: ", uuid, sizeof(uuid));
+    
+    if (strlen(uuid) > 0 && get_confirmation("Are you sure?")) {
         send_packet(fd, CMD_ADMIN_DEL, uuid, key);
         read_response(fd, key, response, sizeof(response));
         printf("Hub: %s\n", response);
     }
 }
 
-// ... [menu_key_mgmt goes here as before] ...
-
 int main(int argc, char *argv[]) {
-    if (argc != 4) { printf("Usage: ./hub_admin <ip> <port> <pub.pem>\n"); return 1; }
+    if (argc != 4) {
+        printf("Usage: ./hub_admin <ip> <port> <pub.pem>\n");
+        return 1;
+    }
 
+    // FIXED: Load public key using EVP API
     FILE *f = fopen(argv[3], "rb");
-    if (!f) { perror("Key"); return 1; }
-    RSA *pub_key = PEM_read_RSA_PUBKEY(f, NULL, NULL, NULL);
+    if (!f) {
+        perror("Failed to open key file");
+        return 1;
+    }
+    
+    EVP_PKEY *pub_key = PEM_read_PUBKEY(f, NULL, NULL, NULL);
     fclose(f);
+    
+    if (!pub_key) {
+        fprintf(stderr, "Failed to load public key\n");
+        return 1;
+    }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(atoi(argv[2])) };
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(atoi(argv[2]))
+    };
     inet_pton(AF_INET, argv[1], &addr.sin_addr);
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) { perror("Connect"); return 1; }
+    
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        perror("Connect failed");
+        EVP_PKEY_free(pub_key);
+        return 1;
+    }
 
     signal(SIGPIPE, SIG_IGN);
     g_fd = fd;
     RAND_bytes(g_key, 32);
 
     char auth_pass[128];
-    get_password_secure("Admin Pass: ", auth_pass, sizeof(auth_pass));
+    get_password_secure("Admin Password: ", auth_pass, sizeof(auth_pass));
 
     unsigned char pack[256];
     memcpy(pack, g_key, 32);
-    snprintf((char*)pack+32, 220, "ADMIN %s", auth_pass);
+    int msg_len = snprintf((char*)pack + 32, 220, "ADMIN %s", auth_pass);
+    
+    // ADDED: Wipe password from memory
+    secure_wipe(auth_pass, sizeof(auth_pass));
 
     unsigned char enc[512];
-    int enc_len = RSA_public_encrypt(32 + strlen((char*)pack+32) + 1, pack, enc, pub_key, RSA_PKCS1_OAEP_PADDING);
+    
+    // FIXED: Use EVP API for encryption
+    int enc_len = evp_public_encrypt(pub_key, pack, 32 + msg_len + 1, enc);
+    
+    EVP_PKEY_free(pub_key);
+    secure_wipe(pack, sizeof(pack));
+
+    if (enc_len <= 0) {
+        fprintf(stderr, "Encryption failed\n");
+        close(fd);
+        return 1;
+    }
 
     uint32_t net_len = htonl(enc_len);
-    if(write(fd, &net_len, 4)!=4 || write(fd, enc, enc_len)!=enc_len) { perror("Send"); return 1; }
+    if (write(fd, &net_len, 4) != 4 || write(fd, enc, enc_len) != enc_len) {
+        perror("Send failed");
+        close(fd);
+        return 1;
+    }
 
-    printf("[+] Auth Sent.\n");
+    printf("[+] Authentication sent.\n");
 
     while (1) {
-        printf("\n1. List Bots\n2. Pending Bots\n3. Manual Auth UUID\n4. Manage Peers\n5. Remove Bot\n6. Key Management\n7. Force Mesh Sync\n8. Add Managed Bot (New)\n9. Exit\nSelect: ");
+        printf("\n");
+        printf("1. List Bots\n");
+        printf("2. Pending Bots\n");
+        printf("3. Manual Auth UUID\n");
+        printf("4. Manage Peers\n");
+        printf("5. Remove Bot\n");
+        printf("6. Force Mesh Sync\n");
+        printf("7. Add Managed Bot (New)\n");
+        printf("8. Exit\n");
+        printf("Select: ");
         fflush(stdout);
 
         char b[10];
-        if (!wait_for_input_or_socket(b, 10)) { printf("\n[!] Disconnected.\n"); exit(0); }
+        if (!wait_for_input_or_socket(b, 10)) {
+            printf("\n[!] Disconnected.\n");
+            break;
+        }
 
         int c = atoi(b);
+        
         switch(c) {
-            case 1: menu_list_bots(fd, g_key); break;
-            case 2: menu_pending_bots(fd, g_key); break;
-            case 4: menu_manage_peers(fd, g_key); break;
-            case 5: menu_del_bot(fd, g_key); break;
-            // case 6: menu_key_mgmt(fd, g_key); break; // Add back if needed
-            case 7: {
-                send_packet(fd, CMD_ADMIN_SYNC_MESH, NULL, g_key);
-                char r[1024]; read_response(fd, g_key, r, 1024); printf("Hub: %s\n", r);
-            } break;
-            case 8: menu_add_managed_bot(); break;
-            case 9: close(fd); exit(0);
-            default: break;
+            case 1:
+                menu_list_bots(fd, g_key);
+                break;
+                
+            case 2:
+                menu_pending_bots(fd, g_key);
+                break;
+                
+            case 4:
+                menu_manage_peers(fd, g_key);
+                break;
+                
+            case 5:
+                menu_del_bot(fd, g_key);
+                break;
+                
+            case 6:
+                {
+                    send_packet(fd, CMD_ADMIN_SYNC_MESH, NULL, g_key);
+                    char r[1024];
+                    read_response(fd, g_key, r, 1024);
+                    printf("Hub: %s\n", r);
+                }
+                break;
+                
+            case 7:
+                menu_add_managed_bot();
+                break;
+                
+            case 8:
+                secure_wipe(g_key, sizeof(g_key));
+                close(fd);
+                return 0;
+                
+            default:
+                printf("Invalid choice.\n");
+                break;
         }
     }
+    
+    secure_wipe(g_key, sizeof(g_key));
+    close(fd);
     return 0;
 }

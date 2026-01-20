@@ -6,9 +6,15 @@
 #include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <time.h>
@@ -20,11 +26,12 @@
 #define MAX_BOTS 100
 #define MAX_PEERS 10
 #define MAX_BUFFER 16384
-#define SALT_SIZE 8
+#define SALT_SIZE 16  // FIXED: Increased from 8 to 16 bytes (128 bits)
 #define GCM_IV_LEN 12
 #define GCM_TAG_LEN 16
 #define HEADER_SIZE 4
 #define MAX_PENDING_BOTS 10
+#define PBKDF2_ITERATIONS 100000  // NEW: For password-based key derivation
 
 // Timeout Settings
 #define PING_INTERVAL 60
@@ -54,9 +61,11 @@
 #define CMD_ADMIN_DEL_PEER      0x1A
 #define CMD_ADMIN_GET_PUBKEY    0x1B
 #define CMD_ADMIN_SET_PRIVKEY   0x1C
-#define CMD_ADMIN_GET_PRIVKEY   0x1D // [NEW] Export Private
-#define CMD_ADMIN_SET_PUBKEY    0x1E // [NEW] Import Public
+#define CMD_ADMIN_GET_PRIVKEY   0x1D
+#define CMD_ADMIN_SET_PUBKEY    0x1E
 #define CMD_ADMIN_SYNC_MESH     0x1F
+#define CMD_ADMIN_CREATE_BOT    0x32  // 50 decimal
+
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
 
@@ -89,7 +98,7 @@ typedef struct {
     int remote_connected_count;
     int remote_total_peers;
     time_t last_mesh_report;
-    char last_gossip[1024]; // [NEW] Stores full peer list from gossip
+    char last_gossip[1024];
 } hub_peer_config_t;
 
 typedef enum { CLIENT_BOT, CLIENT_ADMIN, CLIENT_HUB } client_type_t;
@@ -114,7 +123,7 @@ typedef struct {
 
     char *private_key_pem;
     char *public_key_pem;
-    RSA *priv_key;
+    EVP_PKEY *priv_key;  // FIXED: Changed from RSA* to EVP_PKEY*
 
     hub_client_t *clients[MAX_CLIENTS];
     int client_count;
@@ -137,13 +146,19 @@ void hub_log(const char *format, ...);
 bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);
 
-RSA *load_private_key_from_memory(const char *pem_data);
+// FIXED: Updated crypto function signatures
+EVP_PKEY *load_private_key_from_memory(const char *pem_data);
 bool hub_crypto_generate_keypair(char **priv_pem_out, char **pub_pem_out);
-int rsa_private_decrypt(RSA *rsa, const unsigned char *enc, int enc_len, unsigned char *dec);
+int evp_private_decrypt(EVP_PKEY *pkey, const unsigned char *enc, int enc_len, unsigned char *dec);
+int evp_public_encrypt(EVP_PKEY *pkey, const unsigned char *plain, int plain_len, unsigned char *enc);
+
+// FIXED: Simplified - removed AAD parameters (not needed since we encrypt everything)
 int aes_gcm_decrypt(const unsigned char *input, int input_len,
-                    const unsigned char *key, unsigned char *output, unsigned char *tag);
+                    const unsigned char *key, unsigned char *output, 
+                    unsigned char *tag);
 int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
-                    const unsigned char *key, unsigned char *output, unsigned char *tag);
+                    const unsigned char *key, unsigned char *output, 
+                    unsigned char *tag);
 
 void hub_storage_init(void);
 bool hub_storage_update_entry(hub_state_t *state, const char *uuid, const char *key, const char *value, time_t ts);
@@ -156,7 +171,11 @@ void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload, int ex
 
 bool hub_handle_client_data(hub_state_t *state, hub_client_t *client);
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c);
-void hub_broadcast_mesh_state(hub_state_t *state); // [NEW]
+void hub_broadcast_mesh_state(hub_state_t *state);
+
+// NEW: Crypto utility functions
+bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64, char **out_pub_b64);
+void secure_wipe(void *ptr, size_t len);
 
 char *base64_encode(const unsigned char *input, int length);
 unsigned char *base64_decode(const char *input, int *out_len);
