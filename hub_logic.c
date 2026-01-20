@@ -134,7 +134,7 @@ static void hub_state_add_bot_memory(hub_state_t *state, const char *uuid,
     }
 }
 
-// FIXED: Added bounds checking
+// FIXED: Added comprehensive bounds checking for CMD_ADMIN_LIST_PEERS
 void hub_broadcast_mesh_state(hub_state_t *state) {
     char payload[MAX_BUFFER];
     memset(payload, 0, sizeof(payload));
@@ -268,16 +268,19 @@ static void process_mesh_state(hub_state_t *state, hub_client_t *c, char *payloa
         for (int i = 0; i < state->peer_count; i++) {
             if (state->peers[i].connected && state->peers[i].fd == c->fd) {
                 state->peers[i].last_mesh_report = time(NULL);
-                strncpy(state->peers[i].last_gossip, payload, 
-                       sizeof(state->peers[i].last_gossip) - 1);
-                state->peers[i].last_gossip[sizeof(state->peers[i].last_gossip) - 1] = 0;
+                
+                // Safe truncating copy with explicit length calculation
+                size_t payload_len = strlen(payload);
+                size_t max_len = sizeof(state->peers[i].last_gossip) - 1;
+                size_t copy_len = (payload_len < max_len) ? payload_len : max_len;
+                
+                memcpy(state->peers[i].last_gossip, payload, copy_len);
+                state->peers[i].last_gossip[copy_len] = '\0';
                 return;
             }
         }
     }
 }
-
-// Continuation of hub_logic.c
 
 void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload, int exclude_fd) {
     unsigned char buffer[MAX_BUFFER];
@@ -773,22 +776,38 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                 matrix_peer_t all_peers[64];
                 int count = 0;
 
-                snprintf(all_peers[count].ip, 256, "127.0.0.1"); all_peers[count].port = state->port; all_peers[count].is_me = true; count++;
+                snprintf(all_peers[count].ip, 256, "127.0.0.1"); 
+                all_peers[count].port = state->port; 
+                all_peers[count].is_me = true; 
+                count++;
+                
                 for(int i=0; i<state->peer_count; i++) {
-                    snprintf(all_peers[count].ip, 256, "%s", state->peers[i].ip); all_peers[count].port = state->peers[i].port; all_peers[count].is_me = false; count++;
+                    snprintf(all_peers[count].ip, 256, "%s", state->peers[i].ip); 
+                    all_peers[count].port = state->peers[i].port; 
+                    all_peers[count].is_me = false; 
+                    count++;
                 }
+                
                 for(int i=0; i<state->peer_count; i++) {
                     if(state->peers[i].connected && strlen(state->peers[i].last_gossip) > 0) {
                         char *body = strchr(state->peers[i].last_gossip, '|');
                         if (!body) continue;
-                        char work_buf[MAX_BUFFER]; snprintf(work_buf, sizeof(work_buf), "%.*s", MAX_BUFFER-1, body + 1);
+                        char work_buf[MAX_BUFFER]; 
+                        snprintf(work_buf, sizeof(work_buf), "%.*s", MAX_BUFFER-1, body + 1);
                         char *saveptr, *block = strtok_r(work_buf, ";", &saveptr);
                         while(block) {
                             char owner[256]; int o_port;
                             if (sscanf(block, "%255[^:]:%d|", owner, &o_port) == 2) {
                                 bool exists = false;
-                                for(int k=0; k<count; k++) if(all_peers[k].port == o_port && strcmp(all_peers[k].ip, owner) == 0) exists=true;
-                                if(!exists && count < 64) { snprintf(all_peers[count].ip, 256, "%s", owner); all_peers[count].port = o_port; all_peers[count].is_me = false; count++; }
+                                for(int k=0; k<count; k++) 
+                                    if(all_peers[k].port == o_port && strcmp(all_peers[k].ip, owner) == 0) 
+                                        exists=true;
+                                if(!exists && count < 64) { 
+                                    snprintf(all_peers[count].ip, 256, "%s", owner); 
+                                    all_peers[count].port = o_port; 
+                                    all_peers[count].is_me = false; 
+                                    count++; 
+                                }
                                 char *list = strchr(block, '|');
                                 if(list) {
                                     char *t_save, *tok = strtok_r(list+1, ",", &t_save);
@@ -796,8 +815,15 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                                         char t_ip[256]; int t_port;
                                         if (sscanf(tok, "%255[^:]:%d", t_ip, &t_port) >= 2) {
                                             bool t_exists = false;
-                                            for(int k=0; k<count; k++) if(all_peers[k].port == t_port && strcmp(all_peers[k].ip, t_ip) == 0) t_exists=true;
-                                            if(!t_exists && count < 64) { snprintf(all_peers[count].ip, 256, "%s", t_ip); all_peers[count].port = t_port; all_peers[count].is_me = false; count++; }
+                                            for(int k=0; k<count; k++) 
+                                                if(all_peers[k].port == t_port && strcmp(all_peers[k].ip, t_ip) == 0) 
+                                                    t_exists=true;
+                                            if(!t_exists && count < 64) { 
+                                                snprintf(all_peers[count].ip, 256, "%s", t_ip); 
+                                                all_peers[count].port = t_port; 
+                                                all_peers[count].is_me = false; 
+                                                count++; 
+                                            }
                                         }
                                         tok = strtok_r(NULL, ",", &t_save);
                                     }
@@ -810,11 +836,14 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
                 int peer_col_width = 16; 
                 for(int i=0; i<count; i++) {
-                    char tmp[512]; snprintf(tmp, 512, "%.255s:%d", all_peers[i].ip, all_peers[i].port);
-                    int len = strlen(tmp); if(len > peer_col_width) peer_col_width = len;
+                    char tmp[512]; 
+                    snprintf(tmp, 512, "%.255s:%d", all_peers[i].ip, all_peers[i].port);
+                    int len = strlen(tmp); 
+                    if(len > peer_col_width) peer_col_width = len;
                 }
                 peer_col_width += 3;
                 
+                // CRITICAL FIX: Add overflow check before write
                 written = snprintf(response + offset, sizeof(response) - offset, 
                                  "\n [M] MESH CONNECTION MATRIX        You are connected to peer 1\n");
                 if (written < 0 || written >= (int)(sizeof(response) - offset)) {
@@ -823,14 +852,18 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                 offset += written;
                 
                 int line_len = peer_col_width + 3 + (count * 5) + 15 + 10; 
-                for(int k=0; k<line_len && offset < (int)sizeof(response); k++) { 
+                
+                // CRITICAL FIX: Bounds check for line drawing
+                for(int k=0; k<line_len && offset < (int)sizeof(response) - 1; k++) { 
                     response[offset++] = '-'; 
                 }
-                if (offset >= (int)sizeof(response)) {
+                if (offset >= (int)sizeof(response) - 1) {
                     return send_response(state, client, "ERROR: Response buffer overflow");
                 }
                 response[offset++] = '\n';
+                response[offset] = '\0';
                 
+                // CRITICAL FIX: Add overflow check
                 written = snprintf(response + offset, sizeof(response) - offset, 
                                  " %-*s |", peer_col_width, "Peer");
                 if (written < 0 || written >= (int)(sizeof(response) - offset)) {
@@ -839,12 +872,14 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                 offset += written;
                 
                 for(int i=0; i<count; i++) {
+                    // CRITICAL FIX: Add overflow check in loop
                     written = snprintf(response + offset, sizeof(response) - offset, 
                                      " %-2d |", i+1);
                     if (written < 0 || written >= (int)(sizeof(response) - offset)) break;
                     offset += written;
                 }
                 
+                // CRITICAL FIX: Add overflow check
                 written = snprintf(response + offset, sizeof(response) - offset, 
                                  " Mesh State   | Bots |\n");
                 if (written < 0 || written >= (int)(sizeof(response) - offset)) {
@@ -852,27 +887,35 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                 }
                 offset += written;
                 
-                for(int k=0; k<line_len && offset < (int)sizeof(response); k++) { 
+                // CRITICAL FIX: Bounds check for line drawing
+                for(int k=0; k<line_len && offset < (int)sizeof(response) - 1; k++) { 
                     response[offset++] = '-'; 
-                }
-                if (offset >= (int)sizeof(response)) {
+                } 
+                if (offset >= (int)sizeof(response) - 1) {
                     return send_response(state, client, "ERROR: Response buffer overflow");
                 }
                 response[offset++] = '\n';
+                response[offset] = '\0';
 
-                int issues = 0; char issue_log[MAX_BUFFER]; memset(issue_log, 0, sizeof(issue_log)); int issue_off = 0;
-                char reported_mismatches[64][MAX_BUFFER]; int rm_count = 0;
+                int issues = 0; 
+                char issue_log[MAX_BUFFER]; 
+                memset(issue_log, 0, sizeof(issue_log)); 
+                int issue_off = 0;
+                char reported_mismatches[64][MAX_BUFFER]; 
+                int rm_count = 0;
 
                 for (int row = 0; row < count; row++) {
                     char peer_str[512]; 
                     snprintf(peer_str, 512, "%.255s:%d", all_peers[row].ip, all_peers[row].port);
                     
+                    // CRITICAL FIX: Add overflow check
                     written = snprintf(response + offset, sizeof(response) - offset, 
                                      " %d. %-*s |", row+1, peer_col_width - 3, peer_str);
                     if (written < 0 || written >= (int)(sizeof(response) - offset)) {
                         return send_response(state, client, "ERROR: Matrix too large for buffer");
                     }
                     offset += written;
+                    
                     int row_connected = 0, row_total = 0; 
                     for (int col = 0; col < count; col++) {
                         char cell[32] = "??"; 
@@ -882,32 +925,44 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                             if (all_peers[row].is_me) {
                                 found_block = true;
                                 for(int p=0; p<state->peer_count; p++) {
-                                    if(state->peers[p].port == all_peers[col].port && strcmp(state->peers[p].ip, all_peers[col].ip)==0) {
+                                    if(state->peers[p].port == all_peers[col].port && 
+                                       strcmp(state->peers[p].ip, all_peers[col].ip)==0) {
                                         found_link = true; 
                                         for(int c=0; c<state->client_count; c++) {
-                                            if(state->clients[c]->type == CLIENT_HUB && state->clients[c]->authenticated && state->clients[c]->fd == state->peers[p].fd) link_up = true;
+                                            if(state->clients[c]->type == CLIENT_HUB && 
+                                               state->clients[c]->authenticated && 
+                                               state->clients[c]->fd == state->peers[p].fd) 
+                                                link_up = true;
                                         }
                                     }
                                 }
                             } else {
                                 for(int p=0; p<state->peer_count; p++) {
-                                    if (state->peers[p].connected && strlen(state->peers[p].last_gossip) > 0) {
+                                    if (state->peers[p].connected && 
+                                        strlen(state->peers[p].last_gossip) > 0) {
                                         char *body = strchr(state->peers[p].last_gossip, '|');
                                         if (!body) continue;
-                                        char work_buf[MAX_BUFFER]; snprintf(work_buf, sizeof(work_buf), "%.*s", MAX_BUFFER-1, body + 1);
+                                        char work_buf[MAX_BUFFER]; 
+                                        snprintf(work_buf, sizeof(work_buf), "%.*s", 
+                                                MAX_BUFFER-1, body + 1);
                                         char *bsave, *block = strtok_r(work_buf, ";", &bsave);
                                         while(block) {
                                             char owner[256]; int o_port;
                                             if(sscanf(block, "%255[^:]:%d|", owner, &o_port) == 2) {
-                                                if (o_port == all_peers[row].port && strcmp(owner, all_peers[row].ip) == 0) {
-                                                    found_block = true; char *list = strchr(block, '|');
+                                                if (o_port == all_peers[row].port && 
+                                                    strcmp(owner, all_peers[row].ip) == 0) {
+                                                    found_block = true; 
+                                                    char *list = strchr(block, '|');
                                                     if(list) {
                                                         char *lsave, *tok = strtok_r(list+1, ",", &lsave);
                                                         while(tok) {
                                                             char t_ip[256]; int t_port; int stat;
-                                                            if(sscanf(tok, "%255[^:]:%d:%d", t_ip, &t_port, &stat) >= 3) {
-                                                                if(t_port == all_peers[col].port && strcmp(t_ip, all_peers[col].ip) == 0) {
-                                                                    found_link = true; if(stat) link_up = true;
+                                                            if(sscanf(tok, "%255[^:]:%d:%d", 
+                                                                     t_ip, &t_port, &stat) >= 3) {
+                                                                if(t_port == all_peers[col].port && 
+                                                                   strcmp(t_ip, all_peers[col].ip) == 0) {
+                                                                    found_link = true; 
+                                                                    if(stat) link_up = true;
                                                                 }
                                                             }
                                                             tok = strtok_r(NULL, ",", &lsave);
@@ -924,9 +979,13 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                                 if (found_link && link_up) {
                                     bool actually_connected = false;
                                     for(int p=0; p<state->peer_count; p++) {
-                                        if (state->peers[p].port == all_peers[row].port && strcmp(state->peers[p].ip, all_peers[row].ip) == 0) {
+                                        if (state->peers[p].port == all_peers[row].port && 
+                                            strcmp(state->peers[p].ip, all_peers[row].ip) == 0) {
                                             for(int c=0; c<state->client_count; c++) {
-                                                if(state->clients[c]->type == CLIENT_HUB && state->clients[c]->authenticated && state->clients[c]->fd == state->peers[p].fd) actually_connected = true;
+                                                if(state->clients[c]->type == CLIENT_HUB && 
+                                                   state->clients[c]->authenticated && 
+                                                   state->clients[c]->fd == state->peers[p].fd) 
+                                                    actually_connected = true;
                                             }
                                         }
                                     }
@@ -935,22 +994,30 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                             }
                             if (found_block) {
                                 if (found_link) {
-                                    strcpy(cell, link_up ? "\033[32mUP\033[0m" : "\033[31mDN\033[0m"); row_total++; if(link_up) row_connected++;
+                                    strcpy(cell, link_up ? "\033[32mUP\033[0m" : "\033[31mDN\033[0m"); 
+                                    row_total++; 
+                                    if(link_up) row_connected++;
                                 } else strcpy(cell, "??"); 
                             } else strcpy(cell, "??"); 
                         }
-                        written = snprintf(response + offset, sizeof(response) - offset, " %s |", cell);
+                        
+                        // CRITICAL FIX: Add overflow check
+                        written = snprintf(response + offset, sizeof(response) - offset, 
+                                         " %s |", cell);
                         if (written < 0 || written >= (int)(sizeof(response) - offset)) {
                             return send_response(state, client, "ERROR: Matrix too large for buffer");
                         }
                         offset += written;
                     }
+                    
                     bool is_offline = false;
                     if(row_total > 0) {
                         if(row_connected > 0) {
+                            // CRITICAL FIX: Add overflow check
                             written = snprintf(response + offset, sizeof(response) - offset, 
                                              " %d/%d Connected |", row_connected, row_total);
                         } else { 
+                            // CRITICAL FIX: Add overflow check
                             written = snprintf(response + offset, sizeof(response) - offset, 
                                              " \033[31mOffline\033[0m       |"); 
                             is_offline = true; 
@@ -958,21 +1025,28 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                         }
                     } else {
                         if (all_peers[row].is_me) {
+                            // CRITICAL FIX: Add overflow check
                             written = snprintf(response + offset, sizeof(response) - offset, 
                                              " ---          |");
                         } else { 
+                            // CRITICAL FIX: Add overflow check
                             written = snprintf(response + offset, sizeof(response) - offset, 
                                              " \033[31mOffline\033[0m       |"); 
                             is_offline = true; 
                             issues++; 
                         }
                     }
+                    
+                    // CRITICAL FIX: Check the write result
                     if (written < 0 || written >= (int)(sizeof(response) - offset)) {
                         return send_response(state, client, "ERROR: Matrix too large for buffer");
                     }
                     offset += written;
+                    
                     if (is_offline) {
-                        written = snprintf(response + offset, sizeof(response) - offset, " ??   |\n");
+                        // CRITICAL FIX: Add overflow check
+                        written = snprintf(response + offset, sizeof(response) - offset, 
+                                         " ??   |\n");
                     } else {
                         int bot_cnt = 0;
                         if (all_peers[row].is_me) {
@@ -986,52 +1060,95 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                                    state->peers[p].port == all_peers[row].port && 
                                    strcmp(state->peers[p].ip, all_peers[row].ip) == 0) {
                                     int rc, rt, rb; 
-                                    if(sscanf(state->peers[p].last_gossip, "%d:%d:%d|", &rc, &rt, &rb) == 3) {
+                                    if(sscanf(state->peers[p].last_gossip, "%d:%d:%d|", 
+                                             &rc, &rt, &rb) == 3) {
                                         bot_cnt = rb;
                                     }
                                     break;
                                 }
                             }
                         }
+                        // CRITICAL FIX: Add overflow check
                         written = snprintf(response + offset, sizeof(response) - offset, 
                                          " %-4d |\n", bot_cnt);
                     }
+                    
+                    // CRITICAL FIX: Check the write result
                     if (written < 0 || written >= (int)(sizeof(response) - offset)) {
                         return send_response(state, client, "ERROR: Matrix too large for buffer");
                     }
                     offset += written;
+                    
                     if(all_peers[row].is_me) {
                          for(int p=0; p<state->peer_count; p++) {
                              bool active = false;
                              for(int c=0; c<state->client_count; c++) {
-                                 if(state->clients[c]->type == CLIENT_HUB && state->clients[c]->authenticated && state->clients[c]->fd == state->peers[p].fd) active = true;
+                                 if(state->clients[c]->type == CLIENT_HUB && 
+                                    state->clients[c]->authenticated && 
+                                    state->clients[c]->fd == state->peers[p].fd) active = true;
                              }
-                             if(!active) { issues++; issue_off += snprintf(issue_log + issue_off, sizeof(issue_log)-issue_off, " [!] Peer %s:%d is DOWN.\n", state->peers[p].ip, state->peers[p].port); }
+                             if(!active) { 
+                                 issues++; 
+                                 // CRITICAL FIX: Add overflow check for issue_log
+                                 int w = snprintf(issue_log + issue_off, 
+                                                sizeof(issue_log)-issue_off, 
+                                                " [!] Peer %s:%d is DOWN.\n", 
+                                                state->peers[p].ip, state->peers[p].port);
+                                 if (w > 0 && w < (int)(sizeof(issue_log) - issue_off)) {
+                                     issue_off += w;
+                                 }
+                             }
                          }
                     }
                 }
+                
                 for (int i=0; i<count; i++) {
                     if (!all_peers[i].is_me) { 
                         bool in_config = false;
-                        for(int p=0; p<state->peer_count; p++) if(state->peers[p].port == all_peers[i].port && strcmp(state->peers[p].ip, all_peers[i].ip)==0) in_config=true;
+                        for(int p=0; p<state->peer_count; p++) 
+                            if(state->peers[p].port == all_peers[i].port && 
+                               strcmp(state->peers[p].ip, all_peers[i].ip)==0) 
+                                in_config=true;
                         if (!in_config) {
                             for(int p=0; p<state->peer_count; p++) {
-                                if (state->peers[p].connected && strlen(state->peers[p].last_gossip) > 0) {
-                                    char *body = strchr(state->peers[p].last_gossip, '|'); if (!body) continue;
-                                    char work_buf[MAX_BUFFER]; snprintf(work_buf, sizeof(work_buf), "%.*s", MAX_BUFFER-1, body + 1);
+                                if (state->peers[p].connected && 
+                                    strlen(state->peers[p].last_gossip) > 0) {
+                                    char *body = strchr(state->peers[p].last_gossip, '|'); 
+                                    if (!body) continue;
+                                    char work_buf[MAX_BUFFER]; 
+                                    snprintf(work_buf, sizeof(work_buf), "%.*s", 
+                                            MAX_BUFFER-1, body + 1);
                                     char *bsave, *block = strtok_r(work_buf, ";", &bsave);
                                     while(block) {
-                                        char owner[256]; int o_port; sscanf(block, "%255[^:]:%d|", owner, &o_port);
+                                        char owner[256]; int o_port; 
+                                        sscanf(block, "%255[^:]:%d|", owner, &o_port);
                                         bool owner_is_known = false;
-                                        for(int z=0; z<state->peer_count; z++) if(state->peers[z].port == o_port && strcmp(state->peers[z].ip, owner) == 0) owner_is_known = true;
+                                        for(int z=0; z<state->peer_count; z++) 
+                                            if(state->peers[z].port == o_port && 
+                                               strcmp(state->peers[z].ip, owner) == 0) 
+                                                owner_is_known = true;
                                         if (owner_is_known) {
                                             if(strstr(block, all_peers[i].ip)) { 
-                                                char check_sig[MAX_BUFFER]; snprintf(check_sig, sizeof(check_sig), "%.255s:%d->%.255s:%d", owner, o_port, all_peers[i].ip, all_peers[i].port);
+                                                char check_sig[MAX_BUFFER]; 
+                                                snprintf(check_sig, sizeof(check_sig), 
+                                                        "%.255s:%d->%.255s:%d", owner, o_port, 
+                                                        all_peers[i].ip, all_peers[i].port);
                                                 bool already_rept = false;
-                                                for(int k=0; k<rm_count; k++) if(strcmp(reported_mismatches[k], check_sig)==0) already_rept = true;
+                                                for(int k=0; k<rm_count; k++) 
+                                                    if(strcmp(reported_mismatches[k], check_sig)==0) 
+                                                        already_rept = true;
                                                 if(!already_rept && rm_count < 64) {
-                                                    snprintf(reported_mismatches[rm_count++], MAX_BUFFER, "%.1023s", check_sig);
-                                                    issues++; issue_off += snprintf(issue_log + issue_off, sizeof(issue_log)-issue_off, " [!] Config Mismatch: Peer %.255s:%d knows %.255s:%d, but we don't.\n", owner, o_port, all_peers[i].ip, all_peers[i].port);
+                                                    snprintf(reported_mismatches[rm_count++], 
+                                                            MAX_BUFFER, "%.1023s", check_sig);
+                                                    issues++; 
+                                                    // CRITICAL FIX: Add overflow check
+                                                    int w = snprintf(issue_log + issue_off, 
+                                                                   sizeof(issue_log)-issue_off, 
+                                                                   " [!] Config Mismatch: Peer %.255s:%d knows %.255s:%d, but we don't.\n", 
+                                                                   owner, o_port, all_peers[i].ip, all_peers[i].port);
+                                                    if (w > 0 && w < (int)(sizeof(issue_log) - issue_off)) {
+                                                        issue_off += w;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1042,13 +1159,16 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                         }
                     }
                 }
-                for(int k=0; k<line_len && offset < (int)sizeof(response); k++) { 
+                
+                // CRITICAL FIX: Bounds check for line drawing
+                for(int k=0; k<line_len && offset < (int)sizeof(response) - 1; k++) { 
                     response[offset++] = '-'; 
                 } 
-                if (offset >= (int)sizeof(response)) {
+                if (offset >= (int)sizeof(response) - 1) {
                     return send_response(state, client, "ERROR: Response buffer overflow");
                 }
                 response[offset++] = '\n';
+                response[offset] = '\0';
                 
                 char status_str[128]; 
                 if (issues == 0 && state->peer_count > 0) {
@@ -1057,6 +1177,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                     snprintf(status_str, 64, "\033[33mDEGRADED (%d ISSUES)\033[0m", issues);
                 }
                 
+                // CRITICAL FIX: Add overflow check
                 written = snprintf(response + offset, sizeof(response) - offset, 
                                  " [i] MESH STATUS: %s\n [Legend: -- = Self, UP = Connected, DN = Down, ?? = Unknown/Not Configured]\n", 
                                  status_str);
@@ -1066,6 +1187,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                 offset += written;
                 
                 if (issues > 0) {
+                    // CRITICAL FIX: Add overflow check
                     written = snprintf(response + offset, sizeof(response) - offset, 
                                      " --- Mesh Diagnostics ---\n%s", issue_log);
                     if (written < 0 || written >= (int)(sizeof(response) - offset)) {
@@ -1158,8 +1280,6 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     }
 }
 
-// Final part of hub_logic.c - Main packet handler
-
 bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
     while (client->recv_len >= 4) {
         uint32_t net_len;
@@ -1251,9 +1371,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                         int total_plain = 1 + 4 + payload_len;
                         memcpy(&plain[1], &payload_len, 4);
                         
-                        unsigned char aad[1] = { CMD_PEER_SYNC };
                         int cipher_len = aes_gcm_encrypt(plain, total_plain, client->session_key, 
-                                                        buffer + 4, tag, aad, sizeof(aad));
+                                                        buffer + 4, tag);
                         
                         if (cipher_len > 0) {
                             memcpy(buffer + 4 + cipher_len, tag, GCM_TAG_LEN);
@@ -1314,7 +1433,6 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 
                 memcpy(tag, data + packet_len - GCM_TAG_LEN, GCM_TAG_LEN);
                 
-                // NOTE: No AAD needed - command byte is encrypted
                 int pl = aes_gcm_decrypt(data, packet_len - GCM_TAG_LEN, 
                                         client->session_key, plain, tag);
                 
@@ -1328,8 +1446,6 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                     }
                     else {
                         plain[pl] = 0;
-                        
-                        // Extract payload (skip cmd byte + 4-byte length)
                         char *payload_ptr = (char*)plain + 5;
                         
                         if (client->type == CLIENT_ADMIN) {
