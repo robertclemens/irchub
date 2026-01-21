@@ -103,6 +103,14 @@ typedef struct {
 
 typedef enum { CLIENT_BOT, CLIENT_ADMIN, CLIENT_HUB } client_type_t;
 
+typedef enum {
+    BOT_AUTH_IDLE = 0,
+    BOT_AUTH_UUID_RECEIVED,
+    BOT_AUTH_CHALLENGE_SENT,
+    BOT_AUTH_SIGNATURE_RECEIVED,
+    BOT_AUTH_COMPLETE
+} bot_auth_state_t;
+
 typedef struct {
     int fd;
     char ip[64];
@@ -111,8 +119,11 @@ typedef struct {
     bool authenticated;
     client_type_t type;
     time_t last_seen;
+    time_t last_pong_sent;
     unsigned char recv_buf[MAX_BUFFER];
-    int recv_len;
+    bot_auth_state_t bot_auth_state;
+    unsigned char challenge[32];  
+  int recv_len;
 } hub_client_t;
 
 typedef struct {

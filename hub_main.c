@@ -267,6 +267,7 @@ void hub_check_peers(hub_state_t *state) {
                     c->ip[sizeof(c->ip) - 1] = 0;
                     c->type = CLIENT_HUB;
                     c->last_seen = time(NULL);
+c->last_pong_sent = 0;
                     state->clients[state->client_count++] = c;
                     
                     state->peers[i].connected = true;
@@ -447,6 +448,7 @@ int main(int argc, char *argv[]) {
                         strncpy(c->ip, inet_ntoa(ca.sin_addr), sizeof(c->ip) - 1);
                         c->ip[sizeof(c->ip) - 1] = 0;
                         c->last_seen = time(NULL);
+c->last_pong_sent = 0;
                         state.clients[state.client_count++] = c;
                         hub_log("[HUB] Incoming connect: %s\n", c->ip);
                     } else {

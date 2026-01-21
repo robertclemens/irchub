@@ -298,7 +298,7 @@ err:
 }
 
 // FIXED: Updated to use EVP API
-bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64, 
+bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
                                     char **out_pub_b64) {
     EVP_PKEY_CTX *ctx = NULL;
     EVP_PKEY *pkey = NULL;
@@ -307,7 +307,7 @@ bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
     bool success = false;
 
     // 1. Generate UUID
-    *out_uuid = malloc(37); 
+    *out_uuid = malloc(37);
     if (!*out_uuid) return false;
     generate_uuid_v4(*out_uuid, 37);
 
@@ -319,7 +319,7 @@ bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
     if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0) goto cleanup;
     if (EVP_PKEY_keygen(ctx, &pkey) <= 0) goto cleanup;
 
-    // 3. Export Private Key -> Base64
+    // 3. Export Private Key -> Base64(FULL PEM WITH HEADERS)
     bio_priv = BIO_new(BIO_s_mem());
     if (!bio_priv) goto cleanup;
     
@@ -332,7 +332,7 @@ bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
     *out_priv_b64 = base64_encode((unsigned char*)priv_data, priv_len);
     if (!*out_priv_b64) goto cleanup;
 
-    // 4. Export Public Key -> Base64
+    // 4. Export Public Key -> Base64(FULL PEM WITH HEADERS)
     bio_pub = BIO_new(BIO_s_mem());
     if (!bio_pub) goto cleanup;
     

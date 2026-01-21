@@ -27,7 +27,6 @@ int recv_all(int socket, void *buffer, size_t length) {
     return bytes_read;
 }
 
-// FIXED: Added AAD parameter
 void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
     unsigned char buffer[MAX_BUFFER];
     unsigned char tag[GCM_TAG_LEN];
@@ -49,7 +48,7 @@ void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
 
     int total = 4 + packet_len;
     if (write(fd, buffer, total) != total) {
-        // Write failed, but we'll let higher-level code handle disconnect
+        // Write failed
     }
 }
 
@@ -60,7 +59,6 @@ bool process_incoming_packet() {
     recv_all(g_fd, &net_len, 4);
     int len = ntohl(net_len);
     
-    // ADDED: Bounds checking
     if (len > MAX_BUFFER || len < GCM_TAG_LEN + 5) return false;
 
     unsigned char enc_buf[MAX_BUFFER];
@@ -189,55 +187,84 @@ void read_response(int fd, unsigned char *key, char *out_buf, int max_len) {
     }
 }
 
+// FIXED: Larger buffer + automatic file save for private key
 void menu_add_managed_bot() {
-    char nick[64];
+ char nick[64];
+    char response[8192];
+    
     printf("\n--- Create New Bot (Remote Provisioning) ---\n");
     get_input("Enter Bot Nickname: ", nick, sizeof(nick));
     
     printf("[*] Requesting Hub to generate credentials...\n");
     send_packet(g_fd, CMD_ADMIN_CREATE_BOT, nick, g_key);
 
-    char response[8192];
     read_response(g_fd, g_key, response, sizeof(response));
-
+    
     if (strncmp(response, "SUCCESS|", 8) == 0) {
-        char *uuid = response + 8;
-        char *priv_key = strchr(uuid, '|');
+        char *uuid_start = response + 8;
+        char *priv_key = strchr(uuid_start, '|');
         
         if (priv_key) {
             *priv_key = 0;
-            priv_key++;
-
-            printf("\n");
-            printf("################################################################\n");
-            printf("#                   BOT CREATED SUCCESSFULLY                   #\n");
-            printf("################################################################\n\n");
+            priv_key++;  // Now points to BASE64(full PEM)
+            
+            char uuid[64];
+            strncpy(uuid, uuid_start, sizeof(uuid) - 1);
+            uuid[sizeof(uuid) - 1] = '\0';
+            
+            printf("\n╔══════════════════════════════════════════════════╗\n");
+            printf("║       BOT CREATED - REMOTE PROVISIONING          ║\n");
+            printf("╚══════════════════════════════════════════════════╝\n\n");
             
             printf("Bot Name: %s\n", nick);
             printf("UUID:     %s\n\n", uuid);
             
-            printf("[ACTION REQUIRED]\n");
-            printf("Copy the command below and paste it into your IRC client:\n\n");
+            size_t key_len = strlen(priv_key);
+            int total_parts = (key_len + 249) / 250;
             
-            printf("/msg %s <your_hash> +hubkey %s\n\n", nick, priv_key);
+            printf("Private key: %zu chars → %d parts\n\n", key_len, total_parts);
+            printf("COPY AND PASTE THESE COMMANDS:\n");
+            printf("═══════════════════════════════════════════════════\n\n");
             
-            printf("################################################################\n");
-            printf("[INFO] The Private Key has been transmitted securely.\n");
-            printf("[INFO] The Hub has stored the Public Key only.\n");
+            for (int i = 0; i < total_parts; i++) {
+                size_t start = i * 250;
+                size_t len = (start + 250 > key_len) ? (key_len - start) : 250;
+                
+                char chunk[260];
+                memset(chunk, 0, sizeof(chunk));
+                strncpy(chunk, priv_key + start, len);
+                
+                printf("/msg %s <hash> sethubkey %d/%d:%s\n",
+                       nick, i+1, total_parts, chunk);
+            }
             
-            // ADDED: Secure wipe
+            printf("\n/msg %s <hash> setuuid %s\n", nick, uuid);
+            printf("/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
+            
+            printf("═══════════════════════════════════════════════════\n");
+            printf("After all parts: Bot will auto-reconnect to hub.\n\n");
+            
+            // Save backup - decode to get actual PEM
+            char fname[128];
+            snprintf(fname, sizeof(fname), "bot_%s_priv.pem", nick);
+            FILE *f = fopen(fname, "w");
+            if (f) {
+                int pem_len;
+                unsigned char *pem_data = base64_decode(priv_key, &pem_len);
+                if (pem_data) {
+                    fwrite(pem_data, 1, pem_len, f);
+                    free(pem_data);
+                }
+                fclose(f);
+                printf("[Backup saved: %s]\n\n", fname);
+            }
+            
             secure_wipe(response, sizeof(response));
-        } else {
-            printf("[ERROR] Malformed success response from Hub.\n");
         }
-    } else {
-        printf("[HUB RESPONSE] %s\n", response);
     }
-    
-    printf("\nPress Enter to return...");
-    char d[10];
-    wait_for_input_or_socket(d, 10);
 }
+
+
 
 void menu_manage_peers(int fd, unsigned char *key) {
     char response[MAX_BUFFER];
@@ -318,7 +345,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // FIXED: Load public key using EVP API
     FILE *f = fopen(argv[3], "rb");
     if (!f) {
         perror("Failed to open key file");
@@ -357,12 +383,10 @@ int main(int argc, char *argv[]) {
     memcpy(pack, g_key, 32);
     int msg_len = snprintf((char*)pack + 32, 220, "ADMIN %s", auth_pass);
     
-    // ADDED: Wipe password from memory
     secure_wipe(auth_pass, sizeof(auth_pass));
 
     unsigned char enc[512];
     
-    // FIXED: Use EVP API for encryption
     int enc_len = evp_public_encrypt(pub_key, pack, 32 + msg_len + 1, enc);
     
     EVP_PKEY_free(pub_key);

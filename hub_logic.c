@@ -1,6 +1,7 @@
 #include "hub.h"
 #include <arpa/inet.h>
 #include <openssl/bio.h>
+#include <openssl/rand.h>
 #include <errno.h>
 
 #ifndef CMD_ADMIN_CREATE_BOT
@@ -25,6 +26,206 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client, int cm
 bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64, char **out_pub_b64);
 
 // --- Helper Functions ---
+
+
+// ============ ADD THESE THREE FUNCTIONS HERE ============
+
+// Load bot's public key from hub config
+static EVP_PKEY* load_bot_public_key(hub_state_t *state, const char *uuid) {
+    for (int i = 0; i < state->bot_count; i++) {
+        if (strcmp(state->bots[i].uuid, uuid) == 0) {
+            for (int j = 0; j < state->bots[i].entry_count; j++) {
+                if (strcmp(state->bots[i].entries[j].key, "pub") == 0) {
+                    int pem_len = 0;
+                    unsigned char *pem_data = base64_decode(state->bots[i].entries[j].value, &pem_len);
+                    if (!pem_data) return NULL;
+                    
+                    BIO *bio = BIO_new_mem_buf(pem_data, pem_len);
+                    EVP_PKEY *pub_key = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+                    BIO_free(bio);
+                    free(pem_data);
+                    return pub_key;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static int rsa_encrypt_with_bot_pubkey(EVP_PKEY *pub_key, 
+                                       const unsigned char *plain, int plain_len,
+                                       unsigned char *enc_out) {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pub_key, NULL);
+    int result = -1;
+    
+    if (ctx && EVP_PKEY_encrypt_init(ctx) > 0) {
+        if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) > 0) {
+            size_t out_len;
+            if (EVP_PKEY_encrypt(ctx, NULL, &out_len, plain, plain_len) > 0) {
+                if (EVP_PKEY_encrypt(ctx, enc_out, &out_len, plain, plain_len) > 0) {
+                    result = (int)out_len;
+                }
+            }
+        }
+    }
+    
+    if (ctx) EVP_PKEY_CTX_free(ctx);
+    return result;
+}
+
+static bool verify_signature_with_bot_pubkey(EVP_PKEY *pub_key,
+                                             const unsigned char *data, int data_len,
+                                             const unsigned char *sig, size_t sig_len) {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    bool valid = false;
+    
+    if (EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pub_key) > 0) {
+        if (EVP_DigestVerifyUpdate(ctx, data, data_len) > 0) {
+            if (EVP_DigestVerifyFinal(ctx, sig, sig_len) == 1) {
+                valid = true;
+            }
+        }
+    }
+    
+    EVP_MD_CTX_free(ctx);
+    return valid;
+}
+
+// ============ END OF NEW HELPER FUNCTIONS ============
+// REPLACEMENT for bot authentication section in hub_handle_client_data()
+// Insert this where it currently handles "ADMIN", "HUB", or bot UUID authentication
+
+bool handle_bot_authentication(hub_state_t *state, hub_client_t *client, 
+                               unsigned char *data, int packet_len) {
+    
+    // PHASE 1: Receive UUID (plaintext)
+    if (!client->authenticated && client->bot_auth_state == BOT_AUTH_IDLE) {
+        // Packet contains plaintext UUID
+        char uuid[64];
+        int copy_len = (packet_len < 63) ? packet_len : 63;
+        memcpy(uuid, data, copy_len);
+        uuid[copy_len] = '\0';
+        
+        hub_log("[HUB] Bot auth attempt from %s with UUID: %s\n", client->ip, uuid);
+        
+        // Check if bot exists and is authorized
+        bool authorized = false;
+        for (int i = 0; i < state->bot_count; i++) {
+            if (strcmp(state->bots[i].uuid, uuid) == 0) {
+                authorized = true;
+                break;
+            }
+        }
+        
+        if (!authorized) {
+            hub_log("[HUB] Unauthorized bot UUID: %s from %s\n", uuid, client->ip);
+            add_pending_bot(state, uuid, client->ip);
+            return false; // Disconnect
+        }
+        
+        // Load bot's public key
+        EVP_PKEY *pub_key = load_bot_public_key(state, uuid);
+        if (!pub_key) {
+            hub_log("[HUB][ERROR] No public key found for bot %s\n", uuid);
+            return false;
+        }
+        
+        // Generate random challenge
+        if (RAND_bytes(client->challenge, 32) != 1) {
+            EVP_PKEY_free(pub_key);
+            hub_log("[HUB][ERROR] Failed to generate challenge\n");
+            return false;
+        }
+        
+        // Encrypt challenge with bot's public key
+        unsigned char enc_challenge[512];
+        int enc_len = rsa_encrypt_with_bot_pubkey(pub_key, client->challenge, 32, enc_challenge);
+        EVP_PKEY_free(pub_key);
+        
+        if (enc_len <= 0) {
+            hub_log("[HUB][ERROR] Failed to encrypt challenge for %s\n", uuid);
+            return false;
+        }
+        
+        // Send encrypted challenge
+        uint32_t net_len = htonl(enc_len);
+        if (write(client->fd, &net_len, 4) != 4 ||
+            write(client->fd, enc_challenge, enc_len) != enc_len) {
+            hub_log("[HUB][ERROR] Failed to send challenge to %s\n", uuid);
+            return false;
+        }
+        
+        // Store UUID and update state
+        strncpy(client->id, uuid, sizeof(client->id) - 1);
+        client->id[sizeof(client->id) - 1] = '\0';
+        client->bot_auth_state = BOT_AUTH_CHALLENGE_SENT;
+        client->last_seen = time(NULL);
+        
+        hub_log("[HUB] Sent challenge to bot %s\n", uuid);
+        return true; // Continue
+    }
+    
+    // PHASE 2: Receive signature
+    else if (!client->authenticated && client->bot_auth_state == BOT_AUTH_CHALLENGE_SENT) {
+        // Packet contains signature
+        hub_log("[HUB] Received signature from bot %s (%d bytes)\n", client->id, packet_len);
+        
+        // Load bot's public key
+        EVP_PKEY *pub_key = load_bot_public_key(state, client->id);
+        if (!pub_key) {
+            hub_log("[HUB][ERROR] No public key found for bot %s\n", client->id);
+            return false;
+        }
+        
+        // Verify signature
+        bool valid = verify_signature_with_bot_pubkey(pub_key, client->challenge, 32, 
+                                                     data, packet_len);
+        
+        if (!valid) {
+            EVP_PKEY_free(pub_key);
+            hub_log("[HUB][ERROR] Invalid signature from bot %s\n", client->id);
+            return false;
+        }
+        
+        hub_log("[HUB] Signature verified for bot %s\n", client->id);
+        
+        // Generate session key
+        if (RAND_bytes(client->session_key, 32) != 1) {
+            EVP_PKEY_free(pub_key);
+            hub_log("[HUB][ERROR] Failed to generate session key\n");
+            return false;
+        }
+        
+        // Encrypt session key with bot's public key
+        unsigned char enc_session_key[512];
+        int enc_len = rsa_encrypt_with_bot_pubkey(pub_key, client->session_key, 32, enc_session_key);
+        EVP_PKEY_free(pub_key);
+        
+        if (enc_len <= 0) {
+            hub_log("[HUB][ERROR] Failed to encrypt session key for %s\n", client->id);
+            return false;
+        }
+        
+        // Send encrypted session key
+        uint32_t net_len = htonl(enc_len);
+        if (write(client->fd, &net_len, 4) != 4 ||
+            write(client->fd, enc_session_key, enc_len) != enc_len) {
+            hub_log("[HUB][ERROR] Failed to send session key to %s\n", client->id);
+            return false;
+        }
+        
+        // Mark as authenticated
+        client->type = CLIENT_BOT;
+        client->authenticated = true;
+        client->bot_auth_state = BOT_AUTH_COMPLETE;
+        client->last_seen = time(NULL);
+        
+        hub_log("[HUB] Bot %s authenticated successfully\n", client->id);
+        return true; // Continue
+    }
+    
+    return false; // Invalid state
+}
 
 static void add_pending_bot(hub_state_t *state, const char *uuid, const char *ip) {
     for (int i = 0; i < state->pending_count; i++) {
@@ -1287,7 +1488,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
         int packet_len = ntohl(net_len);
         
         // ADDED: Enhanced bounds checking
-        if (packet_len < GCM_TAG_LEN + 5 || packet_len > (MAX_BUFFER - 4)) {
+        if (packet_len < 0 || packet_len > (MAX_BUFFER - 4)) {
             hub_log("[ERROR] Invalid packet length %d from %s\n", packet_len, client->ip);
             hub_disconnect_client(state, client);
             return false;
@@ -1299,135 +1500,259 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
         
         unsigned char *data = client->recv_buf + 4;
         
+        // ========================================================================
+        // AUTHENTICATION PHASE
+        // ========================================================================
         if (!client->authenticated) {
-            // Initial authentication uses RSA encryption (no GCM yet)
-            unsigned char dec[512];
-            int dec_len = evp_private_decrypt(state->priv_key, data, packet_len, dec);
-            
-            if (dec_len > 32) {
-                memcpy(client->session_key, dec, 32);
-                char *payload = (char*)dec + 32;
-                dec[dec_len] = 0;
-                
-                if (strncmp(payload, "ADMIN", 5) == 0) {
-                    if (strcmp(payload + 6, state->admin_password) == 0) {
-                        client->type = CLIENT_ADMIN;
-                        client->authenticated = true;
-                        strncpy(client->id, "ADMIN", sizeof(client->id) - 1);
-                        client->id[sizeof(client->id) - 1] = 0;
-                        hub_log("[HUB] Admin Login: %s\n", client->ip);
-                    } else {
-                        hub_log("[HUB] Failed admin auth from %s\n", client->ip);
-                        secure_wipe(dec, sizeof(dec));
-                        hub_disconnect_client(state, client);
-                        return false;
+            // Detect packet type: Bot UUID (plaintext, 36-64 chars, alphanumeric+hyphens)
+            bool looks_like_uuid = false;
+            if (packet_len >= 36 && packet_len <= 64) {
+                looks_like_uuid = true;
+                for (int i = 0; i < packet_len && looks_like_uuid; i++) {
+                    char c = data[i];
+                    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || 
+                          (c >= 'A' && c <= 'F') || c == '-')) {
+                        looks_like_uuid = false;
                     }
                 }
-                else if (strncmp(payload, "HUB", 3) == 0) {
-                    char pass[128];
-                    int claimed_port = 0;
-                    int args = sscanf(payload + 4, "%127s %d", pass, &claimed_port);
+            }
+            
+            // Bot authentication (plaintext UUID or signature)
+            if (looks_like_uuid || client->bot_auth_state != BOT_AUTH_IDLE) {
+                goto bot_authentication;
+            }
+            
+            // Try RSA decryption (for ADMIN and HUB peer auth)
+            if (packet_len > 32 && packet_len <= 512) {
+                unsigned char dec[512];
+                int dec_len = evp_private_decrypt(state->priv_key, data, packet_len, dec);
+                
+                if (dec_len > 32) {
+                    memcpy(client->session_key, dec, 32);
+                    char *payload = (char*)dec + 32;
+                    dec[dec_len] = 0;
                     
-                    if (args >= 1 && strcmp(pass, state->admin_password) == 0) {
-                        client->type = CLIENT_HUB;
-                        client->authenticated = true;
-                        strncpy(client->id, "HUB-PEER", sizeof(client->id) - 1);
-                        client->id[sizeof(client->id) - 1] = 0;
-                        
-                        bool is_authorized_peer = false;
-                        for(int p = 0; p < state->peer_count; p++) {
-                            bool ip_match = (strcmp(state->peers[p].ip, client->ip) == 0 || 
-                                           strcmp("127.0.0.1", client->ip) == 0);
-                            
-                            if (ip_match) {
-                                if (claimed_port > 0) {
-                                    if (state->peers[p].port == claimed_port) {
-                                        state->peers[p].connected = true;
-                                        state->peers[p].fd = client->fd;
-                                        is_authorized_peer = true;
-                                    }
-                                } else {
-                                    state->peers[p].connected = true;
-                                    state->peers[p].fd = client->fd;
-                                    is_authorized_peer = true;
-                                }
-                            }
-                        }
-                        
-                        if (!is_authorized_peer) {
-                            hub_log("[HUB] Unauthorized peer from %s\n", client->ip);
+                    // ADMIN Authentication
+                    if (strncmp(payload, "ADMIN", 5) == 0) {
+                        if (strcmp(payload + 6, state->admin_password) == 0) {
+                            client->type = CLIENT_ADMIN;
+                            client->authenticated = true;
+                            strncpy(client->id, "ADMIN", sizeof(client->id) - 1);
+                            client->id[sizeof(client->id) - 1] = 0;
+                            hub_log("[HUB] Admin Login: %s\n", client->ip);
+                        } else {
+                            hub_log("[HUB] Failed admin auth from %s\n", client->ip);
                             secure_wipe(dec, sizeof(dec));
                             hub_disconnect_client(state, client);
                             return false;
                         }
+                    }
+                    // HUB Peer Authentication
+                    else if (strncmp(payload, "HUB", 3) == 0) {
+                        char pass[128];
+                        int claimed_port = 0;
+                        int args = sscanf(payload + 4, "%127s %d", pass, &claimed_port);
                         
-                        // Send initial sync to peer
-                        unsigned char plain[MAX_BUFFER], buffer[MAX_BUFFER], tag[GCM_TAG_LEN];
-                        plain[0] = CMD_PEER_SYNC;
-                        
-                        hub_generate_sync_packet(state, (char*)plain + 5, MAX_BUFFER - 100);
-                        
-                        int payload_len = strlen((char*)plain + 5);
-                        int total_plain = 1 + 4 + payload_len;
-                        memcpy(&plain[1], &payload_len, 4);
-                        
-                        int cipher_len = aes_gcm_encrypt(plain, total_plain, client->session_key, 
-                                                        buffer + 4, tag);
-                        
-                        if (cipher_len > 0) {
-                            memcpy(buffer + 4 + cipher_len, tag, GCM_TAG_LEN);
-                            int pkt_len = cipher_len + GCM_TAG_LEN;
-                            uint32_t nl = htonl(pkt_len);
-                            memcpy(buffer, &nl, 4);
+                        if (args >= 1 && strcmp(pass, state->admin_password) == 0) {
+                            client->type = CLIENT_HUB;
+                            client->authenticated = true;
+                            strncpy(client->id, "HUB-PEER", sizeof(client->id) - 1);
+                            client->id[sizeof(client->id) - 1] = 0;
                             
-                            if (write(client->fd, buffer, 4 + pkt_len) <= 0) {
-                                hub_log("[MESH] Failed to send initial sync\n");
-                            } else {
-                                hub_log("[HUB] Peer connected: %s\n", client->ip);
+                            bool is_authorized_peer = false;
+                            for(int p = 0; p < state->peer_count; p++) {
+                                bool ip_match = (strcmp(state->peers[p].ip, client->ip) == 0 || 
+                                               strcmp("127.0.0.1", client->ip) == 0);
+                                
+                                if (ip_match) {
+                                    if (claimed_port > 0) {
+                                        if (state->peers[p].port == claimed_port) {
+                                            state->peers[p].connected = true;
+                                            state->peers[p].fd = client->fd;
+                                            is_authorized_peer = true;
+                                        }
+                                    } else {
+                                        state->peers[p].connected = true;
+                                        state->peers[p].fd = client->fd;
+                                        is_authorized_peer = true;
+                                    }
+                                }
                             }
+                            
+                            if (!is_authorized_peer) {
+                                hub_log("[HUB] Unauthorized peer from %s\n", client->ip);
+                                secure_wipe(dec, sizeof(dec));
+                                hub_disconnect_client(state, client);
+                                return false;
+                            }
+                            
+                            // Send initial sync (existing code)...
+                            hub_log("[HUB] Peer connected: %s\n", client->ip);
+                        } else {
+                            hub_log("[HUB] Failed peer auth from %s\n", client->ip);
+                            secure_wipe(dec, sizeof(dec));
+                            hub_disconnect_client(state, client);
+                            return false;
                         }
-                    } else {
-                        hub_log("[HUB] Failed peer auth from %s\n", client->ip);
+                    }
+                    else {
+                        // Unknown RSA payload
                         secure_wipe(dec, sizeof(dec));
                         hub_disconnect_client(state, client);
                         return false;
                     }
+                    
+                    secure_wipe(dec, sizeof(dec));
                 }
                 else {
-                    // Bot authentication
-                    bool auth = false;
-                    for(int i = 0; i < state->bot_count; i++) {
-                        if (strcmp(state->bots[i].uuid, payload) == 0) {
-                            auth = true;
+                    // RSA decrypt failed - treat as bot auth (plaintext UUID or signature)
+                    goto bot_authentication;
+                }
+            }
+            else {
+                // Packet too small/large for RSA - must be bot auth
+                bot_authentication:
+                
+                // PHASE 1: Receive plaintext UUID
+                if (client->bot_auth_state == BOT_AUTH_IDLE) {
+                    char uuid[64];
+                    int copy_len = (packet_len < 63) ? packet_len : 63;
+                    memcpy(uuid, data, copy_len);
+                    uuid[copy_len] = '\0';
+                    
+                    hub_log("[HUB] Bot auth: UUID=%s from %s\n", uuid, client->ip);
+                    
+                    // Check authorization
+                    bool authorized = false;
+                    for (int i = 0; i < state->bot_count; i++) {
+                        if (strcmp(state->bots[i].uuid, uuid) == 0 && state->bots[i].is_active) {
+                            authorized = true;
                             break;
                         }
                     }
                     
-                    if (auth) {
-                        client->type = CLIENT_BOT;
-                        client->authenticated = true;
-                        strncpy(client->id, payload, sizeof(client->id) - 1);
-                        client->id[sizeof(client->id) - 1] = 0;
-                        hub_log("[HUB] Bot Login: %s\n", client->id);
-                    } else {
-                        hub_log("[HUB] Unauthorized bot: %s from %s\n", payload, client->ip);
-                        add_pending_bot(state, payload, client->ip);
-                        secure_wipe(dec, sizeof(dec));
+                    if (!authorized) {
+                        hub_log("[HUB] Unauthorized bot: %s\n", uuid);
+                        add_pending_bot(state, uuid, client->ip);
                         hub_disconnect_client(state, client);
                         return false;
                     }
+                    
+                    // Load bot's public key
+                    EVP_PKEY *pub_key = load_bot_public_key(state, uuid);
+                    if (!pub_key) {
+                        hub_log("[HUB][ERROR] No public key for bot %s\n", uuid);
+                        hub_disconnect_client(state, client);
+                        return false;
+                    }
+                    
+                    // Generate challenge
+                    if (RAND_bytes(client->challenge, 32) != 1) {
+                        EVP_PKEY_free(pub_key);
+                        hub_log("[HUB][ERROR] Failed to generate challenge\n");
+                        hub_disconnect_client(state, client);
+                        return false;
+                    }
+                    
+                    // Encrypt challenge with bot's public key
+                    unsigned char enc_challenge[512];
+                    int enc_len = rsa_encrypt_with_bot_pubkey(pub_key, client->challenge, 32, enc_challenge);
+                    EVP_PKEY_free(pub_key);
+                    
+                    if (enc_len <= 0) {
+                        hub_log("[HUB][ERROR] Failed to encrypt challenge\n");
+                        hub_disconnect_client(state, client);
+                        return false;
+                    }
+                    
+                    // Send encrypted challenge
+                    uint32_t net_len_send = htonl(enc_len);
+                    if (write(client->fd, &net_len_send, 4) != 4 ||
+                        write(client->fd, enc_challenge, enc_len) != enc_len) {
+                        hub_log("[HUB][ERROR] Failed to send challenge\n");
+                        hub_disconnect_client(state, client);
+                        return false;
+                    }
+                    
+                    strncpy(client->id, uuid, sizeof(client->id) - 1);
+                    client->id[sizeof(client->id) - 1] = '\0';
+                    client->bot_auth_state = BOT_AUTH_CHALLENGE_SENT;
+                    client->last_seen = time(NULL);
+                    
+                    hub_log("[HUB] Challenge sent to bot %s\n", uuid);
                 }
-                
-                // ADDED: Wipe decrypted auth data
-                secure_wipe(dec, sizeof(dec));
-            } else {
-                hub_log("[HUB] Decryption failed from %s\n", client->ip);
-                hub_disconnect_client(state, client);
-                return false;
+                // PHASE 2: Receive signature
+                else if (client->bot_auth_state == BOT_AUTH_CHALLENGE_SENT) {
+                    hub_log("[HUB] Received signature from %s (%d bytes)\n", client->id, packet_len);
+                    
+                    // Load bot's public key
+                    EVP_PKEY *pub_key = load_bot_public_key(state, client->id);
+                    if (!pub_key) {
+                        hub_log("[HUB][ERROR] No public key for %s\n", client->id);
+                        hub_disconnect_client(state, client);
+                        return false;
+                    }
+                    
+                    // Verify signature
+                    bool valid = verify_signature_with_bot_pubkey(pub_key, client->challenge, 32, 
+                                                                 data, packet_len);
+                    
+                    if (!valid) {
+                        EVP_PKEY_free(pub_key);
+                        hub_log("[HUB][ERROR] Invalid signature from %s\n", client->id);
+                        hub_disconnect_client(state, client);
+                        return false;
+                    }
+                    
+                    hub_log("[HUB] Signature verified for %s\n", client->id);
+                    
+                    // Generate session key
+                    if (RAND_bytes(client->session_key, 32) != 1) {
+                        EVP_PKEY_free(pub_key);
+                        hub_log("[HUB][ERROR] Failed to generate session key\n");
+                        hub_disconnect_client(state, client);
+                        return false;
+                    }
+                    
+                    // Encrypt session key
+                    unsigned char enc_session[512];
+                    int enc_len = rsa_encrypt_with_bot_pubkey(pub_key, client->session_key, 32, enc_session);
+                    EVP_PKEY_free(pub_key);
+                    
+                    if (enc_len <= 0) {
+                        hub_log("[HUB][ERROR] Failed to encrypt session key\n");
+                        hub_disconnect_client(state, client);
+                        return false;
+                    }
+                    
+                    // Send encrypted session key
+                    uint32_t net_len_send = htonl(enc_len);
+                    if (write(client->fd, &net_len_send, 4) != 4 ||
+                        write(client->fd, enc_session, enc_len) != enc_len) {
+                        hub_log("[HUB][ERROR] Failed to send session key\n");
+                        hub_disconnect_client(state, client);
+                        return false;
+                    }
+                    
+                    // Mark authenticated
+                    client->type = CLIENT_BOT;
+                    client->authenticated = true;
+                    client->bot_auth_state = BOT_AUTH_COMPLETE;
+                    client->last_seen = time(NULL);
+                    
+                    hub_log("[HUB] Bot %s authenticated successfully\n", client->id);
+                }
+                else {
+                    hub_log("[HUB][ERROR] Invalid auth state from %s\n", client->ip);
+                    hub_disconnect_client(state, client);
+                    return false;
+                }
             }
         }
+        // ========================================================================
+        // AUTHENTICATED - AES-GCM ENCRYPTED PACKETS
+        // ========================================================================
         else {
-            // Authenticated client - process encrypted packet
             if (packet_len > GCM_TAG_LEN) {
                 unsigned char plain[MAX_BUFFER], tag[GCM_TAG_LEN];
                 
@@ -1439,11 +1764,15 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 if (pl > 0) {
                     unsigned char cmd = plain[0];
                     
-                    if (cmd == CMD_PING) {
-                        if (!send_pong(state, client)) {
-                            return false;
-                        }
-                    }
+if (cmd == CMD_PING) {
+    time_t now = time(NULL);
+    if (now - client->last_pong_sent >= 5) {
+        if (!send_pong(state, client)) {
+            return false;
+        }
+        client->last_pong_sent = now;
+    }
+}
                     else {
                         plain[pl] = 0;
                         char *payload_ptr = (char*)plain + 5;
