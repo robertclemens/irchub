@@ -9,6 +9,7 @@
 #endif
 
 void hub_log(const char *format, ...);
+static void send_config_to_bot(hub_state_t *state, hub_client_t *client);
 
 // --- Forward Declarations ---
 static bool send_response(hub_state_t *state, hub_client_t *client, const char *msg);
@@ -659,9 +660,9 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     int written;
     
     switch(cmd) {
-        case CMD_ADMIN_LIST_FULL:
-            hub_storage_get_full_list(state, response, sizeof(response));
-            return send_response(state, client, response);
+       // case CMD_ADMIN_LIST_FULL:
+       //     hub_storage_get_full_list(state, response, sizeof(response));
+       //     return send_response(state, client, response);
             
         case CMD_ADMIN_LIST_SUMMARY:
             hub_storage_get_summary_list(state, response, sizeof(response));
@@ -692,7 +693,204 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                 }
                 return send_response(state, client, response);
             }
+            case CMD_ADMIN_REKEY_BOT:
+    if (payload && strlen(payload) > 0) {
+        // Find bot by UUID
+        bot_config_t *bot = NULL;
+        for (int i = 0; i < state->bot_count; i++) {
+            if (strcmp(state->bots[i].uuid, payload) == 0) {
+                bot = &state->bots[i];
+                break;
+            }
+        }
+        
+        if (!bot) {
+            return send_response(state, client, "ERROR|Bot not found");
+        }
+        
+        // Get bot nickname
+        char nick[64] = "Unknown";
+        for (int i = 0; i < bot->entry_count; i++) {
+            if (strcmp(bot->entries[i].key, "n") == 0) {
+                strncpy(nick, bot->entries[i].value, sizeof(nick) - 1);
+                nick[sizeof(nick) - 1] = 0;
+                break;
+            }
+        }
+        
+        // Generate new keypair (same logic as CREATE_BOT)
+        char *new_priv_b64 = NULL, *new_pub_b64 = NULL;
+        
+        // Use existing crypto function
+        char *uuid_temp = NULL, *priv_temp = NULL, *pub_temp = NULL;
+        if (hub_crypto_generate_bot_creds(&uuid_temp, &priv_temp, &pub_temp)) {
+            // We only need the keys, not the UUID
+            new_priv_b64 = priv_temp;
+            new_pub_b64 = pub_temp;
             
+            if (uuid_temp) free(uuid_temp);
+            
+            // Update bot's public key in storage
+            time_t now = time(NULL);
+            hub_storage_update_entry(state, payload, "pub", new_pub_b64, now);
+            hub_config_write(state);
+            
+            // Disconnect bot if currently connected
+            for (int i = 0; i < state->client_count; i++) {
+                if (state->clients[i]->type == CLIENT_BOT && 
+                    strcmp(state->clients[i]->id, payload) == 0) {
+                    hub_log("[ADMIN] Disconnecting bot %s for rekey\n", payload);
+                    hub_disconnect_client(state, state->clients[i]);
+                    break;
+                }
+            }
+            
+            // Build response: SUCCESS|<nick>|<base64_priv_key>
+            char response[8192];
+            snprintf(response, sizeof(response), "SUCCESS|%s|%s", nick, new_priv_b64);
+            
+            // Broadcast sync to peers
+            char sync_packet[MAX_BUFFER];
+            snprintf(sync_packet, sizeof(sync_packet), 
+                    "b|%s|pub|%s|%ld\n", payload, new_pub_b64, (long)now);
+            hub_broadcast_sync_to_peers(state, sync_packet, -1);
+            
+            // Cleanup
+            if (new_pub_b64) free(new_pub_b64);
+            bool result = send_response(state, client, response);
+            
+            // Wipe private key from memory
+            if (new_priv_b64) {
+                secure_wipe(new_priv_b64, strlen(new_priv_b64));
+                free(new_priv_b64);
+            }
+            
+            return result;
+        } else {
+            return send_response(state, client, "ERROR|Keypair generation failed");
+        }
+    }
+    return send_response(state, client, "ERROR|Missing UUID");
+
+case CMD_ADMIN_DISCONNECT_BOT:
+    if (payload && strlen(payload) > 0) {
+        // Find and disconnect bot by UUID
+        bool found = false;
+        for (int i = 0; i < state->client_count; i++) {
+            if (state->clients[i]->type == CLIENT_BOT && 
+                strcmp(state->clients[i]->id, payload) == 0) {
+                hub_log("[ADMIN] Disconnecting bot %s\n", payload);
+                hub_disconnect_client(state, state->clients[i]);
+                found = true;
+                break;
+            }
+        }
+        
+        if (found) {
+            return send_response(state, client, "SUCCESS: Bot disconnected");
+        } else {
+            return send_response(state, client, "ERROR: Bot not connected");
+        }
+    }
+    return send_response(state, client, "ERROR: Missing UUID");
+
+
+// ENHANCEMENT: Update existing CMD_ADMIN_DEL to disconnect bot
+case CMD_ADMIN_DEL:
+    if (payload && hub_storage_delete(state, payload)) {
+        // Disconnect bot if currently connected
+        for (int i = 0; i < state->client_count; i++) {
+            if (state->clients[i]->type == CLIENT_BOT && 
+                strcmp(state->clients[i]->id, payload) == 0) {
+                hub_log("[ADMIN] Disconnecting deleted bot %s\n", payload);
+                hub_disconnect_client(state, state->clients[i]);
+                break;
+            }
+        }
+        
+        time_t now = time(NULL);
+        char sync[256];
+        snprintf(sync, sizeof(sync), "%s|d|1|%ld\n", payload, now);
+        hub_broadcast_sync_to_peers(state, sync, -1);
+        return send_response(state, client, "SUCCESS: Deleted & Synced.");
+    }
+    return send_response(state, client, "ERROR: Not found.");
+
+
+// ENHANCEMENT: Update CMD_ADMIN_LIST_FULL to show connection status
+case CMD_ADMIN_LIST_FULL:
+    {
+        char response[MAX_BUFFER];
+        int offset = 0;
+        int written;
+        
+        int active_count = 0;
+        for (int i = 0; i < state->bot_count; i++) {
+            if (state->bots[i].is_active) active_count++;
+        }
+        
+        written = snprintf(response + offset, MAX_BUFFER - offset,
+                          "--- Registered Bots (%d) ---\n", active_count);
+        if (written >= MAX_BUFFER - offset) return send_response(state, client, "ERROR: Buffer overflow");
+        offset += written;
+        
+        for (int i = 0; i < state->bot_count; i++) {
+            bot_config_t *b = &state->bots[i];
+            if (!b->is_active) continue;
+            
+            // Get nickname
+            char nick[32] = "Unknown";
+            for (int k = 0; k < b->entry_count; k++) {
+                if (strcmp(b->entries[k].key, "n") == 0) {
+                    strncpy(nick, b->entries[k].value, sizeof(nick) - 1);
+                    nick[sizeof(nick) - 1] = 0;
+                    break;
+                }
+            }
+            
+            // Check if bot is currently connected
+            bool is_connected = false;
+            char connected_to[128] = "N/A";
+            time_t last_seen = b->last_sync_time;
+            
+            for (int c = 0; c < state->client_count; c++) {
+                if (state->clients[c]->type == CLIENT_BOT && 
+                    strcmp(state->clients[c]->id, b->uuid) == 0) {
+                    is_connected = true;
+                    snprintf(connected_to, sizeof(connected_to), 
+                            "LOCAL (127.0.0.1:%d)", state->port);
+                    last_seen = state->clients[c]->last_seen;
+                    break;
+                }
+            }
+            
+            // TODO: Check if connected to remote peers (requires mesh state tracking)
+            
+            // Format last seen time
+            char time_buf[64];
+            if (last_seen == 0) {
+                snprintf(time_buf, sizeof(time_buf), "Never");
+            } else {
+                struct tm *t = localtime(&last_seen);
+                strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", t);
+            }
+            
+            // Build output line
+            written = snprintf(response + offset, MAX_BUFFER - offset,
+                             "[%s] %-15s | Status: %-10s | Peer: %-20s | Last: %s\n",
+                             b->uuid, nick,
+                             is_connected ? "CONNECTED" : "OFFLINE",
+                             is_connected ? connected_to : "N/A",
+                             time_buf);
+            
+            if (written >= MAX_BUFFER - offset) break;
+            offset += written;
+            
+            if (offset >= MAX_BUFFER - 100) break;
+        }
+        
+        return send_response(state, client, response);
+    }
         case CMD_ADMIN_APPROVE:
             if (payload && strlen(payload) > 0) {
                 char target_uuid[64] = {0};
@@ -740,15 +938,15 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             }
             return send_response(state, client, "ERROR: Invalid UUID.");
             
-        case CMD_ADMIN_DEL:
-            if (payload && hub_storage_delete(state, payload)) {
-                time_t now = time(NULL);
-                char sync[256];
-                snprintf(sync, sizeof(sync), "%s|d|1|%ld\n", payload, now);
-                hub_broadcast_sync_to_peers(state, sync, -1);
-                return send_response(state, client, "SUCCESS: Deleted & Synced.");
-            }
-            return send_response(state, client, "ERROR: Not found.");
+    //    case CMD_ADMIN_DEL:
+    //        if (payload && hub_storage_delete(state, payload)) {
+    //            time_t now = time(NULL);
+   //             char sync[256];
+   //             snprintf(sync, sizeof(sync), "%s|d|1|%ld\n", payload, now);
+  //              hub_broadcast_sync_to_peers(state, sync, -1);
+  //              return send_response(state, client, "SUCCESS: Deleted & Synced.");
+ //           }
+ //           return send_response(state, client, "ERROR: Not found.");
             
         case CMD_ADMIN_SYNC_MESH:
             {
@@ -1415,69 +1613,156 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
             break;
             
         case CMD_CONFIG_PUSH:
-            hub_log("[HUB] Sync from %s\n", client->id);
-            if (payload) {
-                char target_nick[32], servers[256], chans[256], pass[128];
+            {
+                hub_log("[HUB] Config PUSH from %s\n", client->id);
+                
+                if (!payload || strlen(payload) == 0) {
+                    hub_log("[HUB] Empty config payload from %s\n", client->id);
+                    break;
+                }
+                
+                char target_nick[32] = "", servers[256] = "", chans[256] = "", pass[128] = "";
+                
+                // Parse: nick|servers|channels|botpass
+                int parsed = sscanf(payload, "%31[^|]|%255[^|]|%255[^|]|%127s", 
+                                   target_nick, servers, chans, pass);
+                
+                if (parsed < 4) {
+                    hub_log("[HUB] Malformed config from %s (parsed=%d): %s\n", 
+                           client->id, parsed, payload);
+                    break;
+                }
+                
                 time_t now = time(NULL);
                 char sync_packet[MAX_BUFFER];
                 int sp_len = 0;
-                int written;
                 
+                // Update last sync time
                 hub_storage_update_entry(state, client->id, "t", "", now);
+                sp_len += snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
+                                 "b|%s|t||%ld\n", client->id, (long)now);
                 
-                written = snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
-                                 "%s|t||%ld\n", client->id, (long)now);
-                if (written > 0 && written < (int)(sizeof(sync_packet) - sp_len)) {
-                    sp_len += written;
+                // Store nick
+                hub_storage_update_entry(state, client->id, "n", target_nick, now);
+                sp_len += snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
+                                 "b|%s|n|%s|%ld\n", client->id, target_nick, (long)now);
+                
+                // Store botpass
+                hub_storage_update_entry(state, client->id, "b", pass, now);
+                sp_len += snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
+                                 "b|%s|b|%s|%ld\n", client->id, pass, (long)now);
+                
+                // Parse and store servers (comma-separated)
+                if (strlen(servers) > 0) {
+                    char servers_copy[256];
+                    strncpy(servers_copy, servers, sizeof(servers_copy) - 1);
+                    servers_copy[sizeof(servers_copy) - 1] = 0;
+                    
+                    char *saveptr, *tok = strtok_r(servers_copy, ",", &saveptr);
+                    while (tok) {
+                        hub_storage_update_entry(state, client->id, "s", tok, now);
+                        sp_len += snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
+                                         "b|%s|s|%s|%ld\n", client->id, tok, (long)now);
+                        tok = strtok_r(NULL, ",", &saveptr);
+                    }
                 }
                 
-                if (sscanf(payload, "%31[^|]|%255[^|]|%255[^|]|%127s", 
-                          target_nick, servers, chans, pass) >= 1) {
-                    hub_storage_update_entry(state, client->id, "n", target_nick, now);
+                // Parse and store channels (comma-separated)
+                if (strlen(chans) > 0) {
+                    char chans_copy[256];
+                    strncpy(chans_copy, chans, sizeof(chans_copy) - 1);
+                    chans_copy[sizeof(chans_copy) - 1] = 0;
                     
-                    written = snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
-                                     "%s|n|%s|%ld\n", client->id, target_nick, (long)now);
-                    if (written > 0 && written < (int)(sizeof(sync_packet) - sp_len)) {
-                        sp_len += written;
+                    char *saveptr, *tok = strtok_r(chans_copy, ",", &saveptr);
+                    while (tok) {
+                        hub_storage_update_entry(state, client->id, "c", tok, now);
+                        sp_len += snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
+                                         "b|%s|c|%s|%ld\n", client->id, tok, (long)now);
+                        tok = strtok_r(NULL, ",", &saveptr);
                     }
-                    
-                    hub_storage_update_entry(state, client->id, "b", pass, now);
-                    
-                    written = snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
-                                     "%s|b|%s|%ld\n", client->id, pass, (long)now);
-                    if (written > 0 && written < (int)(sizeof(sync_packet) - sp_len)) {
-                        sp_len += written;
-                    }
-                    
-                    char *sp, *t = strtok_r(servers, ",", &sp);
-                    while(t) {
-                        hub_storage_update_entry(state, client->id, "s", t, now);
-                        
-                        written = snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
-                                         "%s|s|%s|%ld\n", client->id, t, (long)now);
-                        if (written > 0 && written < (int)(sizeof(sync_packet) - sp_len)) {
-                            sp_len += written;
-                        }
-                        t = strtok_r(NULL, ",", &sp);
-                    }
-                    
-                    t = strtok_r(chans, ",", &sp);
-                    while(t) {
-                        hub_storage_update_entry(state, client->id, "c", t, now);
-                        
-                        written = snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
-                                         "%s|c|%s|%ld\n", client->id, t, (long)now);
-                        if (written > 0 && written < (int)(sizeof(sync_packet) - sp_len)) {
-                            sp_len += written;
-                        }
-                        t = strtok_r(NULL, ",", &sp);
-                    }
-                    
-                    hub_config_write(state);
+                }
+                
+                // Save to disk
+                hub_config_write(state);
+                
+                // Broadcast to peer hubs
+                if (sp_len > 0) {
                     hub_broadcast_sync_to_peers(state, sync_packet, -1);
                 }
+                
+                hub_log("[HUB] Config PUSH from %s complete - Nick:%s Servers:%d Channels:%d\n", 
+                       client->id, target_nick, 
+                       strlen(servers) > 0 ? 1 : 0,
+                       strlen(chans) > 0 ? 1 : 0);
+                
+                // Send acknowledgment + current hub config back to bot
+                send_config_to_bot(state, client);
             }
             break;
+            
+        case CMD_CONFIG_PULL:
+            hub_log("[HUB] Config PULL request from %s\n", client->id);
+            send_config_to_bot(state, client);
+            break;
+    }
+}
+
+// NEW FUNCTION: Send hub's stored config back to bot
+static void send_config_to_bot(hub_state_t *state, hub_client_t *client) {
+    // Find bot in storage
+    bot_config_t *bot = NULL;
+    for (int i = 0; i < state->bot_count; i++) {
+        if (strcmp(state->bots[i].uuid, client->id) == 0) {
+            bot = &state->bots[i];
+            break;
+        }
+    }
+    
+    if (!bot) {
+        hub_log("[HUB] Bot %s not found in storage\n", client->id);
+        return;
+    }
+    
+    // Build config payload
+    char payload[MAX_BUFFER];
+    int offset = 0;
+    
+    // Format: line-by-line config entries
+    for (int i = 0; i < bot->entry_count; i++) {
+        int written = snprintf(payload + offset, MAX_BUFFER - offset,
+                             "%s=%s\n", 
+                             bot->entries[i].key, 
+                             bot->entries[i].value);
+        if (written > 0 && written < (MAX_BUFFER - offset)) {
+            offset += written;
+        }
+    }
+    
+    if (offset == 0) {
+        hub_log("[HUB] No config to send to %s\n", client->id);
+        return;
+    }
+    
+    // Send CMD_CONFIG_DATA packet
+    unsigned char buffer[MAX_BUFFER];
+    unsigned char plain[MAX_BUFFER];
+    unsigned char tag[GCM_TAG_LEN];
+    
+    plain[0] = CMD_CONFIG_DATA;
+    uint32_t payload_len = offset;
+    memcpy(&plain[1], &payload_len, 4);
+    memcpy(&plain[5], payload, offset);
+    
+    int enc_len = aes_gcm_encrypt(plain, 5 + offset, client->session_key, 
+                                 buffer + 4, tag);
+    if (enc_len > 0) {
+        memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+        uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+        memcpy(buffer, &net_len, 4);
+        
+        if (write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
+            hub_log("[HUB] Sent config (%d bytes) to %s\n", offset, client->id);
+        }
     }
 }
 

@@ -65,6 +65,9 @@
 #define CMD_ADMIN_SET_PUBKEY    0x1E
 #define CMD_ADMIN_SYNC_MESH     0x1F
 #define CMD_ADMIN_CREATE_BOT    0x32  // 50 decimal
+#define CMD_ADMIN_REKEY_BOT     0x20  // Generate new bot keypair
+#define CMD_ADMIN_DISCONNECT_BOT 0x21  // Force disconnect bot
+#define CMD_ADMIN_BOT_STATUS    0x22  // Get bot connection info
 
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64

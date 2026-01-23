@@ -183,7 +183,9 @@ void hub_maintenance(hub_state_t *state) {
     time_t now = time(NULL);
     static time_t last_anti_entropy = 0;
     static time_t last_mesh_gossip = 0;
+    static time_t last_config_sync = 0;  // NEW
 
+    // Existing mesh gossip...
     if (now - last_mesh_gossip > 10) {
         last_mesh_gossip = now;
         if (state->peer_count > 0) {
@@ -193,6 +195,7 @@ void hub_maintenance(hub_state_t *state) {
 
     if (last_anti_entropy == 0) last_anti_entropy = now;
     
+    // Existing anti-entropy...
     if ((now - last_anti_entropy) > MESH_ANTI_ENTROPY_INTERVAL) {
         last_anti_entropy = now;
         if (state->peer_count > 0) {
@@ -203,7 +206,47 @@ void hub_maintenance(hub_state_t *state) {
         }
     }
     
-    // Check clients for timeouts and send pings
+    // NEW: Bidirectional config sync every 5 minutes
+    #define CONFIG_SYNC_INTERVAL 300  // 5 minutes
+    
+    if (last_config_sync == 0) last_config_sync = now;
+    
+    if ((now - last_config_sync) > CONFIG_SYNC_INTERVAL) {
+        last_config_sync = now;
+        
+        int sync_count = 0;
+        for (int i = 0; i < state->client_count; i++) {
+            hub_client_t *c = state->clients[i];
+            if (c->type == CLIENT_BOT && c->authenticated) {
+                // Send CONFIG_PULL to request fresh config
+                unsigned char buffer[MAX_BUFFER];
+                unsigned char plain[16];
+                unsigned char tag[GCM_TAG_LEN];
+                
+                plain[0] = CMD_CONFIG_PULL;
+                uint32_t zero = 0;
+                memcpy(&plain[1], &zero, 4);
+                
+                int enc_len = aes_gcm_encrypt(plain, 5, c->session_key, 
+                                             buffer + 4, tag);
+                if (enc_len > 0) {
+                    memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+                    uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+                    memcpy(buffer, &net_len, 4);
+                    
+                    if (write(c->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
+                        sync_count++;
+                    }
+                }
+            }
+        }
+        
+        if (sync_count > 0) {
+            hub_log("[HUB] Requested config sync from %d bots\n", sync_count);
+        }
+    }
+    
+    // Existing timeout/ping code...
     for (int i = 0; i < state->client_count; i++) {
         hub_client_t *c = state->clients[i];
         
