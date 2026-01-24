@@ -22,10 +22,10 @@ static bot_config_t *get_or_create_bot(hub_state_t *state, const char *uuid) {
 }
 
 // Global Storage Update
-static bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
-                                            const char *value,
-                                            const char *extra, const char *op,
-                                            time_t ts) {
+// Global Storage Update
+bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
+                                     const char *value, const char *extra,
+                                     const char *op, time_t ts) {
   char combined_value[1024];
 
   // Format value based on key type

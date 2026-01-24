@@ -21,7 +21,6 @@
 #include <time.h>
 #include <unistd.h>
 
-
 #define HUB_CONFIG_FILE ".irchub.cnf"
 #define MAX_CLIENTS 100
 #define MAX_BOTS 100
@@ -190,6 +189,9 @@ void hub_storage_init(void);
 bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
                               const char *key, const char *value,
                               const char *extra, const char *op, time_t ts);
+bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
+                                     const char *value, const char *extra,
+                                     const char *op, time_t ts);
 bool hub_storage_delete(hub_state_t *state, const char *uuid);
 int hub_storage_get_full_list(hub_state_t *state, char *buffer, int max_len);
 int hub_storage_get_summary_list(hub_state_t *state, char *buffer, int max_len);
