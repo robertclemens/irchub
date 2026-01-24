@@ -25,6 +25,10 @@
 #define MAX_CLIENTS 100
 #define MAX_BOTS 100
 #define MAX_PEERS 10
+#define MAX_CHAN 65
+#define MAX_KEY 31
+#define MAX_MASK_LEN 128
+#define MAX_PASS 128
 #define MAX_BUFFER 16384
 #define SALT_SIZE 16  // FIXED: Increased from 8 to 16 bytes (128 bits)
 #define GCM_IV_LEN 12
@@ -175,7 +179,10 @@ int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
                     unsigned char *tag);
 
 void hub_storage_init(void);
-bool hub_storage_update_entry(hub_state_t *state, const char *uuid, const char *key, const char *value, time_t ts);
+bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
+                               const char *key, const char *value,
+                               const char *extra, const char *op, 
+                               time_t ts);
 bool hub_storage_delete(hub_state_t *state, const char *uuid);
 int hub_storage_get_full_list(hub_state_t *state, char *buffer, int max_len);
 int hub_storage_get_summary_list(hub_state_t *state, char *buffer, int max_len);

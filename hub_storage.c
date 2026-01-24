@@ -22,8 +22,10 @@ static bot_config_t *get_or_create_bot(hub_state_t *state, const char *uuid) {
 }
 
 // Core Logic: Add/Update Entry
-bool hub_storage_update_entry(hub_state_t *state, const char *uuid, 
-                               const char *key, const char *value, time_t ts) {
+bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
+                               const char *key, const char *value,
+                               const char *extra, const char *op, 
+                               time_t ts) {
     bot_config_t *b = get_or_create_bot(state, uuid);
     if (!b) return false;
 
@@ -36,9 +38,43 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
         return false;
     }
 
-    // Determine Type: Singleton (n, b, d, pub, seen) or List (c, s, m)
+    // Build combined value for storage
+    // Format depends on type:
+    // c| → "chan_name|key|add" or "chan_name||del"
+    // m| → "mask|add" or "mask|del"
+    // o| → "mask|password|add" or "mask|password|del"
+    // a|, p|, h| → just the value (no op)
+    
+    char combined_value[1024];
+    
+    if (strcmp(key, "c") == 0) {
+        // Channel: value|extra|op
+        if (extra && extra[0]) {
+            snprintf(combined_value, sizeof(combined_value), "%s|%s|%s", 
+                    value, extra, op ? op : "add");
+        } else {
+            snprintf(combined_value, sizeof(combined_value), "%s||%s", 
+                    value, op ? op : "add");
+        }
+    } else if (strcmp(key, "m") == 0) {
+        // Mask: value|op
+        snprintf(combined_value, sizeof(combined_value), "%s|%s", 
+                value, op ? op : "add");
+    } else if (strcmp(key, "o") == 0) {
+        // Oper: value|extra|op
+        snprintf(combined_value, sizeof(combined_value), "%s|%s|%s", 
+                value, extra ? extra : "", op ? op : "add");
+    } else {
+        // Simple value (a, p, h)
+        strncpy(combined_value, value, sizeof(combined_value) - 1);
+        combined_value[sizeof(combined_value) - 1] = 0;
+    }
+    
+    // Determine Type: Singleton or List
     bool is_singleton = (strcmp(key, "n") == 0 || 
-                        strcmp(key, "b") == 0 || 
+                        strcmp(key, "a") == 0 || 
+                        strcmp(key, "p") == 0 || 
+                        strcmp(key, "h") == 0 ||
                         strcmp(key, "d") == 0 || 
                         strcmp(key, "pub") == 0 || 
                         strcmp(key, "seen") == 0);
@@ -48,6 +84,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
         b->is_active = true;
     }
 
+    // Check for existing entry
     for (int i = 0; i < b->entry_count; i++) {
         bool match = false;
         
@@ -56,40 +93,49 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
                 match = true;
             }
         } else {
-            // For lists, key AND value must match
+            // For lists (c, m, o, s), key AND value must match
+            // Extract just the first part (before first |) for matching
+            char stored_first[256];
+            const char *pipe = strchr(b->entries[i].value, '|');
+            if (pipe) {
+                size_t len = pipe - b->entries[i].value;
+                if (len >= sizeof(stored_first)) len = sizeof(stored_first) - 1;
+                memcpy(stored_first, b->entries[i].value, len);
+                stored_first[len] = 0;
+            } else {
+                strncpy(stored_first, b->entries[i].value, sizeof(stored_first) - 1);
+                stored_first[sizeof(stored_first) - 1] = 0;
+            }
+            
             if (strcmp(b->entries[i].key, key) == 0 && 
-                strcmp(b->entries[i].value, value) == 0) {
+                strcmp(stored_first, value) == 0) {
                 match = true;
             }
         }
 
         if (match) {
-            // Loop Prevention Logic:
-            
-            // 1. If incoming is older, ignore it
-            if (ts < b->entries[i].timestamp) {
-                return false;
-            }
+            // Timestamp comparison
+            if (ts < b->entries[i].timestamp) return false;
 
-            // 2. If incoming is newer, update
             if (ts > b->entries[i].timestamp) {
-                strncpy(b->entries[i].value, value, sizeof(b->entries[i].value) - 1);
-                b->entries[i].value[sizeof(b->entries[i].value) - 1] = 0;
+size_t len = strlen(combined_value);
+                if (len >= sizeof(b->entries[i].value)) len = sizeof(b->entries[i].value) - 1;
+                memcpy(b->entries[i].value, combined_value, len);
+                b->entries[i].value[len] = 0;
                 b->entries[i].timestamp = ts;
 
-                // Handle deletion side-effect
                 if (strcmp(key, "d") == 0) {
                     b->is_active = (strcmp(value, "1") != 0);
                 }
-
                 return true;
             }
 
-            // 3. If timestamps are EQUAL, only update if value is DIFFERENT
             if (ts == b->entries[i].timestamp) {
-                if (strcmp(b->entries[i].value, value) != 0) {
-                    strncpy(b->entries[i].value, value, sizeof(b->entries[i].value) - 1);
-                    b->entries[i].value[sizeof(b->entries[i].value) - 1] = 0;
+                if (strcmp(b->entries[i].value, combined_value) != 0) {
+ size_t len = strlen(combined_value);
+                    if (len >= sizeof(b->entries[i].value)) len = sizeof(b->entries[i].value) - 1;
+                    memcpy(b->entries[i].value, combined_value, len);
+                    b->entries[i].value[len] = 0;
 
                     if (strcmp(key, "d") == 0) {
                         b->is_active = (strcmp(value, "1") != 0);
@@ -97,8 +143,6 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
                     return true;
                 }
             }
-
-            // Same timestamp AND same value - DO NOT propagate (kills echo)
             return false;
         }
     }
@@ -108,8 +152,10 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
         config_entry_t *e = &b->entries[b->entry_count++];
         strncpy(e->key, key, sizeof(e->key) - 1);
         e->key[sizeof(e->key) - 1] = 0;
-        strncpy(e->value, value, sizeof(e->value) - 1);
-        e->value[sizeof(e->value) - 1] = 0;
+size_t len = strlen(combined_value);
+        if (len >= sizeof(e->value)) len = sizeof(e->value) - 1;
+        memcpy(e->value, combined_value, len);
+        e->value[len] = 0;
         e->timestamp = ts;
 
         if (strcmp(key, "d") == 0) {
@@ -138,7 +184,7 @@ bool hub_storage_delete(hub_state_t *state, const char *uuid) {
     }
 
     // Apply Soft Delete
-    hub_storage_update_entry(state, uuid, "d", "1", time(NULL));
+hub_storage_update_entry(state, uuid, "d", "1", "", "", time(NULL));
     hub_config_write(state);
     return true;
 }

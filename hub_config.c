@@ -324,7 +324,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
                     state->peer_count++;
                 }
             }
-            else if (strcmp(k, "b") == 0) {
+      else if (strcmp(k, "b") == 0) {
                 char *s2 = strchr(v, '|');
                 if (s2) {
                     *s2 = 0;
@@ -337,18 +337,53 @@ bool hub_config_load(hub_state_t *state, const char *password) {
                         char *bv = s3 + 1;
                         
                         if (strcmp(bk, "t") == 0) {
-                            hub_storage_update_entry(state, uuid, bk, "", atol(bv));
+                            // Metadata sync timestamp: b|uuid|t||timestamp
+                            hub_storage_update_entry(state, uuid, bk, "", "", "", atol(bv));
                         } else {
+                            // Config entry: b|uuid|key|value|timestamp
+                            // Parse: value might contain pipes (e.g., "chan|key|add")
+                            // Last pipe is always timestamp
                             char *s4 = strrchr(bv, '|');
                             if (s4) {
                                 *s4 = 0;
-                                hub_storage_update_entry(state, uuid, bk, bv, atol(s4 + 1));
+                                long ts = atol(s4 + 1);
+                                
+                                // Now parse value which might be:
+                                // Simple: "password" (a, p)
+                                // Channel: "chan|key|add" (c)
+                                // Mask: "mask|add" (m)
+                                // Oper: "mask|password|add" (o)
+                                // Hostmask: "nick!user@host" (h)
+                                
+                                char *pipe1 = strchr(bv, '|');
+                                if (pipe1) {
+                                    *pipe1 = 0;
+                                    char *rest2 = pipe1 + 1;
+                                    char *pipe2 = strchr(rest2, '|');
+                                    
+                                    if (pipe2) {
+                                        // Three parts: value|extra|op (channel or oper)
+                                        *pipe2 = 0;
+                                        char *value = bv;
+                                        char *extra = rest2;
+                                        char *op = pipe2 + 1;
+                                        hub_storage_update_entry(state, uuid, bk, value, extra, op, ts);
+                                    } else {
+                                        // Two parts: value|op (mask)
+                                        char *value = bv;
+                                        char *op = rest2;
+                                        hub_storage_update_entry(state, uuid, bk, value, "", op, ts);
+                                    }
+                                } else {
+                                    // One part: simple value (a, p, h)
+                                    hub_storage_update_entry(state, uuid, bk, bv, "", "", ts);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+         }
         line = strtok_r(NULL, "\n", &saveptr);
     }
 

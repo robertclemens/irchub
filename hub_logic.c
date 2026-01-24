@@ -330,9 +330,9 @@ static void hub_state_add_bot_memory(hub_state_t *state, const char *uuid,
         b->last_sync_time = 0;
         
         time_t now = time(NULL);
-        hub_storage_update_entry(state, uuid, "n", nick, now);
-        hub_storage_update_entry(state, uuid, "pub", pub_key, now);
-        hub_storage_update_entry(state, uuid, "seen", "0", now);
+        hub_storage_update_entry(state, uuid, "n", nick, "", "", now);
+        hub_storage_update_entry(state, uuid, "pub", pub_key, "", "", now);
+        hub_storage_update_entry(state, uuid, "seen", "0", "", "", now);
     }
 }
 
@@ -516,6 +516,164 @@ void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload, int ex
     }
 }
 
+static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
+                                     char *payload) {
+  if (client->type != CLIENT_BOT || !client->authenticated) {
+    hub_log("[HUB] Rejected config push from non-bot client\n");
+    return;
+  }
+  
+  hub_log("[HUB] Processing config push from %s\n", client->id);
+  
+  char work_buf[MAX_BUFFER];
+  strncpy(work_buf, payload, sizeof(work_buf) - 1);
+  work_buf[sizeof(work_buf) - 1] = '\0';
+  
+  char *saveptr;
+  char *line = strtok_r(work_buf, "\n", &saveptr);
+  int updates = 0;
+  char sync_buffer[MAX_BUFFER];
+  int sync_offset = 0;
+  
+  while (line) {
+    if (strlen(line) < 2 || line[0] == '#') {
+      line = strtok_r(NULL, "\n", &saveptr);
+      continue;
+    }
+    
+    // Parse line: type|data
+    char type = line[0];
+    if (line[1] != '|') {
+      line = strtok_r(NULL, "\n", &saveptr);
+      continue;
+    }
+    
+    char *data = line + 2;
+    
+    // Special handling for different types
+    if (type == 'c') {
+      // Channel: c|#chan|key|add|timestamp
+      char chan[MAX_CHAN], key[MAX_KEY], op[8];
+      long ts;
+      int parsed = sscanf(data, "%64[^|]|%30[^|]|%7[^|]|%ld", 
+                         chan, key, op, &ts);
+      if (parsed < 3) {
+        parsed = sscanf(data, "%64[^|]||%7[^|]|%ld", chan, op, &ts);
+        key[0] = '\0';
+      }
+      
+      if (parsed >= 3) {
+        if (hub_storage_update_entry(state, client->id, "c", 
+                                     chan, key, op, ts)) {
+          updates++;
+          // Add to sync buffer for peer broadcast
+          int w = snprintf(sync_buffer + sync_offset, 
+                          sizeof(sync_buffer) - sync_offset,
+                          "b|%s|c|%s|%s|%s|%ld\n",
+                          client->id, chan, key, op, ts);
+          if (w > 0) sync_offset += w;
+        }
+      }
+    }
+    else if (type == 'm') {
+      // Mask: m|mask|add|timestamp
+      char mask[MAX_MASK_LEN], op[8];
+      long ts;
+      if (sscanf(data, "%127[^|]|%7[^|]|%ld", mask, op, &ts) == 3) {
+        if (hub_storage_update_entry(state, client->id, "m", 
+                                     mask, "", op, ts)) {
+          updates++;
+          int w = snprintf(sync_buffer + sync_offset,
+                          sizeof(sync_buffer) - sync_offset,
+                          "b|%s|m|%s||%s|%ld\n",
+                          client->id, mask, op, ts);
+          if (w > 0) sync_offset += w;
+        }
+      }
+    }
+    else if (type == 'o') {
+      // Oper: o|mask|password|add|timestamp
+      char mask[MAX_MASK_LEN], pass[MAX_PASS], op[8];
+      long ts;
+      if (sscanf(data, "%127[^|]|%127[^|]|%7[^|]|%ld", 
+                mask, pass, op, &ts) == 4) {
+        // Validate password exists
+        if (pass[0] != '\0') {
+          if (hub_storage_update_entry(state, client->id, "o",
+                                       mask, pass, op, ts)) {
+            updates++;
+            int w = snprintf(sync_buffer + sync_offset,
+                            sizeof(sync_buffer) - sync_offset,
+                            "b|%s|o|%s|%s|%s|%ld\n",
+                            client->id, mask, pass, op, ts);
+            if (w > 0) sync_offset += w;
+          }
+        } else {
+          hub_log("[HUB] Rejected oper line without password from %s\n",
+                 client->id);
+        }
+      }
+    }
+    else if (type == 'a') {
+      // Admin password: a|password
+      // Store with current timestamp
+      long ts = time(NULL);
+      if (hub_storage_update_entry(state, client->id, "a", 
+                                   data, "", "", ts)) {
+        updates++;
+        int w = snprintf(sync_buffer + sync_offset,
+                        sizeof(sync_buffer) - sync_offset,
+                        "b|%s|a|%s|||%ld\n",
+                        client->id, data, ts);
+        if (w > 0) sync_offset += w;
+      }
+    }
+    else if (type == 'p') {
+      // Bot password: p|password
+      long ts = time(NULL);
+      if (hub_storage_update_entry(state, client->id, "p",
+                                   data, "", "", ts)) {
+        updates++;
+        int w = snprintf(sync_buffer + sync_offset,
+                        sizeof(sync_buffer) - sync_offset,
+                        "b|%s|p|%s|||%ld\n",
+                        client->id, data, ts);
+        if (w > 0) sync_offset += w;
+      }
+    }
+    else if (type == 'h') {
+      // Hostmask: h|nick!user@host|timestamp
+      char hostmask[256];
+      long ts;
+      if (sscanf(data, "%255[^|]|%ld", hostmask, &ts) == 2) {
+        if (hub_storage_update_entry(state, client->id, "h",
+                                     hostmask, "", "", ts)) {
+          updates++;
+          int w = snprintf(sync_buffer + sync_offset,
+                          sizeof(sync_buffer) - sync_offset,
+                          "b|%s|h|%s|||%ld\n",
+                          client->id, hostmask, ts);
+          if (w > 0) sync_offset += w;
+        }
+      }
+    }
+    
+    line = strtok_r(NULL, "\n", &saveptr);
+  }
+  
+  if (updates > 0) {
+    hub_log("[HUB] Applied %d updates from %s\n", updates, client->id);
+    hub_config_write(state);
+    
+    // Broadcast to peer hubs
+    if (sync_offset > 0) {
+      hub_broadcast_sync_to_peers(state, sync_buffer, client->fd);
+    }
+    
+    // TODO: Broadcast to other bots (optional - they'll get it on next sync)
+  }
+}
+
 void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
     int offset = 0;
     int written;
@@ -580,7 +738,7 @@ static void process_peer_sync(hub_state_t *state, char *payload, int origin_fd) 
                     val[sizeof(val) - 1] = 0;
                     ts = atol(p3 + 1);
 
-                    if (hub_storage_update_entry(state, uuid, key, val, ts)) {
+if (hub_storage_update_entry(state, uuid, key, val, "", "", ts)) {
                         updates++;
                         
                         if (sizeof(forward_buf) - fwd_offset > 1200) {
@@ -732,7 +890,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             
             // Update bot's public key in storage
             time_t now = time(NULL);
-            hub_storage_update_entry(state, payload, "pub", new_pub_b64, now);
+hub_storage_update_entry(state, payload, "pub", new_pub_b64, "", "", now);
             hub_config_write(state);
             
             // Disconnect bot if currently connected
@@ -911,7 +1069,7 @@ case CMD_ADMIN_LIST_FULL:
                 
                 if (target_uuid[0]) {
                     time_t now = time(NULL);
-                    hub_storage_update_entry(state, target_uuid, "t", "", now);
+hub_storage_update_entry(state, target_uuid, "t", "", "", "", now);
                     hub_config_write(state);
                     remove_pending_bot(state, target_uuid);
                     
@@ -927,7 +1085,7 @@ case CMD_ADMIN_LIST_FULL:
         case CMD_ADMIN_ADD:
             if (payload && strlen(payload) > 0) {
                 time_t now = time(NULL);
-                hub_storage_update_entry(state, payload, "t", "", now);
+hub_storage_update_entry(state, payload, "t", "", "", "", now);
                 hub_config_write(state);
                 
                 char sync[256];
@@ -1614,89 +1772,7 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
             
         case CMD_CONFIG_PUSH:
             {
-                hub_log("[HUB] Config PUSH from %s\n", client->id);
-                
-                if (!payload || strlen(payload) == 0) {
-                    hub_log("[HUB] Empty config payload from %s\n", client->id);
-                    break;
-                }
-                
-                char target_nick[32] = "", servers[256] = "", chans[256] = "", pass[128] = "";
-                
-                // Parse: nick|servers|channels|botpass
-                int parsed = sscanf(payload, "%31[^|]|%255[^|]|%255[^|]|%127s", 
-                                   target_nick, servers, chans, pass);
-                
-                if (parsed < 4) {
-                    hub_log("[HUB] Malformed config from %s (parsed=%d): %s\n", 
-                           client->id, parsed, payload);
-                    break;
-                }
-                
-                time_t now = time(NULL);
-                char sync_packet[MAX_BUFFER];
-                int sp_len = 0;
-                
-                // Update last sync time
-                hub_storage_update_entry(state, client->id, "t", "", now);
-                sp_len += snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
-                                 "b|%s|t||%ld\n", client->id, (long)now);
-                
-                // Store nick
-                hub_storage_update_entry(state, client->id, "n", target_nick, now);
-                sp_len += snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
-                                 "b|%s|n|%s|%ld\n", client->id, target_nick, (long)now);
-                
-                // Store botpass
-                hub_storage_update_entry(state, client->id, "b", pass, now);
-                sp_len += snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
-                                 "b|%s|b|%s|%ld\n", client->id, pass, (long)now);
-                
-                // Parse and store servers (comma-separated)
-                if (strlen(servers) > 0) {
-                    char servers_copy[256];
-                    strncpy(servers_copy, servers, sizeof(servers_copy) - 1);
-                    servers_copy[sizeof(servers_copy) - 1] = 0;
-                    
-                    char *saveptr, *tok = strtok_r(servers_copy, ",", &saveptr);
-                    while (tok) {
-                        hub_storage_update_entry(state, client->id, "s", tok, now);
-                        sp_len += snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
-                                         "b|%s|s|%s|%ld\n", client->id, tok, (long)now);
-                        tok = strtok_r(NULL, ",", &saveptr);
-                    }
-                }
-                
-                // Parse and store channels (comma-separated)
-                if (strlen(chans) > 0) {
-                    char chans_copy[256];
-                    strncpy(chans_copy, chans, sizeof(chans_copy) - 1);
-                    chans_copy[sizeof(chans_copy) - 1] = 0;
-                    
-                    char *saveptr, *tok = strtok_r(chans_copy, ",", &saveptr);
-                    while (tok) {
-                        hub_storage_update_entry(state, client->id, "c", tok, now);
-                        sp_len += snprintf(sync_packet + sp_len, sizeof(sync_packet) - sp_len, 
-                                         "b|%s|c|%s|%ld\n", client->id, tok, (long)now);
-                        tok = strtok_r(NULL, ",", &saveptr);
-                    }
-                }
-                
-                // Save to disk
-                hub_config_write(state);
-                
-                // Broadcast to peer hubs
-                if (sp_len > 0) {
-                    hub_broadcast_sync_to_peers(state, sync_packet, -1);
-                }
-                
-                hub_log("[HUB] Config PUSH from %s complete - Nick:%s Servers:%d Channels:%d\n", 
-                       client->id, target_nick, 
-                       strlen(servers) > 0 ? 1 : 0,
-                       strlen(chans) > 0 ? 1 : 0);
-                
-                // Send acknowledgment + current hub config back to bot
-                send_config_to_bot(state, client);
+process_bot_config_push(state, client, payload);
             }
             break;
             
@@ -1706,6 +1782,7 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
             break;
     }
 }
+
 
 // NEW FUNCTION: Send hub's stored config back to bot
 static void send_config_to_bot(hub_state_t *state, hub_client_t *client) {
@@ -2024,7 +2101,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                     client->authenticated = true;
                     client->bot_auth_state = BOT_AUTH_COMPLETE;
                     client->last_seen = time(NULL);
-                    
+                    send_config_to_bot(state, client);
                     hub_log("[HUB] Bot %s authenticated successfully\n", client->id);
                 }
                 else {
