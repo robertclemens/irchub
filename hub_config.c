@@ -90,7 +90,7 @@ void hub_config_write(hub_state_t *state) {
 
   // NEW: Write Global Entries
   for (int i = 0; i < state->global_entry_count; i++) {
-    SAFE_WRITE("g|%s|%s|%ld\n", state->global_entries[i].key,
+    SAFE_WRITE("%s|%s|%ld\n", state->global_entries[i].key,
                state->global_entries[i].value,
                (long)state->global_entries[i].timestamp);
   }
