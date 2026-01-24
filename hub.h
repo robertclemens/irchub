@@ -26,8 +26,9 @@
 #define MAX_BOTS 100
 #define MAX_PEERS 10
 #define MAX_CHAN 65
+#define MAX_NICK 32
 #define MAX_KEY 31
-#define MAX_MASK_LEN 128
+#define MAX_MASK_LEN 256
 #define MAX_PASS 128
 #define MAX_BUFFER 16384
 #define SALT_SIZE 16 // FIXED: Increased from 8 to 16 bytes (128 bits)
