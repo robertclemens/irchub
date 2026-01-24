@@ -4,7 +4,6 @@
 #include <openssl/bio.h>
 #include <openssl/rand.h>
 
-
 #ifndef CMD_ADMIN_CREATE_BOT
 #define CMD_ADMIN_CREATE_BOT 50
 #endif
@@ -678,6 +677,21 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
             sync_offset += w;
         }
       }
+    } else if (type == 'n') {
+      // Nick: n|nickname|timestamp
+      char nick[MAX_NICK];
+      long ts;
+      if (sscanf(data, "%32[^|]|%ld", nick, &ts) == 2) {
+        if (hub_storage_update_entry(state, client->id, "n", nick, "", "",
+                                     ts)) {
+          updates++;
+          int w = snprintf(sync_buffer + sync_offset,
+                           sizeof(sync_buffer) - sync_offset,
+                           "b|%s|n|%s|||%ld\n", client->id, nick, ts);
+          if (w > 0)
+            sync_offset += w;
+        }
+      }
     }
 
     line = strtok_r(NULL, "\n", &saveptr);
@@ -692,7 +706,41 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       hub_broadcast_sync_to_peers(state, sync_buffer, client->fd);
     }
 
-    // TODO: Broadcast to other bots (optional - they'll get it on next sync)
+    // Broadcast to other bots
+    if (sync_buffer[0] != '\0') {
+      unsigned char plain[MAX_BUFFER];
+      unsigned char buffer[MAX_BUFFER];
+      unsigned char tag[GCM_TAG_LEN];
+      int pay_len = strlen(sync_buffer);
+
+      plain[0] = CMD_CONFIG_DATA;
+      int net_pay_len = htonl(pay_len);
+      memcpy(&plain[1], &net_pay_len, 4);
+      memcpy(&plain[5], sync_buffer, pay_len);
+      int total_plain = 1 + 4 + pay_len;
+
+      int sent_count = 0;
+      for (int i = 0; i < state->client_count; i++) {
+        hub_client_t *c = state->clients[i];
+        // Send to all authenticated bots (except self is optional, but skipping
+        // self saves bandwidth)
+        if (c->type == CLIENT_BOT && c->authenticated && c->fd != client->fd) {
+          int cipher_len = aes_gcm_encrypt(plain, total_plain, c->session_key,
+                                           buffer + 4, tag);
+          if (cipher_len > 0) {
+            memcpy(buffer + 4 + cipher_len, tag, GCM_TAG_LEN);
+            uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
+            memcpy(buffer, &net_len, 4);
+            if (write(c->fd, buffer, 4 + cipher_len + GCM_TAG_LEN) > 0) {
+              sent_count++;
+            }
+          }
+        }
+      }
+      if (sent_count > 0) {
+        hub_log("[HUB] Broadcasted updates to %d bots\n", sent_count);
+      }
+    }
   }
 }
 
