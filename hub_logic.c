@@ -544,6 +544,20 @@ void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
   }
 }
 
+// NEW FUNCTION: Broadcast full config to all connected bots to ensure
+// consistency
+static void broadcast_full_config_to_all_bots(hub_state_t *state) {
+  int sent_count = 0;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_BOT && c->authenticated) {
+      send_config_to_bot(state, c);
+      sent_count++;
+    }
+  }
+  hub_log("[HUB] Broadcasted FULL config to %d bots\n", sent_count);
+}
+
 static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
                                     char *payload) {
   if (client->type != CLIENT_BOT || !client->authenticated) {
@@ -732,40 +746,10 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
     }
 
     // Broadcast to other bots
-    if (sync_buffer[0] != '\0') {
-      unsigned char plain[MAX_BUFFER];
-      unsigned char buffer[MAX_BUFFER];
-      unsigned char tag[GCM_TAG_LEN];
-      int pay_len = strlen(sync_buffer);
-
-      plain[0] = CMD_CONFIG_DATA;
-      int net_pay_len = htonl(pay_len);
-      memcpy(&plain[1], &net_pay_len, 4);
-      memcpy(&plain[5], sync_buffer, pay_len);
-      int total_plain = 1 + 4 + pay_len;
-
-      int sent_count = 0;
-      for (int i = 0; i < state->client_count; i++) {
-        hub_client_t *c = state->clients[i];
-        // Send to all authenticated bots (except self is optional, but skipping
-        // self saves bandwidth)
-        if (c->type == CLIENT_BOT && c->authenticated && c->fd != client->fd) {
-          int cipher_len = aes_gcm_encrypt(plain, total_plain, c->session_key,
-                                           buffer + 4, tag);
-          if (cipher_len > 0) {
-            memcpy(buffer + 4 + cipher_len, tag, GCM_TAG_LEN);
-            uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
-            memcpy(buffer, &net_len, 4);
-            if (write(c->fd, buffer, 4 + cipher_len + GCM_TAG_LEN) > 0) {
-              sent_count++;
-            }
-          }
-        }
-      }
-      if (sent_count > 0) {
-        hub_log("[HUB] Broadcasted updates to %d bots\n", sent_count);
-      }
-    }
+    // FIXED: Send FULL config to all connected bots to ensure consistency
+    // This fixes issues where bots might miss updates if they were temporarily
+    // unreachable
+    broadcast_full_config_to_all_bots(state);
   }
 }
 
@@ -1926,6 +1910,106 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     hub_log("[HUB] Config PULL request from %s\n", client->id);
     send_config_to_bot(state, client);
     break;
+
+  case CMD_OP_REQUEST: {
+    // Payload format: target_uuid|channel
+    char target_uuid[64];
+    char channel[MAX_CHAN];
+
+    if (sscanf(payload, "%63[^|]|%64s", target_uuid, channel) != 2) {
+      hub_log("[HUB] Invalid OP_REQUEST payload from %s\n", client->id);
+      break;
+    }
+
+    hub_log("[HUB] OP_REQUEST from %s for target %s in %s\n", client->id,
+            target_uuid, channel);
+
+    // Find target bot's client connection
+    hub_client_t *target = NULL;
+    for (int i = 0; i < state->client_count; i++) {
+      if (state->clients[i]->type == CLIENT_BOT &&
+          state->clients[i]->authenticated &&
+          strcmp(state->clients[i]->id, target_uuid) == 0) {
+        target = state->clients[i];
+        break;
+      }
+    }
+
+    if (!target) {
+      // Target bot not connected - send OP_FAILED
+      hub_log("[HUB] Target bot %s not connected\n", target_uuid);
+
+      unsigned char plain[MAX_BUFFER];
+      unsigned char buffer[MAX_BUFFER];
+      unsigned char tag[GCM_TAG_LEN];
+
+      plain[0] = CMD_OP_FAILED;
+      const char *reason = "Target bot not connected";
+      int reason_len = strlen(reason);
+      uint32_t net_len_inner = htonl(reason_len);
+      memcpy(&plain[1], &net_len_inner, 4);
+      memcpy(&plain[5], reason, reason_len);
+
+      int enc_len = aes_gcm_encrypt(plain, 5 + reason_len, client->session_key,
+                                    buffer + 4, tag);
+      if (enc_len > 0) {
+        memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+        uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+        memcpy(buffer, &net_len, 4);
+        write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN);
+      }
+      break;
+    }
+
+    // Look up requesting bot's hostmask from storage
+    char requester_hostmask[MAX_MASK_LEN] = "";
+    for (int i = 0; i < state->bot_count; i++) {
+      if (strcmp(state->bots[i].uuid, client->id) == 0) {
+        for (int j = 0; j < state->bots[i].entry_count; j++) {
+          if (strcmp(state->bots[i].entries[j].key, "h") == 0) {
+            strncpy(requester_hostmask, state->bots[i].entries[j].value,
+                    sizeof(requester_hostmask) - 1);
+            break;
+          }
+        }
+        break;
+      }
+    }
+
+    if (requester_hostmask[0] == '\0') {
+      hub_log("[HUB] No hostmask stored for requesting bot %s\n", client->id);
+      break;
+    }
+
+    // Forward CMD_OP_GRANT to target bot
+    // Payload: requester_hostmask|channel
+    char grant_payload[512];
+    snprintf(grant_payload, sizeof(grant_payload), "%s|%s", requester_hostmask,
+             channel);
+
+    unsigned char plain[MAX_BUFFER];
+    unsigned char buffer[MAX_BUFFER];
+    unsigned char tag[GCM_TAG_LEN];
+
+    plain[0] = CMD_OP_GRANT;
+    int pay_len = strlen(grant_payload);
+    uint32_t net_pay_len = htonl(pay_len);
+    memcpy(&plain[1], &net_pay_len, 4);
+    memcpy(&plain[5], grant_payload, pay_len);
+
+    int enc_len = aes_gcm_encrypt(plain, 5 + pay_len, target->session_key,
+                                  buffer + 4, tag);
+    if (enc_len > 0) {
+      memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+      uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+      memcpy(buffer, &net_len, 4);
+
+      if (write(target->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
+        hub_log("[HUB] Forwarded OP_GRANT to %s: grant ops to %s in %s\n",
+                target_uuid, requester_hostmask, channel);
+      }
+    }
+  } break;
   }
 }
 

@@ -74,6 +74,11 @@
 #define CMD_ADMIN_DISCONNECT_BOT 0x21 // Force disconnect bot
 #define CMD_ADMIN_BOT_STATUS 0x22     // Get bot connection info
 
+// Bot-to-Bot Op Commands (via Hub)
+#define CMD_OP_REQUEST 0x28 // Bot -> Hub: Request ops from another bot
+#define CMD_OP_GRANT 0x29   // Hub -> Bot: Grant ops to requesting bot
+#define CMD_OP_FAILED 0x2A  // Hub -> Bot: Op request failed
+
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
 
