@@ -10,6 +10,7 @@
 
 void hub_log(const char *format, ...);
 static void send_config_to_bot(hub_state_t *state, hub_client_t *client);
+static void hub_broadcast_config_to_bots(hub_state_t *state, const char *config_line);
 
 // --- Forward Declarations ---
 static bool send_response(hub_state_t *state, hub_client_t *client,
@@ -893,6 +894,19 @@ static bool send_pong(hub_state_t *state, hub_client_t *c) {
     }
   }
   return true;
+}
+
+// Broadcast config update to all connected bots
+static void hub_broadcast_config_to_bots(hub_state_t *state,
+                                          const char *config_line) {
+  hub_log("[HUB] Broadcasting config update to all bots: %s", config_line);
+
+  for (int i = 0; i < state->client_count; i++) {
+    if (state->clients[i]->type == CLIENT_BOT &&
+        state->clients[i]->authenticated) {
+      send_config_to_bot(state, state->clients[i]);
+    }
+  }
 }
 
 static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
@@ -2135,7 +2149,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             memcpy(&plain[5], op_payload, pay_len);
 
             unsigned char enc[MAX_BUFFER], tag[GCM_TAG_LEN];
-            int enc_len = crypto_aes_gcm_encrypt(
+            int enc_len = aes_gcm_encrypt(
                 plain, 5 + pay_len, state->clients[i]->session_key, enc + 4, tag);
 
             if (enc_len > 0) {
@@ -2322,19 +2336,6 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client) {
 
     if (write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
       hub_log("[HUB] Sent config (%d bytes) to %s\n", len, client->id);
-    }
-  }
-}
-
-// NEW FUNCTION: Broadcast config update to all connected bots
-static void hub_broadcast_config_to_bots(hub_state_t *state,
-                                          const char *config_line) {
-  hub_log("[HUB] Broadcasting config update to all bots: %s", config_line);
-
-  for (int i = 0; i < state->client_count; i++) {
-    if (state->clients[i]->type == CLIENT_BOT &&
-        state->clients[i]->authenticated) {
-      send_config_to_bot(state, state->clients[i]);
     }
   }
 }
