@@ -1956,7 +1956,10 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
         memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
         uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
         memcpy(buffer, &net_len, 4);
-        write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN);
+        if (write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) < 0) {
+          hub_log("[HUB][ERROR] Failed to send OP_FAILED response to %s\n",
+                  client->id);
+        }
       }
       break;
     }
