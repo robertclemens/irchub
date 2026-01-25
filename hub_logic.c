@@ -655,9 +655,10 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       }
       if (hub_storage_update_entry(state, client->id, "a", pass, "", "", ts)) {
         updates++;
-        int w = snprintf(sync_buffer + sync_offset,
-                         sizeof(sync_buffer) - sync_offset, "b|%s|a|%s|||%ld\n",
-                         client->id, pass, ts);
+        // Broadcast as global admin password update (WITHOUT b| prefix)
+        int w =
+            snprintf(sync_buffer + sync_offset,
+                     sizeof(sync_buffer) - sync_offset, "a|%s|%ld\n", pass, ts);
         if (w > 0)
           sync_offset += w;
       }
@@ -677,9 +678,10 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       }
       if (hub_storage_update_entry(state, client->id, "p", pass, "", "", ts)) {
         updates++;
-        int w = snprintf(sync_buffer + sync_offset,
-                         sizeof(sync_buffer) - sync_offset, "b|%s|p|%s|||%ld\n",
-                         client->id, pass, ts);
+        // Broadcast as global bot password update (WITHOUT b| prefix)
+        int w =
+            snprintf(sync_buffer + sync_offset,
+                     sizeof(sync_buffer) - sync_offset, "p|%s|%ld\n", pass, ts);
         if (w > 0)
           sync_offset += w;
       }
@@ -691,9 +693,10 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         if (hub_storage_update_entry(state, client->id, "h", hostmask, "", "",
                                      ts)) {
           updates++;
+          // Broadcast in format: b|hostmask|uuid|timestamp
           int w = snprintf(sync_buffer + sync_offset,
-                           sizeof(sync_buffer) - sync_offset,
-                           "b|%s|h|%s|||%ld\n", client->id, hostmask, ts);
+                           sizeof(sync_buffer) - sync_offset, "b|%s|%s|%ld\n",
+                           hostmask, client->id, ts);
           if (w > 0)
             sync_offset += w;
         }
@@ -706,9 +709,10 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         if (hub_storage_update_entry(state, client->id, "n", nick, "", "",
                                      ts)) {
           updates++;
+          // Broadcast as nickname update (NOT b| prefix)
           int w = snprintf(sync_buffer + sync_offset,
-                           sizeof(sync_buffer) - sync_offset,
-                           "b|%s|n|%s|||%ld\n", client->id, nick, ts);
+                           sizeof(sync_buffer) - sync_offset, "n|%s|%s|%ld\n",
+                           nick, client->id, ts);
           if (w > 0)
             sync_offset += w;
         }
