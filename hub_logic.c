@@ -1888,6 +1888,277 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     return send_response(state, client, response);
   }
 
+  case CMD_ADMIN_LIST_CHANNELS: {
+    offset = 0;
+    written = snprintf(response, sizeof(response), "--- Global Channels ---\n");
+    if (written >= (int)sizeof(response))
+      return send_response(state, client, "ERROR: Buffer overflow");
+    offset += written;
+
+    int chan_count = 0;
+    for (int i = 0; i < state->global_entry_count; i++) {
+      if (strcmp(state->global_entries[i].key, "c") == 0) {
+        chan_count++;
+        char chan_name[128], chan_key[64], op[16];
+        if (sscanf(state->global_entries[i].value, "%127[^|]|%63[^|]|%15s",
+                   chan_name, chan_key, op) >= 2) {
+          written = snprintf(response + offset, sizeof(response) - offset,
+                             "  %s %s %s\n", chan_name,
+                             strlen(chan_key) > 0 ? chan_key : "(no key)",
+                             strcmp(op, "del") == 0 ? "[DELETED]" : "");
+          if (written >= (int)(sizeof(response) - offset))
+            break;
+          offset += written;
+        }
+      }
+    }
+    if (chan_count == 0) {
+      written = snprintf(response + offset, sizeof(response) - offset,
+                         "  (No channels configured)\n");
+      offset += written;
+    }
+    return send_response(state, client, response);
+  }
+
+  case CMD_ADMIN_ADD_CHANNEL: {
+    if (payload && strlen(payload) > 0) {
+      char chan[128], key[64];
+      key[0] = '\0';
+      if (sscanf(payload, "%127[^|]|%63s", chan, key) >= 1) {
+        time_t now = time(NULL);
+        hub_storage_update_global_entry(state, "c", chan, key, "add", now);
+        hub_config_write(state);
+
+        char sync_msg[256];
+        if (strlen(key) > 0) {
+          snprintf(sync_msg, sizeof(sync_msg), "c|%s|%s|add|%ld\n", chan, key,
+                   (long)now);
+        } else {
+          snprintf(sync_msg, sizeof(sync_msg), "c|%s||add|%ld\n", chan,
+                   (long)now);
+        }
+        hub_broadcast_config_to_bots(state, sync_msg);
+        return send_response(state, client, "SUCCESS: Channel added and synced.");
+      }
+    }
+    return send_response(state, client, "ERROR: Invalid payload.");
+  }
+
+  case CMD_ADMIN_DEL_CHANNEL: {
+    if (payload && strlen(payload) > 0) {
+      time_t now = time(NULL);
+      hub_storage_update_global_entry(state, "c", payload, "", "del", now);
+      hub_config_write(state);
+
+      char sync_msg[256];
+      snprintf(sync_msg, sizeof(sync_msg), "c|%s||del|%ld\n", payload,
+               (long)now);
+      hub_broadcast_config_to_bots(state, sync_msg);
+      return send_response(state, client,
+                           "SUCCESS: Channel removed and synced.");
+    }
+    return send_response(state, client, "ERROR: Missing channel name.");
+  }
+
+  case CMD_ADMIN_LIST_MASKS: {
+    offset = 0;
+    written = snprintf(response, sizeof(response), "--- Admin Masks ---\n");
+    if (written >= (int)sizeof(response))
+      return send_response(state, client, "ERROR: Buffer overflow");
+    offset += written;
+
+    int mask_count = 0;
+    for (int i = 0; i < state->global_entry_count; i++) {
+      if (strcmp(state->global_entries[i].key, "m") == 0) {
+        mask_count++;
+        char mask[256], op[16];
+        if (sscanf(state->global_entries[i].value, "%255[^|]|%15s", mask, op) ==
+            2) {
+          written = snprintf(response + offset, sizeof(response) - offset,
+                             "  %s %s\n", mask,
+                             strcmp(op, "del") == 0 ? "[DELETED]" : "");
+          if (written >= (int)(sizeof(response) - offset))
+            break;
+          offset += written;
+        }
+      }
+    }
+    if (mask_count == 0) {
+      written = snprintf(response + offset, sizeof(response) - offset,
+                         "  (No admin masks configured)\n");
+      offset += written;
+    }
+    return send_response(state, client, response);
+  }
+
+  case CMD_ADMIN_ADD_MASK: {
+    if (payload && strlen(payload) > 0) {
+      time_t now = time(NULL);
+      hub_storage_update_global_entry(state, "m", payload, "", "add", now);
+      hub_config_write(state);
+
+      char sync_msg[256];
+      snprintf(sync_msg, sizeof(sync_msg), "m|%s|add|%ld\n", payload,
+               (long)now);
+      hub_broadcast_config_to_bots(state, sync_msg);
+      return send_response(state, client, "SUCCESS: Admin mask added and synced.");
+    }
+    return send_response(state, client, "ERROR: Missing mask.");
+  }
+
+  case CMD_ADMIN_DEL_MASK: {
+    if (payload && strlen(payload) > 0) {
+      time_t now = time(NULL);
+      hub_storage_update_global_entry(state, "m", payload, "", "del", now);
+      hub_config_write(state);
+
+      char sync_msg[256];
+      snprintf(sync_msg, sizeof(sync_msg), "m|%s|del|%ld\n", payload,
+               (long)now);
+      hub_broadcast_config_to_bots(state, sync_msg);
+      return send_response(state, client,
+                           "SUCCESS: Admin mask removed and synced.");
+    }
+    return send_response(state, client, "ERROR: Missing mask.");
+  }
+
+  case CMD_ADMIN_LIST_OPERS: {
+    offset = 0;
+    written = snprintf(response, sizeof(response), "--- Oper Masks ---\n");
+    if (written >= (int)sizeof(response))
+      return send_response(state, client, "ERROR: Buffer overflow");
+    offset += written;
+
+    int oper_count = 0;
+    for (int i = 0; i < state->global_entry_count; i++) {
+      if (strcmp(state->global_entries[i].key, "o") == 0) {
+        oper_count++;
+        char mask[256], pass[128], op[16];
+        if (sscanf(state->global_entries[i].value, "%255[^|]|%127[^|]|%15s",
+                   mask, pass, op) == 3) {
+          written = snprintf(response + offset, sizeof(response) - offset,
+                             "  %s (password: %s) %s\n", mask, pass,
+                             strcmp(op, "del") == 0 ? "[DELETED]" : "");
+          if (written >= (int)(sizeof(response) - offset))
+            break;
+          offset += written;
+        }
+      }
+    }
+    if (oper_count == 0) {
+      written = snprintf(response + offset, sizeof(response) - offset,
+                         "  (No oper masks configured)\n");
+      offset += written;
+    }
+    return send_response(state, client, response);
+  }
+
+  case CMD_ADMIN_ADD_OPER: {
+    if (payload && strlen(payload) > 0) {
+      char mask[256], pass[128];
+      if (sscanf(payload, "%255[^|]|%127s", mask, pass) == 2) {
+        time_t now = time(NULL);
+        hub_storage_update_global_entry(state, "o", mask, pass, "add", now);
+        hub_config_write(state);
+
+        char sync_msg[512];
+        snprintf(sync_msg, sizeof(sync_msg), "o|%s|%s|add|%ld\n", mask, pass,
+                 (long)now);
+        hub_broadcast_config_to_bots(state, sync_msg);
+        return send_response(state, client, "SUCCESS: Oper mask added and synced.");
+      }
+    }
+    return send_response(state, client, "ERROR: Invalid payload (need mask|password).");
+  }
+
+  case CMD_ADMIN_DEL_OPER: {
+    if (payload && strlen(payload) > 0) {
+      time_t now = time(NULL);
+      hub_storage_update_global_entry(state, "o", payload, "", "del", now);
+      hub_config_write(state);
+
+      char sync_msg[256];
+      snprintf(sync_msg, sizeof(sync_msg), "o|%s||del|%ld\n", payload,
+               (long)now);
+      hub_broadcast_config_to_bots(state, sync_msg);
+      return send_response(state, client, "SUCCESS: Oper mask removed and synced.");
+    }
+    return send_response(state, client, "ERROR: Missing mask.");
+  }
+
+  case CMD_ADMIN_SET_ADMIN_PASS: {
+    if (payload && strlen(payload) > 0) {
+      time_t now = time(NULL);
+      hub_storage_update_global_entry(state, "a", payload, "", "", now);
+      hub_config_write(state);
+
+      char sync_msg[256];
+      snprintf(sync_msg, sizeof(sync_msg), "a|%s|%ld\n", payload, (long)now);
+      hub_broadcast_config_to_bots(state, sync_msg);
+      return send_response(state, client,
+                           "SUCCESS: Admin password updated and synced.");
+    }
+    return send_response(state, client, "ERROR: Missing password.");
+  }
+
+  case CMD_ADMIN_SET_BOT_PASS: {
+    if (payload && strlen(payload) > 0) {
+      time_t now = time(NULL);
+      hub_storage_update_global_entry(state, "p", payload, "", "", now);
+      hub_config_write(state);
+
+      char sync_msg[256];
+      snprintf(sync_msg, sizeof(sync_msg), "p|%s|%ld\n", payload, (long)now);
+      hub_broadcast_config_to_bots(state, sync_msg);
+      return send_response(state, client,
+                           "SUCCESS: Bot password updated and synced.");
+    }
+    return send_response(state, client, "ERROR: Missing password.");
+  }
+
+  case CMD_ADMIN_OP_USER: {
+    if (payload && strlen(payload) > 0) {
+      char nick[64], channel[64];
+      if (sscanf(payload, "%63[^|]|%63s", nick, channel) == 2) {
+        // Find a bot connected to this channel and send op grant
+        for (int i = 0; i < state->client_count; i++) {
+          if (state->clients[i]->type == CLIENT_BOT) {
+            // Build OP_GRANT message
+            char op_payload[256];
+            snprintf(op_payload, sizeof(op_payload), "%s|%s", nick, channel);
+
+            unsigned char plain[MAX_BUFFER];
+            plain[0] = CMD_OP_GRANT;
+            uint32_t pay_len = strlen(op_payload);
+            uint32_t net_len = htonl(pay_len);
+            memcpy(&plain[1], &net_len, 4);
+            memcpy(&plain[5], op_payload, pay_len);
+
+            unsigned char enc[MAX_BUFFER], tag[GCM_TAG_LEN];
+            int enc_len = crypto_aes_gcm_encrypt(
+                plain, 5 + pay_len, state->clients[i]->session_key, enc + 4, tag);
+
+            if (enc_len > 0) {
+              memcpy(enc + 4 + enc_len, tag, GCM_TAG_LEN);
+              net_len = htonl(enc_len + GCM_TAG_LEN);
+              memcpy(enc, &net_len, 4);
+
+              if (send(state->clients[i]->fd, enc, 4 + enc_len + GCM_TAG_LEN, 0) >
+                  0) {
+                snprintf(response, sizeof(response),
+                         "SUCCESS: Op request sent to bot %s", state->clients[i]->id);
+                return send_response(state, client, response);
+              }
+            }
+          }
+        }
+        return send_response(state, client,
+                             "ERROR: No connected bots available.");
+      }
+    }
+    return send_response(state, client, "ERROR: Invalid payload (need nick|channel).");
+  }
+
   default:
     return send_response(state, client, "ERROR: Unknown command.");
   }
@@ -2051,6 +2322,19 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client) {
 
     if (write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
       hub_log("[HUB] Sent config (%d bytes) to %s\n", len, client->id);
+    }
+  }
+}
+
+// NEW FUNCTION: Broadcast config update to all connected bots
+static void hub_broadcast_config_to_bots(hub_state_t *state,
+                                          const char *config_line) {
+  hub_log("[HUB] Broadcasting config update to all bots: %s", config_line);
+
+  for (int i = 0; i < state->client_count; i++) {
+    if (state->clients[i]->type == CLIENT_BOT &&
+        state->clients[i]->authenticated) {
+      send_config_to_bot(state, state->clients[i]);
     }
   }
 }

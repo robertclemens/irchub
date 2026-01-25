@@ -74,6 +74,20 @@
 #define CMD_ADMIN_DISCONNECT_BOT 0x21 // Force disconnect bot
 #define CMD_ADMIN_BOT_STATUS 0x22     // Get bot connection info
 
+// Global Config Management Commands
+#define CMD_ADMIN_LIST_CHANNELS 0x23  // List all channels
+#define CMD_ADMIN_ADD_CHANNEL 0x24    // Add channel
+#define CMD_ADMIN_DEL_CHANNEL 0x25    // Remove channel
+#define CMD_ADMIN_LIST_MASKS 0x26     // List admin masks
+#define CMD_ADMIN_ADD_MASK 0x27       // Add admin mask
+#define CMD_ADMIN_DEL_MASK 0x2B       // Remove admin mask
+#define CMD_ADMIN_LIST_OPERS 0x2C     // List oper masks
+#define CMD_ADMIN_ADD_OPER 0x2D       // Add oper mask
+#define CMD_ADMIN_DEL_OPER 0x2E       // Remove oper mask
+#define CMD_ADMIN_SET_ADMIN_PASS 0x2F // Change admin password
+#define CMD_ADMIN_SET_BOT_PASS 0x30   // Change bot password
+#define CMD_ADMIN_OP_USER 0x31        // Op a user in a channel
+
 // Bot-to-Bot Op Commands (via Hub)
 #define CMD_OP_REQUEST 0x28 // Bot -> Hub: Request ops from another bot
 #define CMD_OP_GRANT 0x29   // Hub -> Bot: Grant ops to requesting bot

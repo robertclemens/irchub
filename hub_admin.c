@@ -538,6 +538,448 @@ void peer_rekey_hubs() {
 }
 
 // ============================================================================
+// ADMIN COMMANDS FUNCTIONS
+// ============================================================================
+
+void admin_op_user() {
+    char response[MAX_BUFFER];
+    char nick[64], channel[64];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                     OP USER\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+
+    get_input("Nick to OP: ", nick, sizeof(nick));
+    get_input("Channel: ", channel, sizeof(channel));
+
+    if (strlen(nick) > 0 && strlen(channel) > 0) {
+        char payload[256];
+        snprintf(payload, sizeof(payload), "%s|%s", nick, channel);
+
+        printf("[*] Sending op request to hub...\n");
+        send_packet(g_fd, CMD_ADMIN_OP_USER, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_list_masks() {
+    char response[MAX_BUFFER];
+
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_LIST_MASKS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_add_mask() {
+    char response[MAX_BUFFER];
+    char mask[256];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                  ADD ADMIN MASK\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Format examples:\n");
+    printf("  *!*@*.example.com\n");
+    printf("  nick!*@*\n");
+    printf("  *!user@host.com\n\n");
+
+    get_input("Admin Mask: ", mask, sizeof(mask));
+
+    if (strlen(mask) > 0) {
+        send_packet(g_fd, CMD_ADMIN_ADD_MASK, mask, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_del_mask() {
+    char response[MAX_BUFFER];
+
+    send_packet(g_fd, CMD_ADMIN_LIST_MASKS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\n%s\n", response);
+
+    char mask[256];
+    get_input("Mask to REMOVE (or blank to cancel): ", mask, sizeof(mask));
+
+    if (strlen(mask) > 0 && get_confirmation("Remove this admin mask?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_MASK, mask, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_list_opers() {
+    char response[MAX_BUFFER];
+
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_LIST_OPERS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_add_oper() {
+    char response[MAX_BUFFER];
+    char mask[256], pass[128];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                  ADD OPER MASK\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+
+    get_input("Oper Mask: ", mask, sizeof(mask));
+    get_password_secure("Oper Password: ", pass, sizeof(pass));
+
+    if (strlen(mask) > 0 && strlen(pass) > 0) {
+        char payload[512];
+        snprintf(payload, sizeof(payload), "%s|%s", mask, pass);
+
+        send_packet(g_fd, CMD_ADMIN_ADD_OPER, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+
+        secure_wipe(pass, sizeof(pass));
+        secure_wipe(payload, sizeof(payload));
+    }
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_del_oper() {
+    char response[MAX_BUFFER];
+
+    send_packet(g_fd, CMD_ADMIN_LIST_OPERS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\n%s\n", response);
+
+    char mask[256];
+    get_input("Oper Mask to REMOVE (or blank to cancel): ", mask, sizeof(mask));
+
+    if (strlen(mask) > 0 && get_confirmation("Remove this oper mask?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_OPER, mask, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_list_channels() {
+    char response[MAX_BUFFER];
+
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_LIST_CHANNELS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_add_channel() {
+    char response[MAX_BUFFER];
+    char chan[64], key[64];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                   ADD CHANNEL\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+
+    get_input("Channel Name: ", chan, sizeof(chan));
+    get_input("Channel Key (or blank): ", key, sizeof(key));
+
+    if (strlen(chan) > 0) {
+        char payload[256];
+        if (strlen(key) > 0) {
+            snprintf(payload, sizeof(payload), "%s|%s", chan, key);
+        } else {
+            snprintf(payload, sizeof(payload), "%s|", chan);
+        }
+
+        send_packet(g_fd, CMD_ADMIN_ADD_CHANNEL, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_del_channel() {
+    char response[MAX_BUFFER];
+
+    send_packet(g_fd, CMD_ADMIN_LIST_CHANNELS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\n%s\n", response);
+
+    char chan[64];
+    get_input("Channel to REMOVE (or blank to cancel): ", chan, sizeof(chan));
+
+    if (strlen(chan) > 0 && get_confirmation("Remove this channel from all bots?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_CHANNEL, chan, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_change_admin_password() {
+    char response[MAX_BUFFER];
+    char pass[128];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("             CHANGE ADMIN PASSWORD\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+
+    get_password_secure("New Admin Password: ", pass, sizeof(pass));
+
+    if (strlen(pass) > 0 && get_confirmation("Update admin password?")) {
+        send_packet(g_fd, CMD_ADMIN_SET_ADMIN_PASS, pass, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    secure_wipe(pass, sizeof(pass));
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_change_bot_password() {
+    char response[MAX_BUFFER];
+    char pass[128];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("              CHANGE BOT PASSWORD\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("This will update the bot communication password\n");
+    printf("synced to all bots.\n\n");
+
+    get_password_secure("New Bot Password: ", pass, sizeof(pass));
+
+    if (strlen(pass) > 0 && get_confirmation("Update bot password on all bots?")) {
+        send_packet(g_fd, CMD_ADMIN_SET_BOT_PASS, pass, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    secure_wipe(pass, sizeof(pass));
+
+    printf("\nPress Enter to continue...");
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void menu_manage_admin_masks() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║              MANAGE ADMIN MASKS                  ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. List Admin Masks\n");
+        printf("  2. Add Admin Mask\n");
+        printf("  3. Del Admin Mask\n");
+        printf("  4. Back to Admin Commands\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1:
+                admin_list_masks();
+                break;
+            case 2:
+                admin_add_mask();
+                break;
+            case 3:
+                admin_del_mask();
+                break;
+            case 4:
+                return;
+            default:
+                printf("Invalid choice.\n");
+                break;
+        }
+    }
+}
+
+void menu_manage_oper_masks() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║              MANAGE OPER MASKS                   ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. List Oper Masks\n");
+        printf("  2. Add Oper Mask\n");
+        printf("  3. Del Oper Mask\n");
+        printf("  4. Back to Admin Commands\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1:
+                admin_list_opers();
+                break;
+            case 2:
+                admin_add_oper();
+                break;
+            case 3:
+                admin_del_oper();
+                break;
+            case 4:
+                return;
+            default:
+                printf("Invalid choice.\n");
+                break;
+        }
+    }
+}
+
+void menu_manage_channels() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║               MANAGE CHANNELS                    ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. List Channels\n");
+        printf("  2. Add Channel\n");
+        printf("  3. Del Channel\n");
+        printf("  4. Back to Admin Commands\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1:
+                admin_list_channels();
+                break;
+            case 2:
+                admin_add_channel();
+                break;
+            case 3:
+                admin_del_channel();
+                break;
+            case 4:
+                return;
+            default:
+                printf("Invalid choice.\n");
+                break;
+        }
+    }
+}
+
+void menu_admin_commands() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║               ADMIN COMMANDS                     ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. Op User\n");
+        printf("  2. Manage Admin Masks\n");
+        printf("  3. Manage Oper Masks\n");
+        printf("  4. Manage Channels\n");
+        printf("  5. Change Admin Password\n");
+        printf("  6. Change Bot Password\n");
+        printf("  7. Back to Main Menu\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1:
+                admin_op_user();
+                break;
+            case 2:
+                menu_manage_admin_masks();
+                break;
+            case 3:
+                menu_manage_oper_masks();
+                break;
+            case 4:
+                menu_manage_channels();
+                break;
+            case 5:
+                admin_change_admin_password();
+                break;
+            case 6:
+                admin_change_bot_password();
+                break;
+            case 7:
+                return;
+            default:
+                printf("Invalid choice.\n");
+                break;
+        }
+    }
+}
+
+// ============================================================================
 // MENU FUNCTIONS
 // ============================================================================
 
@@ -717,7 +1159,8 @@ int main(int argc, char *argv[]) {
         printf("\n");
         printf("  1. Manage Bots\n");
         printf("  2. Manage Peers (Hubs)\n");
-        printf("  3. Exit\n");
+        printf("  3. Admin Commands\n");
+        printf("  4. Exit\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -729,22 +1172,26 @@ int main(int argc, char *argv[]) {
         }
 
         int choice = atoi(buf);
-        
+
         switch(choice) {
             case 1:
                 menu_manage_bots();
                 break;
-                
+
             case 2:
                 menu_manage_peers();
                 break;
-                
+
             case 3:
+                menu_admin_commands();
+                break;
+
+            case 4:
                 printf("\nExiting...\n");
                 secure_wipe(g_key, sizeof(g_key));
                 close(fd);
                 return 0;
-                
+
             default:
                 printf("Invalid choice.\n");
                 break;

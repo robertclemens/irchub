@@ -432,6 +432,47 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           }
         }
       }
+      // FIXED: Handle unprefixed global entries (c, m, o, a, p)
+      // These are written by hub_config_write() without a prefix
+      else if (strcmp(k, "c") == 0 || strcmp(k, "m") == 0 ||
+               strcmp(k, "o") == 0 || strcmp(k, "a") == 0 ||
+               strcmp(k, "p") == 0) {
+        // Parse: key|value|...|timestamp
+        char *s_ts = strrchr(v, '|');
+        if (s_ts) {
+          *s_ts = 0;
+          long ts = atol(s_ts + 1);
+
+          if (strcmp(k, "c") == 0 || strcmp(k, "o") == 0) {
+            // Channel or Oper: value|extra|op
+            char *pipe1 = strchr(v, '|');
+            if (pipe1) {
+              *pipe1 = 0;
+              char *rest = pipe1 + 1;
+              char *pipe2 = strchr(rest, '|');
+              if (pipe2) {
+                *pipe2 = 0;
+                char *value = v;
+                char *extra = rest;
+                char *op = pipe2 + 1;
+                hub_storage_update_global_entry(state, k, value, extra, op, ts);
+              }
+            }
+          } else if (strcmp(k, "m") == 0) {
+            // Mask: value|op
+            char *pipe1 = strchr(v, '|');
+            if (pipe1) {
+              *pipe1 = 0;
+              char *value = v;
+              char *op = pipe1 + 1;
+              hub_storage_update_global_entry(state, k, value, "", op, ts);
+            }
+          } else {
+            // Admin/Bot password: just value
+            hub_storage_update_global_entry(state, k, v, "", "", ts);
+          }
+        }
+      }
     }
     line = strtok_r(NULL, "\n", &saveptr);
   }
