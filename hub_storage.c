@@ -409,10 +409,10 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
     bot_config_t *b = &state->bots[i];
     for (int j = 0; j < b->entry_count; j++) {
       if (strcmp(b->entries[j].key, "h") == 0) {
-        // Format: b|uuid|h|hostmask||timestamp
-        // Uses b| prefix so bot parser adds to trusted_bots list
-        written = snprintf(buffer + offset, max_len - offset,
-                           "b|%s|h|%s||%ld\n", b->uuid, b->entries[j].value,
+        // Format: b|hostmask|uuid|timestamp
+        // Cleaner format for storage and matching
+        written = snprintf(buffer + offset, max_len - offset, "b|%s|%s|%ld\n",
+                           b->entries[j].value, b->uuid,
                            (long)b->entries[j].timestamp);
         if (written < 0 || written >= (max_len - offset))
           break;
