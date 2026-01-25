@@ -640,25 +640,46 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         }
       }
     } else if (type == 'a') {
-      // Admin password: a|password
-      // Store with current timestamp
-      long ts = time(NULL);
-      if (hub_storage_update_entry(state, client->id, "a", data, "", "", ts)) {
+      // Admin password: a|password|timestamp
+      char pass[MAX_PASS];
+      long ts = 0;
+      int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
+      if (parsed < 1) {
+        // Fallback: no delimiter found, treat entire data as password
+        strncpy(pass, data, MAX_PASS - 1);
+        pass[MAX_PASS - 1] = '\0';
+        ts = time(NULL);
+      } else if (parsed < 2 || ts <= 0) {
+        // Password found but no valid timestamp
+        ts = time(NULL);
+      }
+      if (hub_storage_update_entry(state, client->id, "a", pass, "", "", ts)) {
         updates++;
         int w = snprintf(sync_buffer + sync_offset,
                          sizeof(sync_buffer) - sync_offset, "b|%s|a|%s|||%ld\n",
-                         client->id, data, ts);
+                         client->id, pass, ts);
         if (w > 0)
           sync_offset += w;
       }
     } else if (type == 'p') {
-      // Bot password: p|password
-      long ts = time(NULL);
-      if (hub_storage_update_entry(state, client->id, "p", data, "", "", ts)) {
+      // Bot password: p|password|timestamp
+      char pass[MAX_PASS];
+      long ts = 0;
+      int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
+      if (parsed < 1) {
+        // Fallback: no delimiter found, treat entire data as password
+        strncpy(pass, data, MAX_PASS - 1);
+        pass[MAX_PASS - 1] = '\0';
+        ts = time(NULL);
+      } else if (parsed < 2 || ts <= 0) {
+        // Password found but no valid timestamp
+        ts = time(NULL);
+      }
+      if (hub_storage_update_entry(state, client->id, "p", pass, "", "", ts)) {
         updates++;
         int w = snprintf(sync_buffer + sync_offset,
                          sizeof(sync_buffer) - sync_offset, "b|%s|p|%s|||%ld\n",
-                         client->id, data, ts);
+                         client->id, pass, ts);
         if (w > 0)
           sync_offset += w;
       }
