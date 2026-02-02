@@ -77,6 +77,8 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
 
     if (match) {
       if (ts > state->global_entries[i].timestamp) {
+        hub_log("[STORAGE] Global %s=%s: incoming_ts=%ld > stored_ts=%ld -> UPDATED\n",
+                key, value, (long)ts, (long)state->global_entries[i].timestamp);
         size_t len = strlen(combined_value);
         if (len >= sizeof(state->global_entries[i].value))
           len = sizeof(state->global_entries[i].value) - 1;
@@ -85,11 +87,14 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
         state->global_entries[i].timestamp = ts;
         return true;
       }
+      hub_log("[STORAGE] Global %s=%s: incoming_ts=%ld <= stored_ts=%ld -> REJECTED\n",
+              key, value, (long)ts, (long)state->global_entries[i].timestamp);
       return false;
     }
   }
 
   if (state->global_entry_count < MAX_BOT_ENTRIES) {
+    hub_log("[STORAGE] Global %s=%s: NEW entry ts=%ld\n", key, value, (long)ts);
     config_entry_t *e = &state->global_entries[state->global_entry_count++];
     strncpy(e->key, key, sizeof(e->key) - 1);
     e->key[sizeof(e->key) - 1] = 0;
@@ -101,6 +106,7 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
     e->timestamp = ts;
     return true;
   }
+  hub_log("[STORAGE] Global %s=%s: REJECTED (max entries reached)\n", key, value);
   return false;
 }
 

@@ -567,6 +567,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
   }
 
   hub_log("[HUB] Processing config push from %s\n", client->id);
+  hub_log("[HUB-DEBUG] Received payload:\n%s\n", payload);
 
   char work_buf[MAX_BUFFER];
   strncpy(work_buf, payload, sizeof(work_buf) - 1);
@@ -606,8 +607,9 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       }
 
       if (parsed >= 3) {
-        if (hub_storage_update_entry(state, client->id, "c", chan, key, op,
-                                     ts)) {
+        bool accepted = hub_storage_update_entry(state, client->id, "c", chan, key, op, ts);
+        hub_log("[HUB-DEBUG] Channel %s: ts=%ld op=%s -> %s\n", chan, ts, op, accepted ? "ACCEPTED" : "REJECTED");
+        if (accepted) {
           updates++;
           // Add to sync buffer for peer broadcast
           int w = snprintf(
@@ -622,8 +624,9 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       char mask[MAX_MASK_LEN], op[8];
       long ts;
       if (sscanf(data, "%127[^|]|%7[^|]|%ld", mask, op, &ts) == 3) {
-        if (hub_storage_update_entry(state, client->id, "m", mask, "", op,
-                                     ts)) {
+        bool accepted = hub_storage_update_entry(state, client->id, "m", mask, "", op, ts);
+        hub_log("[HUB-DEBUG] Mask %s: ts=%ld op=%s -> %s\n", mask, ts, op, accepted ? "ACCEPTED" : "REJECTED");
+        if (accepted) {
           updates++;
           int w = snprintf(sync_buffer + sync_offset,
                            sizeof(sync_buffer) - sync_offset,
@@ -640,8 +643,9 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
           4) {
         // Validate password exists
         if (pass[0] != '\0') {
-          if (hub_storage_update_entry(state, client->id, "o", mask, pass, op,
-                                       ts)) {
+          bool accepted = hub_storage_update_entry(state, client->id, "o", mask, pass, op, ts);
+          hub_log("[HUB-DEBUG] Oper %s: ts=%ld op=%s -> %s\n", mask, ts, op, accepted ? "ACCEPTED" : "REJECTED");
+          if (accepted) {
             updates++;
             int w = snprintf(
                 sync_buffer + sync_offset, sizeof(sync_buffer) - sync_offset,
@@ -650,8 +654,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
               sync_offset += w;
           }
         } else {
-          hub_log("[HUB] Rejected oper line without password from %s\n",
-                  client->id);
+          hub_log("[HUB-DEBUG] Oper %s: REJECTED (no password)\n", mask);
         }
       }
     } else if (type == 'a') {
@@ -668,7 +671,9 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         // Password found but no valid timestamp
         ts = time(NULL);
       }
-      if (hub_storage_update_entry(state, client->id, "a", pass, "", "", ts)) {
+      bool accepted = hub_storage_update_entry(state, client->id, "a", pass, "", "", ts);
+      hub_log("[HUB-DEBUG] AdminPass: ts=%ld -> %s\n", ts, accepted ? "ACCEPTED" : "REJECTED");
+      if (accepted) {
         updates++;
         // Broadcast as global admin password update (WITHOUT b| prefix)
         int w =
@@ -691,7 +696,9 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         // Password found but no valid timestamp
         ts = time(NULL);
       }
-      if (hub_storage_update_entry(state, client->id, "p", pass, "", "", ts)) {
+      bool accepted = hub_storage_update_entry(state, client->id, "p", pass, "", "", ts);
+      hub_log("[HUB-DEBUG] BotPass: ts=%ld -> %s\n", ts, accepted ? "ACCEPTED" : "REJECTED");
+      if (accepted) {
         updates++;
         // Broadcast as global bot password update (WITHOUT b| prefix)
         int w =
@@ -705,8 +712,9 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       char hostmask[256];
       long ts;
       if (sscanf(data, "%255[^|]|%ld", hostmask, &ts) == 2) {
-        if (hub_storage_update_entry(state, client->id, "h", hostmask, "", "",
-                                     ts)) {
+        bool accepted = hub_storage_update_entry(state, client->id, "h", hostmask, "", "", ts);
+        hub_log("[HUB-DEBUG] Hostmask %s: ts=%ld -> %s\n", hostmask, ts, accepted ? "ACCEPTED" : "REJECTED");
+        if (accepted) {
           updates++;
           // Broadcast in format: b|hostmask|uuid|timestamp
           int w = snprintf(sync_buffer + sync_offset,
@@ -721,8 +729,9 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       char nick[MAX_NICK];
       long ts;
       if (sscanf(data, "%32[^|]|%ld", nick, &ts) == 2) {
-        if (hub_storage_update_entry(state, client->id, "n", nick, "", "",
-                                     ts)) {
+        bool accepted = hub_storage_update_entry(state, client->id, "n", nick, "", "", ts);
+        hub_log("[HUB-DEBUG] Nick %s: ts=%ld -> %s\n", nick, ts, accepted ? "ACCEPTED" : "REJECTED");
+        if (accepted) {
           updates++;
           // Broadcast as nickname update (NOT b| prefix)
           int w = snprintf(sync_buffer + sync_offset,
