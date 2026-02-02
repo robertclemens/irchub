@@ -2317,13 +2317,15 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client) {
     return;
   }
 
+  hub_log("[HUB-SYNC] Sending to %s (%d bytes):\n%s", client->id, len, payload);
+
   // Send CMD_CONFIG_DATA packet
   unsigned char buffer[MAX_BUFFER];
   unsigned char plain[MAX_BUFFER];
   unsigned char tag[GCM_TAG_LEN];
 
   plain[0] = CMD_CONFIG_DATA;
-  uint32_t payload_len = len;
+  uint32_t payload_len = htonl(len);  // Must be network byte order for bot to decode
   memcpy(&plain[1], &payload_len, 4);
   memcpy(&plain[5], payload, len);
 
