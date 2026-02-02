@@ -388,12 +388,20 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
     offset += written;
   }
 
-  // 2. Add Bot-Specific Entries (h, n, etc.)
+  // 2. Add Bot-Specific Entries
+  // Skip: h, n (hub-only metadata), c, m, o, a, p (now global entries)
   for (int i = 0; i < state->bot_count; i++) {
     if (strcmp(state->bots[i].uuid, uuid) == 0) {
       bot_config_t *b = &state->bots[i];
       for (int j = 0; j < b->entry_count; j++) {
         config_entry_t *e = &b->entries[j];
+        // Skip hub-only metadata and global entries
+        if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0 ||
+            strcmp(e->key, "c") == 0 || strcmp(e->key, "m") == 0 ||
+            strcmp(e->key, "o") == 0 || strcmp(e->key, "a") == 0 ||
+            strcmp(e->key, "p") == 0) {
+          continue;
+        }
         written = snprintf(buffer + offset, max_len - offset, "%s|%s|%ld\n",
                            e->key, e->value, (long)e->timestamp);
         if (written < 0 || written >= (max_len - offset))
