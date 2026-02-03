@@ -378,9 +378,13 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   int written;
   buffer[0] = 0;
 
-  // 1. Add Global Entries
+  // 1. Add Global Entries (c, m, o, a, p only - skip h and n which are hub-only)
   for (int i = 0; i < state->global_entry_count; i++) {
     config_entry_t *e = &state->global_entries[i];
+    // Skip h and n - these are hub-only metadata, not meant for bots
+    if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0) {
+      continue;
+    }
     written = snprintf(buffer + offset, max_len - offset, "%s|%s|%ld\n", e->key,
                        e->value, (long)e->timestamp);
     if (written < 0 || written >= (max_len - offset))

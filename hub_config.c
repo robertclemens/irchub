@@ -88,8 +88,13 @@ void hub_config_write(hub_state_t *state) {
     }
   }
 
-  // NEW: Write Global Entries
+  // NEW: Write Global Entries (skip h and n which are hub-only metadata)
   for (int i = 0; i < state->global_entry_count; i++) {
+    // Skip h and n - these should not be in global entries
+    if (strcmp(state->global_entries[i].key, "h") == 0 ||
+        strcmp(state->global_entries[i].key, "n") == 0) {
+      continue;
+    }
     SAFE_WRITE("%s|%s|%ld\n", state->global_entries[i].key,
                state->global_entries[i].value,
                (long)state->global_entries[i].timestamp);
