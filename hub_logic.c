@@ -768,10 +768,12 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
   int written;
   buffer[0] = 0;
 
-  // 1. Include global entries (c, m, o, a, p) - skip hub-only metadata (h, n)
+  // 1. Include global entries (c, m, o, a, p)
+  // Note: h/n in global_entries are hub-only local metadata (shouldn't exist here)
+  // Bot-specific h/n (like b|uuid|h|..., b|uuid|n|...) are synced in the bot loop below
   for (int i = 0; i < state->global_entry_count; i++) {
     config_entry_t *e = &state->global_entries[i];
-    // Skip hub-only metadata
+    // Safety: skip any h/n that ended up in global entries (hub-local metadata)
     if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0)
       continue;
     if (max_len - offset <= 1)
@@ -862,10 +864,8 @@ static bool store_global_entry_raw(hub_state_t *state, const char *key,
 
     if (match) {
       if (ts > state->global_entries[i].timestamp) {
-        strncpy(state->global_entries[i].value, value,
-                sizeof(state->global_entries[i].value) - 1);
-        state->global_entries[i].value[sizeof(state->global_entries[i].value) -
-                                       1] = 0;
+        snprintf(state->global_entries[i].value,
+                 sizeof(state->global_entries[i].value), "%s", value);
         state->global_entries[i].timestamp = ts;
         return true;
       }
@@ -875,13 +875,12 @@ static bool store_global_entry_raw(hub_state_t *state, const char *key,
 
   // Add new entry
   if (state->global_entry_count < MAX_BOT_ENTRIES) {
-    strncpy(state->global_entries[state->global_entry_count].key, key, 31);
-    state->global_entries[state->global_entry_count].key[31] = 0;
-    strncpy(state->global_entries[state->global_entry_count].value, value,
-            sizeof(state->global_entries[state->global_entry_count].value) - 1);
-    state->global_entries[state->global_entry_count]
-        .value[sizeof(state->global_entries[state->global_entry_count].value) -
-               1] = 0;
+    snprintf(state->global_entries[state->global_entry_count].key,
+             sizeof(state->global_entries[state->global_entry_count].key), "%s",
+             key);
+    snprintf(state->global_entries[state->global_entry_count].value,
+             sizeof(state->global_entries[state->global_entry_count].value),
+             "%s", value);
     state->global_entries[state->global_entry_count].timestamp = ts;
     state->global_entry_count++;
     return true;
