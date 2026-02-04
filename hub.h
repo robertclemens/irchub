@@ -36,6 +36,7 @@
 #define GCM_TAG_LEN 16
 #define HEADER_SIZE 4
 #define MAX_PENDING_BOTS 10
+#define MAX_PENDING_OP_REQUESTS 50
 #define PBKDF2_ITERATIONS 100000 // NEW: For password-based key derivation
 
 // Timeout Settings
@@ -92,6 +93,9 @@
 #define CMD_OP_REQUEST 0x28 // Bot -> Hub: Request ops from another bot
 #define CMD_OP_GRANT 0x29   // Hub -> Bot: Grant ops to requesting bot
 #define CMD_OP_FAILED 0x2A  // Hub -> Bot: Op request failed
+#define CMD_OP_FORWARD_REQUEST 0x33 // Hub -> Hub: Forward OP request to peer
+#define CMD_OP_FORWARD_GRANT 0x34   // Hub -> Hub: Forward grant response back
+#define CMD_OP_FORWARD_FAILED 0x35  // Hub -> Hub: Forward failure back
 
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
@@ -116,6 +120,16 @@ typedef struct {
   char ip[64];
   time_t last_attempt;
 } pending_bot_t;
+
+typedef struct {
+  char request_id[64];     // Unique ID for this request
+  char requester_uuid[64]; // UUID of bot requesting ops
+  char target_uuid[64];    // UUID of bot that should grant ops
+  char channel[MAX_CHAN];  // Channel where ops are needed
+  int origin_fd;           // FD to send response back to (-1 if local bot)
+  time_t timestamp;        // When request was created
+  bool active;             // Whether this slot is in use
+} pending_op_request_t;
 
 typedef struct {
   char ip[64];
@@ -179,6 +193,8 @@ typedef struct {
   pending_bot_t pending[MAX_PENDING_BOTS];
   int pending_head;
   int pending_count;
+
+  pending_op_request_t pending_op_requests[MAX_PENDING_OP_REQUESTS];
 
   volatile bool running;
 } hub_state_t;

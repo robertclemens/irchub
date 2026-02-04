@@ -29,6 +29,28 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 static void process_bot_command(hub_state_t *state, hub_client_t *client,
                                 int cmd, char *payload);
 
+// OP Request Forwarding Forward Decls
+static void generate_request_id(char *out_id, size_t len);
+static int add_pending_op_request(hub_state_t *state, const char *request_id,
+                                   const char *requester_uuid,
+                                   const char *target_uuid,
+                                   const char *channel, int origin_fd);
+static pending_op_request_t *find_pending_op_request(hub_state_t *state,
+                                                      const char *request_id);
+static void remove_pending_op_request(hub_state_t *state,
+                                       const char *request_id);
+static void forward_op_request_to_peers(hub_state_t *state,
+                                         const char *request_id,
+                                         const char *requester_uuid,
+                                         const char *target_uuid,
+                                         const char *channel, int exclude_fd);
+static void process_forward_op_request(hub_state_t *state,
+                                        hub_client_t *client, char *payload);
+static void process_forward_op_grant(hub_state_t *state, hub_client_t *client,
+                                      char *payload);
+static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
+                                       char *payload);
+
 // Crypto/Config Forward Decls
 bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
                                    char **out_pub_b64);
@@ -2329,6 +2351,345 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   return true;
 }
 
+// ========== OP Request Forwarding Helper Functions ==========
+
+static void generate_request_id(char *out_id, size_t len) {
+  unsigned char rand_bytes[16];
+  RAND_bytes(rand_bytes, sizeof(rand_bytes));
+  snprintf(out_id, len, "%02x%02x%02x%02x-%02x%02x-%02x%02x",
+           rand_bytes[0], rand_bytes[1], rand_bytes[2], rand_bytes[3],
+           rand_bytes[4], rand_bytes[5], rand_bytes[6], rand_bytes[7]);
+}
+
+static int add_pending_op_request(hub_state_t *state, const char *request_id,
+                                   const char *requester_uuid,
+                                   const char *target_uuid,
+                                   const char *channel, int origin_fd) {
+  // Find an empty slot
+  for (int i = 0; i < MAX_PENDING_OP_REQUESTS; i++) {
+    if (!state->pending_op_requests[i].active) {
+      strncpy(state->pending_op_requests[i].request_id, request_id, 63);
+      state->pending_op_requests[i].request_id[63] = '\0';
+      strncpy(state->pending_op_requests[i].requester_uuid, requester_uuid, 63);
+      state->pending_op_requests[i].requester_uuid[63] = '\0';
+      strncpy(state->pending_op_requests[i].target_uuid, target_uuid, 63);
+      state->pending_op_requests[i].target_uuid[63] = '\0';
+      strncpy(state->pending_op_requests[i].channel, channel, MAX_CHAN - 1);
+      state->pending_op_requests[i].channel[MAX_CHAN - 1] = '\0';
+      state->pending_op_requests[i].origin_fd = origin_fd;
+      state->pending_op_requests[i].timestamp = time(NULL);
+      state->pending_op_requests[i].active = true;
+      return i;
+    }
+  }
+  return -1; // No space available
+}
+
+static pending_op_request_t *find_pending_op_request(hub_state_t *state,
+                                                      const char *request_id) {
+  for (int i = 0; i < MAX_PENDING_OP_REQUESTS; i++) {
+    if (state->pending_op_requests[i].active &&
+        strcmp(state->pending_op_requests[i].request_id, request_id) == 0) {
+      return &state->pending_op_requests[i];
+    }
+  }
+  return NULL;
+}
+
+static void remove_pending_op_request(hub_state_t *state,
+                                       const char *request_id) {
+  for (int i = 0; i < MAX_PENDING_OP_REQUESTS; i++) {
+    if (state->pending_op_requests[i].active &&
+        strcmp(state->pending_op_requests[i].request_id, request_id) == 0) {
+      state->pending_op_requests[i].active = false;
+      return;
+    }
+  }
+}
+
+static void forward_op_request_to_peers(hub_state_t *state,
+                                         const char *request_id,
+                                         const char *requester_uuid,
+                                         const char *target_uuid,
+                                         const char *channel, int exclude_fd) {
+  // Payload format: request_id|requester_uuid|target_uuid|channel
+  char forward_payload[512];
+  snprintf(forward_payload, sizeof(forward_payload), "%s|%s|%s|%s", request_id,
+           requester_uuid, target_uuid, channel);
+
+  unsigned char plain[MAX_BUFFER];
+  unsigned char buffer[MAX_BUFFER];
+  unsigned char tag[GCM_TAG_LEN];
+
+  plain[0] = CMD_OP_FORWARD_REQUEST;
+  int pay_len = strlen(forward_payload);
+  uint32_t net_pay_len = htonl(pay_len);
+  memcpy(&plain[1], &net_pay_len, 4);
+  memcpy(&plain[5], forward_payload, pay_len);
+
+  // Send to all connected peer hubs (excluding origin)
+  for (int i = 0; i < state->client_count; i++) {
+    if (state->clients[i]->type == CLIENT_HUB &&
+        state->clients[i]->authenticated && state->clients[i]->fd != exclude_fd) {
+
+      int enc_len = aes_gcm_encrypt(plain, 5 + pay_len,
+                                    state->clients[i]->session_key, buffer + 4,
+                                    tag);
+      if (enc_len > 0) {
+        memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+        uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+        memcpy(buffer, &net_len, 4);
+
+        if (write(state->clients[i]->fd, buffer, 4 + enc_len + GCM_TAG_LEN) >
+            0) {
+          hub_log("[HUB] Forwarded OP_REQUEST (id:%s) to peer hub fd=%d\n",
+                  request_id, state->clients[i]->fd);
+        }
+      }
+    }
+  }
+}
+
+// ========== End OP Request Forwarding Helper Functions ==========
+
+// ========== Handlers for Forwarded OP Commands from Peer Hubs ==========
+
+static void process_forward_op_request(hub_state_t *state,
+                                        hub_client_t *client, char *payload) {
+  // Payload format: request_id|requester_uuid|target_uuid|channel
+  char request_id[64], requester_uuid[64], target_uuid[64], channel[MAX_CHAN];
+
+  if (sscanf(payload, "%63[^|]|%63[^|]|%63[^|]|%64s", request_id,
+             requester_uuid, target_uuid, channel) != 4) {
+    hub_log("[HUB] Invalid OP_FORWARD_REQUEST payload from peer fd=%d\n",
+            client->fd);
+    return;
+  }
+
+  hub_log(
+      "[HUB] Received OP_FORWARD_REQUEST (id:%s) from peer for target %s\n",
+      request_id, target_uuid);
+
+  // Search for target bot locally
+  hub_client_t *target = NULL;
+  for (int i = 0; i < state->client_count; i++) {
+    if (state->clients[i]->type == CLIENT_BOT &&
+        state->clients[i]->authenticated &&
+        strcmp(state->clients[i]->id, target_uuid) == 0) {
+      target = state->clients[i];
+      break;
+    }
+  }
+
+  if (target) {
+    // Target bot found locally - look up requester's hostmask
+    char requester_hostmask[MAX_MASK_LEN] = "";
+    for (int i = 0; i < state->bot_count; i++) {
+      if (strcmp(state->bots[i].uuid, requester_uuid) == 0) {
+        for (int j = 0; j < state->bots[i].entry_count; j++) {
+          if (strcmp(state->bots[i].entries[j].key, "h") == 0) {
+            strncpy(requester_hostmask, state->bots[i].entries[j].value,
+                    sizeof(requester_hostmask) - 1);
+            break;
+          }
+        }
+        break;
+      }
+    }
+
+    if (requester_hostmask[0] == '\0') {
+      hub_log("[HUB] No hostmask stored for requester %s\n", requester_uuid);
+      // Send FORWARD_FAILED back to origin
+      char fail_payload[256];
+      snprintf(fail_payload, sizeof(fail_payload), "%s|No hostmask found",
+               request_id);
+
+      unsigned char plain[MAX_BUFFER], buffer[MAX_BUFFER], tag[GCM_TAG_LEN];
+      plain[0] = CMD_OP_FORWARD_FAILED;
+      int pay_len = strlen(fail_payload);
+      uint32_t net_pay_len = htonl(pay_len);
+      memcpy(&plain[1], &net_pay_len, 4);
+      memcpy(&plain[5], fail_payload, pay_len);
+
+      int enc_len =
+          aes_gcm_encrypt(plain, 5 + pay_len, client->session_key, buffer + 4,
+tag);
+      if (enc_len > 0) {
+        memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+        uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+        memcpy(buffer, &net_len, 4);
+        write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN);
+      }
+      return;
+    }
+
+    // Send OP_GRANT to local target bot
+    char grant_payload[512];
+    snprintf(grant_payload, sizeof(grant_payload), "%s|%s", requester_hostmask,
+             channel);
+
+    unsigned char plain[MAX_BUFFER], buffer[MAX_BUFFER], tag[GCM_TAG_LEN];
+    plain[0] = CMD_OP_GRANT;
+    int pay_len = strlen(grant_payload);
+    uint32_t net_pay_len = htonl(pay_len);
+    memcpy(&plain[1], &net_pay_len, 4);
+    memcpy(&plain[5], grant_payload, pay_len);
+
+    int enc_len = aes_gcm_encrypt(plain, 5 + pay_len, target->session_key,
+                                  buffer + 4, tag);
+    if (enc_len > 0) {
+      memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+      uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+      memcpy(buffer, &net_len, 4);
+
+      if (write(target->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
+        hub_log("[HUB] Sent OP_GRANT to local bot %s for request id:%s\n",
+                target_uuid, request_id);
+
+        // Send FORWARD_GRANT back to origin peer
+        char success_payload[256];
+        snprintf(success_payload, sizeof(success_payload), "%s", request_id);
+
+        plain[0] = CMD_OP_FORWARD_GRANT;
+        pay_len = strlen(success_payload);
+        net_pay_len = htonl(pay_len);
+        memcpy(&plain[1], &net_pay_len, 4);
+        memcpy(&plain[5], success_payload, pay_len);
+
+        enc_len = aes_gcm_encrypt(plain, 5 + pay_len, client->session_key,
+                                  buffer + 4, tag);
+        if (enc_len > 0) {
+          memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+          net_len = htonl(enc_len + GCM_TAG_LEN);
+          memcpy(buffer, &net_len, 4);
+          write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN);
+          hub_log("[HUB] Sent OP_FORWARD_GRANT back to peer for id:%s\n",
+                  request_id);
+        }
+      }
+    }
+  } else {
+    // Target not found locally - forward to other peers (exclude origin)
+    hub_log("[HUB] Target bot %s not found locally, forwarding to other "
+            "peers\n",
+            target_uuid);
+    forward_op_request_to_peers(state, request_id, requester_uuid, target_uuid,
+                                 channel, client->fd);
+  }
+}
+
+static void process_forward_op_grant(hub_state_t *state, hub_client_t *client,
+                                      char *payload) {
+  // Payload format: request_id
+  char request_id[64];
+  strncpy(request_id, payload, 63);
+  request_id[63] = '\0';
+
+  hub_log("[HUB] Received OP_FORWARD_GRANT from peer for request id:%s\n",
+          request_id);
+
+  // Find the pending request
+  pending_op_request_t *req = find_pending_op_request(state, request_id);
+  if (!req) {
+    hub_log("[HUB] No pending request found for id:%s\n", request_id);
+    return;
+  }
+
+  // Find the original requester bot
+  hub_client_t *requester = NULL;
+  for (int i = 0; i < state->client_count; i++) {
+    if (state->clients[i]->fd == req->origin_fd &&
+        state->clients[i]->type == CLIENT_BOT) {
+      requester = state->clients[i];
+      break;
+    }
+  }
+
+  if (requester) {
+    // Send success notification to requester
+    unsigned char plain[MAX_BUFFER], buffer[MAX_BUFFER], tag[GCM_TAG_LEN];
+    plain[0] = CMD_OP_GRANT;
+    const char *success_msg = "Request forwarded successfully";
+    int msg_len = strlen(success_msg);
+    uint32_t net_msg_len = htonl(msg_len);
+    memcpy(&plain[1], &net_msg_len, 4);
+    memcpy(&plain[5], success_msg, msg_len);
+
+    int enc_len = aes_gcm_encrypt(plain, 5 + msg_len, requester->session_key,
+                                  buffer + 4, tag);
+    if (enc_len > 0) {
+      memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+      uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+      memcpy(buffer, &net_len, 4);
+      write(requester->fd, buffer, 4 + enc_len + GCM_TAG_LEN);
+      hub_log("[HUB] Notified requester bot of successful grant for id:%s\n",
+              request_id);
+    }
+  }
+
+  // Remove the pending request
+  remove_pending_op_request(state, request_id);
+}
+
+static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
+                                       char *payload) {
+  // Payload format: request_id|reason
+  char request_id[64], reason[256];
+
+  if (sscanf(payload, "%63[^|]|%255[^\n]", request_id, reason) < 1) {
+    hub_log("[HUB] Invalid OP_FORWARD_FAILED payload from peer\n");
+    return;
+  }
+
+  hub_log("[HUB] Received OP_FORWARD_FAILED from peer for request id:%s\n",
+          request_id);
+
+  // Find the pending request
+  pending_op_request_t *req = find_pending_op_request(state, request_id);
+  if (!req) {
+    hub_log("[HUB] No pending request found for id:%s\n", request_id);
+    return;
+  }
+
+  // Find the original requester bot
+  hub_client_t *requester = NULL;
+  for (int i = 0; i < state->client_count; i++) {
+    if (state->clients[i]->fd == req->origin_fd &&
+        state->clients[i]->type == CLIENT_BOT) {
+      requester = state->clients[i];
+      break;
+    }
+  }
+
+  if (requester) {
+    // Send failure notification to requester
+    unsigned char plain[MAX_BUFFER], buffer[MAX_BUFFER], tag[GCM_TAG_LEN];
+    plain[0] = CMD_OP_FAILED;
+    const char *fail_msg =
+        (reason[0] != '\0') ? reason : "Target bot not found on network";
+    int msg_len = strlen(fail_msg);
+    uint32_t net_msg_len = htonl(msg_len);
+    memcpy(&plain[1], &net_msg_len, 4);
+    memcpy(&plain[5], fail_msg, msg_len);
+
+    int enc_len = aes_gcm_encrypt(plain, 5 + msg_len, requester->session_key,
+                                  buffer + 4, tag);
+    if (enc_len > 0) {
+      memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+      uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+      memcpy(buffer, &net_len, 4);
+      write(requester->fd, buffer, 4 + enc_len + GCM_TAG_LEN);
+      hub_log("[HUB] Notified requester bot of failure for id:%s\n",
+              request_id);
+    }
+  }
+
+  // Remove the pending request
+  remove_pending_op_request(state, request_id);
+}
+
+// ========== End Handlers for Forwarded OP Commands ==========
+
 static void process_bot_command(hub_state_t *state, hub_client_t *client,
                                 int cmd, char *payload) {
   switch (cmd) {
@@ -2370,29 +2731,59 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     }
 
     if (!target) {
-      // Target bot not connected - send OP_FAILED
-      hub_log("[HUB] Target bot %s not connected\n", target_uuid);
+      // Target bot not connected locally - check for peer hubs
+      hub_log("[HUB] Target bot %s not connected locally\n", target_uuid);
 
-      unsigned char plain[MAX_BUFFER];
-      unsigned char buffer[MAX_BUFFER];
-      unsigned char tag[GCM_TAG_LEN];
+      // Count connected peer hubs
+      int peer_count = 0;
+      for (int i = 0; i < state->client_count; i++) {
+        if (state->clients[i]->type == CLIENT_HUB &&
+            state->clients[i]->authenticated) {
+          peer_count++;
+        }
+      }
 
-      plain[0] = CMD_OP_FAILED;
-      const char *reason = "Target bot not connected";
-      int reason_len = strlen(reason);
-      uint32_t net_len_inner = htonl(reason_len);
-      memcpy(&plain[1], &net_len_inner, 4);
-      memcpy(&plain[5], reason, reason_len);
+      if (peer_count > 0) {
+        // Forward request to peer hubs
+        char request_id[64];
+        generate_request_id(request_id, sizeof(request_id));
 
-      int enc_len = aes_gcm_encrypt(plain, 5 + reason_len, client->session_key,
-                                    buffer + 4, tag);
-      if (enc_len > 0) {
-        memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-        uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
-        memcpy(buffer, &net_len, 4);
-        if (write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) < 0) {
-          hub_log("[HUB][ERROR] Failed to send OP_FAILED response to %s\n",
-                  client->id);
+        if (add_pending_op_request(state, request_id, client->id, target_uuid,
+                                    channel, client->fd) >= 0) {
+          forward_op_request_to_peers(state, request_id, client->id,
+                                       target_uuid, channel, -1);
+          hub_log("[HUB] Forwarded OP_REQUEST (id:%s) to %d peer hub(s)\n",
+                  request_id, peer_count);
+        } else {
+          hub_log("[HUB] Failed to add pending OP request - table full\n");
+          // Fall through to send OP_FAILED
+          peer_count = 0;
+        }
+      }
+
+      if (peer_count == 0) {
+        // No peers available or table full - send OP_FAILED
+        unsigned char plain[MAX_BUFFER];
+        unsigned char buffer[MAX_BUFFER];
+        unsigned char tag[GCM_TAG_LEN];
+
+        plain[0] = CMD_OP_FAILED;
+        const char *reason = "Target bot not connected";
+        int reason_len = strlen(reason);
+        uint32_t net_len_inner = htonl(reason_len);
+        memcpy(&plain[1], &net_len_inner, 4);
+        memcpy(&plain[5], reason, reason_len);
+
+        int enc_len = aes_gcm_encrypt(plain, 5 + reason_len,
+                                      client->session_key, buffer + 4, tag);
+        if (enc_len > 0) {
+          memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+          uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+          memcpy(buffer, &net_len, 4);
+          if (write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) < 0) {
+            hub_log("[HUB][ERROR] Failed to send OP_FAILED response to %s\n",
+                    client->id);
+          }
         }
       }
       break;
@@ -2801,6 +3192,12 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 process_peer_sync(state, payload_ptr, client->fd);
               } else if (cmd == CMD_MESH_STATE) {
                 process_mesh_state(state, client, payload_ptr);
+              } else if (cmd == CMD_OP_FORWARD_REQUEST) {
+                process_forward_op_request(state, client, payload_ptr);
+              } else if (cmd == CMD_OP_FORWARD_GRANT) {
+                process_forward_op_grant(state, client, payload_ptr);
+              } else if (cmd == CMD_OP_FORWARD_FAILED) {
+                process_forward_op_failed(state, client, payload_ptr);
               }
             }
           }
