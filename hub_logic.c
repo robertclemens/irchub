@@ -768,6 +768,24 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
   int written;
   buffer[0] = 0;
 
+  // 1. Include global entries (c, m, o, a, p) - skip hub-only metadata (h, n)
+  for (int i = 0; i < state->global_entry_count; i++) {
+    config_entry_t *e = &state->global_entries[i];
+    // Skip hub-only metadata
+    if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0)
+      continue;
+    if (max_len - offset <= 1)
+      break;
+
+    // Format: key|value|timestamp (same as config file format)
+    written = snprintf(buffer + offset, max_len - offset, "%s|%s|%ld\n",
+                       e->key, e->value, (long)e->timestamp);
+    if (written < 0 || written >= (max_len - offset))
+      break;
+    offset += written;
+  }
+
+  // 2. Include bot entries
   for (int i = 0; i < state->bot_count; i++) {
     bot_config_t *b = &state->bots[i];
     if (max_len - offset <= 1)
@@ -793,6 +811,84 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
   }
 }
 
+// Helper: Check if a key is a global config key
+static bool is_global_key(const char *key) {
+  return (strcmp(key, "c") == 0 || strcmp(key, "m") == 0 ||
+          strcmp(key, "o") == 0 || strcmp(key, "a") == 0 ||
+          strcmp(key, "p") == 0);
+}
+
+// Helper: Store global entry directly without re-formatting (value is already combined)
+static bool store_global_entry_raw(hub_state_t *state, const char *key,
+                                   const char *value, time_t ts) {
+  bool is_singleton = (strcmp(key, "a") == 0 || strcmp(key, "p") == 0);
+
+  for (int i = 0; i < state->global_entry_count; i++) {
+    bool match = false;
+    if (is_singleton) {
+      if (strcmp(state->global_entries[i].key, key) == 0)
+        match = true;
+    } else {
+      // List match: compare key and first part of value (before first |)
+      char stored_first[256], incoming_first[256];
+      const char *pipe = strchr(state->global_entries[i].value, '|');
+      if (pipe) {
+        size_t len = pipe - state->global_entries[i].value;
+        if (len >= sizeof(stored_first))
+          len = sizeof(stored_first) - 1;
+        memcpy(stored_first, state->global_entries[i].value, len);
+        stored_first[len] = 0;
+      } else {
+        strncpy(stored_first, state->global_entries[i].value,
+                sizeof(stored_first) - 1);
+        stored_first[sizeof(stored_first) - 1] = 0;
+      }
+      const char *incoming_pipe = strchr(value, '|');
+      if (incoming_pipe) {
+        size_t len = incoming_pipe - value;
+        if (len >= sizeof(incoming_first))
+          len = sizeof(incoming_first) - 1;
+        memcpy(incoming_first, value, len);
+        incoming_first[len] = 0;
+      } else {
+        strncpy(incoming_first, value, sizeof(incoming_first) - 1);
+        incoming_first[sizeof(incoming_first) - 1] = 0;
+      }
+      if (strcmp(state->global_entries[i].key, key) == 0 &&
+          strcmp(stored_first, incoming_first) == 0) {
+        match = true;
+      }
+    }
+
+    if (match) {
+      if (ts > state->global_entries[i].timestamp) {
+        strncpy(state->global_entries[i].value, value,
+                sizeof(state->global_entries[i].value) - 1);
+        state->global_entries[i].value[sizeof(state->global_entries[i].value) -
+                                       1] = 0;
+        state->global_entries[i].timestamp = ts;
+        return true;
+      }
+      return false;
+    }
+  }
+
+  // Add new entry
+  if (state->global_entry_count < MAX_BOT_ENTRIES) {
+    strncpy(state->global_entries[state->global_entry_count].key, key, 31);
+    state->global_entries[state->global_entry_count].key[31] = 0;
+    strncpy(state->global_entries[state->global_entry_count].value, value,
+            sizeof(state->global_entries[state->global_entry_count].value) - 1);
+    state->global_entries[state->global_entry_count]
+        .value[sizeof(state->global_entries[state->global_entry_count].value) -
+               1] = 0;
+    state->global_entries[state->global_entry_count].timestamp = ts;
+    state->global_entry_count++;
+    return true;
+  }
+  return false;
+}
+
 static void process_peer_sync(hub_state_t *state, char *payload,
                               int origin_fd) {
   char *saveptr;
@@ -806,6 +902,51 @@ static void process_peer_sync(hub_state_t *state, char *payload,
   forward_buf[0] = 0;
 
   while (line) {
+    // Check if this is a global entry (format: key|value|timestamp)
+    // Global keys: c, m, o, a, p (NOT starting with b|)
+    if (strncmp(line, "b|", 2) != 0) {
+      char *p1 = strchr(line, '|');
+      if (p1) {
+        // Extract key (before first |)
+        char key[32];
+        size_t key_len = p1 - line;
+        if (key_len < sizeof(key)) {
+          memcpy(key, line, key_len);
+          key[key_len] = 0;
+
+          if (is_global_key(key)) {
+            // Parse: key|value|timestamp (value may contain |)
+            char *p_last = strrchr(p1 + 1, '|');
+            if (p_last && p_last > p1) {
+              char val[1024];
+              size_t val_len = p_last - (p1 + 1);
+              if (val_len < sizeof(val)) {
+                memcpy(val, p1 + 1, val_len);
+                val[val_len] = 0;
+                long ts = atol(p_last + 1);
+
+                if (store_global_entry_raw(state, key, val, ts)) {
+                  updates++;
+                  // Forward to other peers
+                  if (sizeof(forward_buf) - fwd_offset > 1200) {
+                    int w = snprintf(forward_buf + fwd_offset,
+                                     sizeof(forward_buf) - fwd_offset,
+                                     "%s|%s|%ld\n", key, val, ts);
+                    if (w > 0 && w < (int)(sizeof(forward_buf) - fwd_offset)) {
+                      fwd_offset += w;
+                    }
+                  }
+                }
+              }
+            }
+            line = strtok_r(NULL, "\n", &saveptr);
+            continue;
+          }
+        }
+      }
+    }
+
+    // Handle bot entries (format: b|uuid|key|value|timestamp)
     char *ptr = line;
     if (strncmp(line, "b|", 2) == 0) {
       ptr = line + 2;
