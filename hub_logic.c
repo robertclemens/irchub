@@ -2368,14 +2368,24 @@ static int add_pending_op_request(hub_state_t *state, const char *request_id,
   // Find an empty slot
   for (int i = 0; i < MAX_PENDING_OP_REQUESTS; i++) {
     if (!state->pending_op_requests[i].active) {
-      strncpy(state->pending_op_requests[i].request_id, request_id, 63);
-      state->pending_op_requests[i].request_id[63] = '\0';
-      strncpy(state->pending_op_requests[i].requester_uuid, requester_uuid, 63);
-      state->pending_op_requests[i].requester_uuid[63] = '\0';
-      strncpy(state->pending_op_requests[i].target_uuid, target_uuid, 63);
-      state->pending_op_requests[i].target_uuid[63] = '\0';
-      strncpy(state->pending_op_requests[i].channel, channel, MAX_CHAN - 1);
-      state->pending_op_requests[i].channel[MAX_CHAN - 1] = '\0';
+      strncpy(state->pending_op_requests[i].request_id, request_id,
+              sizeof(state->pending_op_requests[i].request_id) - 1);
+      state->pending_op_requests[i]
+          .request_id[sizeof(state->pending_op_requests[i].request_id) - 1] =
+          '\0';
+      strncpy(state->pending_op_requests[i].requester_uuid, requester_uuid,
+              sizeof(state->pending_op_requests[i].requester_uuid) - 1);
+      state->pending_op_requests[i].requester_uuid
+          [sizeof(state->pending_op_requests[i].requester_uuid) - 1] = '\0';
+      strncpy(state->pending_op_requests[i].target_uuid, target_uuid,
+              sizeof(state->pending_op_requests[i].target_uuid) - 1);
+      state->pending_op_requests[i]
+          .target_uuid[sizeof(state->pending_op_requests[i].target_uuid) - 1] =
+          '\0';
+      strncpy(state->pending_op_requests[i].channel, channel,
+              sizeof(state->pending_op_requests[i].channel) - 1);
+      state->pending_op_requests[i]
+          .channel[sizeof(state->pending_op_requests[i].channel) - 1] = '\0';
       state->pending_op_requests[i].origin_fd = origin_fd;
       state->pending_op_requests[i].timestamp = time(NULL);
       state->pending_op_requests[i].active = true;
@@ -2518,7 +2528,9 @@ tag);
         memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
         uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
         memcpy(buffer, &net_len, 4);
-        write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN);
+        if (write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) < 0) {
+          hub_log("[HUB] Failed to send OP_FORWARD_FAILED to peer\n");
+        }
       }
       return;
     }
@@ -2562,9 +2574,10 @@ tag);
           memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
           net_len = htonl(enc_len + GCM_TAG_LEN);
           memcpy(buffer, &net_len, 4);
-          write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN);
-          hub_log("[HUB] Sent OP_FORWARD_GRANT back to peer for id:%s\n",
-                  request_id);
+          if (write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
+            hub_log("[HUB] Sent OP_FORWARD_GRANT back to peer for id:%s\n",
+                    request_id);
+          }
         }
       }
     }
@@ -2580,6 +2593,7 @@ tag);
 
 static void process_forward_op_grant(hub_state_t *state, hub_client_t *client,
                                       char *payload) {
+  (void)client; // Not used - response goes to original requester
   // Payload format: request_id
   char request_id[64];
   strncpy(request_id, payload, 63);
@@ -2621,9 +2635,10 @@ static void process_forward_op_grant(hub_state_t *state, hub_client_t *client,
       memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
       uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
       memcpy(buffer, &net_len, 4);
-      write(requester->fd, buffer, 4 + enc_len + GCM_TAG_LEN);
-      hub_log("[HUB] Notified requester bot of successful grant for id:%s\n",
-              request_id);
+      if (write(requester->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
+        hub_log("[HUB] Notified requester bot of successful grant for id:%s\n",
+                request_id);
+      }
     }
   }
 
@@ -2633,6 +2648,7 @@ static void process_forward_op_grant(hub_state_t *state, hub_client_t *client,
 
 static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
                                        char *payload) {
+  (void)client; // Not used - response goes to original requester
   // Payload format: request_id|reason
   char request_id[64], reason[256];
 
@@ -2678,9 +2694,10 @@ static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
       memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
       uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
       memcpy(buffer, &net_len, 4);
-      write(requester->fd, buffer, 4 + enc_len + GCM_TAG_LEN);
-      hub_log("[HUB] Notified requester bot of failure for id:%s\n",
-              request_id);
+      if (write(requester->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
+        hub_log("[HUB] Notified requester bot of failure for id:%s\n",
+                request_id);
+      }
     }
   }
 
