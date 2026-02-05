@@ -815,12 +815,6 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
     if (max_len - offset <= 1)
       break;
 
-    written = snprintf(buffer + offset, max_len - offset, "b|%s|t||%ld\n",
-                       b->uuid, (long)b->last_sync_time);
-    if (written < 0 || written >= (max_len - offset))
-      break;
-    offset += written;
-
     for (int j = 0; j < b->entry_count; j++) {
       if (max_len - offset <= 1)
         break;
@@ -1296,7 +1290,26 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         }
       }
 
-      // TODO: Check if connected to remote peers (requires mesh state tracking)
+      // Check if connected to remote peers via gossip
+      if (!is_connected) {
+        for (int p = 0; p < state->peer_count; p++) {
+          if (state->peers[p].connected &&
+              strlen(state->peers[p].last_gossip) > 0) {
+            // Check if this peer has recent bot activity
+            // Note: We can't identify specific bots from gossip alone,
+            // but we can check if the bot has recent activity (last_sync_time)
+            // which suggests it might be connected to a remote peer
+            if (last_seen > 0 && (time(NULL) - last_seen) < 300) {
+              // Recent activity within 5 minutes, likely on a remote peer
+              is_connected = true;
+              snprintf(connected_to, sizeof(connected_to), "REMOTE (%s:%d)",
+                       state->peers[p].ip, state->peers[p].port);
+              // Note: We're guessing which peer, could be any connected peer
+              break;
+            }
+          }
+        }
+      }
 
       // Format last seen time
       char time_buf[64];
@@ -1320,6 +1333,43 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
       if (offset >= MAX_BUFFER - 100)
         break;
+    }
+
+    // Add mesh summary showing bot counts on connected peers
+    if (state->peer_count > 0 && offset < MAX_BUFFER - 500) {
+      written = snprintf(response + offset, MAX_BUFFER - offset,
+                         "\n--- Mesh Bot Summary ---\n");
+      if (written > 0 && written < MAX_BUFFER - offset)
+        offset += written;
+
+      // Show local peer
+      int local_bots = 0;
+      for (int c = 0; c < state->client_count; c++) {
+        if (state->clients[c]->type == CLIENT_BOT &&
+            state->clients[c]->authenticated)
+          local_bots++;
+      }
+      written = snprintf(response + offset, MAX_BUFFER - offset,
+                         "LOCAL (127.0.0.1:%d): %d bots\n", state->port,
+                         local_bots);
+      if (written > 0 && written < MAX_BUFFER - offset)
+        offset += written;
+
+      // Show remote peers with bot counts from gossip
+      for (int p = 0; p < state->peer_count; p++) {
+        if (state->peers[p].connected &&
+            strlen(state->peers[p].last_gossip) > 0) {
+          int rc, rt, rb;
+          if (sscanf(state->peers[p].last_gossip, "%d:%d:%d|", &rc, &rt,
+                     &rb) == 3) {
+            written = snprintf(response + offset, MAX_BUFFER - offset,
+                               "PEER (%s:%d): %d bots\n", state->peers[p].ip,
+                               state->peers[p].port, rb);
+            if (written > 0 && written < MAX_BUFFER - offset)
+              offset += written;
+          }
+        }
+      }
     }
 
     return send_response(state, client, response);
@@ -1877,23 +1927,58 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       }
 
       bool is_offline = false;
+
+      // Check if we're directly connected to this peer
+      bool directly_connected = false;
+      if (all_peers[row].is_me) {
+        directly_connected = true;
+      } else {
+        for (int p = 0; p < state->peer_count; p++) {
+          if (state->peers[p].port == all_peers[row].port &&
+              strcmp(state->peers[p].ip, all_peers[row].ip) == 0) {
+            // Check if there's an active connection
+            for (int c = 0; c < state->client_count; c++) {
+              if (state->clients[c]->type == CLIENT_HUB &&
+                  state->clients[c]->authenticated &&
+                  state->clients[c]->fd == state->peers[p].fd) {
+                directly_connected = true;
+                break;
+              }
+            }
+            break;
+          }
+        }
+      }
+
       if (row_total > 0) {
         if (row_connected > 0) {
           // CRITICAL FIX: Add overflow check
           written = snprintf(response + offset, sizeof(response) - offset,
                              " %d/%d Connected |", row_connected, row_total);
         } else {
-          // CRITICAL FIX: Add overflow check
-          written = snprintf(response + offset, sizeof(response) - offset,
-                             " \033[31mOffline\033[0m       |");
-          is_offline = true;
-          issues++;
+          // Show as "Offline" only if not directly connected
+          if (directly_connected) {
+            // CRITICAL FIX: Add overflow check
+            written = snprintf(response + offset, sizeof(response) - offset,
+                               " 0/%d Partial   |", row_total);
+          } else {
+            // CRITICAL FIX: Add overflow check
+            written = snprintf(response + offset, sizeof(response) - offset,
+                               " \033[31mOffline\033[0m       |");
+            is_offline = true;
+            issues++;
+          }
         }
       } else {
         if (all_peers[row].is_me) {
           // CRITICAL FIX: Add overflow check
           written = snprintf(response + offset, sizeof(response) - offset,
                              " ---          |");
+        } else if (directly_connected) {
+          // Directly connected but no peer mesh info yet
+          // CRITICAL FIX: Add overflow check
+          written = snprintf(response + offset, sizeof(response) - offset,
+                             " Connected     |");
         } else {
           // CRITICAL FIX: Add overflow check
           written = snprintf(response + offset, sizeof(response) - offset,
