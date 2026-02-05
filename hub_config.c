@@ -109,8 +109,14 @@ void hub_config_write(hub_state_t *state) {
     SAFE_WRITE("b|%s|t|%ld\n", b->uuid, (long)b->last_sync_time);
 
     for (int j = 0; j < b->entry_count; j++) {
-      SAFE_WRITE("b|%s|%s|%s|%ld\n", b->uuid, b->entries[j].key,
-                 b->entries[j].value, (long)b->entries[j].timestamp);
+      // Special handling for "seen" and "t" - omit value field
+      if (strcmp(b->entries[j].key, "seen") == 0 || strcmp(b->entries[j].key, "t") == 0) {
+        SAFE_WRITE("b|%s|%s|%ld\n", b->uuid, b->entries[j].key,
+                   (long)b->entries[j].timestamp);
+      } else {
+        SAFE_WRITE("b|%s|%s|%s|%ld\n", b->uuid, b->entries[j].key,
+                   b->entries[j].value, (long)b->entries[j].timestamp);
+      }
     }
 
     if (offset >= estimated_size)
@@ -357,8 +363,8 @@ bool hub_config_load(hub_state_t *state, const char *password) {
             char *bk = rest;
             char *bv = s3 + 1;
 
-            if (strcmp(bk, "t") == 0) {
-              // Metadata sync timestamp: b|uuid|t||timestamp
+            if (strcmp(bk, "t") == 0 || strcmp(bk, "seen") == 0) {
+              // Metadata fields without value: b|uuid|t|timestamp or b|uuid|seen|timestamp
               hub_storage_update_entry(state, uuid, bk, "", "", "", atol(bv));
             } else {
               // Config entry: b|uuid|key|value|timestamp

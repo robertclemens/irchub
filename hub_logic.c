@@ -375,7 +375,7 @@ static void hub_state_add_bot_memory(hub_state_t *state, const char *uuid,
     time_t now = time(NULL);
     hub_storage_update_entry(state, uuid, "n", nick, "", "", now);
     hub_storage_update_entry(state, uuid, "pub", pub_key, "", "", now);
-    hub_storage_update_entry(state, uuid, "seen", "0", "", "", now);
+    hub_storage_update_entry(state, uuid, "seen", "", "", "", now);
   }
 }
 
@@ -834,9 +834,16 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
       if (max_len - offset <= 1)
         break;
 
-      written = snprintf(buffer + offset, max_len - offset, "b|%s|%s|%s|%ld\n",
-                         b->uuid, b->entries[j].key, b->entries[j].value,
-                         (long)b->entries[j].timestamp);
+      // Special handling for "seen" and "t" - omit value field
+      if (strcmp(b->entries[j].key, "seen") == 0 || strcmp(b->entries[j].key, "t") == 0) {
+        written = snprintf(buffer + offset, max_len - offset, "b|%s|%s|%ld\n",
+                           b->uuid, b->entries[j].key,
+                           (long)b->entries[j].timestamp);
+      } else {
+        written = snprintf(buffer + offset, max_len - offset, "b|%s|%s|%s|%ld\n",
+                           b->uuid, b->entries[j].key, b->entries[j].value,
+                           (long)b->entries[j].timestamp);
+      }
       if (written < 0 || written >= (max_len - offset))
         break;
       offset += written;

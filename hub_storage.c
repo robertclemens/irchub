@@ -121,6 +121,15 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
     return hub_storage_update_global_entry(state, key, value, extra, op, ts);
   }
 
+  // CRITICAL: Reject invalid bot-specific keys being used as UUIDs
+  // "n", "h", "seen", "pub", "d", "t" should never be UUIDs
+  if (strcmp(uuid, "n") == 0 || strcmp(uuid, "h") == 0 ||
+      strcmp(uuid, "seen") == 0 || strcmp(uuid, "pub") == 0 ||
+      strcmp(uuid, "d") == 0 || strcmp(uuid, "t") == 0) {
+    hub_log("[STORAGE] REJECTED: Invalid UUID '%s' (bot-specific key used as UUID)\n", uuid);
+    return false;
+  }
+
   bot_config_t *b = get_or_create_bot(state, uuid);
   if (!b)
     return false;
