@@ -260,6 +260,9 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     client->bot_auth_state = BOT_AUTH_COMPLETE;
     client->last_seen = time(NULL);
 
+    // Update "seen" timestamp on successful authentication
+    hub_storage_update_entry(state, client->id, "seen", "", "", "", client->last_seen);
+
     hub_log("[HUB] Bot %s authenticated successfully\n", client->id);
     return true; // Continue
   }
@@ -785,6 +788,11 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
 
   if (updates > 0) {
     hub_log("[HUB] Applied %d updates from %s\n", updates, client->id);
+
+    // Update "seen" timestamp to track last successful sync
+    time_t now = time(NULL);
+    hub_storage_update_entry(state, client->id, "seen", "", "", "", now);
+
     hub_config_write(state);
 
     // Broadcast to peer hubs
@@ -3247,6 +3255,10 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
           client->authenticated = true;
           client->bot_auth_state = BOT_AUTH_COMPLETE;
           client->last_seen = time(NULL);
+
+          // Update "seen" timestamp on successful authentication
+          hub_storage_update_entry(state, client->id, "seen", "", "", "", client->last_seen);
+
           send_config_to_bot(state, client);
           hub_log("[HUB] Bot %s authenticated successfully\n", client->id);
         } else {
