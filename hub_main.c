@@ -378,10 +378,16 @@ int main(int argc, char *argv[]) {
         char kp[256];
         printf("--- Setup ---\nPort: ");
         if (scanf("%d", &state.port) != 1) return 1;
-        
+
+        printf("Bind IP (default 127.0.0.1): ");
+        if (scanf("%63s", state.bind_ip) != 1) {
+            strncpy(state.bind_ip, "127.0.0.1", sizeof(state.bind_ip) - 1);
+        }
+        state.bind_ip[sizeof(state.bind_ip) - 1] = 0;
+
         printf("PrivKey Path: ");
         if (scanf("%255s", kp) != 1) return 1;
-        
+
         printf("Admin Pass: ");
         if (scanf("%127s", state.admin_password) != 1) return 1;
         
@@ -424,6 +430,12 @@ int main(int argc, char *argv[]) {
         if (!daemon_mode) printf("Config load failed. Run -setup.\n");
         if (log_fp) fprintf(log_fp, "Config load failed.\n");
         return 1;
+    }
+
+    // Set default bind_ip if not configured
+    if (!state.bind_ip[0]) {
+        strncpy(state.bind_ip, "127.0.0.1", sizeof(state.bind_ip) - 1);
+        state.bind_ip[sizeof(state.bind_ip) - 1] = 0;
     }
 
     if (!state.private_key_pem) {

@@ -54,6 +54,7 @@ void hub_config_write(hub_state_t *state) {
   } while (0)
 
   SAFE_WRITE("port|%d\n", state->port);
+  SAFE_WRITE("bind_ip|%s\n", state->bind_ip[0] ? state->bind_ip : "127.0.0.1");
   SAFE_WRITE("admin|%s\n", state->admin_password);
 
   for (int i = 0; i < state->peer_count; i++) {
@@ -301,6 +302,9 @@ bool hub_config_load(hub_state_t *state, const char *password) {
 
       if (strcmp(k, "port") == 0) {
         state->port = atoi(v);
+      } else if (strcmp(k, "bind_ip") == 0) {
+        strncpy(state->bind_ip, v, sizeof(state->bind_ip) - 1);
+        state->bind_ip[sizeof(state->bind_ip) - 1] = 0;
       } else if (strcmp(k, "admin") == 0) {
         strncpy(state->admin_password, v, sizeof(state->admin_password) - 1);
         state->admin_password[sizeof(state->admin_password) - 1] = 0;

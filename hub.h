@@ -170,6 +170,7 @@ typedef struct {
 typedef struct {
   int listen_fd;
   int port;
+  char bind_ip[64]; // IP this hub advertises itself as in mesh
   char admin_password[128];
   char config_pass[128];
 

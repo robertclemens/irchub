@@ -386,8 +386,8 @@ void hub_broadcast_mesh_state(hub_state_t *state) {
   int offset = 0;
   int written;
 
-  written = snprintf(payload + offset, MAX_BUFFER - offset, "127.0.0.1:%d|",
-                     state->port);
+  written = snprintf(payload + offset, MAX_BUFFER - offset, "%s:%d|",
+                     state->bind_ip, state->port);
   if (written < 0 || written >= MAX_BUFFER - offset)
     return;
   offset += written;
@@ -434,7 +434,7 @@ void hub_broadcast_mesh_state(hub_state_t *state) {
         char owner_chk[256];
         if (sscanf(block, "%255[^|]", owner_chk) == 1) {
           char my_sig[128];
-          snprintf(my_sig, sizeof(my_sig), "127.0.0.1:%d", state->port);
+          snprintf(my_sig, sizeof(my_sig), "%s:%d", state->bind_ip, state->port);
 
           if (strcmp(owner_chk, my_sig) != 0) {
             char search_sig[260];
@@ -1283,30 +1283,42 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         if (state->clients[c]->type == CLIENT_BOT &&
             strcmp(state->clients[c]->id, b->uuid) == 0) {
           is_connected = true;
-          snprintf(connected_to, sizeof(connected_to), "LOCAL (127.0.0.1:%d)",
-                   state->port);
+          snprintf(connected_to, sizeof(connected_to), "LOCAL (%s:%d)",
+                   state->bind_ip, state->port);
           last_seen = state->clients[c]->last_seen;
           break;
         }
       }
 
-      // Check if connected to remote peers via gossip
-      if (!is_connected) {
-        for (int p = 0; p < state->peer_count; p++) {
-          if (state->peers[p].connected &&
-              strlen(state->peers[p].last_gossip) > 0) {
-            // Check if this peer has recent bot activity
-            // Note: We can't identify specific bots from gossip alone,
-            // but we can check if the bot has recent activity (last_sync_time)
-            // which suggests it might be connected to a remote peer
-            if (last_seen > 0 && (time(NULL) - last_seen) < 300) {
-              // Recent activity within 5 minutes, likely on a remote peer
-              is_connected = true;
-              snprintf(connected_to, sizeof(connected_to), "REMOTE (%s:%d)",
-                       state->peers[p].ip, state->peers[p].port);
-              // Note: We're guessing which peer, could be any connected peer
-              break;
+      // Check if bot might be connected to a remote peer
+      // Note: Gossip protocol only provides bot counts, not individual bot locations
+      if (!is_connected && last_seen > 0) {
+        time_t now = time(NULL);
+        if ((now - last_seen) < 300) {
+          // Bot has recent activity (within 5 minutes) but isn't local
+          // It's likely connected to one of the remote peers
+          is_connected = true;
+
+          // Try to determine which peer by checking gossip
+          bool found_peer = false;
+          for (int p = 0; p < state->peer_count; p++) {
+            if (state->peers[p].connected &&
+                strlen(state->peers[p].last_gossip) > 0) {
+              int rc, rt, rb;
+              if (sscanf(state->peers[p].last_gossip, "%d:%d:%d|", &rc, &rt, &rb) == 3) {
+                if (rb > 0) {
+                  // This peer has bots, likely candidate
+                  snprintf(connected_to, sizeof(connected_to), "REMOTE (%s:%d)",
+                           state->peers[p].ip, state->peers[p].port);
+                  found_peer = true;
+                  break;
+                }
+              }
             }
+          }
+
+          if (!found_peer) {
+            snprintf(connected_to, sizeof(connected_to), "REMOTE (Unknown Peer)");
           }
         }
       }
@@ -1333,43 +1345,6 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
       if (offset >= MAX_BUFFER - 100)
         break;
-    }
-
-    // Add mesh summary showing bot counts on connected peers
-    if (state->peer_count > 0 && offset < MAX_BUFFER - 500) {
-      written = snprintf(response + offset, MAX_BUFFER - offset,
-                         "\n--- Mesh Bot Summary ---\n");
-      if (written > 0 && written < MAX_BUFFER - offset)
-        offset += written;
-
-      // Show local peer
-      int local_bots = 0;
-      for (int c = 0; c < state->client_count; c++) {
-        if (state->clients[c]->type == CLIENT_BOT &&
-            state->clients[c]->authenticated)
-          local_bots++;
-      }
-      written = snprintf(response + offset, MAX_BUFFER - offset,
-                         "LOCAL (127.0.0.1:%d): %d bots\n", state->port,
-                         local_bots);
-      if (written > 0 && written < MAX_BUFFER - offset)
-        offset += written;
-
-      // Show remote peers with bot counts from gossip
-      for (int p = 0; p < state->peer_count; p++) {
-        if (state->peers[p].connected &&
-            strlen(state->peers[p].last_gossip) > 0) {
-          int rc, rt, rb;
-          if (sscanf(state->peers[p].last_gossip, "%d:%d:%d|", &rc, &rt,
-                     &rb) == 3) {
-            written = snprintf(response + offset, MAX_BUFFER - offset,
-                               "PEER (%s:%d): %d bots\n", state->peers[p].ip,
-                               state->peers[p].port, rb);
-            if (written > 0 && written < MAX_BUFFER - offset)
-              offset += written;
-          }
-        }
-      }
     }
 
     return send_response(state, client, response);
@@ -1670,7 +1645,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     matrix_peer_t all_peers[64];
     int count = 0;
 
-    snprintf(all_peers[count].ip, 256, "127.0.0.1");
+    snprintf(all_peers[count].ip, 256, "%s", state->bind_ip);
     all_peers[count].port = state->port;
     all_peers[count].is_me = true;
     count++;
@@ -3061,7 +3036,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               bool is_authorized_peer = false;
               for (int p = 0; p < state->peer_count; p++) {
                 bool ip_match = (strcmp(state->peers[p].ip, client->ip) == 0 ||
-                                 strcmp("127.0.0.1", client->ip) == 0);
+                                 strcmp(state->bind_ip, client->ip) == 0);
 
                 if (ip_match) {
                   if (claimed_port > 0) {
