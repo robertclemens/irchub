@@ -465,10 +465,24 @@ void hub_broadcast_mesh_state(hub_state_t *state) {
   }
 
   int active_bots = 0;
+  char bot_uuid_list[MAX_BUFFER];
+  int uuid_offset = 0;
+  bot_uuid_list[0] = '\0';
+
   for (int i = 0; i < state->client_count; i++) {
     if (state->clients[i]->type == CLIENT_BOT &&
         state->clients[i]->authenticated) {
       active_bots++;
+      // Add bot UUID to list
+      if (uuid_offset > 0 && uuid_offset < MAX_BUFFER - 2) {
+        bot_uuid_list[uuid_offset++] = ',';
+      }
+      int uuid_len = strlen(state->clients[i]->id);
+      if (uuid_offset + uuid_len < MAX_BUFFER - 1) {
+        memcpy(bot_uuid_list + uuid_offset, state->clients[i]->id, uuid_len);
+        uuid_offset += uuid_len;
+        bot_uuid_list[uuid_offset] = '\0';
+      }
     }
   }
 
@@ -479,8 +493,9 @@ void hub_broadcast_mesh_state(hub_state_t *state) {
   plain[0] = CMD_MESH_STATE;
   char final_packet[MAX_BUFFER];
 
-  written = snprintf(final_packet, sizeof(final_packet), "%d:%d:%d|%s",
-                     connected_peers, state->peer_count, active_bots, payload);
+  written = snprintf(final_packet, sizeof(final_packet), "%d:%d:%d:%s|%s",
+                     connected_peers, state->peer_count, active_bots,
+                     bot_uuid_list[0] ? bot_uuid_list : "-", payload);
   if (written < 0 || written >= (int)sizeof(final_packet))
     return;
 
@@ -1290,35 +1305,45 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         }
       }
 
-      // Check if bot might be connected to a remote peer
-      // Note: Gossip protocol only provides bot counts, not individual bot locations
-      if (!is_connected && last_seen > 0) {
-        time_t now = time(NULL);
-        if ((now - last_seen) < 300) {
-          // Bot has recent activity (within 5 minutes) but isn't local
-          // It's likely connected to one of the remote peers
-          is_connected = true;
+      // Check if bot is connected to a remote peer by checking gossip
+      if (!is_connected) {
+        for (int p = 0; p < state->peer_count; p++) {
+          if (state->peers[p].connected &&
+              strlen(state->peers[p].last_gossip) > 0) {
+            // Parse gossip format: connected:total:count:uuid_list|...
+            char *colon3 = strchr(state->peers[p].last_gossip, ':');
+            if (colon3) {
+              colon3 = strchr(colon3 + 1, ':');
+              if (colon3) {
+                colon3 = strchr(colon3 + 1, ':');
+                if (colon3) {
+                  // Found third colon, now extract UUID list
+                  char *pipe = strchr(colon3 + 1, '|');
+                  if (pipe) {
+                    char uuid_list[MAX_BUFFER];
+                    int list_len = pipe - (colon3 + 1);
+                    if (list_len > 0 && list_len < (int)sizeof(uuid_list)) {
+                      memcpy(uuid_list, colon3 + 1, list_len);
+                      uuid_list[list_len] = '\0';
 
-          // Try to determine which peer by checking gossip
-          bool found_peer = false;
-          for (int p = 0; p < state->peer_count; p++) {
-            if (state->peers[p].connected &&
-                strlen(state->peers[p].last_gossip) > 0) {
-              int rc, rt, rb;
-              if (sscanf(state->peers[p].last_gossip, "%d:%d:%d|", &rc, &rt, &rb) == 3) {
-                if (rb > 0) {
-                  // This peer has bots, likely candidate
-                  snprintf(connected_to, sizeof(connected_to), "REMOTE (%s:%d)",
-                           state->peers[p].ip, state->peers[p].port);
-                  found_peer = true;
-                  break;
+                      // Check if this bot's UUID is in the list
+                      if (strcmp(uuid_list, "-") != 0) {
+                        char search_uuid[128];
+                        snprintf(search_uuid, sizeof(search_uuid), "%s", b->uuid);
+
+                        // Check for exact match or as part of comma-separated list
+                        if (strstr(uuid_list, search_uuid) != NULL) {
+                          is_connected = true;
+                          snprintf(connected_to, sizeof(connected_to), "PEER (%s:%d)",
+                                   state->peers[p].ip, state->peers[p].port);
+                          break;
+                        }
+                      }
+                    }
+                  }
                 }
               }
             }
-          }
-
-          if (!found_peer) {
-            snprintf(connected_to, sizeof(connected_to), "REMOTE (Unknown Peer)");
           }
         }
       }
