@@ -1024,12 +1024,21 @@ static void process_peer_sync(hub_state_t *state, char *payload,
             char *vp1 = strchr(val, '|');
             if (vp1) {
               *vp1 = 0;
-              strncpy(parsed_val, val, sizeof(parsed_val) - 1);
+              size_t len = strlen(val);
+              if (len >= sizeof(parsed_val)) len = sizeof(parsed_val) - 1;
+              memcpy(parsed_val, val, len);
+              parsed_val[len] = 0;
               char *vp2 = strchr(vp1 + 1, '|');
               if (vp2) {
                 *vp2 = 0;
-                strncpy(parsed_extra, vp1 + 1, sizeof(parsed_extra) - 1);
-                strncpy(parsed_op, vp2 + 1, sizeof(parsed_op) - 1);
+                len = strlen(vp1 + 1);
+                if (len >= sizeof(parsed_extra)) len = sizeof(parsed_extra) - 1;
+                memcpy(parsed_extra, vp1 + 1, len);
+                parsed_extra[len] = 0;
+                len = strlen(vp2 + 1);
+                if (len >= sizeof(parsed_op)) len = sizeof(parsed_op) - 1;
+                memcpy(parsed_op, vp2 + 1, len);
+                parsed_op[len] = 0;
               }
             }
           } else if (strcmp(key, "m") == 0) {
@@ -1037,16 +1046,22 @@ static void process_peer_sync(hub_state_t *state, char *payload,
             char *vp1 = strchr(val, '|');
             if (vp1) {
               *vp1 = 0;
-              strncpy(parsed_val, val, sizeof(parsed_val) - 1);
-              strncpy(parsed_op, vp1 + 1, sizeof(parsed_op) - 1);
+              size_t len = strlen(val);
+              if (len >= sizeof(parsed_val)) len = sizeof(parsed_val) - 1;
+              memcpy(parsed_val, val, len);
+              parsed_val[len] = 0;
+              len = strlen(vp1 + 1);
+              if (len >= sizeof(parsed_op)) len = sizeof(parsed_op) - 1;
+              memcpy(parsed_op, vp1 + 1, len);
+              parsed_op[len] = 0;
             }
           } else {
             // Other keys: use value as-is
-            strncpy(parsed_val, val, sizeof(parsed_val) - 1);
+            size_t len = strlen(val);
+            if (len >= sizeof(parsed_val)) len = sizeof(parsed_val) - 1;
+            memcpy(parsed_val, val, len);
+            parsed_val[len] = 0;
           }
-          parsed_val[sizeof(parsed_val) - 1] = 0;
-          parsed_extra[sizeof(parsed_extra) - 1] = 0;
-          parsed_op[sizeof(parsed_op) - 1] = 0;
 
           if (hub_storage_update_entry(state, uuid, key,
               parsed_val[0] ? parsed_val : val,
