@@ -1017,7 +1017,41 @@ static void process_peer_sync(hub_state_t *state, char *payload,
           val[sizeof(val) - 1] = 0;
           ts = atol(p3 + 1);
 
-          if (hub_storage_update_entry(state, uuid, key, val, "", "", ts)) {
+          // For c/m/o keys, parse the combined value format
+          char parsed_val[512] = "", parsed_extra[256] = "", parsed_op[16] = "";
+          if (strcmp(key, "c") == 0 || strcmp(key, "o") == 0) {
+            // Format: value|extra|op or value||op
+            char *vp1 = strchr(val, '|');
+            if (vp1) {
+              *vp1 = 0;
+              strncpy(parsed_val, val, sizeof(parsed_val) - 1);
+              char *vp2 = strchr(vp1 + 1, '|');
+              if (vp2) {
+                *vp2 = 0;
+                strncpy(parsed_extra, vp1 + 1, sizeof(parsed_extra) - 1);
+                strncpy(parsed_op, vp2 + 1, sizeof(parsed_op) - 1);
+              }
+            }
+          } else if (strcmp(key, "m") == 0) {
+            // Format: value|op
+            char *vp1 = strchr(val, '|');
+            if (vp1) {
+              *vp1 = 0;
+              strncpy(parsed_val, val, sizeof(parsed_val) - 1);
+              strncpy(parsed_op, vp1 + 1, sizeof(parsed_op) - 1);
+            }
+          } else {
+            // Other keys: use value as-is
+            strncpy(parsed_val, val, sizeof(parsed_val) - 1);
+          }
+          parsed_val[sizeof(parsed_val) - 1] = 0;
+          parsed_extra[sizeof(parsed_extra) - 1] = 0;
+          parsed_op[sizeof(parsed_op) - 1] = 0;
+
+          if (hub_storage_update_entry(state, uuid, key,
+              parsed_val[0] ? parsed_val : val,
+              parsed_extra,
+              parsed_op, ts)) {
             updates++;
 
             if (sizeof(forward_buf) - fwd_offset > 1200) {
