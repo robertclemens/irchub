@@ -431,6 +431,11 @@ bool hub_config_load(hub_state_t *state, const char *password) {
                 if (pipe2) {
                   *pipe2 = 0;
                   char *op = pipe2 + 1;
+                  // Strip any trailing pipes from op (malformed config entries)
+                  char *op_end = op + strlen(op);
+                  while (op_end > op && *(op_end - 1) == '|') {
+                    *(--op_end) = '\0';
+                  }
                   hub_storage_update_global_entry(state, gk, gv, extra, op, ts);
                 }
               }
@@ -439,6 +444,11 @@ bool hub_config_load(hub_state_t *state, const char *password) {
               if (pipe1) {
                 *pipe1 = 0;
                 char *op = pipe1 + 1;
+                // Strip any trailing pipes from op (malformed config entries)
+                char *op_end = op + strlen(op);
+                while (op_end > op && *(op_end - 1) == '|') {
+                  *(--op_end) = '\0';
+                }
                 hub_storage_update_global_entry(state, gk, gv, "", op, ts);
               }
             } else {
@@ -470,6 +480,11 @@ bool hub_config_load(hub_state_t *state, const char *password) {
                 char *value = v;
                 char *extra = rest;
                 char *op = pipe2 + 1;
+                // Strip any trailing pipes from op (malformed config entries)
+                char *op_end = op + strlen(op);
+                while (op_end > op && *(op_end - 1) == '|') {
+                  *(--op_end) = '\0';
+                }
                 hub_storage_update_global_entry(state, k, value, extra, op, ts);
               }
             }
@@ -480,6 +495,11 @@ bool hub_config_load(hub_state_t *state, const char *password) {
               *pipe1 = 0;
               char *value = v;
               char *op = pipe1 + 1;
+              // Strip any trailing pipes from op (malformed config entries)
+              char *op_end = op + strlen(op);
+              while (op_end > op && *(op_end - 1) == '|') {
+                *(--op_end) = '\0';
+              }
               hub_storage_update_global_entry(state, k, value, "", op, ts);
             }
           } else {
