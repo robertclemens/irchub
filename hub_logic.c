@@ -670,7 +670,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
           updates++;
           int w = snprintf(sync_buffer + sync_offset,
                            sizeof(sync_buffer) - sync_offset,
-                           "b|%s|m|%s||%s|%ld\n", client->id, mask, op, ts);
+                           "b|%s|m|%s|%s|%ld\n", client->id, mask, op, ts);
           if (w > 0)
             sync_offset += w;
         }

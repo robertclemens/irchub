@@ -28,14 +28,26 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
                                      const char *op, time_t ts) {
   char combined_value[1024];
 
-  // Sanitize op parameter - strip trailing pipes from malformed input
+  // Sanitize op parameter - strip leading and trailing pipes from malformed input
   char clean_op[16] = "";
   if (op) {
     strncpy(clean_op, op, sizeof(clean_op) - 1);
     clean_op[sizeof(clean_op) - 1] = '\0';
-    char *op_end = clean_op + strlen(clean_op);
-    while (op_end > clean_op && *(op_end - 1) == '|') {
+    // Strip leading pipes
+    char *op_start = clean_op;
+    while (*op_start == '|') {
+      op_start++;
+    }
+    // Strip trailing pipes
+    char *op_end = op_start + strlen(op_start);
+    while (op_end > op_start && *(op_end - 1) == '|') {
       *(--op_end) = '\0';
+    }
+    // Move cleaned string to beginning if needed
+    if (op_start != clean_op && *op_start) {
+      memmove(clean_op, op_start, strlen(op_start) + 1);
+    } else if (!*op_start) {
+      clean_op[0] = '\0';
     }
   }
   const char *safe_op = clean_op[0] ? clean_op : "add";
@@ -164,14 +176,26 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
 
   char combined_value[1024];
 
-  // Sanitize op parameter - strip trailing pipes from malformed input
+  // Sanitize op parameter - strip leading and trailing pipes from malformed input
   char clean_op[16] = "";
   if (op) {
     strncpy(clean_op, op, sizeof(clean_op) - 1);
     clean_op[sizeof(clean_op) - 1] = '\0';
-    char *op_end = clean_op + strlen(clean_op);
-    while (op_end > clean_op && *(op_end - 1) == '|') {
+    // Strip leading pipes
+    char *op_start = clean_op;
+    while (*op_start == '|') {
+      op_start++;
+    }
+    // Strip trailing pipes
+    char *op_end = op_start + strlen(op_start);
+    while (op_end > op_start && *(op_end - 1) == '|') {
       *(--op_end) = '\0';
+    }
+    // Move cleaned string to beginning if needed
+    if (op_start != clean_op && *op_start) {
+      memmove(clean_op, op_start, strlen(op_start) + 1);
+    } else if (!*op_start) {
+      clean_op[0] = '\0';
     }
   }
   const char *safe_op = clean_op[0] ? clean_op : "add";
