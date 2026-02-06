@@ -28,20 +28,32 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
                                      const char *op, time_t ts) {
   char combined_value[1024];
 
+  // Sanitize op parameter - strip trailing pipes from malformed input
+  char clean_op[16] = "";
+  if (op) {
+    strncpy(clean_op, op, sizeof(clean_op) - 1);
+    clean_op[sizeof(clean_op) - 1] = '\0';
+    char *op_end = clean_op + strlen(clean_op);
+    while (op_end > clean_op && *(op_end - 1) == '|') {
+      *(--op_end) = '\0';
+    }
+  }
+  const char *safe_op = clean_op[0] ? clean_op : "add";
+
   // Format value based on key type
   if (strcmp(key, "c") == 0) {
     if (extra && extra[0])
       snprintf(combined_value, sizeof(combined_value), "%s|%s|%s", value, extra,
-               op ? op : "add");
+               safe_op);
     else
       snprintf(combined_value, sizeof(combined_value), "%s||%s", value,
-               op ? op : "add");
+               safe_op);
   } else if (strcmp(key, "m") == 0) {
     snprintf(combined_value, sizeof(combined_value), "%s|%s", value,
-             op ? op : "add");
+             safe_op);
   } else if (strcmp(key, "o") == 0) {
     snprintf(combined_value, sizeof(combined_value), "%s|%s|%s", value,
-             extra ? extra : "", op ? op : "add");
+             extra ? extra : "", safe_op);
   } else {
     strncpy(combined_value, value, sizeof(combined_value) - 1);
     combined_value[sizeof(combined_value) - 1] = 0;
@@ -152,23 +164,35 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
 
   char combined_value[1024];
 
+  // Sanitize op parameter - strip trailing pipes from malformed input
+  char clean_op[16] = "";
+  if (op) {
+    strncpy(clean_op, op, sizeof(clean_op) - 1);
+    clean_op[sizeof(clean_op) - 1] = '\0';
+    char *op_end = clean_op + strlen(clean_op);
+    while (op_end > clean_op && *(op_end - 1) == '|') {
+      *(--op_end) = '\0';
+    }
+  }
+  const char *safe_op = clean_op[0] ? clean_op : "add";
+
   if (strcmp(key, "c") == 0) {
     // Channel: value|extra|op
     if (extra && extra[0]) {
       snprintf(combined_value, sizeof(combined_value), "%s|%s|%s", value, extra,
-               op ? op : "add");
+               safe_op);
     } else {
       snprintf(combined_value, sizeof(combined_value), "%s||%s", value,
-               op ? op : "add");
+               safe_op);
     }
   } else if (strcmp(key, "m") == 0) {
     // Mask: value|op
     snprintf(combined_value, sizeof(combined_value), "%s|%s", value,
-             op ? op : "add");
+             safe_op);
   } else if (strcmp(key, "o") == 0) {
     // Oper: value|extra|op
     snprintf(combined_value, sizeof(combined_value), "%s|%s|%s", value,
-             extra ? extra : "", op ? op : "add");
+             extra ? extra : "", safe_op);
   } else {
     // Simple value (a, p, h)
     strncpy(combined_value, value, sizeof(combined_value) - 1);
