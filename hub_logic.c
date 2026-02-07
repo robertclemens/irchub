@@ -2233,9 +2233,17 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     for (int i = 0; i < state->global_entry_count; i++) {
       if (strcmp(state->global_entries[i].key, "c") == 0) {
         chan_count++;
-        char chan_name[128], chan_key[64], op[16];
-        if (sscanf(state->global_entries[i].value, "%127[^|]|%63[^|]|%15s",
-                   chan_name, chan_key, op) >= 2) {
+        char chan_name[128] = "", chan_key[64] = "", op[16] = "";
+        // Parse: channel|key|op or channel||op (empty key)
+        int parsed = sscanf(state->global_entries[i].value, "%127[^|]|%63[^|]|%15s",
+                           chan_name, chan_key, op);
+        if (parsed < 2) {
+          // Try empty key format: channel||op
+          parsed = sscanf(state->global_entries[i].value, "%127[^|]||%15s",
+                         chan_name, op);
+          chan_key[0] = '\0';
+        }
+        if (parsed >= 2 || (parsed == 1 && chan_name[0])) {
           written = snprintf(response + offset, sizeof(response) - offset,
                              "  %s %s %s\n", chan_name,
                              strlen(chan_key) > 0 ? chan_key : "(no key)",
@@ -2272,6 +2280,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                    (long)now);
         }
         hub_broadcast_config_to_bots(state, sync_msg);
+        hub_broadcast_sync_to_peers(state, sync_msg, -1);
         return send_response(state, client, "SUCCESS: Channel added and synced.");
       }
     }
@@ -2288,6 +2297,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       snprintf(sync_msg, sizeof(sync_msg), "c|%s||del|%ld\n", payload,
                (long)now);
       hub_broadcast_config_to_bots(state, sync_msg);
+      hub_broadcast_sync_to_peers(state, sync_msg, -1);
       return send_response(state, client,
                            "SUCCESS: Channel removed and synced.");
     }
@@ -2335,6 +2345,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       snprintf(sync_msg, sizeof(sync_msg), "m|%s|add|%ld\n", payload,
                (long)now);
       hub_broadcast_config_to_bots(state, sync_msg);
+      hub_broadcast_sync_to_peers(state, sync_msg, -1);
       return send_response(state, client, "SUCCESS: Admin mask added and synced.");
     }
     return send_response(state, client, "ERROR: Missing mask.");
@@ -2350,6 +2361,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       snprintf(sync_msg, sizeof(sync_msg), "m|%s|del|%ld\n", payload,
                (long)now);
       hub_broadcast_config_to_bots(state, sync_msg);
+      hub_broadcast_sync_to_peers(state, sync_msg, -1);
       return send_response(state, client,
                            "SUCCESS: Admin mask removed and synced.");
     }
@@ -2399,6 +2411,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         snprintf(sync_msg, sizeof(sync_msg), "o|%s|%s|add|%ld\n", mask, pass,
                  (long)now);
         hub_broadcast_config_to_bots(state, sync_msg);
+        hub_broadcast_sync_to_peers(state, sync_msg, -1);
         return send_response(state, client, "SUCCESS: Oper mask added and synced.");
       }
     }
@@ -2415,6 +2428,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       snprintf(sync_msg, sizeof(sync_msg), "o|%s||del|%ld\n", payload,
                (long)now);
       hub_broadcast_config_to_bots(state, sync_msg);
+      hub_broadcast_sync_to_peers(state, sync_msg, -1);
       return send_response(state, client, "SUCCESS: Oper mask removed and synced.");
     }
     return send_response(state, client, "ERROR: Missing mask.");
@@ -2429,6 +2443,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       char sync_msg[256];
       snprintf(sync_msg, sizeof(sync_msg), "a|%s|%ld\n", payload, (long)now);
       hub_broadcast_config_to_bots(state, sync_msg);
+      hub_broadcast_sync_to_peers(state, sync_msg, -1);
       return send_response(state, client,
                            "SUCCESS: Admin password updated and synced.");
     }
@@ -2444,6 +2459,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       char sync_msg[256];
       snprintf(sync_msg, sizeof(sync_msg), "p|%s|%ld\n", payload, (long)now);
       hub_broadcast_config_to_bots(state, sync_msg);
+      // Also broadcast to peer hubs for mesh sync
+      hub_broadcast_sync_to_peers(state, sync_msg, -1);
       return send_response(state, client,
                            "SUCCESS: Bot password updated and synced.");
     }
@@ -2454,10 +2471,17 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     if (payload && strlen(payload) > 0) {
       char nick[64], channel[64];
       if (sscanf(payload, "%63[^|]|%63s", nick, channel) == 2) {
-        // Find a bot connected to this channel and send op grant
+        // Generate unique request ID
+        char request_id[64];
+        generate_request_id(request_id, sizeof(request_id));
+
+        // Try to find a bot in the channel locally
+        int sent_count = 0;
         for (int i = 0; i < state->client_count; i++) {
-          if (state->clients[i]->type == CLIENT_BOT) {
-            // Build OP_GRANT message
+          if (state->clients[i]->type == CLIENT_BOT &&
+              state->clients[i]->authenticated) {
+            // Send op grant request to all connected bots
+            // They'll ignore it if they're not in the channel
             char op_payload[256];
             snprintf(op_payload, sizeof(op_payload), "%s|%s", nick, channel);
 
@@ -2477,17 +2501,28 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
               net_len = htonl(enc_len + GCM_TAG_LEN);
               memcpy(enc, &net_len, 4);
 
-              if (send(state->clients[i]->fd, enc, 4 + enc_len + GCM_TAG_LEN, 0) >
-                  0) {
-                snprintf(response, sizeof(response),
-                         "SUCCESS: Op request sent to bot %s", state->clients[i]->id);
-                return send_response(state, client, response);
+              if (send(state->clients[i]->fd, enc, 4 + enc_len + GCM_TAG_LEN, 0) > 0) {
+                sent_count++;
               }
             }
           }
         }
-        return send_response(state, client,
-                             "ERROR: No connected bots available.");
+
+        // Also forward to peer hubs to reach bots connected to them
+        // Encode nick:channel for admin requests
+        char admin_payload[256];
+        snprintf(admin_payload, sizeof(admin_payload), "%s:%s", nick, channel);
+        forward_op_request_to_peers(state, request_id, "ADMIN", "ANY", admin_payload, -1);
+
+        if (sent_count > 0) {
+          snprintf(response, sizeof(response),
+                   "SUCCESS: Op request sent to %d local bot(s) and forwarded to peer hubs",
+                   sent_count);
+        } else {
+          snprintf(response, sizeof(response),
+                   "SUCCESS: Op request forwarded to peer hubs (no local bots connected)");
+        }
+        return send_response(state, client, response);
       }
     }
     return send_response(state, client, "ERROR: Invalid payload (need nick|channel).");
@@ -2619,8 +2654,55 @@ static void process_forward_op_request(hub_state_t *state,
   }
 
   hub_log(
-      "[HUB] Received OP_FORWARD_REQUEST (id:%s) from peer for target %s\n",
-      request_id, target_uuid);
+      "[HUB] Received OP_FORWARD_REQUEST (id:%s) from peer for target %s in channel %s\n",
+      request_id, target_uuid, channel);
+
+  // Handle admin requests specially (target_uuid = "ANY", requester_uuid = "ADMIN")
+  if (strcmp(target_uuid, "ANY") == 0 && strcmp(requester_uuid, "ADMIN") == 0) {
+    // Admin op request - decode nick:channel format
+    char nick[64], chan[MAX_CHAN];
+    if (sscanf(channel, "%63[^:]:%64s", nick, chan) == 2) {
+      hub_log("[HUB] Admin OP_REQUEST for %s in %s - broadcasting to local bots\n",
+              nick, chan);
+
+      // Send op grant to all local bots (they'll filter if not in channel)
+      int sent_count = 0;
+      for (int i = 0; i < state->client_count; i++) {
+        if (state->clients[i]->type == CLIENT_BOT &&
+            state->clients[i]->authenticated) {
+          char op_payload[256];
+          snprintf(op_payload, sizeof(op_payload), "%s|%s", nick, chan);
+
+          unsigned char plain[MAX_BUFFER], buffer[MAX_BUFFER], tag[GCM_TAG_LEN];
+          plain[0] = CMD_OP_GRANT;
+          int pay_len = strlen(op_payload);
+          uint32_t net_pay_len = htonl(pay_len);
+          memcpy(&plain[1], &net_pay_len, 4);
+          memcpy(&plain[5], op_payload, pay_len);
+
+          int enc_len = aes_gcm_encrypt(plain, 5 + pay_len,
+                                       state->clients[i]->session_key,
+                                       buffer + 4, tag);
+          if (enc_len > 0) {
+            memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+            uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+            memcpy(buffer, &net_len, 4);
+
+            if (send(state->clients[i]->fd, buffer, 4 + enc_len + GCM_TAG_LEN, 0) > 0) {
+              sent_count++;
+            }
+          }
+        }
+      }
+
+      // Forward to other peer hubs
+      forward_op_request_to_peers(state, request_id, requester_uuid, target_uuid,
+                                  channel, client->fd);
+      hub_log("[HUB] Admin OP_REQUEST sent to %d local bots and forwarded to peers\n",
+              sent_count);
+    }
+    return;
+  }
 
   // Search for target bot locally
   hub_client_t *target = NULL;
