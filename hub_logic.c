@@ -1055,13 +1055,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
               memcpy(parsed_op, vp1 + 1, len);
               parsed_op[len] = 0;
             }
-          } else {
-            // Other keys: use value as-is
-            size_t len = strlen(val);
-            if (len >= sizeof(parsed_val)) len = sizeof(parsed_val) - 1;
-            memcpy(parsed_val, val, len);
-            parsed_val[len] = 0;
           }
+          // For other keys (pub, h, n, etc.): leave parsed_val empty
+          // so hub_storage_update_entry will use the original val buffer
 
           if (hub_storage_update_entry(state, uuid, key,
               parsed_val[0] ? parsed_val : val,
