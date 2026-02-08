@@ -756,10 +756,10 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         hub_log("[HUB-DEBUG] Hostmask %s: ts=%ld -> %s\n", hostmask, ts, accepted ? "ACCEPTED" : "REJECTED");
         if (accepted) {
           updates++;
-          // Broadcast in format: b|hostmask|uuid|timestamp
+          // Broadcast in bot entry format: b|uuid|h|hostmask|timestamp
           int w = snprintf(sync_buffer + sync_offset,
-                           sizeof(sync_buffer) - sync_offset, "b|%s|%s|%ld\n",
-                           hostmask, client->id, ts);
+                           sizeof(sync_buffer) - sync_offset, "b|%s|h|%s|%ld\n",
+                           client->id, hostmask, ts);
           if (w > 0)
             sync_offset += w;
         }
@@ -773,10 +773,10 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         hub_log("[HUB-DEBUG] Nick %s: ts=%ld -> %s\n", nick, ts, accepted ? "ACCEPTED" : "REJECTED");
         if (accepted) {
           updates++;
-          // Broadcast as nickname update (NOT b| prefix)
+          // Broadcast in bot entry format: b|uuid|n|nickname|timestamp
           int w = snprintf(sync_buffer + sync_offset,
-                           sizeof(sync_buffer) - sync_offset, "n|%s|%s|%ld\n",
-                           nick, client->id, ts);
+                           sizeof(sync_buffer) - sync_offset, "b|%s|n|%s|%ld\n",
+                           client->id, nick, ts);
           if (w > 0)
             sync_offset += w;
         }
@@ -1087,6 +1087,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
     if (fwd_offset > 0) {
       hub_broadcast_sync_to_peers(state, forward_buf, origin_fd);
     }
+
+    // Broadcast full config to all connected bots to ensure they receive peer updates
+    broadcast_full_config_to_all_bots(state);
   }
 }
 
