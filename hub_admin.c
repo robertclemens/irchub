@@ -887,6 +887,223 @@ void admin_purge_tombstones() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
+void admin_list_allowlist() {
+    char response[MAX_BUFFER];
+
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_LIST_ALLOWLIST, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_add_allowlist() {
+    char response[MAX_BUFFER];
+    char ip_pattern[256];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("              ADD IP TO ALLOWLIST\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Format examples:\n");
+    printf("  192.168.1.5       - Single IP\n");
+    printf("  192.168.1.0/24    - Subnet (CIDR notation)\n");
+    printf("  10.0.0.0/8        - Large network\n\n");
+
+    get_input("IP or CIDR pattern: ", ip_pattern, sizeof(ip_pattern));
+
+    if (strlen(ip_pattern) > 0) {
+        send_packet(g_fd, CMD_ADMIN_ADD_ALLOWLIST, ip_pattern, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_del_allowlist() {
+    char response[MAX_BUFFER];
+
+    send_packet(g_fd, CMD_ADMIN_LIST_ALLOWLIST, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\n%s\n", response);
+
+    char ip_pattern[256];
+    get_input("IP/CIDR to REMOVE (or blank to cancel): ", ip_pattern, sizeof(ip_pattern));
+
+    if (strlen(ip_pattern) > 0 && get_confirmation("Remove this allowlist entry?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_ALLOWLIST, ip_pattern, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_list_denylist() {
+    char response[MAX_BUFFER];
+
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_LIST_DENYLIST, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_add_denylist() {
+    char response[MAX_BUFFER];
+    char ip_pattern[256];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("              ADD IP TO DENYLIST\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Format examples:\n");
+    printf("  192.168.1.5       - Single IP\n");
+    printf("  192.168.1.0/24    - Subnet (CIDR notation)\n");
+    printf("  10.0.0.0/8        - Large network\n\n");
+
+    get_input("IP or CIDR pattern: ", ip_pattern, sizeof(ip_pattern));
+
+    if (strlen(ip_pattern) > 0) {
+        send_packet(g_fd, CMD_ADMIN_ADD_DENYLIST, ip_pattern, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_del_denylist() {
+    char response[MAX_BUFFER];
+
+    send_packet(g_fd, CMD_ADMIN_LIST_DENYLIST, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\n%s\n", response);
+
+    char ip_pattern[256];
+    get_input("IP/CIDR to REMOVE (or blank to cancel): ", ip_pattern, sizeof(ip_pattern));
+
+    if (strlen(ip_pattern) > 0 && get_confirmation("Remove this denylist entry?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_DENYLIST, ip_pattern, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void menu_manage_allowlist() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║            MANAGE IP ALLOWLIST                   ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. List Allowlist\n");
+        printf("  2. Add IP to Allowlist\n");
+        printf("  3. Remove IP from Allowlist\n");
+        printf("  4. Back to Admin Commands\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1: admin_list_allowlist(); break;
+            case 2: admin_add_allowlist(); break;
+            case 3: admin_del_allowlist(); break;
+            case 4: return;
+            default: printf("Invalid choice.\n"); break;
+        }
+    }
+}
+
+void menu_manage_denylist() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║            MANAGE IP DENYLIST                    ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. List Denylist\n");
+        printf("  2. Add IP to Denylist\n");
+        printf("  3. Remove IP from Denylist\n");
+        printf("  4. Back to Admin Commands\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1: admin_list_denylist(); break;
+            case 2: admin_add_denylist(); break;
+            case 3: admin_del_denylist(); break;
+            case 4: return;
+            default: printf("Invalid choice.\n"); break;
+        }
+    }
+}
+
+void admin_set_bind_ip() {
+    char response[MAX_BUFFER];
+    char ip[64];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                SET BIND IP ADDRESS\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Set the IP address this hub binds to:\n");
+    printf("  0.0.0.0      - Bind to all interfaces (default)\n");
+    printf("  127.0.0.1    - Localhost only\n");
+    printf("  192.168.x.x  - Specific interface\n\n");
+    printf("NOTE: Hub restart required for changes to take effect.\n\n");
+
+    get_input("Bind IP: ", ip, sizeof(ip));
+
+    if (strlen(ip) > 0) {
+        send_packet(g_fd, CMD_ADMIN_SET_BIND_IP, ip, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
 void menu_manage_admin_masks() {
     while (1) {
         printf("\n");
@@ -1026,8 +1243,11 @@ void menu_admin_commands() {
         printf("  4. Manage Channels\n");
         printf("  5. Change Admin Password\n");
         printf("  6. Change Bot Password\n");
-        printf("  7. Purge Tombstones\n");
-        printf("  8. Back to Main Menu\n");
+        printf("  7. Set Bind IP\n");
+        printf("  8. Manage IP Allowlist\n");
+        printf("  9. Manage IP Denylist\n");
+        printf(" 10. Purge Tombstones\n");
+        printf(" 11. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1060,9 +1280,18 @@ void menu_admin_commands() {
                 admin_change_bot_password();
                 break;
             case 7:
-                admin_purge_tombstones();
+                admin_set_bind_ip();
                 break;
             case 8:
+                menu_manage_allowlist();
+                break;
+            case 9:
+                menu_manage_denylist();
+                break;
+            case 10:
+                admin_purge_tombstones();
+                break;
+            case 11:
                 return;
             default:
                 printf("Invalid choice.\n");

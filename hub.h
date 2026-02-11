@@ -38,6 +38,14 @@
 #define MAX_PENDING_BOTS 10
 #define MAX_PENDING_OP_REQUESTS 50
 #define PBKDF2_ITERATIONS 100000 // NEW: For password-based key derivation
+#define HUB_PID_FILE ".irchub.pid"
+
+// Rate Limiting Settings
+#define MAX_IP_RATE_LIMITS 500
+#define MAX_CONNECTIONS_PER_IP 5
+#define MAX_FAILED_AUTH_ATTEMPTS 3
+#define FAILED_AUTH_BLOCK_DURATION 300  // 5 minutes
+#define FAILED_AUTH_RESET_TIME 3600     // 1 hour
 
 // Timeout Settings
 #define PING_INTERVAL 60
@@ -100,6 +108,15 @@
 // Tombstone Purge Commands
 #define CMD_ADMIN_PURGE_TOMBSTONES 0x36 // Purge tombstoned entries (payload: days or "immediate")
 
+// Bind IP and IP Access Control Commands
+#define CMD_ADMIN_SET_BIND_IP 0x37
+#define CMD_ADMIN_LIST_ALLOWLIST 0x38
+#define CMD_ADMIN_ADD_ALLOWLIST 0x39
+#define CMD_ADMIN_DEL_ALLOWLIST 0x3A
+#define CMD_ADMIN_LIST_DENYLIST 0x3B
+#define CMD_ADMIN_ADD_DENYLIST 0x3C
+#define CMD_ADMIN_DEL_DENYLIST 0x3D
+
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
 
@@ -133,6 +150,15 @@ typedef struct {
   time_t timestamp;        // When request was created
   bool active;             // Whether this slot is in use
 } pending_op_request_t;
+
+typedef struct {
+  char ip[64];
+  int active_connections;    // Current active connections from this IP
+  int failed_auth_count;     // Failed authentication attempts
+  time_t last_failed_auth;   // Timestamp of last failed auth
+  time_t blocked_until;      // Temporary block expiration (0 if not blocked)
+  time_t first_seen;         // For cleanup of old entries
+} ip_rate_limit_t;
 
 typedef struct {
   char ip[64];
@@ -200,6 +226,10 @@ typedef struct {
 
   pending_op_request_t pending_op_requests[MAX_PENDING_OP_REQUESTS];
 
+  ip_rate_limit_t ip_limits[MAX_IP_RATE_LIMITS];
+  int ip_limits_count;
+
+  int pid_fd;  // File descriptor for PID file lock
   volatile bool running;
 } hub_state_t;
 

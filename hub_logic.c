@@ -57,6 +57,217 @@ bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
 
 // --- Helper Functions ---
 
+// ============ RATE LIMITING FUNCTIONS ============
+
+static ip_rate_limit_t* find_or_create_ip_limit(hub_state_t *state, const char *ip) {
+    // Find existing entry
+    for (int i = 0; i < state->ip_limits_count; i++) {
+        if (strcmp(state->ip_limits[i].ip, ip) == 0) {
+            return &state->ip_limits[i];
+        }
+    }
+
+    // Create new entry if space available
+    if (state->ip_limits_count < MAX_IP_RATE_LIMITS) {
+        ip_rate_limit_t *entry = &state->ip_limits[state->ip_limits_count++];
+        strncpy(entry->ip, ip, sizeof(entry->ip) - 1);
+        entry->ip[sizeof(entry->ip) - 1] = '\0';
+        entry->active_connections = 0;
+        entry->failed_auth_count = 0;
+        entry->last_failed_auth = 0;
+        entry->blocked_until = 0;
+        entry->first_seen = time(NULL);
+        return entry;
+    }
+
+    return NULL;  // No space (shouldn't happen with large limit)
+}
+
+static bool is_ip_allowed(hub_state_t *state, const char *ip) {
+    ip_rate_limit_t *entry = find_or_create_ip_limit(state, ip);
+    if (!entry) return true;  // If can't track, allow (fail open)
+
+    time_t now = time(NULL);
+
+    // Check if temporarily blocked
+    if (entry->blocked_until > 0 && now < entry->blocked_until) {
+        hub_log("[RATE_LIMIT] IP %s is blocked until %ld (failed auth)\n",
+                ip, (long)entry->blocked_until);
+        return false;
+    }
+
+    // Reset block if expired
+    if (entry->blocked_until > 0 && now >= entry->blocked_until) {
+        entry->blocked_until = 0;
+        entry->failed_auth_count = 0;
+    }
+
+    // Check connection limit
+    if (entry->active_connections >= MAX_CONNECTIONS_PER_IP) {
+        hub_log("[RATE_LIMIT] IP %s exceeded connection limit (%d/%d)\n",
+                ip, entry->active_connections, MAX_CONNECTIONS_PER_IP);
+        return false;
+    }
+
+    return true;
+}
+
+static void increment_active_connections(hub_state_t *state, const char *ip) {
+    ip_rate_limit_t *entry = find_or_create_ip_limit(state, ip);
+    if (entry) {
+        entry->active_connections++;
+    }
+}
+
+static void decrement_active_connections(hub_state_t *state, const char *ip) {
+    for (int i = 0; i < state->ip_limits_count; i++) {
+        if (strcmp(state->ip_limits[i].ip, ip) == 0) {
+            if (state->ip_limits[i].active_connections > 0) {
+                state->ip_limits[i].active_connections--;
+            }
+            break;
+        }
+    }
+}
+
+static void record_failed_auth(hub_state_t *state, const char *ip) {
+    ip_rate_limit_t *entry = find_or_create_ip_limit(state, ip);
+    if (!entry) return;
+
+    time_t now = time(NULL);
+
+    // Reset counter if last failure was over FAILED_AUTH_RESET_TIME ago
+    if (now - entry->last_failed_auth > FAILED_AUTH_RESET_TIME) {
+        entry->failed_auth_count = 0;
+    }
+
+    entry->failed_auth_count++;
+    entry->last_failed_auth = now;
+
+    hub_log("[AUTH_FAIL] IP %s failed auth (attempt %d/%d)\n",
+            ip, entry->failed_auth_count, MAX_FAILED_AUTH_ATTEMPTS);
+
+    // Block if exceeded max attempts
+    if (entry->failed_auth_count >= MAX_FAILED_AUTH_ATTEMPTS) {
+        entry->blocked_until = now + FAILED_AUTH_BLOCK_DURATION;
+        hub_log("[AUTH_BLOCK] IP %s blocked for %d seconds (too many failed attempts)\n",
+                ip, FAILED_AUTH_BLOCK_DURATION);
+    }
+}
+
+static void cleanup_old_ip_limits(hub_state_t *state) {
+    time_t now = time(NULL);
+    int i = 0;
+
+    while (i < state->ip_limits_count) {
+        ip_rate_limit_t *entry = &state->ip_limits[i];
+
+        // Remove if no active connections and not blocked and old (1 hour+)
+        if (entry->active_connections == 0 &&
+            entry->blocked_until == 0 &&
+            now - entry->first_seen > 3600) {
+
+            // Swap with last and decrement count
+            state->ip_limits[i] = state->ip_limits[--state->ip_limits_count];
+            continue;  // Don't increment i, check swapped entry
+        }
+        i++;
+    }
+}
+
+// ============ IP ACCESS CONTROL FUNCTIONS ============
+
+// Simple CIDR matching (supports /24, /16, /8 and exact match)
+static bool ip_matches_pattern(const char *ip, const char *pattern) {
+    // Check for CIDR notation
+    char pattern_copy[128];
+    strncpy(pattern_copy, pattern, sizeof(pattern_copy) - 1);
+    pattern_copy[sizeof(pattern_copy) - 1] = '\0';
+
+    char *slash = strchr(pattern_copy, '/');
+    if (slash) {
+        *slash = '\0';
+        int prefix_len = atoi(slash + 1);
+
+        // Convert IPs to binary
+        struct in_addr ip_addr, pattern_addr;
+        if (inet_pton(AF_INET, ip, &ip_addr) != 1 ||
+            inet_pton(AF_INET, pattern_copy, &pattern_addr) != 1) {
+            return false;
+        }
+
+        // Create netmask
+        uint32_t mask = 0;
+        if (prefix_len > 0 && prefix_len <= 32) {
+            mask = htonl(~((1u << (32 - prefix_len)) - 1));
+        }
+
+        // Compare network portions
+        return (ip_addr.s_addr & mask) == (pattern_addr.s_addr & mask);
+    }
+
+    // Exact match
+    return strcmp(ip, pattern) == 0;
+}
+
+static bool is_ip_in_list(hub_state_t *state, const char *ip, const char *list_key) {
+    for (int i = 0; i < state->global_entry_count; i++) {
+        if (strcmp(state->global_entries[i].key, list_key) == 0) {
+            // Check if this is a tombstone (deleted)
+            if (strstr(state->global_entries[i].value, "|del") != NULL) {
+                continue;
+            }
+
+            // Extract IP pattern (before first |)
+            char pattern[256];
+            const char *pipe = strchr(state->global_entries[i].value, '|');
+            if (pipe) {
+                size_t len = pipe - state->global_entries[i].value;
+                if (len >= sizeof(pattern)) len = sizeof(pattern) - 1;
+                memcpy(pattern, state->global_entries[i].value, len);
+                pattern[len] = '\0';
+            } else {
+                strncpy(pattern, state->global_entries[i].value, sizeof(pattern) - 1);
+                pattern[sizeof(pattern) - 1] = '\0';
+            }
+
+            if (ip_matches_pattern(ip, pattern)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool check_ip_access_lists(hub_state_t *state, const char *ip) {
+    // Check denylist first
+    if (is_ip_in_list(state, ip, "x")) {
+        hub_log("[ACCESS_CONTROL] IP %s denied (denylist)\n", ip);
+        return false;
+    }
+
+    // Check if allowlist exists (count entries with key "w")
+    bool allowlist_exists = false;
+    for (int i = 0; i < state->global_entry_count; i++) {
+        if (strcmp(state->global_entries[i].key, "w") == 0) {
+            if (strstr(state->global_entries[i].value, "|del") == NULL) {
+                allowlist_exists = true;
+                break;
+            }
+        }
+    }
+
+    // If allowlist exists, IP must be in it
+    if (allowlist_exists) {
+        if (!is_ip_in_list(state, ip, "w")) {
+            hub_log("[ACCESS_CONTROL] IP %s denied (not in allowlist)\n", ip);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // ============ ADD THESE THREE FUNCTIONS HERE ============
 
 // Load bot's public key from hub config
@@ -155,6 +366,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     if (!authorized) {
       hub_log("[HUB] Unauthorized bot UUID: %s from %s\n", uuid, client->ip);
       add_pending_bot(state, uuid, client->ip);
+      record_failed_auth(state, client->ip);
       return false; // Disconnect
     }
 
@@ -222,6 +434,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     if (!valid) {
       EVP_PKEY_free(pub_key);
       hub_log("[HUB][ERROR] Invalid signature from bot %s\n", client->id);
+      record_failed_auth(state, client->ip);
       return false;
     }
 
@@ -2674,6 +2887,181 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     return send_response(state, client, response);
   }
 
+  case CMD_ADMIN_SET_BIND_IP: {
+    if (payload && strlen(payload) > 0) {
+      // Validate IP format
+      struct in_addr test_addr;
+      if (inet_pton(AF_INET, payload, &test_addr) != 1) {
+        return send_response(state, client, "ERROR: Invalid IP address format.");
+      }
+
+      // Update bind_ip in memory
+      strncpy(state->bind_ip, payload, sizeof(state->bind_ip) - 1);
+      state->bind_ip[sizeof(state->bind_ip) - 1] = '\0';
+
+      // Save to config
+      hub_config_write(state);
+
+      // Sync to peers
+      time_t now = time(NULL);
+      char sync_msg[256];
+      snprintf(sync_msg, sizeof(sync_msg), "bind_ip|%s|%ld\n", payload, (long)now);
+      hub_broadcast_sync_to_peers(state, sync_msg, -1);
+
+      return send_response(state, client,
+                         "SUCCESS: Bind IP updated. Restart hub for changes to take effect.");
+    }
+    return send_response(state, client, "ERROR: Missing IP address.");
+  }
+
+  case CMD_ADMIN_LIST_ALLOWLIST: {
+    char list[MAX_BUFFER];
+    int offset = 0;
+    int count = 0;
+
+    offset += snprintf(list + offset, MAX_BUFFER - offset,
+                      "════════════════════════════════════════════\n");
+    offset += snprintf(list + offset, MAX_BUFFER - offset,
+                      "           IP ALLOWLIST\n");
+    offset += snprintf(list + offset, MAX_BUFFER - offset,
+                      "════════════════════════════════════════════\n\n");
+
+    for (int i = 0; i < state->global_entry_count && offset < MAX_BUFFER - 256; i++) {
+        if (strcmp(state->global_entries[i].key, "w") == 0) {
+            // Skip tombstones
+            if (strstr(state->global_entries[i].value, "|del") != NULL) {
+                continue;
+            }
+
+            // Extract IP pattern
+            char pattern[256];
+            const char *pipe = strchr(state->global_entries[i].value, '|');
+            if (pipe) {
+                size_t len = pipe - state->global_entries[i].value;
+                if (len >= sizeof(pattern)) len = sizeof(pattern) - 1;
+                memcpy(pattern, state->global_entries[i].value, len);
+                pattern[len] = '\0';
+            } else {
+                strncpy(pattern, state->global_entries[i].value, sizeof(pattern) - 1);
+                pattern[sizeof(pattern) - 1] = '\0';
+            }
+
+            offset += snprintf(list + offset, MAX_BUFFER - offset,
+                             "%3d. %s\n", ++count, pattern);
+        }
+    }
+
+    if (count == 0) {
+        offset += snprintf(list + offset, MAX_BUFFER - offset,
+                         "(No allowlist entries - all IPs allowed)\n");
+    }
+
+    return send_response(state, client, list);
+  }
+
+  case CMD_ADMIN_ADD_ALLOWLIST: {
+    if (payload && strlen(payload) > 0) {
+        time_t now = time(NULL);
+        hub_storage_update_global_entry(state, "w", payload, "", "add", now);
+        hub_config_write(state);
+
+        char sync_msg[256];
+        snprintf(sync_msg, sizeof(sync_msg), "w|%s|add|%ld\n", payload, (long)now);
+        hub_broadcast_sync_to_peers(state, sync_msg, -1);
+
+        return send_response(state, client, "SUCCESS: IP added to allowlist.");
+    }
+    return send_response(state, client, "ERROR: Missing IP pattern.");
+  }
+
+  case CMD_ADMIN_DEL_ALLOWLIST: {
+    if (payload && strlen(payload) > 0) {
+        time_t now = time(NULL);
+        hub_storage_update_global_entry(state, "w", payload, "", "del", now);
+        hub_config_write(state);
+
+        char sync_msg[256];
+        snprintf(sync_msg, sizeof(sync_msg), "w|%s|del|%ld\n", payload, (long)now);
+        hub_broadcast_sync_to_peers(state, sync_msg, -1);
+
+        return send_response(state, client, "SUCCESS: IP removed from allowlist.");
+    }
+    return send_response(state, client, "ERROR: Missing IP pattern.");
+  }
+
+  case CMD_ADMIN_LIST_DENYLIST: {
+    char list[MAX_BUFFER];
+    int offset = 0;
+    int count = 0;
+
+    offset += snprintf(list + offset, MAX_BUFFER - offset,
+                      "════════════════════════════════════════════\n");
+    offset += snprintf(list + offset, MAX_BUFFER - offset,
+                      "           IP DENYLIST\n");
+    offset += snprintf(list + offset, MAX_BUFFER - offset,
+                      "════════════════════════════════════════════\n\n");
+
+    for (int i = 0; i < state->global_entry_count && offset < MAX_BUFFER - 256; i++) {
+        if (strcmp(state->global_entries[i].key, "x") == 0) {
+            if (strstr(state->global_entries[i].value, "|del") != NULL) {
+                continue;
+            }
+
+            char pattern[256];
+            const char *pipe = strchr(state->global_entries[i].value, '|');
+            if (pipe) {
+                size_t len = pipe - state->global_entries[i].value;
+                if (len >= sizeof(pattern)) len = sizeof(pattern) - 1;
+                memcpy(pattern, state->global_entries[i].value, len);
+                pattern[len] = '\0';
+            } else {
+                strncpy(pattern, state->global_entries[i].value, sizeof(pattern) - 1);
+                pattern[sizeof(pattern) - 1] = '\0';
+            }
+
+            offset += snprintf(list + offset, MAX_BUFFER - offset,
+                             "%3d. %s\n", ++count, pattern);
+        }
+    }
+
+    if (count == 0) {
+        offset += snprintf(list + offset, MAX_BUFFER - offset,
+                         "(No denylist entries)\n");
+    }
+
+    return send_response(state, client, list);
+  }
+
+  case CMD_ADMIN_ADD_DENYLIST: {
+    if (payload && strlen(payload) > 0) {
+        time_t now = time(NULL);
+        hub_storage_update_global_entry(state, "x", payload, "", "add", now);
+        hub_config_write(state);
+
+        char sync_msg[256];
+        snprintf(sync_msg, sizeof(sync_msg), "x|%s|add|%ld\n", payload, (long)now);
+        hub_broadcast_sync_to_peers(state, sync_msg, -1);
+
+        return send_response(state, client, "SUCCESS: IP added to denylist.");
+    }
+    return send_response(state, client, "ERROR: Missing IP pattern.");
+  }
+
+  case CMD_ADMIN_DEL_DENYLIST: {
+    if (payload && strlen(payload) > 0) {
+        time_t now = time(NULL);
+        hub_storage_update_global_entry(state, "x", payload, "", "del", now);
+        hub_config_write(state);
+
+        char sync_msg[256];
+        snprintf(sync_msg, sizeof(sync_msg), "x|%s|del|%ld\n", payload, (long)now);
+        hub_broadcast_sync_to_peers(state, sync_msg, -1);
+
+        return send_response(state, client, "SUCCESS: IP removed from denylist.");
+    }
+    return send_response(state, client, "ERROR: Missing IP pattern.");
+  }
+
   default:
     return send_response(state, client, "ERROR: Unknown command.");
   }
@@ -3333,6 +3721,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               hub_log("[HUB] Admin Login: %s\n", client->ip);
             } else {
               hub_log("[HUB] Failed admin auth from %s\n", client->ip);
+              record_failed_auth(state, client->ip);
               secure_wipe(dec, sizeof(dec));
               hub_disconnect_client(state, client);
               return false;
@@ -3381,6 +3770,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               hub_log("[HUB] Peer connected: %s\n", client->ip);
             } else {
               hub_log("[HUB] Failed peer auth from %s\n", client->ip);
+              record_failed_auth(state, client->ip);
               secure_wipe(dec, sizeof(dec));
               hub_disconnect_client(state, client);
               return false;

@@ -8,6 +8,8 @@
 #include <sys/select.h>
 #include <openssl/rand.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <fcntl.h>
 
 FILE *log_fp = NULL;
 
@@ -38,13 +40,16 @@ void handle_signal(int sig) {
         fprintf(log_fp, "[HUB] Shutting down signal received.\n");
         fclose(log_fp);
     }
+    remove(HUB_PID_FILE);
     exit(0);
 }
 
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
     if (!c) return;
-    
+
     hub_log("[HUB] Disconnecting client %s (FD: %d)\n", c->ip, c->fd);
+
+    decrement_active_connections(state, c->ip);
 
     // 1. Update Peer Status FIRST
     for(int p = 0; p < state->peer_count; p++) {
@@ -245,7 +250,15 @@ void hub_maintenance(hub_state_t *state) {
             hub_log("[HUB] Requested config sync from %d bots\n", sync_count);
         }
     }
-    
+
+    // IP limit cleanup every 5 minutes
+    static time_t last_ip_cleanup = 0;
+    if (last_ip_cleanup == 0) last_ip_cleanup = now;
+    if (now - last_ip_cleanup > 300) {  // Every 5 minutes
+        cleanup_old_ip_limits(state);
+        last_ip_cleanup = now;
+    }
+
     // Existing timeout/ping code...
     for (int i = 0; i < state->client_count; i++) {
         hub_client_t *c = state->clients[i];
@@ -426,9 +439,28 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
+    // Create PID file with exclusive lock
+    int pid_fd = open(HUB_PID_FILE, O_CREAT | O_RDWR, 0600);
+    if (pid_fd == -1) {
+        hub_log("[ERROR] Cannot create PID file\n");
+        return 1;
+    }
+    if (flock(pid_fd, LOCK_EX | LOCK_NB) == -1) {
+        hub_log("[ERROR] Hub already running (PID file locked)\n");
+        close(pid_fd);
+        return 1;
+    }
+    char pid_str[16];
+    snprintf(pid_str, sizeof(pid_str), "%d\n", getpid());
+    if (write(pid_fd, pid_str, strlen(pid_str)) < 0) {
+        hub_log("[WARN] Failed to write PID\n");
+    }
+    state.pid_fd = pid_fd;
+
     if (!hub_config_load(&state, state.config_pass)) {
         if (!daemon_mode) printf("Config load failed. Run -setup.\n");
         if (log_fp) fprintf(log_fp, "Config load failed.\n");
+        remove(HUB_PID_FILE);
         return 1;
     }
 
@@ -453,11 +485,23 @@ int main(int argc, char *argv[]) {
     hub_log("[HUB] Started on port %d (PID: %d)\n", state.port, getpid());
 
     state.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = INADDR_ANY,
-        .sin_port = htons(state.port)
-    };
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(state.port);
+
+    // Use bind_ip if set, otherwise default to 0.0.0.0
+    if (state.bind_ip[0] && strcmp(state.bind_ip, "0.0.0.0") != 0) {
+        if (inet_pton(AF_INET, state.bind_ip, &addr.sin_addr) != 1) {
+            hub_log("[ERROR] Invalid bind_ip: %s, using 0.0.0.0\n", state.bind_ip);
+            addr.sin_addr.s_addr = INADDR_ANY;
+        } else {
+            hub_log("[HUB] Binding to %s:%d\n", state.bind_ip, state.port);
+        }
+    } else {
+        addr.sin_addr.s_addr = INADDR_ANY;
+        hub_log("[HUB] Binding to 0.0.0.0:%d (all interfaces)\n", state.port);
+    }
     
     int opt = 1;
     setsockopt(state.listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -494,17 +538,31 @@ int main(int argc, char *argv[]) {
             struct sockaddr_in ca;
             socklen_t len = sizeof(ca);
             int new_fd = accept(state.listen_fd, (struct sockaddr*)&ca, &len);
-            
+
             if (new_fd >= 0) {
-                if (state.client_count < MAX_CLIENTS) {
+                char incoming_ip[64];
+                strncpy(incoming_ip, inet_ntoa(ca.sin_addr), sizeof(incoming_ip) - 1);
+                incoming_ip[sizeof(incoming_ip) - 1] = '\0';
+
+                // Check access lists first
+                if (!check_ip_access_lists(&state, incoming_ip)) {
+                    hub_log("[HUB] Connection from %s rejected (access control)\n", incoming_ip);
+                    close(new_fd);
+                } else if (!is_ip_allowed(&state, incoming_ip)) {
+                    hub_log("[HUB] Connection from %s rejected (rate limit)\n", incoming_ip);
+                    close(new_fd);
+                } else if (state.client_count < MAX_CLIENTS) {
                     hub_client_t *c = calloc(1, sizeof(hub_client_t));
                     if (c) {
                         c->fd = new_fd;
-                        strncpy(c->ip, inet_ntoa(ca.sin_addr), sizeof(c->ip) - 1);
+                        strncpy(c->ip, incoming_ip, sizeof(c->ip) - 1);
                         c->ip[sizeof(c->ip) - 1] = 0;
                         c->last_seen = time(NULL);
-c->last_pong_sent = 0;
+                        c->last_pong_sent = 0;
                         state.clients[state.client_count++] = c;
+
+                        increment_active_connections(&state, c->ip);
+
                         hub_log("[HUB] Incoming connect: %s\n", c->ip);
                     } else {
                         close(new_fd);
@@ -545,12 +603,17 @@ c->last_pong_sent = 0;
     }
     
     // Cleanup
+    if (state.pid_fd >= 0) {
+        close(state.pid_fd);
+    }
+    remove(HUB_PID_FILE);
+
     if (state.priv_key) EVP_PKEY_free(state.priv_key);
     if (state.private_key_pem) {
         secure_wipe(state.private_key_pem, strlen(state.private_key_pem));
         free(state.private_key_pem);
     }
     if (state.public_key_pem) free(state.public_key_pem);
-    
+
     return 0;
 }
