@@ -97,6 +97,9 @@
 #define CMD_OP_FORWARD_GRANT 0x34   // Hub -> Hub: Forward grant response back
 #define CMD_OP_FORWARD_FAILED 0x35  // Hub -> Hub: Forward failure back
 
+// Tombstone Purge Commands
+#define CMD_ADMIN_PURGE_TOMBSTONES 0x36 // Purge tombstoned entries (payload: days or "immediate")
+
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
 

@@ -2228,10 +2228,21 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       return send_response(state, client, "ERROR: Buffer overflow");
     offset += written;
 
+    written = snprintf(response + offset, sizeof(response) - offset,
+                       "%-30s %-20s\n", "Channel", "Key");
+    if (written >= (int)(sizeof(response) - offset))
+      return send_response(state, client, "ERROR: Buffer overflow");
+    offset += written;
+
+    written = snprintf(response + offset, sizeof(response) - offset,
+                       "%-30s %-20s\n", "-------", "---");
+    if (written >= (int)(sizeof(response) - offset))
+      return send_response(state, client, "ERROR: Buffer overflow");
+    offset += written;
+
     int chan_count = 0;
     for (int i = 0; i < state->global_entry_count; i++) {
       if (strcmp(state->global_entries[i].key, "c") == 0) {
-        chan_count++;
         char chan_name[128] = "", chan_key[64] = "", op[16] = "";
         // Parse: channel|key|op or channel||op (empty key)
         int parsed = sscanf(state->global_entries[i].value, "%127[^|]|%63[^|]|%15s",
@@ -2242,11 +2253,15 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                          chan_name, op);
           chan_key[0] = '\0';
         }
+        // Skip deleted channels
+        if (strcmp(op, "del") == 0)
+          continue;
+
         if (parsed >= 2 || (parsed == 1 && chan_name[0])) {
+          chan_count++;
           written = snprintf(response + offset, sizeof(response) - offset,
-                             "  %s %s %s\n", chan_name,
-                             strlen(chan_key) > 0 ? chan_key : "(no key)",
-                             strcmp(op, "del") == 0 ? "[DELETED]" : "");
+                             "%-30s %-20s\n", chan_name,
+                             strlen(chan_key) > 0 ? chan_key : "");
           if (written >= (int)(sizeof(response) - offset))
             break;
           offset += written;
@@ -2310,16 +2325,31 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       return send_response(state, client, "ERROR: Buffer overflow");
     offset += written;
 
+    written = snprintf(response + offset, sizeof(response) - offset,
+                       "%-50s\n", "Mask");
+    if (written >= (int)(sizeof(response) - offset))
+      return send_response(state, client, "ERROR: Buffer overflow");
+    offset += written;
+
+    written = snprintf(response + offset, sizeof(response) - offset,
+                       "%-50s\n", "----");
+    if (written >= (int)(sizeof(response) - offset))
+      return send_response(state, client, "ERROR: Buffer overflow");
+    offset += written;
+
     int mask_count = 0;
     for (int i = 0; i < state->global_entry_count; i++) {
       if (strcmp(state->global_entries[i].key, "m") == 0) {
-        mask_count++;
         char mask[256], op[16];
         if (sscanf(state->global_entries[i].value, "%255[^|]|%15s", mask, op) ==
             2) {
+          // Skip deleted masks
+          if (strcmp(op, "del") == 0)
+            continue;
+
+          mask_count++;
           written = snprintf(response + offset, sizeof(response) - offset,
-                             "  %s %s\n", mask,
-                             strcmp(op, "del") == 0 ? "[DELETED]" : "");
+                             "%-50s\n", mask);
           if (written >= (int)(sizeof(response) - offset))
             break;
           offset += written;
@@ -2374,16 +2404,31 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       return send_response(state, client, "ERROR: Buffer overflow");
     offset += written;
 
+    written = snprintf(response + offset, sizeof(response) - offset,
+                       "%-40s %-20s\n", "Mask", "Password");
+    if (written >= (int)(sizeof(response) - offset))
+      return send_response(state, client, "ERROR: Buffer overflow");
+    offset += written;
+
+    written = snprintf(response + offset, sizeof(response) - offset,
+                       "%-40s %-20s\n", "----", "--------");
+    if (written >= (int)(sizeof(response) - offset))
+      return send_response(state, client, "ERROR: Buffer overflow");
+    offset += written;
+
     int oper_count = 0;
     for (int i = 0; i < state->global_entry_count; i++) {
       if (strcmp(state->global_entries[i].key, "o") == 0) {
-        oper_count++;
         char mask[256], pass[128], op[16];
         if (sscanf(state->global_entries[i].value, "%255[^|]|%127[^|]|%15s",
                    mask, pass, op) == 3) {
+          // Skip deleted opers
+          if (strcmp(op, "del") == 0)
+            continue;
+
+          oper_count++;
           written = snprintf(response + offset, sizeof(response) - offset,
-                             "  %s (password: %s) %s\n", mask, pass,
-                             strcmp(op, "del") == 0 ? "[DELETED]" : "");
+                             "%-40s %-20s\n", mask, pass);
           if (written >= (int)(sizeof(response) - offset))
             break;
           offset += written;
@@ -2525,6 +2570,110 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       }
     }
     return send_response(state, client, "ERROR: Invalid payload (need nick|channel).");
+  }
+
+  case CMD_ADMIN_PURGE_TOMBSTONES: {
+    // Parse payload: "immediate" or number of days (default 30)
+    int days = 30;
+    bool immediate = false;
+
+    if (payload && strlen(payload) > 0) {
+      if (strcmp(payload, "immediate") == 0) {
+        immediate = true;
+      } else {
+        days = atoi(payload);
+        if (days <= 0) days = 30;
+      }
+    }
+
+    time_t now = time(NULL);
+    time_t cutoff = now - (days * 24 * 60 * 60);
+    int purged_count = 0;
+    char purge_log[MAX_BUFFER] = "";
+    int log_offset = 0;
+
+    // Create a new global_entries array without tombstoned items
+    config_entry_t new_entries[MAX_BOT_ENTRIES];
+    int new_count = 0;
+
+    for (int i = 0; i < state->global_entry_count; i++) {
+      bool is_tombstone = false;
+      char op[16] = "";
+
+      // Check if this entry is tombstoned (op="del")
+      if (strcmp(state->global_entries[i].key, "c") == 0 ||
+          strcmp(state->global_entries[i].key, "o") == 0) {
+        // Format: value|extra|op
+        char temp_val[1024], temp_extra[256], temp_op[16];
+        if (sscanf(state->global_entries[i].value, "%1023[^|]|%255[^|]|%15s",
+                   temp_val, temp_extra, temp_op) == 3) {
+          strncpy(op, temp_op, sizeof(op) - 1);
+          op[sizeof(op) - 1] = '\0';
+          if (strcmp(op, "del") == 0) {
+            is_tombstone = true;
+          }
+        }
+      } else if (strcmp(state->global_entries[i].key, "m") == 0) {
+        // Format: value|op
+        char temp_val[256], temp_op[16];
+        if (sscanf(state->global_entries[i].value, "%255[^|]|%15s",
+                   temp_val, temp_op) == 2) {
+          strncpy(op, temp_op, sizeof(op) - 1);
+          op[sizeof(op) - 1] = '\0';
+          if (strcmp(op, "del") == 0) {
+            is_tombstone = true;
+          }
+        }
+      }
+
+      // Decide whether to purge this entry
+      if (is_tombstone && (immediate || state->global_entries[i].timestamp < cutoff)) {
+        purged_count++;
+        int written = snprintf(purge_log + log_offset, sizeof(purge_log) - log_offset,
+                               "  Purged: %s|%s\n",
+                               state->global_entries[i].key,
+                               state->global_entries[i].value);
+        if (written > 0 && written < (int)(sizeof(purge_log) - log_offset)) {
+          log_offset += written;
+        }
+      } else {
+        // Keep this entry
+        if (new_count < MAX_BOT_ENTRIES) {
+          memcpy(&new_entries[new_count], &state->global_entries[i], sizeof(config_entry_t));
+          new_count++;
+        }
+      }
+    }
+
+    // Update state with new entries
+    memcpy(state->global_entries, new_entries, sizeof(config_entry_t) * new_count);
+    state->global_entry_count = new_count;
+
+    // Write config to disk
+    hub_config_write(state);
+
+    // Broadcast purge to bots so they can purge their local copies
+    char purge_msg[256];
+    snprintf(purge_msg, sizeof(purge_msg), "PURGE|%s|%ld\n",
+             immediate ? "immediate" : payload, (long)now);
+    hub_broadcast_config_to_bots(state, purge_msg);
+    hub_broadcast_sync_to_peers(state, purge_msg, -1);
+
+    // Send response
+    if (purged_count > 0) {
+      snprintf(response, sizeof(response),
+               "SUCCESS: Purged %d tombstoned entries (%s)\n%s",
+               purged_count, immediate ? "immediate" :
+               (payload && strlen(payload) > 0 ? payload : "30 days"),
+               purge_log);
+    } else {
+      snprintf(response, sizeof(response),
+               "No tombstoned entries found to purge (%s)",
+               immediate ? "immediate" :
+               (payload && strlen(payload) > 0 ? payload : "30 days"));
+    }
+
+    return send_response(state, client, response);
   }
 
   default:

@@ -325,21 +325,28 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
 }
 
 bool hub_storage_delete(hub_state_t *state, const char *uuid) {
-  bool found = false;
+  int found_index = -1;
 
   for (int i = 0; i < state->bot_count; i++) {
     if (strcmp(state->bots[i].uuid, uuid) == 0) {
-      found = true;
+      found_index = i;
       break;
     }
   }
 
-  if (!found) {
+  if (found_index == -1) {
     return false;
   }
 
-  // Apply Soft Delete
-  hub_storage_update_entry(state, uuid, "d", "1", "", "", time(NULL));
+  // Hard delete: Remove bot from array by shifting remaining bots
+  for (int i = found_index; i < state->bot_count - 1; i++) {
+    memcpy(&state->bots[i], &state->bots[i + 1], sizeof(bot_config_t));
+  }
+
+  // Clear the last slot and decrement count
+  memset(&state->bots[state->bot_count - 1], 0, sizeof(bot_config_t));
+  state->bot_count--;
+
   hub_config_write(state);
   return true;
 }

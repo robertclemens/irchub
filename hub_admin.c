@@ -206,6 +206,7 @@ void bot_list() {
     printf("\n%s\n", response);
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -288,6 +289,7 @@ void bot_add() {
     }
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -309,6 +311,7 @@ void bot_remove() {
     }
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -395,6 +398,7 @@ void bot_rekey() {
     }
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -412,6 +416,7 @@ void peer_list() {
     printf("%s\n", response);
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -435,6 +440,7 @@ void peer_add() {
     printf("\nHub: %s\n", response);
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -458,6 +464,7 @@ void peer_remove() {
     }
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -471,6 +478,7 @@ void peer_force_sync() {
     printf("Hub: %s\n", response);
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -533,6 +541,7 @@ void peer_rekey_hubs() {
     }
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -563,6 +572,7 @@ void admin_op_user() {
     }
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -576,6 +586,7 @@ void admin_list_masks() {
     printf("%s\n", response);
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -601,6 +612,7 @@ void admin_add_mask() {
     }
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -622,6 +634,7 @@ void admin_del_mask() {
     }
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -635,6 +648,7 @@ void admin_list_opers() {
     printf("%s\n", response);
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -663,6 +677,7 @@ void admin_add_oper() {
     }
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -684,6 +699,7 @@ void admin_del_oper() {
     }
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -697,6 +713,7 @@ void admin_list_channels() {
     printf("%s\n", response);
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -726,6 +743,7 @@ void admin_add_channel() {
     }
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -747,6 +765,7 @@ void admin_del_channel() {
     }
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -770,6 +789,7 @@ void admin_change_admin_password() {
     secure_wipe(pass, sizeof(pass));
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -795,6 +815,74 @@ void admin_change_bot_password() {
     secure_wipe(pass, sizeof(pass));
 
     printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_purge_tombstones() {
+    char response[MAX_BUFFER];
+    char choice[10];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("             PURGE TOMBSTONED ENTRIES\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("This will permanently remove deleted (tombstoned)\n");
+    printf("channels, admin masks, and oper masks.\n\n");
+    printf("  1. Immediate purge (all tombstones)\n");
+    printf("  2. Time-based purge (default: 30 days)\n");
+    printf("  3. Custom time-based purge\n");
+    printf("  4. Cancel\n\n");
+
+    get_input("Select option: ", choice, sizeof(choice));
+    int opt = atoi(choice);
+
+    char payload[64] = "";
+    bool proceed = false;
+
+    switch(opt) {
+        case 1:
+            strncpy(payload, "immediate", sizeof(payload) - 1);
+            payload[sizeof(payload) - 1] = '\0';
+            proceed = get_confirmation("Purge ALL tombstoned entries immediately?");
+            break;
+        case 2:
+            strncpy(payload, "30", sizeof(payload) - 1);
+            payload[sizeof(payload) - 1] = '\0';
+            proceed = get_confirmation("Purge tombstones older than 30 days?");
+            break;
+        case 3: {
+            char days[10];
+            get_input("Enter number of days: ", days, sizeof(days));
+            int d = atoi(days);
+            if (d > 0) {
+                snprintf(payload, sizeof(payload), "%d", d);
+                char confirm_msg[128];
+                snprintf(confirm_msg, sizeof(confirm_msg),
+                         "Purge tombstones older than %d days?", d);
+                proceed = get_confirmation(confirm_msg);
+            } else {
+                printf("Invalid number of days.\n");
+            }
+            break;
+        }
+        case 4:
+            printf("Cancelled.\n");
+            break;
+        default:
+            printf("Invalid option.\n");
+            break;
+    }
+
+    if (proceed) {
+        printf("\n[*] Sending purge request to hub...\n");
+        send_packet(g_fd, CMD_ADMIN_PURGE_TOMBSTONES, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub Response:\n%s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -938,7 +1026,8 @@ void menu_admin_commands() {
         printf("  4. Manage Channels\n");
         printf("  5. Change Admin Password\n");
         printf("  6. Change Bot Password\n");
-        printf("  7. Back to Main Menu\n");
+        printf("  7. Purge Tombstones\n");
+        printf("  8. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -971,6 +1060,9 @@ void menu_admin_commands() {
                 admin_change_bot_password();
                 break;
             case 7:
+                admin_purge_tombstones();
+                break;
+            case 8:
                 return;
             default:
                 printf("Invalid choice.\n");
