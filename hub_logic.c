@@ -2607,8 +2607,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         char temp_val[1024], temp_extra[256], temp_op[16];
         if (sscanf(state->global_entries[i].value, "%1023[^|]|%255[^|]|%15s",
                    temp_val, temp_extra, temp_op) == 3) {
-          strncpy(op, temp_op, sizeof(op) - 1);
-          op[sizeof(op) - 1] = '\0';
+          snprintf(op, sizeof(op), "%s", temp_op);
           if (strcmp(op, "del") == 0) {
             is_tombstone = true;
           }
@@ -2618,8 +2617,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         char temp_val[256], temp_op[16];
         if (sscanf(state->global_entries[i].value, "%255[^|]|%15s",
                    temp_val, temp_op) == 2) {
-          strncpy(op, temp_op, sizeof(op) - 1);
-          op[sizeof(op) - 1] = '\0';
+          snprintf(op, sizeof(op), "%s", temp_op);
           if (strcmp(op, "del") == 0) {
             is_tombstone = true;
           }
