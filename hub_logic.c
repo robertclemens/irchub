@@ -83,7 +83,7 @@ static ip_rate_limit_t* find_or_create_ip_limit(hub_state_t *state, const char *
     return NULL;  // No space (shouldn't happen with large limit)
 }
 
-static bool is_ip_allowed(hub_state_t *state, const char *ip) {
+bool is_ip_allowed(hub_state_t *state, const char *ip) {
     ip_rate_limit_t *entry = find_or_create_ip_limit(state, ip);
     if (!entry) return true;  // If can't track, allow (fail open)
 
@@ -112,14 +112,14 @@ static bool is_ip_allowed(hub_state_t *state, const char *ip) {
     return true;
 }
 
-static void increment_active_connections(hub_state_t *state, const char *ip) {
+void increment_active_connections(hub_state_t *state, const char *ip) {
     ip_rate_limit_t *entry = find_or_create_ip_limit(state, ip);
     if (entry) {
         entry->active_connections++;
     }
 }
 
-static void decrement_active_connections(hub_state_t *state, const char *ip) {
+void decrement_active_connections(hub_state_t *state, const char *ip) {
     for (int i = 0; i < state->ip_limits_count; i++) {
         if (strcmp(state->ip_limits[i].ip, ip) == 0) {
             if (state->ip_limits[i].active_connections > 0) {
@@ -155,7 +155,7 @@ static void record_failed_auth(hub_state_t *state, const char *ip) {
     }
 }
 
-static void cleanup_old_ip_limits(hub_state_t *state) {
+void cleanup_old_ip_limits(hub_state_t *state) {
     time_t now = time(NULL);
     int i = 0;
 
@@ -239,7 +239,7 @@ static bool is_ip_in_list(hub_state_t *state, const char *ip, const char *list_k
     return false;
 }
 
-static bool check_ip_access_lists(hub_state_t *state, const char *ip) {
+bool check_ip_access_lists(hub_state_t *state, const char *ip) {
     // Check denylist first
     if (is_ip_in_list(state, ip, "x")) {
         hub_log("[ACCESS_CONTROL] IP %s denied (denylist)\n", ip);

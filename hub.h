@@ -255,6 +255,13 @@ int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
                     const unsigned char *key, unsigned char *output,
                     unsigned char *tag);
 
+// Rate limiting and IP access control functions
+bool is_ip_allowed(hub_state_t *state, const char *ip);
+void increment_active_connections(hub_state_t *state, const char *ip);
+void decrement_active_connections(hub_state_t *state, const char *ip);
+void cleanup_old_ip_limits(hub_state_t *state);
+bool check_ip_access_lists(hub_state_t *state, const char *ip);
+
 void hub_storage_init(void);
 bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
                               const char *key, const char *value,
