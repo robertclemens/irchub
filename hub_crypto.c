@@ -153,7 +153,7 @@ EVP_PKEY *load_private_key_from_memory(const char *pem_data) {
     
     // ADDED: Validate key size
     if (EVP_PKEY_bits(pkey) < 2048) {
-        fprintf(stderr, "Key size too small: %d bits (minimum 2048)\n", 
+        hub_log("Key size too small: %d bits (minimum 2048)\n",
                 EVP_PKEY_bits(pkey));
         EVP_PKEY_free(pkey);
         return NULL;
@@ -230,7 +230,7 @@ int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
 
     // ADDED: Minimum size check
     if (input_len < GCM_IV_LEN) {
-        fprintf(stderr, "Input too small for IV\n");
+        hub_log("Input too small for IV\n");
         return -1;
     }
 
@@ -250,7 +250,7 @@ int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
     if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag)) goto err;
     
     if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) <= 0) {
-        fprintf(stderr, "GCM tag verification failed\n");
+        hub_log("GCM tag verification failed\n");
         goto err;
     }
     plaintext_len += len;

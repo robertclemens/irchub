@@ -19,7 +19,7 @@ void hub_log(const char *format, ...) {
     struct tm *t = localtime(&now);
     char time_buf[32];
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", t);
-    
+
     if (log_fp) {
         fprintf(log_fp, "[%s] ", time_buf);
         va_start(args, format);
@@ -27,11 +27,6 @@ void hub_log(const char *format, ...) {
         va_end(args);
         fflush(log_fp);
     }
-    
-    printf("[%s] ", time_buf);
-    va_start(args, format);
-    vfprintf(stdout, format, args);
-    va_end(args);
 }
 
 void handle_signal(int sig) {
@@ -300,9 +295,9 @@ void hub_check_peers(hub_state_t *state) {
             timeout.tv_sec = CONNECT_TIMEOUT;
             timeout.tv_usec = 0;
             
-            if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, 
+            if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
                           sizeof(timeout)) < 0) {
-                perror("setsockopt failed");
+                hub_log("setsockopt failed\n");
             }
 
             struct sockaddr_in peer_addr;

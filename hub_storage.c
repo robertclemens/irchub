@@ -320,7 +320,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
     return true;
   }
 
-  fprintf(stderr, "Warning: Bot %s has reached MAX_BOT_ENTRIES\n", uuid);
+  hub_log("Warning: Bot %s has reached MAX_BOT_ENTRIES\n", uuid);
   return false;
 }
 

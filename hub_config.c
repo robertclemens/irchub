@@ -45,7 +45,7 @@ void hub_config_write(hub_state_t *state) {
       written =                                                                \
           snprintf(buffer + offset, estimated_size - offset, __VA_ARGS__);     \
       if (written < 0 || written >= (estimated_size - offset)) {               \
-        fprintf(stderr, "Buffer overflow in config write\n");                  \
+        hub_log("Buffer overflow in config write\n");                          \
         offset = estimated_size;                                               \
       } else {                                                                 \
         offset += written;                                                     \
@@ -132,7 +132,7 @@ void hub_config_write(hub_state_t *state) {
   if (PKCS5_PBKDF2_HMAC(state->config_pass, strlen(state->config_pass), salt,
                         SALT_SIZE, PBKDF2_ITERATIONS, EVP_sha256(), 32,
                         key) != 1) {
-    fprintf(stderr, "PBKDF2 failed\n");
+    hub_log("PBKDF2 failed\n");
     secure_wipe(buffer, offset);
     free(buffer);
     return;
@@ -191,24 +191,24 @@ void hub_config_write(hub_state_t *state) {
 bool hub_config_load(hub_state_t *state, const char *password) {
   FILE *fp = fopen(HUB_CONFIG_FILE, "rb");
   if (!fp) {
-    fprintf(stderr, "Config file not found\n");
+    hub_log("Config file not found\n");
     return false;
   }
 
   unsigned char salt[SALT_SIZE], iv[GCM_IV_LEN], tag[GCM_TAG_LEN];
 
   if (fread(salt, 1, SALT_SIZE, fp) != SALT_SIZE) {
-    fprintf(stderr, "Failed to read salt\n");
+    hub_log("Failed to read salt\n");
     fclose(fp);
     return false;
   }
   if (fread(iv, 1, GCM_IV_LEN, fp) != GCM_IV_LEN) {
-    fprintf(stderr, "Failed to read IV\n");
+    hub_log("Failed to read IV\n");
     fclose(fp);
     return false;
   }
   if (fread(tag, 1, GCM_TAG_LEN, fp) != GCM_TAG_LEN) {
-    fprintf(stderr, "Failed to read tag\n");
+    hub_log("Failed to read tag\n");
     fclose(fp);
     return false;
   }
@@ -218,7 +218,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   long cipher_len = fsize - SALT_SIZE - GCM_IV_LEN - GCM_TAG_LEN;
 
   if (cipher_len <= 0) {
-    fprintf(stderr, "Invalid config file size\n");
+    hub_log("Invalid config file size\n");
     fclose(fp);
     return false;
   }
@@ -231,7 +231,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   }
 
   if (fread(ciphertext, 1, cipher_len, fp) != (size_t)cipher_len) {
-    fprintf(stderr, "Failed to read ciphertext\n");
+    hub_log("Failed to read ciphertext\n");
     free(ciphertext);
     fclose(fp);
     return false;
@@ -242,7 +242,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   unsigned char key[32];
   if (PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_SIZE,
                         PBKDF2_ITERATIONS, EVP_sha256(), 32, key) != 1) {
-    fprintf(stderr, "PBKDF2 failed\n");
+    hub_log("PBKDF2 failed\n");
     free(ciphertext);
     return false;
   }
@@ -268,8 +268,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
 
   if (EVP_DecryptFinal_ex(ctx, plaintext + plain_len, &len) <= 0) {
-    fprintf(stderr,
-            "Config decryption failed (wrong password or corrupted file)\n");
+    hub_log("Config decryption failed (wrong password or corrupted file)\n");
     EVP_CIPHER_CTX_free(ctx);
     secure_wipe(key, sizeof(key));
     free(ciphertext);
