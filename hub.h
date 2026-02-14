@@ -199,6 +199,8 @@ typedef struct {
   bot_auth_state_t bot_auth_state;
   unsigned char challenge[32];
   int recv_len;
+  char admin_connect_ip[64];   // IP that hub_admin used to connect
+  int admin_connect_port;      // Port that hub_admin used to connect
 } hub_client_t;
 
 typedef struct {

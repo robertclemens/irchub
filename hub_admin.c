@@ -1628,7 +1628,7 @@ int main(int argc, char *argv[]) {
 
     unsigned char pack[256];
     memcpy(pack, g_key, 32);
-    int msg_len = snprintf((char*)pack + 32, 220, "ADMIN %s", auth_pass);
+    int msg_len = snprintf((char*)pack + 32, 220, "ADMIN %s|%s:%s", auth_pass, argv[1], argv[2]);
     
     secure_wipe(auth_pass, sizeof(auth_pass));
 

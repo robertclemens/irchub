@@ -2251,10 +2251,17 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
       // For IP:Port column - show actual connection info
       if (all_peers[row].is_me) {
-        // For local hub (peer 1), show the bind IP:port that hub_admin connected to
-        snprintf(ip_port_str, sizeof(ip_port_str), "%.45s:%d",
-                 state->bind_ip[0] ? state->bind_ip : "0.0.0.0",
-                 state->port);
+        // For local hub (peer 1), show the IP:port that hub_admin used to connect
+        // Use the stored connection info from the admin client if available
+        if (client->admin_connect_ip[0] && client->admin_connect_port > 0) {
+          snprintf(ip_port_str, sizeof(ip_port_str), "%.45s:%d",
+                   client->admin_connect_ip, client->admin_connect_port);
+        } else {
+          // Fallback to bind_ip:port if connection info not available
+          snprintf(ip_port_str, sizeof(ip_port_str), "%.45s:%d",
+                   state->bind_ip[0] ? state->bind_ip : "0.0.0.0",
+                   state->port);
+        }
       } else {
         // For remote peers, show their IP:port
         snprintf(ip_port_str, sizeof(ip_port_str), "%.45s:%d",
@@ -3989,11 +3996,48 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
 
           // ADMIN Authentication
           if (strncmp(payload, "ADMIN", 5) == 0) {
-            if (strcmp(payload + 6, state->admin_password) == 0) {
+            // Parse: "ADMIN password|connect_ip:connect_port"
+            char *pipe = strchr(payload + 6, '|');
+            char pass_buf[128];
+            int pass_len;
+
+            if (pipe) {
+              // Extract password (everything between "ADMIN " and "|")
+              pass_len = pipe - (payload + 6);
+              if (pass_len >= (int)sizeof(pass_buf)) pass_len = sizeof(pass_buf) - 1;
+              memcpy(pass_buf, payload + 6, pass_len);
+              pass_buf[pass_len] = '\0';
+            } else {
+              // Old format without connection info
+              strncpy(pass_buf, payload + 6, sizeof(pass_buf) - 1);
+              pass_buf[sizeof(pass_buf) - 1] = '\0';
+            }
+
+            if (strcmp(pass_buf, state->admin_password) == 0) {
               client->type = CLIENT_ADMIN;
               client->authenticated = true;
               strncpy(client->id, "ADMIN", sizeof(client->id) - 1);
               client->id[sizeof(client->id) - 1] = 0;
+
+              // Parse and store connection IP:port if available
+              if (pipe) {
+                char *colon = strchr(pipe + 1, ':');
+                if (colon) {
+                  int ip_len = colon - (pipe + 1);
+                  if (ip_len >= (int)sizeof(client->admin_connect_ip))
+                    ip_len = sizeof(client->admin_connect_ip) - 1;
+                  memcpy(client->admin_connect_ip, pipe + 1, ip_len);
+                  client->admin_connect_ip[ip_len] = '\0';
+                  client->admin_connect_port = atoi(colon + 1);
+                } else {
+                  client->admin_connect_ip[0] = '\0';
+                  client->admin_connect_port = 0;
+                }
+              } else {
+                client->admin_connect_ip[0] = '\0';
+                client->admin_connect_port = 0;
+              }
+
               hub_log("[HUB] Admin Login: %s\n", client->ip);
             } else {
               hub_log("[HUB] Failed admin auth from %s\n", client->ip);
