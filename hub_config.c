@@ -318,8 +318,11 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         strncpy(state->hub_uuid, v, sizeof(state->hub_uuid) - 1);
         state->hub_uuid[sizeof(state->hub_uuid) - 1] = 0;
       } else if (strcmp(k, "hub_name") == 0) {
-        strncpy(state->hub_friendly_name, v, sizeof(state->hub_friendly_name) - 1);
-        state->hub_friendly_name[sizeof(state->hub_friendly_name) - 1] = 0;
+        // Only update if value is non-empty to prevent blanking out existing name
+        if (v && v[0]) {
+          strncpy(state->hub_friendly_name, v, sizeof(state->hub_friendly_name) - 1);
+          state->hub_friendly_name[sizeof(state->hub_friendly_name) - 1] = 0;
+        }
       } else if (strcmp(k, "admin") == 0) {
         strncpy(state->admin_password, v, sizeof(state->admin_password) - 1);
         state->admin_password[sizeof(state->admin_password) - 1] = 0;
@@ -378,7 +381,8 @@ bool hub_config_load(hub_state_t *state, const char *password) {
                     sizeof(state->peers[state->peer_count].uuid) - 1);
             state->peers[state->peer_count].uuid[sizeof(state->peers[state->peer_count].uuid) - 1] = 0;
 
-            if (name_str) {
+            // Only copy friendly_name if it's non-empty
+            if (name_str && name_str[0]) {
               strncpy(state->peers[state->peer_count].friendly_name, name_str,
                       sizeof(state->peers[state->peer_count].friendly_name) - 1);
               state->peers[state->peer_count].friendly_name[sizeof(state->peers[state->peer_count].friendly_name) - 1] = 0;
