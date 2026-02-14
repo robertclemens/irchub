@@ -2252,12 +2252,12 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       // For IP:Port column - show actual connection info
       if (all_peers[row].is_me) {
         // For local hub (peer 1), show the bind IP:port that hub_admin connected to
-        snprintf(ip_port_str, sizeof(ip_port_str), "%s:%d",
+        snprintf(ip_port_str, sizeof(ip_port_str), "%.45s:%d",
                  state->bind_ip[0] ? state->bind_ip : "0.0.0.0",
                  state->port);
       } else {
         // For remote peers, show their IP:port
-        snprintf(ip_port_str, sizeof(ip_port_str), "%.255s:%d",
+        snprintf(ip_port_str, sizeof(ip_port_str), "%.45s:%d",
                  all_peers[row].ip, all_peers[row].port);
       }
 
