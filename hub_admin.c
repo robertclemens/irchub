@@ -1030,7 +1030,7 @@ void menu_manage_allowlist() {
         printf("  1. List Allowlist\n");
         printf("  2. Add IP to Allowlist\n");
         printf("  3. Remove IP from Allowlist\n");
-        printf("  4. Back to Admin Commands\n");
+        printf("  4. Back to Manage Peer Config\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);

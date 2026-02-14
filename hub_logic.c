@@ -2151,19 +2151,16 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       }
     }
 
-    int peer_col_width = 16;
+    int peer_col_width = 25;
     for (int i = 0; i < count; i++) {
       char tmp[512];
-      // Calculate width based on actual display format (friendly name + UUID)
+      // Calculate width based on actual display format (friendly name + full UUID)
       if (all_peers[i].friendly_name[0]) {
-        char uuid_short[16];
         if (all_peers[i].uuid[0]) {
-          snprintf(uuid_short, sizeof(uuid_short), "%.8s", all_peers[i].uuid);
+          snprintf(tmp, 512, "%s (%s)", all_peers[i].friendly_name, all_peers[i].uuid);
         } else {
-          strncpy(uuid_short, "no-uuid", sizeof(uuid_short) - 1);
-          uuid_short[sizeof(uuid_short) - 1] = 0;
+          snprintf(tmp, 512, "%s (no-uuid)", all_peers[i].friendly_name);
         }
-        snprintf(tmp, 512, "%s (%s...)", all_peers[i].friendly_name, uuid_short);
       } else {
         snprintf(tmp, 512, "%.255s:%d", all_peers[i].ip, all_peers[i].port);
       }
@@ -2182,7 +2179,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     }
     offset += written;
 
-    int line_len = peer_col_width + 3 + (count * 5) + 15 + 10;
+    // Add 25 for the IP:Port column (21 chars + " | " = 24)
+    int line_len = peer_col_width + 3 + 24 + (count * 5) + 15 + 10;
 
     // CRITICAL FIX: Bounds check for line drawing
     for (int k = 0; k < line_len && offset < (int)sizeof(response) - 1; k++) {
@@ -2195,8 +2193,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     response[offset] = '\0';
 
     // CRITICAL FIX: Add overflow check
-    written = snprintf(response + offset, sizeof(response) - offset, " %-*s |",
-                       peer_col_width, "Peer");
+    written = snprintf(response + offset, sizeof(response) - offset, " %-*s | %-21s |",
+                       peer_col_width, "Peer", "IP:Port");
     if (written < 0 || written >= (int)(sizeof(response) - offset)) {
       return send_response(state, client, "ERROR: Response buffer overflow");
     }
@@ -2238,23 +2236,34 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
     for (int row = 0; row < count; row++) {
       char peer_str[512];
-      // Show friendly name and UUID prefix, or IP:port if no name
+      char ip_port_str[64];
+
+      // Show friendly name and full UUID, or IP:port if no name
       if (all_peers[row].friendly_name[0]) {
-        char uuid_short[16];
         if (all_peers[row].uuid[0]) {
-          snprintf(uuid_short, sizeof(uuid_short), "%.8s", all_peers[row].uuid);
+          snprintf(peer_str, 512, "%s (%s)", all_peers[row].friendly_name, all_peers[row].uuid);
         } else {
-          strncpy(uuid_short, "no-uuid", sizeof(uuid_short) - 1);
-          uuid_short[sizeof(uuid_short) - 1] = 0;
+          snprintf(peer_str, 512, "%s (no-uuid)", all_peers[row].friendly_name);
         }
-        snprintf(peer_str, 512, "%s (%s...)", all_peers[row].friendly_name, uuid_short);
       } else {
         snprintf(peer_str, 512, "%.255s:%d", all_peers[row].ip, all_peers[row].port);
       }
 
+      // For IP:Port column - show actual connection info
+      if (all_peers[row].is_me) {
+        // For local hub (peer 1), show the bind IP:port that hub_admin connected to
+        snprintf(ip_port_str, sizeof(ip_port_str), "%s:%d",
+                 state->bind_ip[0] ? state->bind_ip : "0.0.0.0",
+                 state->port);
+      } else {
+        // For remote peers, show their IP:port
+        snprintf(ip_port_str, sizeof(ip_port_str), "%.255s:%d",
+                 all_peers[row].ip, all_peers[row].port);
+      }
+
       // CRITICAL FIX: Add overflow check
       written = snprintf(response + offset, sizeof(response) - offset,
-                         " %d. %-*s |", row + 1, peer_col_width - 3, peer_str);
+                         " %d. %-*s | %-21s |", row + 1, peer_col_width - 3, peer_str, ip_port_str);
       if (written < 0 || written >= (int)(sizeof(response) - offset)) {
         return send_response(state, client,
                              "ERROR: Matrix too large for buffer");
@@ -2624,7 +2633,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     response[offset] = '\0';
 
     char status_str[128];
-    if (issues == 0 && state->peer_count > 0) {
+    if (issues == 0) {
+      // Show HEALTHY if no issues, regardless of peer count
       snprintf(status_str, 64, "\033[32mHEALTHY\033[0m");
     } else {
       snprintf(status_str, 64, "\033[33mDEGRADED (%d ISSUES)\033[0m", issues);
