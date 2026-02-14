@@ -196,6 +196,11 @@ keygen.c:
 	@echo '#include <stdio.h>' >> keygen.c
 	@echo '#include <stdlib.h>' >> keygen.c
 	@echo '' >> keygen.c
+	@echo '// Stub hub_log for hub_crypto.c (keygen doesn'"'"'t use file logging)' >> keygen.c
+	@echo 'void hub_log(const char *format, ...) {' >> keygen.c
+	@echo '    (void)format;' >> keygen.c
+	@echo '}' >> keygen.c
+	@echo '' >> keygen.c
 	@echo 'int main(int argc, char *argv[]) {' >> keygen.c
 	@echo '    char *priv_pem = NULL, *pub_pem = NULL;' >> keygen.c
 	@echo '    ' >> keygen.c
