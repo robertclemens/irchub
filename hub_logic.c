@@ -2120,7 +2120,19 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     int peer_col_width = 16;
     for (int i = 0; i < count; i++) {
       char tmp[512];
-      snprintf(tmp, 512, "%.255s:%d", all_peers[i].ip, all_peers[i].port);
+      // Calculate width based on actual display format (friendly name + UUID)
+      if (all_peers[i].friendly_name[0]) {
+        char uuid_short[16];
+        if (all_peers[i].uuid[0]) {
+          snprintf(uuid_short, sizeof(uuid_short), "%.8s", all_peers[i].uuid);
+        } else {
+          strncpy(uuid_short, "no-uuid", sizeof(uuid_short) - 1);
+          uuid_short[sizeof(uuid_short) - 1] = 0;
+        }
+        snprintf(tmp, 512, "%s (%s...)", all_peers[i].friendly_name, uuid_short);
+      } else {
+        snprintf(tmp, 512, "%.255s:%d", all_peers[i].ip, all_peers[i].port);
+      }
       int len = strlen(tmp);
       if (len > peer_col_width)
         peer_col_width = len;
@@ -2225,8 +2237,16 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
           if (all_peers[row].is_me) {
             found_block = true;
             for (int p = 0; p < state->peer_count; p++) {
-              if (state->peers[p].port == all_peers[col].port &&
-                  strcmp(state->peers[p].ip, all_peers[col].ip) == 0) {
+              // Match by UUID if both have UUIDs, otherwise fall back to IP:port
+              bool peer_matches = false;
+              if (all_peers[col].uuid[0] && state->peers[p].uuid[0]) {
+                peer_matches = (strcmp(state->peers[p].uuid, all_peers[col].uuid) == 0);
+              } else {
+                peer_matches = (state->peers[p].port == all_peers[col].port &&
+                                strcmp(state->peers[p].ip, all_peers[col].ip) == 0);
+              }
+
+              if (peer_matches) {
                 found_link = true;
                 for (int c = 0; c < state->client_count; c++) {
                   if (state->clients[c]->type == CLIENT_HUB &&
@@ -2248,23 +2268,54 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                          body + 1);
                 char *bsave, *block = strtok_r(work_buf, ";", &bsave);
                 while (block) {
-                  char owner[256];
+                  char owner[256], owner_uuid[64], owner_name[64];
                   int o_port;
-                  if (sscanf(block, "%255[^:]:%d|", owner, &o_port) == 2) {
-                    if (o_port == all_peers[row].port &&
-                        strcmp(owner, all_peers[row].ip) == 0) {
+                  owner_uuid[0] = 0;
+                  owner_name[0] = 0;
+                  // Parse: ip:port:uuid:friendly_name|
+                  int fields = sscanf(block, "%255[^:]:%d:%63[^:]:%63[^|]|", owner, &o_port, owner_uuid, owner_name);
+                  if (fields >= 2) {
+                    // Replace "-" placeholders with empty strings
+                    if (strcmp(owner_uuid, "-") == 0) owner_uuid[0] = 0;
+                    if (strcmp(owner_name, "-") == 0) owner_name[0] = 0;
+
+                    // Match by UUID if both have UUIDs, otherwise fall back to IP:port
+                    bool owner_matches = false;
+                    if (owner_uuid[0] && all_peers[row].uuid[0]) {
+                      owner_matches = (strcmp(owner_uuid, all_peers[row].uuid) == 0);
+                    } else {
+                      owner_matches = (o_port == all_peers[row].port &&
+                                       strcmp(owner, all_peers[row].ip) == 0);
+                    }
+
+                    if (owner_matches) {
                       found_block = true;
                       char *list = strchr(block, '|');
                       if (list) {
                         char *lsave, *tok = strtok_r(list + 1, ",", &lsave);
                         while (tok) {
-                          char t_ip[256];
-                          int t_port;
-                          int stat;
-                          if (sscanf(tok, "%255[^:]:%d:%d", t_ip, &t_port,
-                                     &stat) >= 3) {
-                            if (t_port == all_peers[col].port &&
-                                strcmp(t_ip, all_peers[col].ip) == 0) {
+                          char t_ip[256], t_uuid[64], t_name[64];
+                          int t_port, stat;
+                          t_uuid[0] = 0;
+                          t_name[0] = 0;
+                          // Parse: ip:port:is_up:uuid:friendly_name
+                          int t_fields = sscanf(tok, "%255[^:]:%d:%d:%63[^:]:%63s", t_ip, &t_port,
+                                                &stat, t_uuid, t_name);
+                          if (t_fields >= 3) {
+                            // Replace "-" placeholders with empty strings
+                            if (t_fields >= 4 && strcmp(t_uuid, "-") == 0) t_uuid[0] = 0;
+                            if (t_fields >= 5 && strcmp(t_name, "-") == 0) t_name[0] = 0;
+
+                            // Match by UUID if both have UUIDs, otherwise fall back to IP:port
+                            bool target_matches = false;
+                            if (t_uuid[0] && all_peers[col].uuid[0]) {
+                              target_matches = (strcmp(t_uuid, all_peers[col].uuid) == 0);
+                            } else {
+                              target_matches = (t_port == all_peers[col].port &&
+                                                strcmp(t_ip, all_peers[col].ip) == 0);
+                            }
+
+                            if (target_matches) {
                               found_link = true;
                               if (stat)
                                 link_up = true;
@@ -2284,8 +2335,16 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             if (found_link && link_up) {
               bool actually_connected = false;
               for (int p = 0; p < state->peer_count; p++) {
-                if (state->peers[p].port == all_peers[row].port &&
-                    strcmp(state->peers[p].ip, all_peers[row].ip) == 0) {
+                // Match by UUID if both have UUIDs, otherwise fall back to IP:port
+                bool peer_matches = false;
+                if (all_peers[row].uuid[0] && state->peers[p].uuid[0]) {
+                  peer_matches = (strcmp(state->peers[p].uuid, all_peers[row].uuid) == 0);
+                } else {
+                  peer_matches = (state->peers[p].port == all_peers[row].port &&
+                                  strcmp(state->peers[p].ip, all_peers[row].ip) == 0);
+                }
+
+                if (peer_matches) {
                   for (int c = 0; c < state->client_count; c++) {
                     if (state->clients[c]->type == CLIENT_HUB &&
                         state->clients[c]->authenticated &&
@@ -2328,8 +2387,16 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         directly_connected = true;
       } else {
         for (int p = 0; p < state->peer_count; p++) {
-          if (state->peers[p].port == all_peers[row].port &&
-              strcmp(state->peers[p].ip, all_peers[row].ip) == 0) {
+          // Match by UUID if both have UUIDs, otherwise fall back to IP:port
+          bool peer_matches = false;
+          if (all_peers[row].uuid[0] && state->peers[p].uuid[0]) {
+            peer_matches = (strcmp(state->peers[p].uuid, all_peers[row].uuid) == 0);
+          } else {
+            peer_matches = (state->peers[p].port == all_peers[row].port &&
+                            strcmp(state->peers[p].ip, all_peers[row].ip) == 0);
+          }
+
+          if (peer_matches) {
             // Check if there's an active connection
             for (int c = 0; c < state->client_count; c++) {
               if (state->clients[c]->type == CLIENT_HUB &&
