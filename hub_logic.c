@@ -764,6 +764,49 @@ static void process_mesh_state(hub_state_t *state, hub_client_t *c,
 
         memcpy(state->peers[i].last_gossip, payload, copy_len);
         state->peers[i].last_gossip[copy_len] = '\0';
+
+        // Extract remote hub's friendly_name and UUID from gossip and update peer record
+        // Gossip format: connected:total:bots:bot_list|ip:port:uuid:friendly_name|...
+        char *mesh_start = strchr(payload, '|');
+        if (mesh_start) {
+          mesh_start++; // Skip the first |
+          char remote_ip[256], remote_uuid[64], remote_name[64];
+          int remote_port;
+          memset(remote_uuid, 0, sizeof(remote_uuid));
+          memset(remote_name, 0, sizeof(remote_name));
+
+          // Parse: ip:port:uuid:friendly_name|
+          int fields = sscanf(mesh_start, "%255[^:]:%d:%63[^:]:%63[^|]",
+                             remote_ip, &remote_port, remote_uuid, remote_name);
+
+          bool config_updated = false;
+
+          // Update friendly_name if it changed
+          if (fields >= 4 && remote_name[0] && strcmp(remote_name, "-") != 0) {
+            if (strcmp(state->peers[i].friendly_name, remote_name) != 0) {
+              snprintf(state->peers[i].friendly_name,
+                      sizeof(state->peers[i].friendly_name), "%s", remote_name);
+              hub_log("[MESH] Updated peer friendly_name to: %s\n", remote_name);
+              config_updated = true;
+            }
+          }
+
+          // Also update UUID if it changed (in case peer was added without UUID)
+          if (fields >= 3 && remote_uuid[0] && strcmp(remote_uuid, "-") != 0) {
+            if (!state->peers[i].uuid[0] ||
+                strcmp(state->peers[i].uuid, remote_uuid) != 0) {
+              snprintf(state->peers[i].uuid,
+                      sizeof(state->peers[i].uuid), "%s", remote_uuid);
+              hub_log("[MESH] Updated peer UUID to: %s\n", remote_uuid);
+              config_updated = true;
+            }
+          }
+
+          // Write config once if anything changed
+          if (config_updated) {
+            hub_config_write(state);
+          }
+        }
         return;
       }
     }
@@ -1880,16 +1923,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             }
           }
 
-          // Check for duplicate friendly name
-          if (name[0]) {
-            for (int i = 0; i < state->peer_count; i++) {
-              if (state->peers[i].friendly_name[0] &&
-                  strcmp(state->peers[i].friendly_name, name) == 0) {
-                return send_response(state, client,
-                                   "ERROR: Peer with this name already exists.");
-              }
-            }
-          }
+          // Note: Friendly name is now auto-populated from gossip, so no duplicate check needed
 
           size_t ip_len = strlen(ip);
           size_t max_len = sizeof(state->peers[state->peer_count].ip) - 1;

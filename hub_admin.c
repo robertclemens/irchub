@@ -433,12 +433,13 @@ void peer_add() {
 
     printf("\n═══════════════════════════════════════════════════\n");
     printf("                   ADD PEER HUB\n");
-    printf("═══════════════════════════════════════════════════\n\n");
+    printf("═══════════════════════════════════════════════════\n");
+    printf("NOTE: Friendly name will be auto-populated from gossip\n\n");
 
     get_input("Peer IP: ", ip, sizeof(ip));
     get_input("Peer Port: ", port, sizeof(port));
     get_input("Peer UUID: ", uuid, sizeof(uuid));
-    get_input("Friendly Name (optional): ", name, sizeof(name));
+    get_input("Friendly Name (optional, auto-syncs): ", name, sizeof(name));
 
     char payload[256];
     snprintf(payload, sizeof(payload), "%s:%s:%s:%s", ip, port, uuid, name);
