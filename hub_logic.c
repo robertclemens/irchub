@@ -2062,7 +2062,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
               all_peers[count].is_me = false;
               count++;
             }
-            skip_owner:
+            skip_owner: ;
             char *list = strchr(block, '|');
             if (list) {
               char *t_save, *tok = strtok_r(list + 1, ",", &t_save);
@@ -2106,7 +2106,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                     all_peers[count].is_me = false;
                     count++;
                   }
-                  skip_peer:
+                  skip_peer: ;
                 }
                 tok = strtok_r(NULL, ",", &t_save);
               }
