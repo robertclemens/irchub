@@ -1990,10 +1990,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     // Add local hub (use actual remote_ip for display if available, else bind_ip)
     snprintf(all_peers[count].ip, 256, "%s", state->bind_ip);
     all_peers[count].port = state->port;
-    strncpy(all_peers[count].uuid, state->hub_uuid, sizeof(all_peers[count].uuid) - 1);
-    all_peers[count].uuid[sizeof(all_peers[count].uuid) - 1] = 0;
-    strncpy(all_peers[count].friendly_name, state->hub_friendly_name, sizeof(all_peers[count].friendly_name) - 1);
-    all_peers[count].friendly_name[sizeof(all_peers[count].friendly_name) - 1] = 0;
+    snprintf(all_peers[count].uuid, sizeof(all_peers[count].uuid), "%s", state->hub_uuid);
+    snprintf(all_peers[count].friendly_name, sizeof(all_peers[count].friendly_name), "%s", state->hub_friendly_name);
     all_peers[count].is_me = true;
     count++;
 

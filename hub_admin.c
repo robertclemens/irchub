@@ -16,6 +16,12 @@
 int g_fd = -1;
 unsigned char g_key[32];
 
+// Stub hub_log for hub_crypto.c (hub_admin doesn't use file logging)
+void hub_log(const char *format, ...) {
+    (void)format;
+    // No-op: hub_admin doesn't log to file
+}
+
 // ============================================================================
 // NETWORK & CRYPTO HELPERS
 // ============================================================================

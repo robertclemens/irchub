@@ -4,6 +4,11 @@
 #include <string.h>
 #include <termios.h>
 
+// Stub hub_log for hub_crypto.c (decrypt tool doesn't use file logging)
+void hub_log(const char *format, ...) {
+    (void)format;
+}
+
 void get_password_secure(const char *prompt, char *buf, size_t len) {
     struct termios oldt, newt;
     printf("%s", prompt);
