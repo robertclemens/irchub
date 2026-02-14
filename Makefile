@@ -24,17 +24,20 @@ OBJ_DIR = $(BUILD_DIR)/obj
 HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c
 ADMIN_SOURCES = hub_admin.c hub_crypto.c
 DECRYPT_SOURCES = hub_decrypt.c hub_crypto.c
+ENCRYPT_SOURCES = hub_encrypt.c hub_crypto.c
 
 # Object files
 HUB_OBJECTS = $(HUB_SOURCES:%.c=$(OBJ_DIR)/%.o)
 ADMIN_OBJECTS = $(ADMIN_SOURCES:%.c=$(OBJ_DIR)/%.o)
 DECRYPT_OBJECTS = $(DECRYPT_SOURCES:%.c=$(OBJ_DIR)/%.o)
+ENCRYPT_OBJECTS = $(ENCRYPT_SOURCES:%.c=$(OBJ_DIR)/%.o)
 
 # Executables
 HUB_TARGET = $(BIN_DIR)/irchub
 ADMIN_TARGET = $(BIN_DIR)/hub_admin
 KEYGEN_TARGET = $(BIN_DIR)/keygen
 DECRYPT_TARGET = $(BIN_DIR)/hub_decrypt
+ENCRYPT_TARGET = $(BIN_DIR)/hub_encrypt
 
 # ============================================================================
 # Compiler Flags
@@ -89,7 +92,7 @@ endif
         directories debug release production check-openssl keygen
 
 # Default target
-all: directories check-openssl $(HUB_TARGET) $(ADMIN_TARGET) $(KEYGEN_TARGET) $(DECRYPT_TARGET)
+all: directories check-openssl $(HUB_TARGET) $(ADMIN_TARGET) $(KEYGEN_TARGET) $(DECRYPT_TARGET) $(ENCRYPT_TARGET)
 
 # Create necessary directories
 directories:
@@ -144,6 +147,16 @@ $(OBJ_DIR)/keygen.o: keygen.c hub.h
 # ============================================================================
 
 $(DECRYPT_TARGET): $(DECRYPT_OBJECTS)
+	@echo "Linking $@..."
+	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+	@echo "Built: $@ (mode: $(BUILD_MODE))"
+	@echo ""
+
+# ============================================================================
+# Config Encryption Utility
+# ============================================================================
+
+$(ENCRYPT_TARGET): $(ENCRYPT_OBJECTS)
 	@echo "Linking $@..."
 	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 	@echo "Built: $@ (mode: $(BUILD_MODE))"
@@ -247,6 +260,7 @@ install: all
 	@install -m 0755 $(ADMIN_TARGET) $(BINDIR)/hub_admin
 	@install -m 0755 $(KEYGEN_TARGET) $(BINDIR)/hub_keygen
 	@install -m 0755 $(DECRYPT_TARGET) $(BINDIR)/hub_decrypt
+	@install -m 0755 $(ENCRYPT_TARGET) $(BINDIR)/hub_encrypt
 	@echo "Installed to $(PREFIX)"
 	@echo ""
 	@echo "First-time setup:"
@@ -257,6 +271,7 @@ install: all
 	@echo "Utilities:"
 	@echo "  - Admin client: $(BINDIR)/hub_admin <ip> <port> <pub.pem>"
 	@echo "  - Decrypt config: $(BINDIR)/hub_decrypt [config_file]"
+	@echo "  - Encrypt config: $(BINDIR)/hub_encrypt [input_file] [output_file]"
 	@echo ""
 
 uninstall:
@@ -265,6 +280,7 @@ uninstall:
 	@rm -f $(BINDIR)/hub_admin
 	@rm -f $(BINDIR)/hub_keygen
 	@rm -f $(BINDIR)/hub_decrypt
+	@rm -f $(BINDIR)/hub_encrypt
 	@echo "Uninstalled from $(PREFIX)"
 	@echo "Note: Config files in $(SYSCONFDIR) and logs in $(LOGDIR) were not removed"
 

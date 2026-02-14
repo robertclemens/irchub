@@ -1853,10 +1853,38 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
   case CMD_ADMIN_ADD_PEER:
     if (payload && strlen(payload) > 0) {
-      char ip[256];
+      char ip[256], uuid[64], name[64];
       int port;
-      if (sscanf(payload, "%255[^:]:%d", ip, &port) == 2) {
+      memset(uuid, 0, sizeof(uuid));
+      memset(name, 0, sizeof(name));
+
+      // Parse: IP:PORT:UUID:NAME (UUID and NAME optional for backward compat)
+      int args = sscanf(payload, "%255[^:]:%d:%63[^:]:%63s", ip, &port, uuid, name);
+
+      if (args >= 2) {
         if (state->peer_count < MAX_PEERS) {
+          // Check for duplicate UUID
+          if (uuid[0]) {
+            for (int i = 0; i < state->peer_count; i++) {
+              if (state->peers[i].uuid[0] &&
+                  strcmp(state->peers[i].uuid, uuid) == 0) {
+                return send_response(state, client,
+                                   "ERROR: Peer with this UUID already exists.");
+              }
+            }
+          }
+
+          // Check for duplicate friendly name
+          if (name[0]) {
+            for (int i = 0; i < state->peer_count; i++) {
+              if (state->peers[i].friendly_name[0] &&
+                  strcmp(state->peers[i].friendly_name, name) == 0) {
+                return send_response(state, client,
+                                   "ERROR: Peer with this name already exists.");
+              }
+            }
+          }
+
           size_t ip_len = strlen(ip);
           size_t max_len = sizeof(state->peers[state->peer_count].ip) - 1;
           size_t copy_len = (ip_len < max_len) ? ip_len : max_len;
@@ -1864,6 +1892,19 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
           memcpy(state->peers[state->peer_count].ip, ip, copy_len);
           state->peers[state->peer_count].ip[copy_len] = '\0';
           state->peers[state->peer_count].port = port;
+
+          if (uuid[0]) {
+            strncpy(state->peers[state->peer_count].uuid, uuid,
+                   sizeof(state->peers[state->peer_count].uuid) - 1);
+            state->peers[state->peer_count].uuid[sizeof(state->peers[state->peer_count].uuid) - 1] = 0;
+          }
+
+          if (name[0]) {
+            strncpy(state->peers[state->peer_count].friendly_name, name,
+                   sizeof(state->peers[state->peer_count].friendly_name) - 1);
+            state->peers[state->peer_count].friendly_name[sizeof(state->peers[state->peer_count].friendly_name) - 1] = 0;
+          }
+
           state->peers[state->peer_count].connected = false;
           state->peers[state->peer_count].fd = -1;
           state->peer_count++;
@@ -1873,7 +1914,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         return send_response(state, client, "ERROR: Max peers reached.");
       }
     }
-    return send_response(state, client, "ERROR: Invalid format. Use IP:PORT");
+    return send_response(state, client, "ERROR: Invalid format. Use IP:PORT:UUID:NAME");
 
   case CMD_ADMIN_DEL_PEER:
     if (payload && strlen(payload) > 0) {
@@ -1941,19 +1982,33 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     typedef struct {
       char ip[256];
       int port;
+      char uuid[64];
+      char friendly_name[64];
       bool is_me;
     } matrix_peer_t;
     matrix_peer_t all_peers[64];
     int count = 0;
 
+    // Add local hub (use actual remote_ip for display if available, else bind_ip)
     snprintf(all_peers[count].ip, 256, "%s", state->bind_ip);
     all_peers[count].port = state->port;
+    strncpy(all_peers[count].uuid, state->hub_uuid, 63);
+    all_peers[count].uuid[63] = 0;
+    strncpy(all_peers[count].friendly_name, state->hub_friendly_name, 63);
+    all_peers[count].friendly_name[63] = 0;
     all_peers[count].is_me = true;
     count++;
 
     for (int i = 0; i < state->peer_count; i++) {
-      snprintf(all_peers[count].ip, 256, "%s", state->peers[i].ip);
+      // Use remote_ip (actual connection IP) if available, else configured IP
+      const char *display_ip = state->peers[i].remote_ip[0] ?
+                               state->peers[i].remote_ip : state->peers[i].ip;
+      snprintf(all_peers[count].ip, 256, "%s", display_ip);
       all_peers[count].port = state->peers[i].port;
+      strncpy(all_peers[count].uuid, state->peers[i].uuid, 63);
+      all_peers[count].uuid[63] = 0;
+      strncpy(all_peers[count].friendly_name, state->peers[i].friendly_name, 63);
+      all_peers[count].friendly_name[63] = 0;
       all_peers[count].is_me = false;
       count++;
     }
@@ -2085,8 +2140,19 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
     for (int row = 0; row < count; row++) {
       char peer_str[512];
-      snprintf(peer_str, 512, "%.255s:%d", all_peers[row].ip,
-               all_peers[row].port);
+      // Show friendly name and UUID prefix, or IP:port if no name
+      if (all_peers[row].friendly_name[0]) {
+        char uuid_short[16];
+        if (all_peers[row].uuid[0]) {
+          snprintf(uuid_short, sizeof(uuid_short), "%.8s", all_peers[row].uuid);
+        } else {
+          strncpy(uuid_short, "no-uuid", sizeof(uuid_short) - 1);
+          uuid_short[sizeof(uuid_short) - 1] = 0;
+        }
+        snprintf(peer_str, 512, "%s (%s...)", all_peers[row].friendly_name, uuid_short);
+      } else {
+        snprintf(peer_str, 512, "%.255s:%d", all_peers[row].ip, all_peers[row].port);
+      }
 
       // CRITICAL FIX: Add overflow check
       written = snprintf(response + offset, sizeof(response) - offset,
@@ -3729,45 +3795,89 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
           }
           // HUB Peer Authentication
           else if (strncmp(payload, "HUB", 3) == 0) {
-            char pass[128];
+            char pass[128], peer_uuid[64], peer_name[64], peer_bind_ip[64];
             int claimed_port = 0;
-            int args = sscanf(payload + 4, "%127s %d", pass, &claimed_port);
+            memset(peer_uuid, 0, sizeof(peer_uuid));
+            memset(peer_name, 0, sizeof(peer_name));
+            memset(peer_bind_ip, 0, sizeof(peer_bind_ip));
+
+            // Parse: HUB <password> <port> <uuid> <friendly_name> <bind_ip>
+            int args = sscanf(payload + 4, "%127s %d %63s %63s %63s",
+                            pass, &claimed_port, peer_uuid, peer_name, peer_bind_ip);
 
             if (args >= 1 && strcmp(pass, state->admin_password) == 0) {
               client->type = CLIENT_HUB;
-              client->authenticated = true;
-              strncpy(client->id, "HUB-PEER", sizeof(client->id) - 1);
-              client->id[sizeof(client->id) - 1] = 0;
 
               bool is_authorized_peer = false;
-              for (int p = 0; p < state->peer_count; p++) {
-                bool ip_match = (strcmp(state->peers[p].ip, client->ip) == 0 ||
-                                 strcmp(state->bind_ip, client->ip) == 0);
+              int peer_idx = -1;
 
-                if (ip_match) {
-                  if (claimed_port > 0) {
-                    if (state->peers[p].port == claimed_port) {
-                      state->peers[p].connected = true;
-                      state->peers[p].fd = client->fd;
-                      is_authorized_peer = true;
-                    }
-                  } else {
-                    state->peers[p].connected = true;
-                    state->peers[p].fd = client->fd;
+              // Find and validate peer by UUID (primary) or IP:port (fallback)
+              for (int p = 0; p < state->peer_count; p++) {
+                // UUID-based matching (preferred)
+                if (args >= 3 && peer_uuid[0] && state->peers[p].uuid[0]) {
+                  if (strcmp(state->peers[p].uuid, peer_uuid) == 0) {
+                    peer_idx = p;
                     is_authorized_peer = true;
+                    break;
+                  }
+                }
+                // Fallback to IP:port matching for backward compatibility
+                else {
+                  bool ip_match = (strcmp(state->peers[p].ip, client->ip) == 0 ||
+                                   strcmp(state->bind_ip, client->ip) == 0);
+
+                  if (ip_match && claimed_port > 0 && state->peers[p].port == claimed_port) {
+                    peer_idx = p;
+                    is_authorized_peer = true;
+                    break;
                   }
                 }
               }
 
               if (!is_authorized_peer) {
-                hub_log("[HUB] Unauthorized peer from %s\n", client->ip);
+                hub_log("[HUB] Unauthorized peer from %s (UUID: %s)\n",
+                       client->ip, peer_uuid[0] ? peer_uuid : "none");
                 secure_wipe(dec, sizeof(dec));
                 hub_disconnect_client(state, client);
                 return false;
               }
 
+              // UUID mismatch check - disconnect if UUIDs don't match
+              if (args >= 3 && peer_uuid[0] && state->peers[peer_idx].uuid[0]) {
+                if (strcmp(state->peers[peer_idx].uuid, peer_uuid) != 0) {
+                  hub_log("[HUB] UUID mismatch for peer %s (expected: %s, got: %s)\n",
+                         client->ip, state->peers[peer_idx].uuid, peer_uuid);
+                  secure_wipe(dec, sizeof(dec));
+                  hub_disconnect_client(state, client);
+                  return false;
+                }
+              }
+
+              // Update peer connection info
+              client->authenticated = true;
+              state->peers[peer_idx].connected = true;
+              state->peers[peer_idx].fd = client->fd;
+
+              // Store actual connection IP (from socket)
+              strncpy(state->peers[peer_idx].remote_ip, client->ip,
+                      sizeof(state->peers[peer_idx].remote_ip) - 1);
+              state->peers[peer_idx].remote_ip[sizeof(state->peers[peer_idx].remote_ip) - 1] = 0;
+
+              // Update friendly name if provided
+              if (args >= 4 && peer_name[0]) {
+                strncpy(state->peers[peer_idx].friendly_name, peer_name,
+                        sizeof(state->peers[peer_idx].friendly_name) - 1);
+                state->peers[peer_idx].friendly_name[sizeof(state->peers[peer_idx].friendly_name) - 1] = 0;
+              }
+
+              snprintf(client->id, sizeof(client->id), "%s",
+                      peer_name[0] ? peer_name : "HUB-PEER");
+              client->id[sizeof(client->id) - 1] = 0;
+
               // Send initial sync (existing code)...
-              hub_log("[HUB] Peer connected: %s\n", client->ip);
+              hub_log("[HUB] Peer connected: %s (%s)\n",
+                     peer_name[0] ? peer_name : client->ip,
+                     peer_uuid[0] ? peer_uuid : "no-uuid");
             } else {
               hub_log("[HUB] Failed peer auth from %s\n", client->ip);
               record_failed_auth(state, client->ip);

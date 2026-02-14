@@ -79,8 +79,9 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c) {
     unsigned char pack[256];
     memcpy(pack, c->session_key, 32);
     
-    int msg_len = snprintf((char*)pack + 32, 220, "HUB %s %d", 
-                          state->admin_password, state->port);
+    int msg_len = snprintf((char*)pack + 32, 220, "HUB %s %d %s %s %s",
+                          state->admin_password, state->port,
+                          state->hub_uuid, state->hub_friendly_name, state->bind_ip);
     if (msg_len < 0 || msg_len >= 220) {
         hub_log("[PEER] Handshake message too long\n");
         hub_disconnect_client(state, c);
@@ -392,6 +393,14 @@ int main(int argc, char *argv[]) {
             strncpy(state.bind_ip, "127.0.0.1", sizeof(state.bind_ip) - 1);
         }
         state.bind_ip[sizeof(state.bind_ip) - 1] = 0;
+
+        printf("Friendly Name: ");
+        if (scanf("%63s", state.hub_friendly_name) != 1) return 1;
+        state.hub_friendly_name[sizeof(state.hub_friendly_name) - 1] = 0;
+
+        // Generate UUID for this hub
+        generate_uuid_v4(state.hub_uuid, sizeof(state.hub_uuid));
+        printf("Generated UUID: %s\n", state.hub_uuid);
 
         printf("PrivKey Path: ");
         if (scanf("%255s", kp) != 1) return 1;

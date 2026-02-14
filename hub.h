@@ -161,8 +161,11 @@ typedef struct {
 } ip_rate_limit_t;
 
 typedef struct {
-  char ip[64];
+  char ip[64];              // Configured/advertised IP
   int port;
+  char uuid[64];            // Remote peer's UUID
+  char friendly_name[64];   // Remote peer's friendly name
+  char remote_ip[64];       // Actual connection IP (from socket)
   bool connected;
   int fd;
   int remote_connected_count;
@@ -199,7 +202,9 @@ typedef struct {
 typedef struct {
   int listen_fd;
   int port;
-  char bind_ip[64]; // IP this hub advertises itself as in mesh
+  char bind_ip[64];          // IP this hub advertises itself as in mesh
+  char hub_uuid[64];         // This hub's UUID
+  char hub_friendly_name[64]; // This hub's friendly name
   char admin_password[128];
   char config_pass[128];
 
@@ -287,6 +292,7 @@ void hub_broadcast_mesh_state(hub_state_t *state);
 bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
                                    char **out_pub_b64);
 void secure_wipe(void *ptr, size_t len);
+void generate_uuid_v4(char *buffer, size_t len);
 
 char *base64_encode(const unsigned char *input, int length);
 unsigned char *base64_decode(const char *input, int *out_len);

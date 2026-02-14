@@ -55,10 +55,14 @@ void hub_config_write(hub_state_t *state) {
 
   SAFE_WRITE("port|%d\n", state->port);
   SAFE_WRITE("bind_ip|%s\n", state->bind_ip[0] ? state->bind_ip : "127.0.0.1");
+  SAFE_WRITE("uuid|%s\n", state->hub_uuid[0] ? state->hub_uuid : "");
+  SAFE_WRITE("hub_name|%s\n", state->hub_friendly_name[0] ? state->hub_friendly_name : "");
   SAFE_WRITE("admin|%s\n", state->admin_password);
 
   for (int i = 0; i < state->peer_count; i++) {
-    SAFE_WRITE("peer|%s|%d\n", state->peers[i].ip, state->peers[i].port);
+    SAFE_WRITE("peer|%s|%d|%s|%s\n", state->peers[i].ip, state->peers[i].port,
+               state->peers[i].uuid[0] ? state->peers[i].uuid : "",
+               state->peers[i].friendly_name[0] ? state->peers[i].friendly_name : "");
   }
 
   if (state->private_key_pem) {
@@ -310,6 +314,12 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       } else if (strcmp(k, "bind_ip") == 0) {
         strncpy(state->bind_ip, v, sizeof(state->bind_ip) - 1);
         state->bind_ip[sizeof(state->bind_ip) - 1] = 0;
+      } else if (strcmp(k, "uuid") == 0) {
+        strncpy(state->hub_uuid, v, sizeof(state->hub_uuid) - 1);
+        state->hub_uuid[sizeof(state->hub_uuid) - 1] = 0;
+      } else if (strcmp(k, "hub_name") == 0) {
+        strncpy(state->hub_friendly_name, v, sizeof(state->hub_friendly_name) - 1);
+        state->hub_friendly_name[sizeof(state->hub_friendly_name) - 1] = 0;
       } else if (strcmp(k, "admin") == 0) {
         strncpy(state->admin_password, v, sizeof(state->admin_password) - 1);
         state->admin_password[sizeof(state->admin_password) - 1] = 0;
@@ -337,18 +347,54 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           free(d);
         }
       } else if (strcmp(k, "peer") == 0) {
-        char *s2 = strchr(v, '|');
-        if (!s2)
-          s2 = strchr(v, ':');
-        if (s2 && state->peer_count < MAX_PEERS) {
-          *s2 = 0;
-          strncpy(state->peers[state->peer_count].ip, v,
-                  sizeof(state->peers[state->peer_count].ip) - 1);
-          state->peers[state->peer_count]
-              .ip[sizeof(state->peers[state->peer_count].ip) - 1] = 0;
-          state->peers[state->peer_count].port = atoi(s2 + 1);
-          state->peers[state->peer_count].fd = -1;
-          state->peer_count++;
+        // Parse: peer|ip|port|uuid|friendly_name
+        char *ip = v;
+        char *port_str = strchr(ip, '|');
+        if (!port_str) port_str = strchr(ip, ':');
+
+        if (port_str && state->peer_count < MAX_PEERS) {
+          *port_str = 0;
+          port_str++;
+
+          char *uuid_str = strchr(port_str, '|');
+          if (uuid_str) {
+            *uuid_str = 0;
+            uuid_str++;
+
+            char *name_str = strchr(uuid_str, '|');
+            if (name_str) {
+              *name_str = 0;
+              name_str++;
+            }
+
+            // Store peer data
+            strncpy(state->peers[state->peer_count].ip, ip,
+                    sizeof(state->peers[state->peer_count].ip) - 1);
+            state->peers[state->peer_count].ip[sizeof(state->peers[state->peer_count].ip) - 1] = 0;
+
+            state->peers[state->peer_count].port = atoi(port_str);
+
+            strncpy(state->peers[state->peer_count].uuid, uuid_str,
+                    sizeof(state->peers[state->peer_count].uuid) - 1);
+            state->peers[state->peer_count].uuid[sizeof(state->peers[state->peer_count].uuid) - 1] = 0;
+
+            if (name_str) {
+              strncpy(state->peers[state->peer_count].friendly_name, name_str,
+                      sizeof(state->peers[state->peer_count].friendly_name) - 1);
+              state->peers[state->peer_count].friendly_name[sizeof(state->peers[state->peer_count].friendly_name) - 1] = 0;
+            }
+
+            state->peers[state->peer_count].fd = -1;
+            state->peer_count++;
+          } else {
+            // Old format: peer|ip|port (for backward compatibility)
+            strncpy(state->peers[state->peer_count].ip, ip,
+                    sizeof(state->peers[state->peer_count].ip) - 1);
+            state->peers[state->peer_count].ip[sizeof(state->peers[state->peer_count].ip) - 1] = 0;
+            state->peers[state->peer_count].port = atoi(port_str);
+            state->peers[state->peer_count].fd = -1;
+            state->peer_count++;
+          }
         }
       } else if (strcmp(k, "b") == 0) {
         char *s2 = strchr(v, '|');

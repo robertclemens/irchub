@@ -423,22 +423,24 @@ void peer_list() {
 
 void peer_add() {
     char response[MAX_BUFFER];
-    char ip[64], port[10];
-    
+    char ip[64], port[10], uuid[64], name[64];
+
     printf("\n═══════════════════════════════════════════════════\n");
     printf("                   ADD PEER HUB\n");
     printf("═══════════════════════════════════════════════════\n\n");
-    
+
     get_input("Peer IP: ", ip, sizeof(ip));
     get_input("Peer Port: ", port, sizeof(port));
-    
-    char payload[128];
-    snprintf(payload, sizeof(payload), "%s:%s", ip, port);
-    
+    get_input("Peer UUID: ", uuid, sizeof(uuid));
+    get_input("Friendly Name (optional): ", name, sizeof(name));
+
+    char payload[256];
+    snprintf(payload, sizeof(payload), "%s:%s:%s:%s", ip, port, uuid, name);
+
     send_packet(g_fd, CMD_ADMIN_ADD_PEER, payload, g_key);
     read_response(g_fd, g_key, response, sizeof(response));
     printf("\nHub: %s\n", response);
-    
+
     printf("\nPress Enter to continue...");
     fflush(stdout);
     char dummy[10];
