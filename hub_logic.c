@@ -3133,6 +3133,53 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     return send_response(state, client, "ERROR: Missing IP address.");
   }
 
+  case CMD_ADMIN_SET_HUB_NAME: {
+    if (payload && strlen(payload) > 0) {
+      // Update hub friendly name in memory
+      strncpy(state->hub_friendly_name, payload, sizeof(state->hub_friendly_name) - 1);
+      state->hub_friendly_name[sizeof(state->hub_friendly_name) - 1] = '\0';
+
+      // Save to config
+      hub_config_write(state);
+
+      // Sync to peers
+      time_t now = time(NULL);
+      char sync_msg[256];
+      snprintf(sync_msg, sizeof(sync_msg), "hub_name|%s|%ld\n", payload, (long)now);
+      hub_broadcast_sync_to_peers(state, sync_msg, -1);
+
+      char response[256];
+      snprintf(response, sizeof(response), "SUCCESS: Hub name updated to '%s'", payload);
+      return send_response(state, client, response);
+    }
+    return send_response(state, client, "ERROR: Missing hub name.");
+  }
+
+  case CMD_ADMIN_SET_BIND_PORT: {
+    if (payload && strlen(payload) > 0) {
+      int port = atoi(payload);
+      if (port <= 0 || port > 65535) {
+        return send_response(state, client, "ERROR: Port must be between 1 and 65535.");
+      }
+
+      // Update port in memory
+      state->port = port;
+
+      // Save to config
+      hub_config_write(state);
+
+      // Sync to peers
+      time_t now = time(NULL);
+      char sync_msg[256];
+      snprintf(sync_msg, sizeof(sync_msg), "port|%d|%ld\n", port, (long)now);
+      hub_broadcast_sync_to_peers(state, sync_msg, -1);
+
+      return send_response(state, client,
+                         "SUCCESS: Bind port updated. Restart hub for changes to take effect.");
+    }
+    return send_response(state, client, "ERROR: Missing port number.");
+  }
+
   case CMD_ADMIN_LIST_ALLOWLIST: {
     char list[MAX_BUFFER];
     int offset = 0;

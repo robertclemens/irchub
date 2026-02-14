@@ -1113,6 +1113,133 @@ void admin_set_bind_ip() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
+void admin_set_hub_name() {
+    char response[MAX_BUFFER];
+    char name[64];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                   SET HUB NAME\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Set a friendly name for this hub.\n");
+    printf("This name will be synced across the mesh network.\n\n");
+
+    get_input("Hub Name: ", name, sizeof(name));
+
+    if (strlen(name) > 0) {
+        send_packet(g_fd, CMD_ADMIN_SET_HUB_NAME, name, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_set_bind_port() {
+    char response[MAX_BUFFER];
+    char port[10];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                 SET BIND PORT\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Set the port this hub listens on (1-65535).\n");
+    printf("NOTE: Hub restart required for changes to take effect.\n\n");
+
+    get_input("Bind Port: ", port, sizeof(port));
+
+    if (strlen(port) > 0) {
+        send_packet(g_fd, CMD_ADMIN_SET_BIND_PORT, port, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_export_private_key() {
+    char response[MAX_BUFFER];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("              EXPORT PRIVATE KEY\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("⚠️  WARNING: Keep this key secure!\n");
+    printf("This private key is used for hub-to-hub authentication.\n\n");
+
+    if (!get_confirmation("Export private key?")) {
+        return;
+    }
+
+    send_packet(g_fd, CMD_ADMIN_GET_PRIVKEY, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+
+    if (strncmp(response, "ERROR", 5) == 0) {
+        printf("\n%s\n", response);
+    } else {
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        char fname[64];
+        strftime(fname, sizeof(fname), "hub_private_%Y%m%d_%H%M%S.pem", t);
+
+        FILE *f = fopen(fname, "w");
+        if (f) {
+            fputs(response, f);
+            fclose(f);
+            printf("\n[PRIVATE KEY SAVED: %s]\n\n", fname);
+            printf("Private key has been exported to:\n%s\n", fname);
+        } else {
+            printf("\nFailed to save private key to file.\n");
+        }
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_export_public_key() {
+    char response[MAX_BUFFER];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("               EXPORT PUBLIC KEY\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("This public key is used for hub_admin authentication.\n\n");
+
+    send_packet(g_fd, CMD_ADMIN_GET_PUBKEY, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+
+    if (strncmp(response, "ERROR", 5) == 0) {
+        printf("\n%s\n", response);
+    } else {
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        char fname[64];
+        strftime(fname, sizeof(fname), "hub_public_%Y%m%d_%H%M%S.pem", t);
+
+        FILE *f = fopen(fname, "w");
+        if (f) {
+            fputs(response, f);
+            fclose(f);
+            printf("\n[PUBLIC KEY SAVED: %s]\n\n", fname);
+            printf("Public key has been exported to:\n%s\n", fname);
+            printf("\nUse this key with hub_admin:\n");
+            printf("  ./hub_admin <ip> <port> %s\n", fname);
+        } else {
+            printf("\nFailed to save public key to file.\n");
+        }
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
 void menu_manage_admin_masks() {
     while (1) {
         printf("\n");
@@ -1252,11 +1379,7 @@ void menu_admin_commands() {
         printf("  4. Manage Channels\n");
         printf("  5. Change Admin Password\n");
         printf("  6. Change Bot Password\n");
-        printf("  7. Set Bind IP\n");
-        printf("  8. Manage IP Allowlist\n");
-        printf("  9. Manage IP Denylist\n");
-        printf(" 10. Purge Tombstones\n");
-        printf(" 11. Back to Main Menu\n");
+        printf("  7. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1289,18 +1412,6 @@ void menu_admin_commands() {
                 admin_change_bot_password();
                 break;
             case 7:
-                admin_set_bind_ip();
-                break;
-            case 8:
-                menu_manage_allowlist();
-                break;
-            case 9:
-                menu_manage_denylist();
-                break;
-            case 10:
-                admin_purge_tombstones();
-                break;
-            case 11:
                 return;
             default:
                 printf("Invalid choice.\n");
@@ -1359,11 +1470,11 @@ void menu_manage_bots() {
     }
 }
 
-void menu_manage_peers() {
+void menu_manage_peer_connections() {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
-        printf("║             MANAGE PEERS (HUBS)                  ║\n");
+        printf("║          MANAGE PEER CONNECTIONS                ║\n");
         printf("╚══════════════════════════════════════════════════╝\n");
         printf("\n");
         printf("  1. List Peers (Mesh Matrix)\n");
@@ -1375,15 +1486,15 @@ void menu_manage_peers() {
         printf("\n");
         printf("Select: ");
         fflush(stdout);
-        
+
         char buf[10];
         if (!wait_for_input_or_socket(buf, sizeof(buf))) {
             printf("\n[!] Connection lost.\n");
             exit(1);
         }
-        
+
         int choice = atoi(buf);
-        
+
         switch(choice) {
             case 1:
                 peer_list();
@@ -1401,6 +1512,68 @@ void menu_manage_peers() {
                 peer_rekey_hubs();
                 break;
             case 6:
+                return;  // Back to main menu
+            default:
+                printf("Invalid choice.\n");
+                break;
+        }
+    }
+}
+
+void menu_manage_peer_config() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║            MANAGE PEER CONFIG                    ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. Set Hub Name\n");
+        printf("  2. Set Bind IP\n");
+        printf("  3. Set Bind Port\n");
+        printf("  4. Manage IP Allowlist\n");
+        printf("  5. Manage IP Denylist\n");
+        printf("  6. Purge Tombstones\n");
+        printf("  7. Export Private Key\n");
+        printf("  8. Export Public Key\n");
+        printf("  9. Back to Main Menu\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1:
+                admin_set_hub_name();
+                break;
+            case 2:
+                admin_set_bind_ip();
+                break;
+            case 3:
+                admin_set_bind_port();
+                break;
+            case 4:
+                menu_manage_allowlist();
+                break;
+            case 5:
+                menu_manage_denylist();
+                break;
+            case 6:
+                admin_purge_tombstones();
+                break;
+            case 7:
+                admin_export_private_key();
+                break;
+            case 8:
+                admin_export_public_key();
+                break;
+            case 9:
                 return;  // Back to main menu
             default:
                 printf("Invalid choice.\n");
@@ -1488,9 +1661,10 @@ int main(int argc, char *argv[]) {
         printf("╚══════════════════════════════════════════════════╝\n");
         printf("\n");
         printf("  1. Manage Bots\n");
-        printf("  2. Manage Peers (Hubs)\n");
-        printf("  3. Admin Commands\n");
-        printf("  4. Exit\n");
+        printf("  2. Manage Peer Connections\n");
+        printf("  3. Manage Peer Config\n");
+        printf("  4. Admin Commands\n");
+        printf("  5. Exit\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1509,14 +1683,18 @@ int main(int argc, char *argv[]) {
                 break;
 
             case 2:
-                menu_manage_peers();
+                menu_manage_peer_connections();
                 break;
 
             case 3:
-                menu_admin_commands();
+                menu_manage_peer_config();
                 break;
 
             case 4:
+                menu_admin_commands();
+                break;
+
+            case 5:
                 printf("\nExiting...\n");
                 secure_wipe(g_key, sizeof(g_key));
                 close(fd);
