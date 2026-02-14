@@ -3914,14 +3914,17 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               snprintf(state->peers[peer_idx].remote_ip,
                       sizeof(state->peers[peer_idx].remote_ip), "%s", client->ip);
 
-              // Update friendly name if provided
-              if (args >= 4 && peer_name[0]) {
+              // Don't overwrite friendly_name from handshake - config is source of truth
+              // Only update if it's currently empty AND handshake provides one
+              if (!state->peers[peer_idx].friendly_name[0] && args >= 4 && peer_name[0]) {
                 snprintf(state->peers[peer_idx].friendly_name,
                         sizeof(state->peers[peer_idx].friendly_name), "%s", peer_name);
               }
 
               snprintf(client->id, sizeof(client->id), "%s",
-                      peer_name[0] ? peer_name : "HUB-PEER");
+                      state->peers[peer_idx].friendly_name[0] ?
+                      state->peers[peer_idx].friendly_name :
+                      (peer_name[0] ? peer_name : "HUB-PEER"));
               client->id[sizeof(client->id) - 1] = 0;
 
               // Send initial sync (existing code)...
