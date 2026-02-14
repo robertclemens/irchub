@@ -1894,15 +1894,13 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
           state->peers[state->peer_count].port = port;
 
           if (uuid[0]) {
-            strncpy(state->peers[state->peer_count].uuid, uuid,
-                   sizeof(state->peers[state->peer_count].uuid) - 1);
-            state->peers[state->peer_count].uuid[sizeof(state->peers[state->peer_count].uuid) - 1] = 0;
+            snprintf(state->peers[state->peer_count].uuid,
+                    sizeof(state->peers[state->peer_count].uuid), "%s", uuid);
           }
 
           if (name[0]) {
-            strncpy(state->peers[state->peer_count].friendly_name, name,
-                   sizeof(state->peers[state->peer_count].friendly_name) - 1);
-            state->peers[state->peer_count].friendly_name[sizeof(state->peers[state->peer_count].friendly_name) - 1] = 0;
+            snprintf(state->peers[state->peer_count].friendly_name,
+                    sizeof(state->peers[state->peer_count].friendly_name), "%s", name);
           }
 
           state->peers[state->peer_count].connected = false;
@@ -1992,10 +1990,10 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     // Add local hub (use actual remote_ip for display if available, else bind_ip)
     snprintf(all_peers[count].ip, 256, "%s", state->bind_ip);
     all_peers[count].port = state->port;
-    strncpy(all_peers[count].uuid, state->hub_uuid, 63);
-    all_peers[count].uuid[63] = 0;
-    strncpy(all_peers[count].friendly_name, state->hub_friendly_name, 63);
-    all_peers[count].friendly_name[63] = 0;
+    strncpy(all_peers[count].uuid, state->hub_uuid, sizeof(all_peers[count].uuid) - 1);
+    all_peers[count].uuid[sizeof(all_peers[count].uuid) - 1] = 0;
+    strncpy(all_peers[count].friendly_name, state->hub_friendly_name, sizeof(all_peers[count].friendly_name) - 1);
+    all_peers[count].friendly_name[sizeof(all_peers[count].friendly_name) - 1] = 0;
     all_peers[count].is_me = true;
     count++;
 
@@ -2005,10 +2003,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                                state->peers[i].remote_ip : state->peers[i].ip;
       snprintf(all_peers[count].ip, 256, "%s", display_ip);
       all_peers[count].port = state->peers[i].port;
-      strncpy(all_peers[count].uuid, state->peers[i].uuid, 63);
-      all_peers[count].uuid[63] = 0;
-      strncpy(all_peers[count].friendly_name, state->peers[i].friendly_name, 63);
-      all_peers[count].friendly_name[63] = 0;
+      snprintf(all_peers[count].uuid, sizeof(all_peers[count].uuid), "%s", state->peers[i].uuid);
+      snprintf(all_peers[count].friendly_name, sizeof(all_peers[count].friendly_name), "%s", state->peers[i].friendly_name);
       all_peers[count].is_me = false;
       count++;
     }
@@ -3859,15 +3855,13 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               state->peers[peer_idx].fd = client->fd;
 
               // Store actual connection IP (from socket)
-              strncpy(state->peers[peer_idx].remote_ip, client->ip,
-                      sizeof(state->peers[peer_idx].remote_ip) - 1);
-              state->peers[peer_idx].remote_ip[sizeof(state->peers[peer_idx].remote_ip) - 1] = 0;
+              snprintf(state->peers[peer_idx].remote_ip,
+                      sizeof(state->peers[peer_idx].remote_ip), "%s", client->ip);
 
               // Update friendly name if provided
               if (args >= 4 && peer_name[0]) {
-                strncpy(state->peers[peer_idx].friendly_name, peer_name,
-                        sizeof(state->peers[peer_idx].friendly_name) - 1);
-                state->peers[peer_idx].friendly_name[sizeof(state->peers[peer_idx].friendly_name) - 1] = 0;
+                snprintf(state->peers[peer_idx].friendly_name,
+                        sizeof(state->peers[peer_idx].friendly_name), "%s", peer_name);
               }
 
               snprintf(client->id, sizeof(client->id), "%s",
