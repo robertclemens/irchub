@@ -602,8 +602,11 @@ void hub_broadcast_mesh_state(hub_state_t *state) {
   int offset = 0;
   int written;
 
-  written = snprintf(payload + offset, MAX_BUFFER - offset, "%s:%d|",
-                     state->bind_ip, state->port);
+  // Format: bind_ip:port:uuid:friendly_name|
+  written = snprintf(payload + offset, MAX_BUFFER - offset, "%s:%d:%s:%s|",
+                     state->bind_ip, state->port,
+                     state->hub_uuid[0] ? state->hub_uuid : "-",
+                     state->hub_friendly_name[0] ? state->hub_friendly_name : "-");
   if (written < 0 || written >= MAX_BUFFER - offset)
     return;
   offset += written;
@@ -621,8 +624,11 @@ void hub_broadcast_mesh_state(hub_state_t *state) {
       }
     }
 
-    written = snprintf(payload + offset, MAX_BUFFER - offset, "%s:%d:%d,",
-                       state->peers[i].ip, state->peers[i].port, is_up);
+    // Format: ip:port:is_up:uuid:friendly_name,
+    written = snprintf(payload + offset, MAX_BUFFER - offset, "%s:%d:%d:%s:%s,",
+                       state->peers[i].ip, state->peers[i].port, is_up,
+                       state->peers[i].uuid[0] ? state->peers[i].uuid : "-",
+                       state->peers[i].friendly_name[0] ? state->peers[i].friendly_name : "-");
     if (written < 0 || written >= MAX_BUFFER - offset)
       break;
     offset += written;
@@ -1987,8 +1993,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     matrix_peer_t all_peers[64];
     int count = 0;
 
-    // Add local hub (use actual remote_ip for display if available, else bind_ip)
-    snprintf(all_peers[count].ip, 256, "%s", state->bind_ip);
+    // Add local hub - show friendly name instead of bind_ip
+    snprintf(all_peers[count].ip, 256, "Local");
     all_peers[count].port = state->port;
     snprintf(all_peers[count].uuid, sizeof(all_peers[count].uuid), "%s", state->hub_uuid);
     snprintf(all_peers[count].friendly_name, sizeof(all_peers[count].friendly_name), "%s", state->hub_friendly_name);
@@ -2017,9 +2023,17 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         snprintf(work_buf, sizeof(work_buf), "%.*s", MAX_BUFFER - 1, body + 1);
         char *saveptr, *block = strtok_r(work_buf, ";", &saveptr);
         while (block) {
-          char owner[256];
+          char owner[256], owner_uuid[64], owner_name[64];
           int o_port;
-          if (sscanf(block, "%255[^:]:%d|", owner, &o_port) == 2) {
+          owner_uuid[0] = 0;
+          owner_name[0] = 0;
+          // Parse: ip:port:uuid:friendly_name|
+          int fields = sscanf(block, "%255[^:]:%d:%63[^:]:%63[^|]|", owner, &o_port, owner_uuid, owner_name);
+          if (fields >= 2) {
+            // Replace "-" placeholders with empty strings
+            if (strcmp(owner_uuid, "-") == 0) owner_uuid[0] = 0;
+            if (strcmp(owner_name, "-") == 0) owner_name[0] = 0;
+
             bool exists = false;
             for (int k = 0; k < count; k++)
               if (all_peers[k].port == o_port &&
@@ -2028,6 +2042,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             if (!exists && count < 64) {
               snprintf(all_peers[count].ip, 256, "%s", owner);
               all_peers[count].port = o_port;
+              snprintf(all_peers[count].uuid, sizeof(all_peers[count].uuid), "%s", owner_uuid);
+              snprintf(all_peers[count].friendly_name, sizeof(all_peers[count].friendly_name), "%s", owner_name);
               all_peers[count].is_me = false;
               count++;
             }
@@ -2035,9 +2051,17 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             if (list) {
               char *t_save, *tok = strtok_r(list + 1, ",", &t_save);
               while (tok) {
-                char t_ip[256];
-                int t_port;
-                if (sscanf(tok, "%255[^:]:%d", t_ip, &t_port) >= 2) {
+                char t_ip[256], t_uuid[64], t_name[64];
+                int t_port, t_up;
+                t_uuid[0] = 0;
+                t_name[0] = 0;
+                // Parse: ip:port:is_up:uuid:friendly_name
+                int t_fields = sscanf(tok, "%255[^:]:%d:%d:%63[^:]:%63s", t_ip, &t_port, &t_up, t_uuid, t_name);
+                if (t_fields >= 2) {
+                  // Replace "-" placeholders with empty strings
+                  if (t_fields >= 4 && strcmp(t_uuid, "-") == 0) t_uuid[0] = 0;
+                  if (t_fields >= 5 && strcmp(t_name, "-") == 0) t_name[0] = 0;
+
                   bool t_exists = false;
                   for (int k = 0; k < count; k++)
                     if (all_peers[k].port == t_port &&
@@ -2046,6 +2070,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                   if (!t_exists && count < 64) {
                     snprintf(all_peers[count].ip, 256, "%s", t_ip);
                     all_peers[count].port = t_port;
+                    snprintf(all_peers[count].uuid, sizeof(all_peers[count].uuid), "%s", t_uuid);
+                    snprintf(all_peers[count].friendly_name, sizeof(all_peers[count].friendly_name), "%s", t_name);
                     all_peers[count].is_me = false;
                     count++;
                   }
