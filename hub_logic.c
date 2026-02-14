@@ -2034,11 +2034,26 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             if (strcmp(owner_uuid, "-") == 0) owner_uuid[0] = 0;
             if (strcmp(owner_name, "-") == 0) owner_name[0] = 0;
 
+            // Skip 0.0.0.0 entries (bind_ip addresses)
+            if (strcmp(owner, "0.0.0.0") == 0)
+              goto skip_owner;
+
             bool exists = false;
-            for (int k = 0; k < count; k++)
-              if (all_peers[k].port == o_port &&
-                  strcmp(all_peers[k].ip, owner) == 0)
+            for (int k = 0; k < count; k++) {
+              // Match by UUID if both have UUIDs (preferred)
+              if (owner_uuid[0] && all_peers[k].uuid[0]) {
+                if (strcmp(all_peers[k].uuid, owner_uuid) == 0) {
+                  exists = true;
+                  break;
+                }
+              }
+              // Fall back to IP:port matching
+              else if (all_peers[k].port == o_port &&
+                       strcmp(all_peers[k].ip, owner) == 0) {
                 exists = true;
+                break;
+              }
+            }
             if (!exists && count < 64) {
               snprintf(all_peers[count].ip, 256, "%s", owner);
               all_peers[count].port = o_port;
@@ -2047,6 +2062,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
               all_peers[count].is_me = false;
               count++;
             }
+            skip_owner:
             char *list = strchr(block, '|');
             if (list) {
               char *t_save, *tok = strtok_r(list + 1, ",", &t_save);
@@ -2062,11 +2078,26 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                   if (t_fields >= 4 && strcmp(t_uuid, "-") == 0) t_uuid[0] = 0;
                   if (t_fields >= 5 && strcmp(t_name, "-") == 0) t_name[0] = 0;
 
+                  // Skip 0.0.0.0 entries (bind_ip addresses)
+                  if (strcmp(t_ip, "0.0.0.0") == 0)
+                    goto skip_peer;
+
                   bool t_exists = false;
-                  for (int k = 0; k < count; k++)
-                    if (all_peers[k].port == t_port &&
-                        strcmp(all_peers[k].ip, t_ip) == 0)
+                  for (int k = 0; k < count; k++) {
+                    // Match by UUID if both have UUIDs (preferred)
+                    if (t_uuid[0] && all_peers[k].uuid[0]) {
+                      if (strcmp(all_peers[k].uuid, t_uuid) == 0) {
+                        t_exists = true;
+                        break;
+                      }
+                    }
+                    // Fall back to IP:port matching
+                    else if (all_peers[k].port == t_port &&
+                             strcmp(all_peers[k].ip, t_ip) == 0) {
                       t_exists = true;
+                      break;
+                    }
+                  }
                   if (!t_exists && count < 64) {
                     snprintf(all_peers[count].ip, 256, "%s", t_ip);
                     all_peers[count].port = t_port;
@@ -2075,6 +2106,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                     all_peers[count].is_me = false;
                     count++;
                   }
+                  skip_peer:
                 }
                 tok = strtok_r(NULL, ",", &t_save);
               }
