@@ -1076,12 +1076,15 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
   buffer[0] = 0;
 
   // 1. Include global entries (c, m, o, a, p)
-  // Note: h/n in global_entries are hub-only local metadata (shouldn't exist here)
+  // Note: h/n/w/x in global_entries are hub-only local metadata
+  // - h/n: hub name/bind settings (shouldn't exist in global_entries)
+  // - w/x: allowlist/denylist (local-only IP access control)
   // Bot-specific h/n (like b|uuid|h|..., b|uuid|n|...) are synced in the bot loop below
   for (int i = 0; i < state->global_entry_count; i++) {
     config_entry_t *e = &state->global_entries[i];
-    // Safety: skip any h/n that ended up in global entries (hub-local metadata)
-    if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0)
+    // Skip local-only configuration: h/n (hub metadata), w/x (allowlist/denylist)
+    if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0 ||
+        strcmp(e->key, "w") == 0 || strcmp(e->key, "x") == 0)
       continue;
     if (max_len - offset <= 1)
       break;
@@ -3248,9 +3251,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         hub_storage_update_global_entry(state, "w", payload, "", "add", now);
         hub_config_write(state);
 
-        char sync_msg[256];
-        snprintf(sync_msg, sizeof(sync_msg), "w|%s|add|%ld\n", payload, (long)now);
-        hub_broadcast_sync_to_peers(state, sync_msg, -1);
+        // NOTE: Allowlist is local-only, do not broadcast to peers
 
         return send_response(state, client, "SUCCESS: IP added to allowlist.");
     }
@@ -3263,9 +3264,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         hub_storage_update_global_entry(state, "w", payload, "", "del", now);
         hub_config_write(state);
 
-        char sync_msg[256];
-        snprintf(sync_msg, sizeof(sync_msg), "w|%s|del|%ld\n", payload, (long)now);
-        hub_broadcast_sync_to_peers(state, sync_msg, -1);
+        // NOTE: Allowlist is local-only, do not broadcast to peers
 
         return send_response(state, client, "SUCCESS: IP removed from allowlist.");
     }
@@ -3321,9 +3320,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         hub_storage_update_global_entry(state, "x", payload, "", "add", now);
         hub_config_write(state);
 
-        char sync_msg[256];
-        snprintf(sync_msg, sizeof(sync_msg), "x|%s|add|%ld\n", payload, (long)now);
-        hub_broadcast_sync_to_peers(state, sync_msg, -1);
+        // NOTE: Denylist is local-only, do not broadcast to peers
 
         return send_response(state, client, "SUCCESS: IP added to denylist.");
     }
@@ -3336,9 +3333,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         hub_storage_update_global_entry(state, "x", payload, "", "del", now);
         hub_config_write(state);
 
-        char sync_msg[256];
-        snprintf(sync_msg, sizeof(sync_msg), "x|%s|del|%ld\n", payload, (long)now);
-        hub_broadcast_sync_to_peers(state, sync_msg, -1);
+        // NOTE: Denylist is local-only, do not broadcast to peers
 
         return send_response(state, client, "SUCCESS: IP removed from denylist.");
     }
