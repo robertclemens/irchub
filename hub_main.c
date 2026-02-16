@@ -388,9 +388,9 @@ int main(int argc, char *argv[]) {
         printf("--- Setup ---\nPort: ");
         if (scanf("%d", &state.port) != 1) return 1;
 
-        printf("Bind IP (default 127.0.0.1): ");
+        printf("Bind IP (default 0.0.0.0): ");
         if (scanf("%63s", state.bind_ip) != 1) {
-            strncpy(state.bind_ip, "127.0.0.1", sizeof(state.bind_ip) - 1);
+            strncpy(state.bind_ip, "0.0.0.0", sizeof(state.bind_ip) - 1);
         }
         state.bind_ip[sizeof(state.bind_ip) - 1] = 0;
 

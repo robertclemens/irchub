@@ -869,7 +869,6 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
   }
 
   hub_log("[HUB] Processing config push from %s\n", client->id);
-  hub_log("[HUB-DEBUG] Received payload:\n%s\n", payload);
 
   char work_buf[MAX_BUFFER];
   strncpy(work_buf, payload, sizeof(work_buf) - 1);
@@ -3910,7 +3909,7 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client) {
     return;
   }
 
-  hub_log("[HUB-SYNC] Sending to %s (%d bytes):\n%s", client->id, len, payload);
+  hub_log("[HUB-SYNC] Sending to %s (%d bytes)\n", client->id, len);
 
   // Send CMD_CONFIG_DATA packet
   unsigned char buffer[MAX_BUFFER];

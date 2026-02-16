@@ -186,13 +186,13 @@ int main(int argc, char *argv[]) {
                 printf("Port: %s\n", val_str);
             }
             else if (strcmp(key_str, "admin") == 0) {
-                printf("Admin Password: %s\n", val_str);
+                printf("Admin Password: [REDACTED]\n");
             }
             else if (strcmp(key_str, "key") == 0) {
-                printf("Private Key (Base64): %.60s...\n", val_str);
+                printf("Private Key (Base64): [REDACTED - %zu chars]\n", strlen(val_str));
             }
             else if (strcmp(key_str, "pub") == 0) {
-                printf("Public Key (Base64): %.60s...\n", val_str);
+                printf("Public Key (Base64): [REDACTED - %zu chars]\n", strlen(val_str));
             }
             else if (strcmp(key_str, "peer") == 0) {
                 printf("Peer: %s\n", val_str);
