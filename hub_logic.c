@@ -1513,20 +1513,67 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                                  now);
         hub_config_write(state);
 
-        // Disconnect bot if currently connected
+        // Check if bot is currently connected
+        hub_client_t *bot_client = NULL;
         for (int i = 0; i < state->client_count; i++) {
           if (state->clients[i]->type == CLIENT_BOT &&
               strcmp(state->clients[i]->id, payload) == 0) {
-            hub_log("[ADMIN] Disconnecting bot %s for rekey\n", payload);
-            hub_disconnect_client(state, state->clients[i]);
+            bot_client = state->clients[i];
             break;
           }
         }
 
-        // Build response: SUCCESS|<nick>|<base64_priv_key>
         char response[8192];
-        snprintf(response, sizeof(response), "SUCCESS|%s|%s", nick,
-                 new_priv_b64);
+
+        if (bot_client && bot_client->authenticated) {
+          // Bot is connected - send new key via secure channel
+          hub_log("[ADMIN] Bot %s is connected, sending key update in real-time\n", payload);
+
+          // Send CMD_BOT_KEY_UPDATE with new private key
+          unsigned char buffer[MAX_BUFFER];
+          unsigned char plain[MAX_BUFFER];
+          unsigned char tag[GCM_TAG_LEN];
+
+          plain[0] = CMD_BOT_KEY_UPDATE;
+          int key_len = strlen(new_priv_b64);
+          uint32_t payload_len = htonl(key_len);
+          memcpy(&plain[1], &payload_len, 4);
+          memcpy(&plain[5], new_priv_b64, key_len);
+
+          int enc_len = aes_gcm_encrypt(plain, 5 + key_len, bot_client->session_key,
+                                        buffer + 4, tag);
+          if (enc_len > 0) {
+            memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+            uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+            memcpy(buffer, &net_len, 4);
+
+            if (write(bot_client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
+              hub_log("[ADMIN] Sent new key to bot %s, disconnecting for reconnect\n", payload);
+
+              // Give bot a moment to process and save the new key
+              usleep(100000); // 100ms delay
+
+              // Now disconnect so bot reconnects with new key
+              hub_disconnect_client(state, bot_client);
+
+              // Build response indicating automatic update
+              snprintf(response, sizeof(response),
+                       "SUCCESS|%s|AUTO-UPDATED (bot was connected)", nick);
+            } else {
+              hub_log("[ADMIN] Failed to send key to bot %s, falling back to manual\n", payload);
+              hub_disconnect_client(state, bot_client);
+              snprintf(response, sizeof(response), "SUCCESS|%s|%s", nick, new_priv_b64);
+            }
+          } else {
+            hub_log("[ADMIN] Encryption failed, falling back to manual key update\n");
+            hub_disconnect_client(state, bot_client);
+            snprintf(response, sizeof(response), "SUCCESS|%s|%s", nick, new_priv_b64);
+          }
+        } else {
+          // Bot is not connected - return key for manual update
+          hub_log("[ADMIN] Bot %s not connected, manual key update required\n", payload);
+          snprintf(response, sizeof(response), "SUCCESS|%s|%s", nick, new_priv_b64);
+        }
 
         // Broadcast sync to peers
         char sync_packet[MAX_BUFFER];

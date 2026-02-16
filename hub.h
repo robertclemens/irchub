@@ -82,6 +82,7 @@
 #define CMD_ADMIN_REKEY_BOT 0x20      // Generate new bot keypair
 #define CMD_ADMIN_DISCONNECT_BOT 0x21 // Force disconnect bot
 #define CMD_ADMIN_BOT_STATUS 0x22     // Get bot connection info
+#define CMD_BOT_KEY_UPDATE 0x40       // Hub -> Bot: New private key update
 
 // Global Config Management Commands
 #define CMD_ADMIN_LIST_CHANNELS 0x23  // List all channels

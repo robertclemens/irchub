@@ -348,55 +348,64 @@ void bot_rekey() {
     if (strncmp(response, "SUCCESS|", 8) == 0) {
         char *nick_start = response + 8;
         char *priv_key = strchr(nick_start, '|');
-        
+
         if (priv_key) {
             *priv_key = 0;
             priv_key++;
-            
+
             char nick[64];
             strncpy(nick, nick_start, sizeof(nick) - 1);
             nick[sizeof(nick) - 1] = '\0';
-            
+
             printf("\n╔══════════════════════════════════════════════════╗\n");
             printf("║              BOT REKEYED SUCCESSFULLY            ║\n");
             printf("╚══════════════════════════════════════════════════╝\n\n");
-            
+
             printf("UUID: %s\n", uuid);
             printf("Nick: %s\n\n", nick);
-            
-            size_t key_len = strlen(priv_key);
-            int total_parts = (key_len + 249) / 250;
-            
-            printf("New private key: %zu chars → %d parts\n\n", key_len, total_parts);
-            printf("COPY AND PASTE THESE COMMANDS:\n");
-            printf("═══════════════════════════════════════════════════\n\n");
-            
-            for (int i = 0; i < total_parts; i++) {
-                size_t start = i * 250;
-                size_t len = (start + 250 > key_len) ? (key_len - start) : 250;
-                
-                char chunk[260];
-                memset(chunk, 0, sizeof(chunk));
-                strncpy(chunk, priv_key + start, len);
-                
-                printf("/msg %s <hash> sethubkey %d/%d:%s\n",
-                       nick, i+1, total_parts, chunk);
+
+            // Check if bot was auto-updated (connected)
+            if (strncmp(priv_key, "AUTO-UPDATED", 12) == 0) {
+                printf("✓ Bot was connected - keys automatically updated!\n");
+                printf("✓ Bot has been disconnected and will reconnect with new keys.\n");
+                printf("✓ No manual intervention required.\n\n");
+            } else {
+                // Manual update required (bot was not connected)
+                size_t key_len = strlen(priv_key);
+                int total_parts = (key_len + 249) / 250;
+
+                printf("⚠ Bot was NOT connected - manual update required.\n\n");
+                printf("New private key: %zu chars → %d parts\n\n", key_len, total_parts);
+                printf("COPY AND PASTE THESE COMMANDS:\n");
+                printf("═══════════════════════════════════════════════════\n\n");
+
+                for (int i = 0; i < total_parts; i++) {
+                    size_t start = i * 250;
+                    size_t len = (start + 250 > key_len) ? (key_len - start) : 250;
+
+                    char chunk[260];
+                    memset(chunk, 0, sizeof(chunk));
+                    strncpy(chunk, priv_key + start, len);
+
+                    printf("/msg %s <hash> sethubkey %d/%d:%s\n",
+                           nick, i+1, total_parts, chunk);
+                }
+
+                printf("\n/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
+
+                printf("═══════════════════════════════════════════════════\n\n");
+
+                // Save new key backup
+                char fname[128];
+                snprintf(fname, sizeof(fname), "bot_%s_priv_key_REKEY.b64", nick);
+                FILE *f = fopen(fname, "w");
+                if (f) {
+                    fprintf(f, "%s\n", priv_key);
+                    fclose(f);
+                    printf("[New key backup: %s]\n\n", fname);
+                }
             }
-            
-            printf("\n/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
-            
-            printf("═══════════════════════════════════════════════════\n\n");
-            
-            // Save new key backup
-            char fname[128];
-            snprintf(fname, sizeof(fname), "bot_%s_priv_key_REKEY.b64", nick);
-            FILE *f = fopen(fname, "w");
-            if (f) {
-                fprintf(f, "%s\n", priv_key);
-                fclose(f);
-                printf("[New key backup: %s]\n\n", fname);
-            }
-            
+
             secure_wipe(response, sizeof(response));
         }
     } else {
