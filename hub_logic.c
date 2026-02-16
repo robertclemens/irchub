@@ -24,6 +24,8 @@ static void broadcast_new_key(hub_state_t *state, const char *new_priv_key, cons
 static void process_mesh_state(hub_state_t *state, hub_client_t *c,
                                char *payload);
 static void process_peer_sync(hub_state_t *state, char *payload, int origin_fd);
+static int hub_execute_purge(hub_state_t *state, const char *days_str,
+                             bool immediate, char *log_out, int log_max_len);
 static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                                  int cmd, char *payload);
 static void process_bot_command(hub_state_t *state, hub_client_t *client,
@@ -1223,6 +1225,35 @@ static void process_peer_sync(hub_state_t *state, char *payload,
   forward_buf[0] = 0;
 
   while (line) {
+    // Check for PURGE command
+    if (strncmp(line, "PURGE|", 6) == 0) {
+      char *payload = line + 6; // Skip "PURGE|"
+      char param[32];
+      long ts;
+      if (sscanf(payload, "%31[^|]|%ld", param, &ts) == 2) {
+        bool immediate = (strcmp(param, "immediate") == 0);
+        hub_log("[MESH] Received PURGE from peer: %s\n",
+                immediate ? "immediate" : param);
+
+        // Execute the purge locally
+        char purge_log[MAX_BUFFER];
+        int purged = hub_execute_purge(state, param, immediate,
+                                        purge_log, sizeof(purge_log));
+
+        if (purged > 0) {
+          hub_log("[MESH] Purged %d entries from peer sync\n", purged);
+          updates += purged;
+
+          // Re-forward to other peers (epidemic broadcast)
+          if (origin_fd != -1) {
+            hub_broadcast_sync_to_peers(state, line, origin_fd);
+          }
+        }
+      }
+      line = strtok_r(NULL, "\n", &saveptr);
+      continue;
+    }
+
     // Check if this is a global entry (format: key|value|timestamp)
     // Global keys: c, m, o, a, p (NOT starting with b|)
     if (strncmp(line, "b|", 2) != 0) {
@@ -1426,6 +1457,95 @@ static void hub_broadcast_config_to_bots(hub_state_t *state,
       send_config_to_bot(state, state->clients[i]);
     }
   }
+}
+
+// Execute tombstone purge (can be called manually or by scheduler)
+static int hub_execute_purge(hub_state_t *state, const char *days_str,
+                             bool immediate, char *log_out, int log_max_len) {
+  int days = 30;
+
+  if (!immediate && days_str && strlen(days_str) > 0) {
+    days = atoi(days_str);
+    if (days <= 0) days = 30;
+  }
+
+  time_t now = time(NULL);
+  time_t cutoff = now - (days * 24 * 60 * 60);
+  int purged_count = 0;
+  int log_offset = 0;
+
+  if (log_out && log_max_len > 0) {
+    log_out[0] = '\0';
+  }
+
+  // Create a new global_entries array without tombstoned items
+  config_entry_t new_entries[MAX_BOT_ENTRIES];
+  int new_count = 0;
+
+  for (int i = 0; i < state->global_entry_count; i++) {
+    bool is_tombstone = false;
+    char op[16] = "";
+
+    // Check if this entry is tombstoned (op="del")
+    if (strcmp(state->global_entries[i].key, "c") == 0 ||
+        strcmp(state->global_entries[i].key, "o") == 0) {
+      // Format: value|extra|op
+      char temp_val[1024], temp_extra[256], temp_op[16];
+      if (sscanf(state->global_entries[i].value, "%1023[^|]|%255[^|]|%15s",
+                 temp_val, temp_extra, temp_op) == 3) {
+        snprintf(op, sizeof(op), "%s", temp_op);
+        if (strcmp(op, "del") == 0) {
+          is_tombstone = true;
+        }
+      }
+    } else if (strcmp(state->global_entries[i].key, "m") == 0) {
+      // Format: value|op
+      char temp_val[256], temp_op[16];
+      if (sscanf(state->global_entries[i].value, "%255[^|]|%15s",
+                 temp_val, temp_op) == 2) {
+        snprintf(op, sizeof(op), "%s", temp_op);
+        if (strcmp(op, "del") == 0) {
+          is_tombstone = true;
+        }
+      }
+    }
+
+    // Decide whether to purge this entry
+    if (is_tombstone && (immediate || state->global_entries[i].timestamp < cutoff)) {
+      purged_count++;
+      if (log_out && log_max_len > 0) {
+        int written = snprintf(log_out + log_offset, log_max_len - log_offset,
+                               "  Purged: %s|%s\n",
+                               state->global_entries[i].key,
+                               state->global_entries[i].value);
+        if (written > 0 && written < (log_max_len - log_offset)) {
+          log_offset += written;
+        }
+      }
+    } else {
+      // Keep this entry
+      if (new_count < MAX_BOT_ENTRIES) {
+        memcpy(&new_entries[new_count], &state->global_entries[i], sizeof(config_entry_t));
+        new_count++;
+      }
+    }
+  }
+
+  // Update state with new entries
+  memcpy(state->global_entries, new_entries, sizeof(config_entry_t) * new_count);
+  state->global_entry_count = new_count;
+
+  // Write config to disk
+  hub_config_write(state);
+
+  // Broadcast purge to bots so they can purge their local copies
+  char purge_msg[256];
+  snprintf(purge_msg, sizeof(purge_msg), "PURGE|%s|%ld\n",
+           immediate ? "immediate" : (days_str ? days_str : "30"), (long)now);
+  hub_broadcast_config_to_bots(state, purge_msg);
+  hub_broadcast_sync_to_peers(state, purge_msg, -1);
+
+  return purged_count;
 }
 
 static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
@@ -3097,88 +3217,15 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
   case CMD_ADMIN_PURGE_TOMBSTONES: {
     // Parse payload: "immediate" or number of days (default 30)
-    int days = 30;
     bool immediate = false;
-
-    if (payload && strlen(payload) > 0) {
-      if (strcmp(payload, "immediate") == 0) {
-        immediate = true;
-      } else {
-        days = atoi(payload);
-        if (days <= 0) days = 30;
-      }
+    if (payload && strlen(payload) > 0 && strcmp(payload, "immediate") == 0) {
+      immediate = true;
     }
 
-    time_t now = time(NULL);
-    time_t cutoff = now - (days * 24 * 60 * 60);
-    int purged_count = 0;
-    char purge_log[MAX_BUFFER] = "";
-    int log_offset = 0;
-
-    // Create a new global_entries array without tombstoned items
-    config_entry_t new_entries[MAX_BOT_ENTRIES];
-    int new_count = 0;
-
-    for (int i = 0; i < state->global_entry_count; i++) {
-      bool is_tombstone = false;
-      char op[16] = "";
-
-      // Check if this entry is tombstoned (op="del")
-      if (strcmp(state->global_entries[i].key, "c") == 0 ||
-          strcmp(state->global_entries[i].key, "o") == 0) {
-        // Format: value|extra|op
-        char temp_val[1024], temp_extra[256], temp_op[16];
-        if (sscanf(state->global_entries[i].value, "%1023[^|]|%255[^|]|%15s",
-                   temp_val, temp_extra, temp_op) == 3) {
-          snprintf(op, sizeof(op), "%s", temp_op);
-          if (strcmp(op, "del") == 0) {
-            is_tombstone = true;
-          }
-        }
-      } else if (strcmp(state->global_entries[i].key, "m") == 0) {
-        // Format: value|op
-        char temp_val[256], temp_op[16];
-        if (sscanf(state->global_entries[i].value, "%255[^|]|%15s",
-                   temp_val, temp_op) == 2) {
-          snprintf(op, sizeof(op), "%s", temp_op);
-          if (strcmp(op, "del") == 0) {
-            is_tombstone = true;
-          }
-        }
-      }
-
-      // Decide whether to purge this entry
-      if (is_tombstone && (immediate || state->global_entries[i].timestamp < cutoff)) {
-        purged_count++;
-        int written = snprintf(purge_log + log_offset, sizeof(purge_log) - log_offset,
-                               "  Purged: %s|%s\n",
-                               state->global_entries[i].key,
-                               state->global_entries[i].value);
-        if (written > 0 && written < (int)(sizeof(purge_log) - log_offset)) {
-          log_offset += written;
-        }
-      } else {
-        // Keep this entry
-        if (new_count < MAX_BOT_ENTRIES) {
-          memcpy(&new_entries[new_count], &state->global_entries[i], sizeof(config_entry_t));
-          new_count++;
-        }
-      }
-    }
-
-    // Update state with new entries
-    memcpy(state->global_entries, new_entries, sizeof(config_entry_t) * new_count);
-    state->global_entry_count = new_count;
-
-    // Write config to disk
-    hub_config_write(state);
-
-    // Broadcast purge to bots so they can purge their local copies
-    char purge_msg[256];
-    snprintf(purge_msg, sizeof(purge_msg), "PURGE|%s|%ld\n",
-             immediate ? "immediate" : payload, (long)now);
-    hub_broadcast_config_to_bots(state, purge_msg);
-    hub_broadcast_sync_to_peers(state, purge_msg, -1);
+    // Execute purge using extracted function
+    char purge_log[MAX_BUFFER];
+    int purged_count = hub_execute_purge(state, payload, immediate,
+                                          purge_log, sizeof(purge_log));
 
     // Send response
     if (purged_count > 0) {
@@ -3195,6 +3242,27 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     }
 
     return send_response(state, client, response);
+  }
+
+  case CMD_ADMIN_SET_PURGE_DAYS: {
+    if (payload && strlen(payload) > 0) {
+      int days = atoi(payload);
+      if (days < 0) days = 0;  // 0 = disabled
+
+      state->purge_days_setting = days;
+      hub_config_write(state);
+
+      if (days > 0) {
+        snprintf(response, sizeof(response),
+                 "SUCCESS: Automatic purge enabled (purge tombstones older than %d days, runs daily)",
+                 days);
+      } else {
+        snprintf(response, sizeof(response),
+                 "SUCCESS: Automatic purge disabled");
+      }
+      return send_response(state, client, response);
+    }
+    return send_response(state, client, "ERROR: Missing days parameter (use 0 to disable)");
   }
 
   case CMD_ADMIN_SET_BIND_IP: {

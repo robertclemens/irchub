@@ -39,6 +39,7 @@
 #define MAX_PENDING_OP_REQUESTS 50
 #define PBKDF2_ITERATIONS 100000 // NEW: For password-based key derivation
 #define HUB_PID_FILE ".irchub.pid"
+#define HUB_CONFIG_PURGE_DAYS_KEY "purge_days"
 
 // Rate Limiting Settings
 #define MAX_IP_RATE_LIMITS 500
@@ -108,6 +109,7 @@
 
 // Tombstone Purge Commands
 #define CMD_ADMIN_PURGE_TOMBSTONES 0x36 // Purge tombstoned entries (payload: days or "immediate")
+#define CMD_ADMIN_SET_PURGE_DAYS 0x41   // Configure automatic purge (payload: days, 0=disabled)
 
 // Bind IP and IP Access Control Commands
 #define CMD_ADMIN_SET_BIND_IP 0x37
@@ -239,6 +241,7 @@ typedef struct {
   ip_rate_limit_t ip_limits[MAX_IP_RATE_LIMITS];
   int ip_limits_count;
 
+  int purge_days_setting;  // Days threshold for tombstone purge (0 = disabled)
   int pid_fd;  // File descriptor for PID file lock
   volatile bool running;
 } hub_state_t;
@@ -288,6 +291,9 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
                               char *buffer, int max_len);
 void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
                                  int exclude_fd);
+
+int hub_execute_purge(hub_state_t *state, const char *days_str,
+                      bool immediate, char *log_out, int log_max_len);
 
 bool hub_handle_client_data(hub_state_t *state, hub_client_t *client);
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c);

@@ -255,6 +255,30 @@ void hub_maintenance(hub_state_t *state) {
         last_ip_cleanup = now;
     }
 
+    // Scheduled tombstone purge (if configured)
+    static time_t last_purge = 0;
+    if (state->purge_days_setting > 0) {
+        if (last_purge == 0) last_purge = now;
+
+        // Run daily (86400 seconds)
+        if (now - last_purge > 86400) {
+            last_purge = now;
+            hub_log("[HUB] Running scheduled purge (older than %d days)\n",
+                    state->purge_days_setting);
+
+            char days_str[16];
+            snprintf(days_str, sizeof(days_str), "%d", state->purge_days_setting);
+            char purge_log[MAX_BUFFER];
+
+            int purged = hub_execute_purge(state, days_str, false,
+                                            purge_log, sizeof(purge_log));
+
+            if (purged > 0) {
+                hub_log("[HUB] Scheduled purge removed %d tombstones\n", purged);
+            }
+        }
+    }
+
     // Existing timeout/ping code...
     for (int i = 0; i < state->client_count; i++) {
         hub_client_t *c = state->clients[i];

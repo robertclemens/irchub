@@ -59,6 +59,11 @@ void hub_config_write(hub_state_t *state) {
   SAFE_WRITE("hub_name|%s\n", state->hub_friendly_name[0] ? state->hub_friendly_name : "");
   SAFE_WRITE("admin|%s\n", state->admin_password);
 
+  // Write purge_days setting (only if enabled)
+  if (state->purge_days_setting > 0) {
+    SAFE_WRITE("purge_days|%d\n", state->purge_days_setting);
+  }
+
   for (int i = 0; i < state->peer_count; i++) {
     SAFE_WRITE("peer|%s|%d|%s|%s\n", state->peers[i].ip, state->peers[i].port,
                state->peers[i].uuid[0] ? state->peers[i].uuid : "",
@@ -326,6 +331,9 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       } else if (strcmp(k, "admin") == 0) {
         strncpy(state->admin_password, v, sizeof(state->admin_password) - 1);
         state->admin_password[sizeof(state->admin_password) - 1] = 0;
+      } else if (strcmp(k, "purge_days") == 0) {
+        state->purge_days_setting = atoi(v);
+        if (state->purge_days_setting < 0) state->purge_days_setting = 0;
       } else if (strcmp(k, "key") == 0) {
         int out;
         unsigned char *d = base64_decode(v, &out);

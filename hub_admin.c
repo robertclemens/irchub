@@ -905,6 +905,44 @@ void admin_purge_tombstones() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
+void admin_configure_auto_purge() {
+    char response[MAX_BUFFER];
+    char days_input[10];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("         CONFIGURE AUTOMATIC PURGE\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Configure automatic daily purging of old tombstones.\n");
+    printf("Tombstones are deleted channels, masks, and opers.\n\n");
+    printf("Enter number of days (tombstones older than this\n");
+    printf("will be purged daily), or 0 to disable:\n\n");
+
+    get_input("Days (0 to disable): ", days_input, sizeof(days_input));
+    int days = atoi(days_input);
+
+    if (days < 0) {
+        printf("Invalid input. Must be 0 or positive number.\n");
+        printf("\nPress Enter to continue...");
+        fflush(stdout);
+        char dummy[10];
+        wait_for_input_or_socket(dummy, sizeof(dummy));
+        return;
+    }
+
+    char payload[16];
+    snprintf(payload, sizeof(payload), "%d", days);
+
+    printf("\n[*] Sending configuration to hub...\n");
+    send_packet(g_fd, CMD_ADMIN_SET_PURGE_DAYS, payload, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\nHub Response:\n%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
 void admin_list_allowlist() {
     char response[MAX_BUFFER];
 
@@ -1542,9 +1580,10 @@ void menu_manage_peer_config() {
         printf("  4. Manage IP Allowlist\n");
         printf("  5. Manage IP Denylist\n");
         printf("  6. Purge Tombstones\n");
-        printf("  7. Export Private Key\n");
-        printf("  8. Export Public Key\n");
-        printf("  9. Back to Main Menu\n");
+        printf("  7. Configure Automatic Purge\n");
+        printf("  8. Export Private Key\n");
+        printf("  9. Export Public Key\n");
+        printf(" 10. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1577,12 +1616,15 @@ void menu_manage_peer_config() {
                 admin_purge_tombstones();
                 break;
             case 7:
-                admin_export_private_key();
+                admin_configure_auto_purge();
                 break;
             case 8:
-                admin_export_public_key();
+                admin_export_private_key();
                 break;
             case 9:
+                admin_export_public_key();
+                break;
+            case 10:
                 return;  // Back to main menu
             default:
                 printf("Invalid choice.\n");
