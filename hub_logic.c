@@ -24,8 +24,8 @@ static void broadcast_new_key(hub_state_t *state, const char *new_priv_key, cons
 static void process_mesh_state(hub_state_t *state, hub_client_t *c,
                                char *payload);
 static void process_peer_sync(hub_state_t *state, char *payload, int origin_fd);
-static int hub_execute_purge(hub_state_t *state, const char *days_str,
-                             bool immediate, char *log_out, int log_max_len);
+int hub_execute_purge(hub_state_t *state, const char *days_str,
+                      bool immediate, char *log_out, int log_max_len);
 static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                                  int cmd, char *payload);
 static void process_bot_command(hub_state_t *state, hub_client_t *client,
@@ -1460,8 +1460,8 @@ static void hub_broadcast_config_to_bots(hub_state_t *state,
 }
 
 // Execute tombstone purge (can be called manually or by scheduler)
-static int hub_execute_purge(hub_state_t *state, const char *days_str,
-                             bool immediate, char *log_out, int log_max_len) {
+int hub_execute_purge(hub_state_t *state, const char *days_str,
+                      bool immediate, char *log_out, int log_max_len) {
   int days = 30;
 
   if (!immediate && days_str && strlen(days_str) > 0) {
