@@ -20,7 +20,7 @@ void hub_broadcast_mesh_state(hub_state_t *state);
 static void add_pending_bot(hub_state_t *state, const char *uuid,
                             const char *ip);
 static void remove_pending_bot(hub_state_t *state, const char *uuid);
-static void broadcast_new_key(hub_state_t *state, const char *new_pub_key);
+static void broadcast_new_key(hub_state_t *state, const char *new_priv_key, const char *new_pub_key);
 static void process_mesh_state(hub_state_t *state, hub_client_t *c,
                                char *payload);
 static void process_peer_sync(hub_state_t *state, char *payload, int origin_fd);
@@ -538,24 +538,36 @@ static void remove_pending_bot(hub_state_t *state, const char *uuid) {
   }
 }
 
-static void broadcast_new_key(hub_state_t *state, const char *new_pub_key) {
+static void broadcast_new_key(hub_state_t *state, const char *new_priv_key, const char *new_pub_key) {
   unsigned char buffer[MAX_BUFFER];
   unsigned char tag[GCM_TAG_LEN];
   unsigned char plain[MAX_BUFFER];
 
+  // Combine private and public keys in payload: "PRIVKEY|||PUBKEY"
+  // Using ||| as delimiter since PEM keys contain single | in base64
+  char combined_payload[MAX_BUFFER];
+  int written = snprintf(combined_payload, sizeof(combined_payload), "%s|||%s", new_priv_key, new_pub_key);
+  if (written < 0 || written >= (int)sizeof(combined_payload)) {
+    hub_log("[HUB] ERROR: Combined key payload too large for buffer\n");
+    return;
+  }
+
   plain[0] = CMD_UPDATE_PUBKEY;
-  int payload_len = strlen(new_pub_key);
+  int payload_len = strlen(combined_payload);
   if (payload_len > (MAX_BUFFER - 10))
     return;
 
   memcpy(&plain[1], &payload_len, 4);
-  memcpy(&plain[5], new_pub_key, payload_len);
+  memcpy(&plain[5], combined_payload, payload_len);
   int total_plain = 1 + 4 + payload_len;
 
-  int sent_count = 0;
+  int hub_count = 0;
+
+  // Send both private and public keys to peer hubs (they share the same keys for hub-to-hub auth)
+  // Do NOT send to bots - they have their own individual keypairs
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
-    if (c->authenticated && c->type == CLIENT_BOT) {
+    if (c->authenticated && c->type == CLIENT_HUB) {
       int enc_len =
           aes_gcm_encrypt(plain, total_plain, c->session_key, buffer + 4, tag);
       if (enc_len > 0) {
@@ -565,12 +577,12 @@ static void broadcast_new_key(hub_state_t *state, const char *new_pub_key) {
         memcpy(buffer, &net_len, 4);
 
         if (write(c->fd, buffer, 4 + packet_len) == (4 + packet_len)) {
-          sent_count++;
+          hub_count++;
         }
       }
     }
   }
-  hub_log("[HUB] Broadcasted new key to %d bots.\n", sent_count);
+  hub_log("[HUB] Broadcasted new private and public keys to %d peer hubs for rekey.\n", hub_count);
 }
 
 static void hub_state_add_bot_memory(hub_state_t *state, const char *uuid,
@@ -1809,7 +1821,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   case CMD_ADMIN_REGEN_KEYS: {
     char *priv = NULL, *pub = NULL;
     if (hub_crypto_generate_keypair(&priv, &pub)) {
-      broadcast_new_key(state, pub);
+      // Send new private and public keys to all peer hubs (they share the same keys)
+      broadcast_new_key(state, priv, pub);
 
       if (state->private_key_pem) {
         secure_wipe(state->private_key_pem, strlen(state->private_key_pem));
@@ -1824,6 +1837,18 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       state->public_key_pem = pub;
       state->priv_key = load_private_key_from_memory(priv);
       hub_config_write(state);
+
+      // Disconnect all peer hubs so they reconnect with new keys
+      int disconnected = 0;
+      for (int i = 0; i < state->client_count; i++) {
+        if (state->clients[i]->type == CLIENT_HUB) {
+          hub_log("[HUB] Disconnecting peer hub %s for rekey\n", state->clients[i]->ip);
+          hub_disconnect_client(state, state->clients[i]);
+          disconnected++;
+          i--; // Adjust index since client_count decreased
+        }
+      }
+      hub_log("[HUB] Disconnected %d peer hubs for rekey\n", disconnected);
 
       time_t now = time(NULL);
       struct tm *t = localtime(&now);
@@ -4338,6 +4363,70 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 process_forward_op_grant(state, client, payload_ptr);
               } else if (cmd == CMD_OP_FORWARD_FAILED) {
                 process_forward_op_failed(state, client, payload_ptr);
+              } else if (cmd == CMD_UPDATE_PUBKEY) {
+                // Peer hub sent us the new shared private and public keys after rekey
+                // Payload format: "PRIVKEY|||PUBKEY"
+                if (payload_ptr && strlen(payload_ptr) > 0) {
+                  hub_log("[HUB] Received key update from peer %s\n", client->ip);
+
+                  // Parse the combined payload
+                  char *separator = strstr(payload_ptr, "|||");
+                  if (separator) {
+                    // Split into private and public keys
+                    size_t priv_len = separator - payload_ptr;
+                    char *new_priv_pem = malloc(priv_len + 1);
+                    char *new_pub_pem = strdup(separator + 3); // Skip "|||"
+
+                    if (new_priv_pem && new_pub_pem) {
+                      memcpy(new_priv_pem, payload_ptr, priv_len);
+                      new_priv_pem[priv_len] = '\0';
+
+                      // Validate the new private key
+                      EVP_PKEY *new_pkey = load_private_key_from_memory(new_priv_pem);
+                      if (new_pkey) {
+                        // Save the new private and public keys
+                        if (state->private_key_pem) {
+                          secure_wipe(state->private_key_pem, strlen(state->private_key_pem));
+                          free(state->private_key_pem);
+                        }
+                        if (state->public_key_pem) {
+                          free(state->public_key_pem);
+                        }
+                        if (state->priv_key) {
+                          EVP_PKEY_free(state->priv_key);
+                        }
+
+                        state->private_key_pem = new_priv_pem;
+                        state->public_key_pem = new_pub_pem;
+                        state->priv_key = new_pkey;
+                        hub_config_write(state);
+
+                        hub_log("[HUB] Updated private and public keys from peer rekey, disconnecting all peers\n");
+
+                        // Disconnect all peer hubs so they reconnect with new keys
+                        for (int i = 0; i < state->client_count; i++) {
+                          if (state->clients[i]->type == CLIENT_HUB) {
+                            hub_disconnect_client(state, state->clients[i]);
+                            i--; // Adjust index since client_count decreased
+                          }
+                        }
+
+                        return false;
+                      } else {
+                        hub_log("[HUB] Failed to load new private key from peer %s\n", client->ip);
+                        secure_wipe(new_priv_pem, strlen(new_priv_pem));
+                        free(new_priv_pem);
+                        free(new_pub_pem);
+                      }
+                    } else {
+                      hub_log("[HUB] Failed to allocate memory for keys\n");
+                      if (new_priv_pem) free(new_priv_pem);
+                      if (new_pub_pem) free(new_pub_pem);
+                    }
+                  } else {
+                    hub_log("[HUB] Invalid key update format from peer %s\n", client->ip);
+                  }
+                }
               }
             }
           }
