@@ -106,6 +106,7 @@
 #define CMD_OP_FORWARD_REQUEST 0x33 // Hub -> Hub: Forward OP request to peer
 #define CMD_OP_FORWARD_GRANT 0x34   // Hub -> Hub: Forward grant response back
 #define CMD_OP_FORWARD_FAILED 0x35  // Hub -> Hub: Forward failure back
+#define CMD_PEER_REKEY_BOT 0x42     // Hub -> Hub: Forward bot rekey to peer
 
 // Tombstone Purge Commands
 #define CMD_ADMIN_PURGE_TOMBSTONES 0x36 // Purge tombstoned entries (payload: days or "immediate")

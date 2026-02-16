@@ -1633,13 +1633,62 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                                  now);
         hub_config_write(state);
 
-        // Check if bot is currently connected
+        // Check if bot is currently connected to THIS hub
         hub_client_t *bot_client = NULL;
         for (int i = 0; i < state->client_count; i++) {
           if (state->clients[i]->type == CLIENT_BOT &&
               strcmp(state->clients[i]->id, payload) == 0) {
             bot_client = state->clients[i];
             break;
+          }
+        }
+
+        // Check if bot is connected to a REMOTE peer by checking gossip
+        bool bot_on_remote_peer = false;
+        int remote_peer_fd = -1;
+        if (!bot_client) {
+          for (int p = 0; p < state->peer_count; p++) {
+            if (state->peers[p].connected &&
+                strlen(state->peers[p].last_gossip) > 0) {
+              // Parse gossip format: connected:total:count:uuid_list|...
+              char *colon3 = strchr(state->peers[p].last_gossip, ':');
+              if (colon3) {
+                colon3 = strchr(colon3 + 1, ':');
+                if (colon3) {
+                  colon3 = strchr(colon3 + 1, ':');
+                  if (colon3) {
+                    // Found third colon, now extract UUID list
+                    char *pipe = strchr(colon3 + 1, '|');
+                    if (pipe) {
+                      char uuid_list[MAX_BUFFER];
+                      int list_len = pipe - (colon3 + 1);
+                      if (list_len > 0 && list_len < (int)sizeof(uuid_list)) {
+                        memcpy(uuid_list, colon3 + 1, list_len);
+                        uuid_list[list_len] = '\0';
+
+                        // Check if this bot's UUID is in the list
+                        if (strcmp(uuid_list, "-") != 0) {
+                          // Check for exact match or as part of comma-separated list
+                          if (strstr(uuid_list, payload) != NULL) {
+                            bot_on_remote_peer = true;
+                            // Find the actual client connection for this peer
+                            for (int c = 0; c < state->client_count; c++) {
+                              if (state->clients[c]->type == CLIENT_HUB &&
+                                  state->clients[c]->authenticated &&
+                                  strcmp(state->clients[c]->ip, state->peers[p].ip) == 0) {
+                                remote_peer_fd = state->clients[c]->fd;
+                                break;
+                              }
+                            }
+                            break;
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
 
@@ -1689,6 +1738,62 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             hub_log("[ADMIN] Encryption failed, falling back to manual key update\n");
             hub_disconnect_client(state, bot_client);
             snprintf(response, sizeof(response), "SUCCESS|%s|%s", nick, new_priv_b64);
+          }
+        } else if (bot_on_remote_peer && remote_peer_fd != -1) {
+          // Bot is connected to a remote peer - forward rekey to that peer
+          hub_log("[ADMIN] Bot %s is connected to remote peer, forwarding rekey\n", payload);
+
+          // Send CMD_PEER_REKEY_BOT to the peer hub
+          // Payload format: bot_uuid|new_priv_b64
+          char forward_payload[MAX_BUFFER];
+          int forward_len = snprintf(forward_payload, sizeof(forward_payload), "%s|%s", payload, new_priv_b64);
+          if (forward_len < 0 || forward_len >= (int)sizeof(forward_payload)) {
+            hub_log("[ADMIN] Rekey forward payload too large\n");
+            snprintf(response, sizeof(response), "SUCCESS|%s|%s", nick, new_priv_b64);
+          } else {
+            unsigned char forward_buffer[MAX_BUFFER];
+            unsigned char forward_plain[MAX_BUFFER];
+            unsigned char forward_tag[GCM_TAG_LEN];
+
+            forward_plain[0] = CMD_PEER_REKEY_BOT;
+            uint32_t fwd_payload_len = htonl(forward_len);
+            memcpy(&forward_plain[1], &fwd_payload_len, 4);
+            memcpy(&forward_plain[5], forward_payload, forward_len);
+
+            // Find the peer hub client to get its session key
+            hub_client_t *peer_hub = NULL;
+            for (int c = 0; c < state->client_count; c++) {
+              if (state->clients[c]->fd == remote_peer_fd) {
+                peer_hub = state->clients[c];
+                break;
+              }
+            }
+
+            if (peer_hub) {
+              int fwd_enc_len = aes_gcm_encrypt(forward_plain, 5 + forward_len,
+                                                peer_hub->session_key,
+                                                forward_buffer + 4, forward_tag);
+              if (fwd_enc_len > 0) {
+                memcpy(forward_buffer + 4 + fwd_enc_len, forward_tag, GCM_TAG_LEN);
+                uint32_t fwd_net_len = htonl(fwd_enc_len + GCM_TAG_LEN);
+                memcpy(forward_buffer, &fwd_net_len, 4);
+
+                if (write(remote_peer_fd, forward_buffer, 4 + fwd_enc_len + GCM_TAG_LEN) > 0) {
+                  hub_log("[ADMIN] Forwarded rekey to peer hub for bot %s\n", payload);
+                  snprintf(response, sizeof(response),
+                           "SUCCESS|%s|AUTO-UPDATED (bot connected to peer hub)", nick);
+                } else {
+                  hub_log("[ADMIN] Failed to forward rekey to peer, falling back to manual\n");
+                  snprintf(response, sizeof(response), "SUCCESS|%s|%s", nick, new_priv_b64);
+                }
+              } else {
+                hub_log("[ADMIN] Failed to encrypt forward payload\n");
+                snprintf(response, sizeof(response), "SUCCESS|%s|%s", nick, new_priv_b64);
+              }
+            } else {
+              hub_log("[ADMIN] Could not find peer hub client\n");
+              snprintf(response, sizeof(response), "SUCCESS|%s|%s", nick, new_priv_b64);
+            }
           }
         } else {
           // Bot is not connected - return key for manual update
@@ -4480,6 +4585,67 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 process_forward_op_grant(state, client, payload_ptr);
               } else if (cmd == CMD_OP_FORWARD_FAILED) {
                 process_forward_op_failed(state, client, payload_ptr);
+              } else if (cmd == CMD_PEER_REKEY_BOT) {
+                // Peer hub is forwarding a bot rekey request to us
+                // Payload format: bot_uuid|new_priv_b64
+                if (payload_ptr && strlen(payload_ptr) > 0) {
+                  char bot_uuid[64];
+                  char *pipe = strchr(payload_ptr, '|');
+                  if (pipe && (pipe - payload_ptr) < 64) {
+                    memcpy(bot_uuid, payload_ptr, pipe - payload_ptr);
+                    bot_uuid[pipe - payload_ptr] = '\0';
+                    char *new_priv_b64 = pipe + 1;
+
+                    hub_log("[HUB] Received rekey forward for bot %s from peer %s\n", bot_uuid, client->ip);
+
+                    // Find the bot client connected to THIS hub
+                    hub_client_t *bot_client = NULL;
+                    for (int i = 0; i < state->client_count; i++) {
+                      if (state->clients[i]->type == CLIENT_BOT &&
+                          strcmp(state->clients[i]->id, bot_uuid) == 0 &&
+                          state->clients[i]->authenticated) {
+                        bot_client = state->clients[i];
+                        break;
+                      }
+                    }
+
+                    if (bot_client) {
+                      // Send CMD_BOT_KEY_UPDATE to the bot
+                      unsigned char buffer[MAX_BUFFER];
+                      unsigned char plain[MAX_BUFFER];
+                      unsigned char tag[GCM_TAG_LEN];
+
+                      plain[0] = CMD_BOT_KEY_UPDATE;
+                      int key_len = strlen(new_priv_b64);
+                      uint32_t payload_len = htonl(key_len);
+                      memcpy(&plain[1], &payload_len, 4);
+                      memcpy(&plain[5], new_priv_b64, key_len);
+
+                      int enc_len = aes_gcm_encrypt(plain, 5 + key_len, bot_client->session_key,
+                                                    buffer + 4, tag);
+                      if (enc_len > 0) {
+                        memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+                        uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+                        memcpy(buffer, &net_len, 4);
+
+                        if (write(bot_client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
+                          hub_log("[HUB] Sent forwarded rekey to bot %s, disconnecting\n", bot_uuid);
+
+                          // Give bot a moment to process and save the new key
+                          struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000}; // 100ms
+                          nanosleep(&delay, NULL);
+
+                          // Disconnect so bot reconnects with new key
+                          hub_disconnect_client(state, bot_client);
+                        } else {
+                          hub_log("[HUB] Failed to send forwarded rekey to bot %s\n", bot_uuid);
+                        }
+                      }
+                    } else {
+                      hub_log("[HUB] Bot %s not connected to this hub (peer forwarding miss)\n", bot_uuid);
+                    }
+                  }
+                }
               } else if (cmd == CMD_UPDATE_PUBKEY) {
                 // Peer hub sent us the new shared private and public keys after rekey
                 // Payload format: "PRIVKEY|||PUBKEY"
