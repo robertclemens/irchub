@@ -2511,7 +2511,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
     // CRITICAL FIX: Add overflow check
     written = snprintf(response + offset, sizeof(response) - offset,
-                       " Mesh State   | Bots |\n");
+                       " Mesh State    | Bots |\n");
     if (written < 0 || written >= (int)(sizeof(response) - offset)) {
       return send_response(state, client, "ERROR: Response buffer overflow");
     }
