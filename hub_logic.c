@@ -1671,7 +1671,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
               hub_log("[ADMIN] Sent new key to bot %s, disconnecting for reconnect\n", payload);
 
               // Give bot a moment to process and save the new key
-              usleep(100000); // 100ms delay
+              struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000}; // 100ms
+              nanosleep(&delay, NULL);
 
               // Now disconnect so bot reconnects with new key
               hub_disconnect_client(state, bot_client);
@@ -3223,17 +3224,18 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     }
 
     // Execute purge using extracted function
-    char purge_log[MAX_BUFFER];
+    // Use smaller buffer for log to ensure response won't overflow
+    char purge_log[MAX_BUFFER / 2];
     int purged_count = hub_execute_purge(state, payload, immediate,
                                           purge_log, sizeof(purge_log));
 
     // Send response
     if (purged_count > 0) {
       snprintf(response, sizeof(response),
-               "SUCCESS: Purged %d tombstoned entries (%s)\n%s",
+               "SUCCESS: Purged %d tombstoned entries (%s)\n%.*s",
                purged_count, immediate ? "immediate" :
                (payload && strlen(payload) > 0 ? payload : "30 days"),
-               purge_log);
+               (int)(sizeof(response) - 100), purge_log);
     } else {
       snprintf(response, sizeof(response),
                "No tombstoned entries found to purge (%s)",
