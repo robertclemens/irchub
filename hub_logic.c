@@ -1484,29 +1484,16 @@ int hub_execute_purge(hub_state_t *state, const char *days_str,
 
   for (int i = 0; i < state->global_entry_count; i++) {
     bool is_tombstone = false;
-    char op[16] = "";
 
-    // Check if this entry is tombstoned (op="del")
+    // Check if this entry is tombstoned by inspecting the last pipe-delimited
+    // field. Using strrchr avoids sscanf's inability to match empty fields,
+    // which breaks detection of channel tombstones stored as "name||del".
     if (strcmp(state->global_entries[i].key, "c") == 0 ||
+        strcmp(state->global_entries[i].key, "m") == 0 ||
         strcmp(state->global_entries[i].key, "o") == 0) {
-      // Format: value|extra|op
-      char temp_val[1024], temp_extra[256], temp_op[16];
-      if (sscanf(state->global_entries[i].value, "%1023[^|]|%255[^|]|%15s",
-                 temp_val, temp_extra, temp_op) == 3) {
-        snprintf(op, sizeof(op), "%s", temp_op);
-        if (strcmp(op, "del") == 0) {
-          is_tombstone = true;
-        }
-      }
-    } else if (strcmp(state->global_entries[i].key, "m") == 0) {
-      // Format: value|op
-      char temp_val[256], temp_op[16];
-      if (sscanf(state->global_entries[i].value, "%255[^|]|%15s",
-                 temp_val, temp_op) == 2) {
-        snprintf(op, sizeof(op), "%s", temp_op);
-        if (strcmp(op, "del") == 0) {
-          is_tombstone = true;
-        }
+      const char *last_pipe = strrchr(state->global_entries[i].value, '|');
+      if (last_pipe && strcmp(last_pipe + 1, "del") == 0) {
+        is_tombstone = true;
       }
     }
 
@@ -1531,9 +1518,61 @@ int hub_execute_purge(hub_state_t *state, const char *days_str,
     }
   }
 
-  // Update state with new entries
+  // Update state with new global entries
   memcpy(state->global_entries, new_entries, sizeof(config_entry_t) * new_count);
   state->global_entry_count = new_count;
+
+  // Purge tombstoned bots (is_active=false with a d=1 entry).
+  // Peer hubs accumulate these when the initiating hub broadcasts a deletion.
+  bot_config_t new_bots[MAX_BOTS];
+  int new_bot_count = 0;
+
+  for (int i = 0; i < state->bot_count; i++) {
+    bot_config_t *b = &state->bots[i];
+    if (!b->is_active) {
+      // Find the deletion timestamp from the d=1 entry
+      time_t del_ts = 0;
+      for (int j = 0; j < b->entry_count; j++) {
+        if (strcmp(b->entries[j].key, "d") == 0 &&
+            strcmp(b->entries[j].value, "1") == 0) {
+          del_ts = b->entries[j].timestamp;
+          break;
+        }
+      }
+
+      if (immediate || (del_ts > 0 && del_ts < cutoff)) {
+        purged_count++;
+        if (log_out && log_max_len > 0) {
+          // Find nickname for the log line
+          char bot_nick[32] = "";
+          for (int j = 0; j < b->entry_count; j++) {
+            if (strcmp(b->entries[j].key, "n") == 0) {
+              snprintf(bot_nick, sizeof(bot_nick), "%s", b->entries[j].value);
+              break;
+            }
+          }
+          int written;
+          if (bot_nick[0]) {
+            written = snprintf(log_out + log_offset, log_max_len - log_offset,
+                               "  Purged bot: %s (%s)\n", b->uuid, bot_nick);
+          } else {
+            written = snprintf(log_out + log_offset, log_max_len - log_offset,
+                               "  Purged bot: %s\n", b->uuid);
+          }
+          if (written > 0 && written < (log_max_len - log_offset)) {
+            log_offset += written;
+          }
+        }
+        continue; // don't copy this bot to new_bots
+      }
+    }
+    if (new_bot_count < MAX_BOTS) {
+      memcpy(&new_bots[new_bot_count++], b, sizeof(bot_config_t));
+    }
+  }
+
+  memcpy(state->bots, new_bots, sizeof(bot_config_t) * new_bot_count);
+  state->bot_count = new_bot_count;
 
   // Write config to disk
   hub_config_write(state);
