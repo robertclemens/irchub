@@ -1231,6 +1231,17 @@ static void process_peer_sync(hub_state_t *state, char *payload,
       char param[32];
       long ts;
       if (sscanf(payload, "%31[^|]|%ld", param, &ts) == 2) {
+        // Deduplicate: ignore a PURGE we have already processed.  Without
+        // this, every hub in the mesh re-broadcasts to all its peers, creating
+        // an infinite forwarding loop in any topology with cycles.
+        static time_t last_peer_purge_ts = 0;
+        if ((time_t)ts <= last_peer_purge_ts) {
+          hub_log("[MESH] Ignoring duplicate PURGE ts=%ld (already processed)\n", ts);
+          line = strtok_r(NULL, "\n", &saveptr);
+          continue;
+        }
+        last_peer_purge_ts = (time_t)ts;
+
         bool immediate = (strcmp(param, "immediate") == 0);
         hub_log("[MESH] Received PURGE from peer: %s\n",
                 immediate ? "immediate" : param);
@@ -1243,11 +1254,13 @@ static void process_peer_sync(hub_state_t *state, char *payload,
         if (purged > 0) {
           hub_log("[MESH] Purged %d entries from peer sync\n", purged);
           updates += purged;
+        }
 
-          // Re-forward to other peers (epidemic broadcast)
-          if (origin_fd != -1) {
-            hub_broadcast_sync_to_peers(state, line, origin_fd);
-          }
+        // Always re-forward to other peers regardless of whether this hub had
+        // anything to purge — peers further in the mesh may still have
+        // tombstones.  Use origin_fd to exclude the sender and break loops.
+        if (origin_fd != -1) {
+          hub_broadcast_sync_to_peers(state, line, origin_fd);
         }
       }
       line = strtok_r(NULL, "\n", &saveptr);
@@ -1584,13 +1597,13 @@ int hub_execute_purge(hub_state_t *state, const char *days_str,
   // Write config to disk
   hub_config_write(state);
 
-broadcast_purge:
-  // Broadcast purge to bots so they can purge their local copies
+broadcast_purge:;
+  // Notify locally-connected bots so they can purge their own channel/mask lists.
+  // Peer-hub propagation is handled by the caller, not here, to avoid loops.
   char purge_msg[256];
   snprintf(purge_msg, sizeof(purge_msg), "PURGE|%s|%ld\n",
            immediate ? "immediate" : (days_str ? days_str : "30"), (long)now);
   hub_broadcast_config_to_bots(state, purge_msg);
-  hub_broadcast_sync_to_peers(state, purge_msg, -1);
 
   return purged_count;
 }
@@ -3378,8 +3391,17 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     // Execute purge using extracted function
     // Use smaller buffer for log to ensure response won't overflow
     char purge_log[MAX_BUFFER / 2];
+    time_t purge_now = time(NULL);
     int purged_count = hub_execute_purge(state, payload, immediate,
                                           purge_log, sizeof(purge_log));
+
+    // Broadcast to peer hubs so they can purge their own tombstones.
+    // hub_execute_purge only notifies bots; peer propagation is the caller's job.
+    char peer_purge_msg[64];
+    snprintf(peer_purge_msg, sizeof(peer_purge_msg), "PURGE|%s|%ld\n",
+             immediate ? "immediate" : (payload && strlen(payload) > 0 ? payload : "30"),
+             (long)purge_now);
+    hub_broadcast_sync_to_peers(state, peer_purge_msg, -1);
 
     // Send response
     if (purged_count > 0) {

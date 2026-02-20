@@ -276,6 +276,12 @@ void hub_maintenance(hub_state_t *state) {
             if (purged > 0) {
                 hub_log("[HUB] Scheduled purge removed %d tombstones\n", purged);
             }
+
+            // Broadcast to peer hubs so they purge their own tombstones.
+            char sched_purge_msg[64];
+            snprintf(sched_purge_msg, sizeof(sched_purge_msg), "PURGE|%s|%ld\n",
+                     days_str, (long)now);
+            hub_broadcast_sync_to_peers(state, sched_purge_msg, -1);
         }
     }
 
