@@ -1524,7 +1524,13 @@ int hub_execute_purge(hub_state_t *state, const char *days_str,
 
   // Purge tombstoned bots (is_active=false with a d=1 entry).
   // Peer hubs accumulate these when the initiating hub broadcasts a deletion.
-  bot_config_t new_bots[MAX_BOTS];
+  // Heap-allocated: bot_config_t[MAX_BOTS] is ~6.8 MB, too large for the stack.
+  bot_config_t *new_bots = malloc(sizeof(bot_config_t) * MAX_BOTS);
+  if (!new_bots) {
+    hub_log("[PURGE] malloc failed for new_bots\n");
+    hub_config_write(state);
+    goto broadcast_purge;
+  }
   int new_bot_count = 0;
 
   for (int i = 0; i < state->bot_count; i++) {
@@ -1573,10 +1579,12 @@ int hub_execute_purge(hub_state_t *state, const char *days_str,
 
   memcpy(state->bots, new_bots, sizeof(bot_config_t) * new_bot_count);
   state->bot_count = new_bot_count;
+  free(new_bots);
 
   // Write config to disk
   hub_config_write(state);
 
+broadcast_purge:
   // Broadcast purge to bots so they can purge their local copies
   char purge_msg[256];
   snprintf(purge_msg, sizeof(purge_msg), "PURGE|%s|%ld\n",
