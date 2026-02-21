@@ -266,21 +266,20 @@ void hub_maintenance(hub_state_t *state) {
             hub_log("[HUB] Running scheduled purge (older than %d days)\n",
                     state->purge_days_setting);
 
-            char days_str[16];
-            snprintf(days_str, sizeof(days_str), "%d", state->purge_days_setting);
             char purge_log[MAX_BUFFER];
+            time_t cutoff = now - ((time_t)state->purge_days_setting * 86400);
 
-            int purged = hub_execute_purge(state, days_str, false,
+            int purged = hub_execute_purge(state, cutoff,
                                             purge_log, sizeof(purge_log));
 
             if (purged > 0) {
                 hub_log("[HUB] Scheduled purge removed %d tombstones\n", purged);
             }
 
-            // Broadcast to peer hubs so they purge their own tombstones.
+            // Broadcast PURGE|<cutoff> to peer hubs.
             char sched_purge_msg[64];
-            snprintf(sched_purge_msg, sizeof(sched_purge_msg), "PURGE|%s|%ld\n",
-                     days_str, (long)now);
+            snprintf(sched_purge_msg, sizeof(sched_purge_msg),
+                     "PURGE|%ld\n", (long)cutoff);
             hub_broadcast_sync_to_peers(state, sched_purge_msg, -1);
         }
     }

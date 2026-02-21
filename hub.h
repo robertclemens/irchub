@@ -293,8 +293,9 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
 void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
                                  int exclude_fd);
 
-int hub_execute_purge(hub_state_t *state, const char *days_str,
-                      bool immediate, char *log_out, int log_max_len);
+// cutoff==0: purge all tombstones; cutoff>0: purge tombstones older than cutoff
+int hub_execute_purge(hub_state_t *state, time_t cutoff,
+                      char *log_out, int log_max_len);
 
 bool hub_handle_client_data(hub_state_t *state, hub_client_t *client);
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c);
