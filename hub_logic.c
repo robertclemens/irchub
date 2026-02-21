@@ -1509,7 +1509,7 @@ int hub_execute_purge(hub_state_t *state, time_t cutoff,
          sizeof(config_entry_t) * new_count);
   state->global_entry_count = new_count;
 
-  // --- Purge tombstoned bots (is_active=false, d=1 entry) ---
+  // --- Purge tombstoned bots (d=1 entry present, regardless of is_active) ---
   // Heap-allocated: bot_config_t[MAX_BOTS] is ~6.8 MB, too large for the stack.
   bot_config_t *new_bots = malloc(sizeof(bot_config_t) * MAX_BOTS);
   if (!new_bots) {
@@ -1522,18 +1522,18 @@ int hub_execute_purge(hub_state_t *state, time_t cutoff,
     bot_config_t *b = &state->bots[i];
     bool purge_bot = false;
 
-    if (!b->is_active) {
-      time_t del_ts = 0;
-      for (int j = 0; j < b->entry_count; j++) {
-        if (strcmp(b->entries[j].key, "d") == 0 &&
-            strcmp(b->entries[j].value, "1") == 0) {
-          del_ts = b->entries[j].timestamp;
-          break;
-        }
+    time_t del_ts = 0;
+    bool found_d1 = false;
+    for (int j = 0; j < b->entry_count; j++) {
+      if (strcmp(b->entries[j].key, "d") == 0 &&
+          strcmp(b->entries[j].value, "1") == 0) {
+        found_d1 = true;
+        del_ts = b->entries[j].timestamp;
+        break;
       }
-      if (cutoff == 0 || (del_ts > 0 && del_ts < cutoff)) {
-        purge_bot = true;
-      }
+    }
+    if (found_d1 && (cutoff == 0 || (del_ts > 0 && del_ts < cutoff))) {
+      purge_bot = true;
     }
 
     if (purge_bot) {
