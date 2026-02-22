@@ -1521,7 +1521,7 @@ void menu_manage_peer_connections() {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
-        printf("║          MANAGE PEER CONNECTIONS                ║\n");
+        printf("║          MANAGE PEER CONNECTIONS                 ║\n");
         printf("╚══════════════════════════════════════════════════╝\n");
         printf("\n");
         printf("  1. List Peers (Mesh Matrix)\n");

@@ -53,6 +53,7 @@
 #define CLIENT_TIMEOUT 180
 #define CONNECT_TIMEOUT 5
 #define PEER_RECONNECT_INTERVAL 120
+#define CONFIG_SYNC_INTERVAL 300
 
 // Protocol Commands
 #define CMD_PING 0x01
@@ -299,6 +300,8 @@ int hub_execute_purge(hub_state_t *state, time_t cutoff,
                       char *log_out, int log_max_len);
 
 bool hub_handle_client_data(hub_state_t *state, hub_client_t *client);
+bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
+                               unsigned char *data, int packet_len);
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c);
 void hub_broadcast_mesh_state(hub_state_t *state);
 

@@ -208,8 +208,6 @@ void hub_maintenance(hub_state_t *state) {
     }
     
     // NEW: Bidirectional config sync every 5 minutes
-    #define CONFIG_SYNC_INTERVAL 300  // 5 minutes
-    
     if (last_config_sync == 0) last_config_sync = now;
     
     if ((now - last_config_sync) > CONFIG_SYNC_INTERVAL) {

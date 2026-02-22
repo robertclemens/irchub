@@ -4,11 +4,6 @@
 #include <openssl/bio.h>
 #include <openssl/rand.h>
 
-#ifndef CMD_ADMIN_CREATE_BOT
-#define CMD_ADMIN_CREATE_BOT 50
-#endif
-
-void hub_log(const char *format, ...);
 static void send_config_to_bot(hub_state_t *state, hub_client_t *client);
 static void hub_broadcast_config_to_bots(hub_state_t *state, const char *config_line);
 
@@ -16,7 +11,6 @@ static void hub_broadcast_config_to_bots(hub_state_t *state, const char *config_
 static bool send_response(hub_state_t *state, hub_client_t *client,
                           const char *msg);
 static bool send_pong(hub_state_t *state, hub_client_t *c);
-void hub_broadcast_mesh_state(hub_state_t *state);
 static void add_pending_bot(hub_state_t *state, const char *uuid,
                             const char *ip);
 static void remove_pending_bot(hub_state_t *state, const char *uuid);
@@ -24,8 +18,6 @@ static void broadcast_new_key(hub_state_t *state, const char *new_priv_key, cons
 static void process_mesh_state(hub_state_t *state, hub_client_t *c,
                                char *payload);
 static void process_peer_sync(hub_state_t *state, char *payload, int origin_fd);
-int hub_execute_purge(hub_state_t *state, time_t cutoff,
-                      char *log_out, int log_max_len);
 static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                                  int cmd, char *payload);
 static void process_bot_command(hub_state_t *state, hub_client_t *client,
@@ -52,10 +44,6 @@ static void process_forward_op_grant(hub_state_t *state, hub_client_t *client,
                                       char *payload);
 static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
                                        char *payload);
-
-// Crypto/Config Forward Decls
-bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
-                                   char **out_pub_b64);
 
 // --- Helper Functions ---
 
