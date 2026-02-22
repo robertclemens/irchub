@@ -62,6 +62,7 @@
 #define CMD_UPDATE_PUBKEY 0x05
 #define CMD_PEER_SYNC 0x06
 #define CMD_MESH_STATE 0x07
+#define CMD_INVITE_REQUEST 0x09 // Bot -> Hub: Request invite for nick into channel
 
 #define CMD_ADMIN_AUTH 0x10
 #define CMD_ADMIN_LIST_FULL 0x11

@@ -911,25 +911,52 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
 
     // Special handling for different types
     if (type == 'c') {
-      // Channel: c|#chan|key|add|timestamp
+      // Channel: c|#chan|key|modes|add|timestamp (new) or c|#chan|key|add|timestamp (old)
       char chan[MAX_CHAN], key[MAX_KEY], op[8];
       long ts;
-      int parsed =
-          sscanf(data, "%64[^|]|%30[^|]|%7[^|]|%ld", chan, key, op, &ts);
-      if (parsed < 3) {
-        parsed = sscanf(data, "%64[^|]||%7[^|]|%ld", chan, op, &ts);
-        key[0] = '\0';
+      int modes_val = 0;
+      int parsed;
+
+      /* Try new 5-field: chan|key|modes|op|ts */
+      parsed = sscanf(data, "%64[^|]|%30[^|]|%d|%7[^|]|%ld",
+                      chan, key, &modes_val, op, &ts);
+      if (parsed < 5) {
+        /* Try new 5-field without key: chan||modes|op|ts */
+        modes_val = 0;
+        parsed = sscanf(data, "%64[^|]||%d|%7[^|]|%ld",
+                        chan, &modes_val, op, &ts);
+        if (parsed >= 4) {
+          key[0] = '\0';
+        } else {
+          /* Old 4-field: chan|key|op|ts */
+          modes_val = 0;
+          parsed = sscanf(data, "%64[^|]|%30[^|]|%7[^|]|%ld",
+                          chan, key, op, &ts);
+          if (parsed < 3) {
+            parsed = sscanf(data, "%64[^|]||%7[^|]|%ld", chan, op, &ts);
+            key[0] = '\0';
+          }
+        }
       }
 
       if (parsed >= 3) {
-        bool accepted = hub_storage_update_entry(state, client->id, "c", chan, key, op, ts);
-        hub_log("[HUB-DEBUG] Channel %s: ts=%ld op=%s -> %s\n", chan, ts, op, accepted ? "ACCEPTED" : "REJECTED");
+        /* Build extra as "key|modes" so storage value = "chan|key|modes|op" */
+        char extra[80];
+        if (key[0])
+          snprintf(extra, sizeof(extra), "%s|%d", key, modes_val);
+        else
+          snprintf(extra, sizeof(extra), "|%d", modes_val);
+
+        bool accepted = hub_storage_update_global_entry(state, "c", chan, extra, op, ts);
+        hub_log("[HUB-DEBUG] Channel %s: ts=%ld op=%s modes=%d -> %s\n",
+                chan, ts, op, modes_val, accepted ? "ACCEPTED" : "REJECTED");
         if (accepted) {
           updates++;
-          // Add to sync buffer for peer broadcast
+          /* Sync buffer: include modes for peer hubs */
           int w = snprintf(
               sync_buffer + sync_offset, sizeof(sync_buffer) - sync_offset,
-              "b|%s|c|%s|%s|%s|%ld\n", client->id, chan, key, op, ts);
+              "b|%s|c|%s|%s|%d|%s|%ld\n",
+              client->id, chan, key, modes_val, op, ts);
           if (w > 0)
             sync_offset += w;
         }
@@ -1251,6 +1278,41 @@ static void process_peer_sync(hub_state_t *state, char *payload,
       continue;
     }
 
+    /* Peer-forwarded invite request: invite|nick|#channel */
+    if (strncmp(line, "invite|", 7) == 0) {
+      char inv_nick[64], inv_chan[64];
+      if (sscanf(line + 7, "%63[^|]|%63s", inv_nick, inv_chan) == 2) {
+        hub_log("[MESH] Forwarded INVITE_REQUEST: invite %s into %s\n",
+                inv_nick, inv_chan);
+        /* Broadcast CMD_INVITE_REQUEST to our connected bots */
+        unsigned char plain[MAX_BUFFER], inv_buf[MAX_BUFFER];
+        unsigned char inv_tag[GCM_TAG_LEN];
+        char inv_payload[160];
+        int inv_pay_len = snprintf(inv_payload, sizeof(inv_payload),
+                                   "%s|%s", inv_nick, inv_chan);
+        plain[0] = (unsigned char)CMD_INVITE_REQUEST;
+        uint32_t inv_net_pay = htonl((uint32_t)inv_pay_len);
+        memcpy(&plain[1], &inv_net_pay, 4);
+        memcpy(&plain[5], inv_payload, inv_pay_len);
+        for (int i = 0; i < state->client_count; i++) {
+          hub_client_t *bc = state->clients[i];
+          if (bc->type == CLIENT_BOT && bc->authenticated) {
+            int enc_len = aes_gcm_encrypt(plain, 5 + inv_pay_len,
+                                          bc->session_key, inv_buf + 4,
+                                          inv_tag);
+            if (enc_len > 0) {
+              memcpy(inv_buf + 4 + enc_len, inv_tag, GCM_TAG_LEN);
+              uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
+              memcpy(inv_buf, &net_len, 4);
+              write(bc->fd, inv_buf, 4 + enc_len + GCM_TAG_LEN);
+            }
+          }
+        }
+      }
+      line = strtok_r(NULL, "\n", &saveptr);
+      continue;
+    }
+
     // Check if this is a global entry (format: key|value|timestamp)
     // Global keys: c, m, o, a, p (NOT starting with b|)
     if (strncmp(line, "b|", 2) != 0) {
@@ -1324,7 +1386,8 @@ static void process_peer_sync(hub_state_t *state, char *payload,
           // For c/m/o keys, parse the combined value format
           char parsed_val[512] = "", parsed_extra[256] = "", parsed_op[16] = "";
           if (strcmp(key, "c") == 0 || strcmp(key, "o") == 0) {
-            // Format: value|extra|op or value||op
+            /* Format: chan|key[|modes]|op  (3 or 4 fields)
+             * Use first pipe for chan, last pipe for op, middle = extra */
             char *vp1 = strchr(val, '|');
             if (vp1) {
               *vp1 = 0;
@@ -1332,17 +1395,19 @@ static void process_peer_sync(hub_state_t *state, char *payload,
               if (len >= sizeof(parsed_val)) len = sizeof(parsed_val) - 1;
               memcpy(parsed_val, val, len);
               parsed_val[len] = 0;
-              char *vp2 = strchr(vp1 + 1, '|');
-              if (vp2) {
-                *vp2 = 0;
+              /* last pipe gives op (add/del), everything between = extra */
+              char *last = strrchr(vp1 + 1, '|');
+              if (last) {
+                *last = 0;
+                len = strlen(last + 1);
+                if (len >= sizeof(parsed_op)) len = sizeof(parsed_op) - 1;
+                memcpy(parsed_op, last + 1, len);
+                parsed_op[len] = 0;
+                /* extra = "key" or "key|modes" */
                 len = strlen(vp1 + 1);
                 if (len >= sizeof(parsed_extra)) len = sizeof(parsed_extra) - 1;
                 memcpy(parsed_extra, vp1 + 1, len);
                 parsed_extra[len] = 0;
-                len = strlen(vp2 + 1);
-                if (len >= sizeof(parsed_op)) len = sizeof(parsed_op) - 1;
-                memcpy(parsed_op, vp2 + 1, len);
-                parsed_op[len] = 0;
               }
             }
           } else if (strcmp(key, "m") == 0) {
@@ -4179,6 +4244,48 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
                 target_uuid, requester_hostmask, channel);
       }
     }
+  } break;
+
+  case CMD_INVITE_REQUEST: {
+    /* Payload: nick|#channel — broadcast to all other bots, forward to peers */
+    char inv_nick[64], inv_chan[64];
+    if (sscanf(payload, "%63[^|]|%63s", inv_nick, inv_chan) != 2) {
+      hub_log("[HUB] Invalid INVITE_REQUEST payload from %s\n", client->id);
+      break;
+    }
+    hub_log("[HUB] INVITE_REQUEST from %s: invite %s into %s\n",
+            client->id, inv_nick, inv_chan);
+
+    /* Broadcast to all other connected bots */
+    unsigned char plain[MAX_BUFFER], inv_buf[MAX_BUFFER], inv_tag[GCM_TAG_LEN];
+    int inv_pay_len = (int)strlen(payload);
+    plain[0] = (unsigned char)CMD_INVITE_REQUEST;
+    uint32_t inv_net_pay = htonl((uint32_t)inv_pay_len);
+    memcpy(&plain[1], &inv_net_pay, 4);
+    memcpy(&plain[5], payload, inv_pay_len);
+
+    for (int i = 0; i < state->client_count; i++) {
+      hub_client_t *bc = state->clients[i];
+      if (bc->type == CLIENT_BOT && bc->authenticated &&
+          bc->fd != client->fd) {
+        int enc_len = aes_gcm_encrypt(plain, 5 + inv_pay_len,
+                                      bc->session_key, inv_buf + 4, inv_tag);
+        if (enc_len > 0) {
+          memcpy(inv_buf + 4 + enc_len, inv_tag, GCM_TAG_LEN);
+          uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
+          memcpy(inv_buf, &net_len, 4);
+          if (write(bc->fd, inv_buf, 4 + enc_len + GCM_TAG_LEN) <= 0) {
+            hub_log("[HUB] Failed to forward INVITE_REQUEST to bot %s\n",
+                    bc->id);
+          }
+        }
+      }
+    }
+
+    /* Forward to peer hubs via mesh sync */
+    char peer_inv[192];
+    snprintf(peer_inv, sizeof(peer_inv), "invite|%s|%s", inv_nick, inv_chan);
+    hub_broadcast_sync_to_peers(state, peer_inv, client->fd);
   } break;
   }
 }

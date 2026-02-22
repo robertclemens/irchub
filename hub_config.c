@@ -480,20 +480,17 @@ bool hub_config_load(hub_state_t *state, const char *password) {
             // a, p -> value
 
             if (strcmp(gk, "c") == 0 || strcmp(gk, "o") == 0) {
+              /* Format: chan|key[|modes]|op — use first pipe for chan,
+               * last pipe for op, middle portion = extra (key or key|modes) */
               char *pipe1 = strchr(gv, '|');
               if (pipe1) {
                 *pipe1 = 0;
-                char *extra = pipe1 + 1;
-                char *pipe2 = strchr(extra, '|');
-                if (pipe2) {
-                  *pipe2 = 0;
-                  char *op = pipe2 + 1;
-                  // Strip any trailing pipes from op (malformed config entries)
-                  char *op_end = op + strlen(op);
-                  while (op_end > op && *(op_end - 1) == '|') {
-                    *(--op_end) = '\0';
-                  }
-                  hub_storage_update_global_entry(state, gk, gv, extra, op, ts);
+                char *rest = pipe1 + 1;
+                char *last = strrchr(rest, '|');
+                if (last) {
+                  *last = 0;
+                  char *op = last + 1;
+                  hub_storage_update_global_entry(state, gk, gv, rest, op, ts);
                 }
               }
             } else if (strcmp(gk, "m") == 0) {
@@ -526,23 +523,17 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           long ts = atol(s_ts + 1);
 
           if (strcmp(k, "c") == 0 || strcmp(k, "o") == 0) {
-            // Channel or Oper: value|extra|op
+            /* Format: chan|key[|modes]|op — use first pipe for chan,
+             * last pipe for op, middle portion = extra */
             char *pipe1 = strchr(v, '|');
             if (pipe1) {
               *pipe1 = 0;
               char *rest = pipe1 + 1;
-              char *pipe2 = strchr(rest, '|');
-              if (pipe2) {
-                *pipe2 = 0;
-                char *value = v;
-                char *extra = rest;
-                char *op = pipe2 + 1;
-                // Strip any trailing pipes from op (malformed config entries)
-                char *op_end = op + strlen(op);
-                while (op_end > op && *(op_end - 1) == '|') {
-                  *(--op_end) = '\0';
-                }
-                hub_storage_update_global_entry(state, k, value, extra, op, ts);
+              char *last = strrchr(rest, '|');
+              if (last) {
+                *last = 0;
+                char *op = last + 1;
+                hub_storage_update_global_entry(state, k, v, rest, op, ts);
               }
             }
           } else if (strcmp(k, "m") == 0) {
