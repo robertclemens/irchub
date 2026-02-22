@@ -1304,7 +1304,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
               memcpy(inv_buf + 4 + enc_len, inv_tag, GCM_TAG_LEN);
               uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
               memcpy(inv_buf, &net_len, 4);
-              write(bc->fd, inv_buf, 4 + enc_len + GCM_TAG_LEN);
+              if (write(bc->fd, inv_buf, 4 + enc_len + GCM_TAG_LEN) <= 0) {
+                // write failed, continue to next client
+              }
             }
           }
         }
