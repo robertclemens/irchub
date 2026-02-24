@@ -88,14 +88,11 @@ static void record_recent_purge(hub_state_t *state, time_t cutoff) {
 // Check if this hub should initiate scheduled purges (leader election)
 // Strategy: The hub with the lexicographically smallest UUID leads
 bool hub_should_initiate_scheduled_purge(hub_state_t *state) {
-  // If no connected peer hubs, always initiate (avoid single-point failure)
-  bool has_peers = false;
   for (int i = 0; i < state->client_count; i++) {
     if (state->clients[i]->type == CLIENT_HUB && state->clients[i]->authenticated) {
-      has_peers = true;
-      // Check if any peer has a UUID less than ours (they should lead)
+      // If any peer has a UUID less than ours, they should lead
       if (strcmp(state->clients[i]->id, state->hub_uuid) < 0) {
-        return false;  // A smaller UUID peer exists, let them lead
+        return false;
       }
     }
   }
