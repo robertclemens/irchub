@@ -186,6 +186,8 @@ void hub_maintenance(hub_state_t *state) {
     static time_t last_mesh_gossip = 0;
     static time_t last_config_sync = 0;  // NEW
 
+    if (last_mesh_gossip == 0) last_mesh_gossip = now;
+
     // Existing mesh gossip...
     if (now - last_mesh_gossip > 10) {
         last_mesh_gossip = now;
