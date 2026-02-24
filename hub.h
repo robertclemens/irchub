@@ -47,6 +47,8 @@
 #define MAX_FAILED_AUTH_ATTEMPTS 3
 #define FAILED_AUTH_BLOCK_DURATION 300  // 5 minutes
 #define FAILED_AUTH_RESET_TIME 3600     // 1 hour
+#define MAX_RECENT_PURGES 5             // Track recent PURGE cutoffs to prevent loops
+#define PURGE_DEDUP_WINDOW 60            // Seconds to remember PURGE (prevents loops)
 
 // Timeout Settings
 #define PING_INTERVAL 60
@@ -209,6 +211,12 @@ typedef struct {
   int admin_connect_port;      // Port that hub_admin used to connect
 } hub_client_t;
 
+// Track recently processed PURGE messages to prevent feedback loops
+typedef struct {
+  time_t cutoff;       // PURGE cutoff timestamp
+  time_t received_at;  // When this PURGE was received/processed
+} recent_purge_t;
+
 typedef struct {
   int listen_fd;
   int port;
@@ -247,6 +255,11 @@ typedef struct {
   int purge_days_setting;  // Days threshold for tombstone purge (0 = disabled)
   int pid_fd;  // File descriptor for PID file lock
   volatile bool running;
+
+  // PURGE deduplication: prevent feedback loops in peer mesh
+  recent_purge_t recent_purges[MAX_RECENT_PURGES];
+  int recent_purge_count;
+  time_t last_scheduled_purge;  // Timestamp of last scheduled purge this hub initiated
 } hub_state_t;
 
 // --- Prototypes ---
@@ -298,6 +311,10 @@ void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
 // cutoff==0: purge all tombstones; cutoff>0: purge tombstones older than cutoff
 int hub_execute_purge(hub_state_t *state, time_t cutoff,
                       char *log_out, int log_max_len);
+
+// Leader election: Check if this hub should initiate scheduled purges
+// (Hub with smallest UUID in connected mesh leads)
+bool hub_should_initiate_scheduled_purge(hub_state_t *state);
 
 bool hub_handle_client_data(hub_state_t *state, hub_client_t *client);
 bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,

@@ -47,6 +47,62 @@ static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
 
 // --- Helper Functions ---
 
+// Check if PURGE with this cutoff was recently seen (deduplication)
+static bool is_purge_recent(hub_state_t *state, time_t cutoff) {
+  time_t now = time(NULL);
+  for (int i = 0; i < state->recent_purge_count; i++) {
+    if (state->recent_purges[i].cutoff == cutoff) {
+      // Check if still within dedup window
+      if (now - state->recent_purges[i].received_at < PURGE_DEDUP_WINDOW) {
+        return true;  // This PURGE was recently processed, skip it
+      }
+    }
+  }
+  return false;
+}
+
+// Record a recently processed PURGE
+static void record_recent_purge(hub_state_t *state, time_t cutoff) {
+  time_t now = time(NULL);
+
+  // Check if already exists (update timestamp)
+  for (int i = 0; i < state->recent_purge_count; i++) {
+    if (state->recent_purges[i].cutoff == cutoff) {
+      state->recent_purges[i].received_at = now;
+      return;
+    }
+  }
+
+  // Add new entry (circular buffer)
+  if (state->recent_purge_count < MAX_RECENT_PURGES) {
+    state->recent_purges[state->recent_purge_count].cutoff = cutoff;
+    state->recent_purges[state->recent_purge_count].received_at = now;
+    state->recent_purge_count++;
+  } else {
+    // Overwrite oldest entry
+    state->recent_purges[0].cutoff = cutoff;
+    state->recent_purges[0].received_at = now;
+  }
+}
+
+// Check if this hub should initiate scheduled purges (leader election)
+// Strategy: The hub with the lexicographically smallest UUID leads
+bool hub_should_initiate_scheduled_purge(hub_state_t *state) {
+  // If no connected peer hubs, always initiate (avoid single-point failure)
+  bool has_peers = false;
+  for (int i = 0; i < state->client_count; i++) {
+    if (state->clients[i]->type == CLIENT_HUB && state->clients[i]->authenticated) {
+      has_peers = true;
+      // Check if any peer has a UUID less than ours (they should lead)
+      if (strcmp(state->clients[i]->id, state->hub_uuid) < 0) {
+        return false;  // A smaller UUID peer exists, let them lead
+      }
+    }
+  }
+  // Either no peers, or we have the smallest UUID
+  return true;
+}
+
 // ============ RATE LIMITING FUNCTIONS ============
 
 static ip_rate_limit_t* find_or_create_ip_limit(hub_state_t *state, const char *ip) {
@@ -1247,19 +1303,27 @@ static void process_peer_sync(hub_state_t *state, char *payload,
         time_t cutoff = (time_t)cutoff_val;
         hub_log("[MESH] Received PURGE from peer: cutoff=%ld\n", (long)cutoff);
 
-        char purge_log[MAX_BUFFER];
-        int purged = hub_execute_purge(state, cutoff,
-                                       purge_log, sizeof(purge_log));
-        if (purged > 0) {
-          hub_log("[MESH] Purged %d entries from peer sync\n", purged);
-          updates += purged;
-        }
+        // DEDUPLICATION: Check if this PURGE was recently seen
+        if (is_purge_recent(state, cutoff)) {
+          hub_log("[MESH] PURGE cutoff=%ld already processed recently, skipping to prevent loop\n",
+                  (long)cutoff);
+        } else {
+          // Record this PURGE and process it
+          record_recent_purge(state, cutoff);
 
-        // Forward to all other peers (exclude sender to prevent immediate
-        // echo; origin_fd exclusion is sufficient loop prevention for typical
-        // hub topologies).
-        if (origin_fd != -1) {
-          hub_broadcast_sync_to_peers(state, line, origin_fd);
+          char purge_log[MAX_BUFFER];
+          int purged = hub_execute_purge(state, cutoff,
+                                         purge_log, sizeof(purge_log));
+          if (purged > 0) {
+            hub_log("[MESH] Purged %d entries from peer sync\n", purged);
+            updates += purged;
+          }
+
+          // Forward to all other peers (exclude sender to prevent immediate
+          // echo; combined with deduplication prevents feedback loops).
+          if (origin_fd != -1) {
+            hub_broadcast_sync_to_peers(state, line, origin_fd);
+          }
         }
       }
       line = strtok_r(NULL, "\n", &saveptr);

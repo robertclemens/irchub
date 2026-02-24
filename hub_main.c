@@ -254,6 +254,7 @@ void hub_maintenance(hub_state_t *state) {
     }
 
     // Scheduled tombstone purge (if configured)
+    // Only the elected leader hub initiates to prevent duplicate purges across mesh
     static time_t last_purge = 0;
     if (state->purge_days_setting > 0) {
         if (last_purge == 0) last_purge = now;
@@ -261,24 +262,30 @@ void hub_maintenance(hub_state_t *state) {
         // Run daily (86400 seconds)
         if (now - last_purge > 86400) {
             last_purge = now;
-            hub_log("[HUB] Running scheduled purge (older than %d days)\n",
-                    state->purge_days_setting);
 
-            char purge_log[MAX_BUFFER];
-            time_t cutoff = now - ((time_t)state->purge_days_setting * 86400);
+            // Leader election: only hub with smallest UUID in mesh initiates
+            if (hub_should_initiate_scheduled_purge(state)) {
+                hub_log("[HUB] Running scheduled purge (older than %d days)\n",
+                        state->purge_days_setting);
 
-            int purged = hub_execute_purge(state, cutoff,
-                                            purge_log, sizeof(purge_log));
+                char purge_log[MAX_BUFFER];
+                time_t cutoff = now - ((time_t)state->purge_days_setting * 86400);
 
-            if (purged > 0) {
-                hub_log("[HUB] Scheduled purge removed %d tombstones\n", purged);
+                int purged = hub_execute_purge(state, cutoff,
+                                                purge_log, sizeof(purge_log));
+
+                if (purged > 0) {
+                    hub_log("[HUB] Scheduled purge removed %d tombstones\n", purged);
+                }
+
+                // Broadcast PURGE|<cutoff> to peer hubs.
+                char sched_purge_msg[64];
+                snprintf(sched_purge_msg, sizeof(sched_purge_msg),
+                         "PURGE|%ld\n", (long)cutoff);
+                hub_broadcast_sync_to_peers(state, sched_purge_msg, -1);
+            } else {
+                hub_log("[HUB] Scheduled purge skipped (not elected leader in mesh)\n");
             }
-
-            // Broadcast PURGE|<cutoff> to peer hubs.
-            char sched_purge_msg[64];
-            snprintf(sched_purge_msg, sizeof(sched_purge_msg),
-                     "PURGE|%ld\n", (long)cutoff);
-            hub_broadcast_sync_to_peers(state, sched_purge_msg, -1);
         }
     }
 

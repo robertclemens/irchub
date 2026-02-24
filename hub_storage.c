@@ -456,6 +456,15 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
     offset += written;
   }
 
+  // 1b. Add purge_days setting (allows bots to validate purge policies)
+  // Format: pd|<days>|<timestamp>
+  time_t now = time(NULL);
+  written = snprintf(buffer + offset, max_len - offset, "pd|%d|%ld\n",
+                     state->purge_days_setting, (long)now);
+  if (written > 0 && written < (max_len - offset)) {
+    offset += written;
+  }
+
   // 2. Add Bot-Specific Entries
   // Skip: h, n (hub-only metadata), c, m, o, a, p (now global entries)
   for (int i = 0; i < state->bot_count; i++) {
