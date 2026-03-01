@@ -3746,6 +3746,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   }
 
         case CMD_ADMIN_SET_LOG_LEVEL: {
+            size_t len = payload ? strlen(payload) : 0;
             if (len < 1) {
                 send_response(state, client, "ERR:invalid payload");
                 break;
@@ -3761,6 +3762,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         }
 
         case CMD_ADMIN_SET_LOG_SIZE: {
+            size_t len = payload ? strlen(payload) : 0;
             if (len < 4) {
                 send_response(state, client, "ERR:invalid payload");
                 break;
