@@ -40,6 +40,15 @@
 #define PBKDF2_ITERATIONS 100000 // NEW: For password-based key derivation
 #define HUB_PID_FILE ".irchub.pid"
 #define HUB_CONFIG_PURGE_DAYS_KEY "purge_days"
+#define HUB_LOG_FILE ".irchub.log"
+#define HUB_LOG_FILE_SIZE (10 * 1024 * 1024)  // 10MB
+
+// Log levels
+#define LOG_NONE    0
+#define LOG_ERROR   1
+#define LOG_WARNING 2
+#define LOG_INFO    3
+#define LOG_DEBUG   4
 
 // Rate Limiting Settings
 #define MAX_IP_RATE_LIMITS 500
@@ -126,6 +135,8 @@
 #define CMD_ADMIN_DEL_DENYLIST 0x3D
 #define CMD_ADMIN_SET_HUB_NAME 0x3E
 #define CMD_ADMIN_SET_BIND_PORT 0x3F
+#define CMD_ADMIN_SET_LOG_LEVEL 0x43    // Set log level (payload: level 0-4)
+#define CMD_ADMIN_SET_LOG_SIZE  0x44    // Set log size limit (payload: size in bytes)
 
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
@@ -260,10 +271,24 @@ typedef struct {
   recent_purge_t recent_purges[MAX_RECENT_PURGES];
   int recent_purge_count;
   time_t last_scheduled_purge;  // Timestamp of last scheduled purge this hub initiated
+
+  int log_level;       // Current log level (LOG_NONE, LOG_ERROR, etc.)
+  int log_max_size;    // Max log file size in bytes (default 10MB)
 } hub_state_t;
 
 // --- Prototypes ---
 void hub_log(const char *format, ...);
+
+// Log level filtering macros - these check the log level before calling hub_log
+#define hub_log_error(format, ...) \
+    do { if (g_state && g_state->log_level >= LOG_ERROR) hub_log("[ERROR] " format, ##__VA_ARGS__); } while(0)
+#define hub_log_warning(format, ...) \
+    do { if (g_state && g_state->log_level >= LOG_WARNING) hub_log("[WARNING] " format, ##__VA_ARGS__); } while(0)
+#define hub_log_info(format, ...) \
+    do { if (g_state && g_state->log_level >= LOG_INFO) hub_log("[INFO] " format, ##__VA_ARGS__); } while(0)
+#define hub_log_debug(format, ...) \
+    do { if (g_state && g_state->log_level >= LOG_DEBUG) hub_log("[DEBUG] " format, ##__VA_ARGS__); } while(0)
+
 bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);
 

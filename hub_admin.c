@@ -48,7 +48,31 @@ void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
     if (payload) memcpy(&plain[5], payload, payload_len);
 
     int total_plain = 1 + 4 + payload_len;
-    
+
+    int enc_len = aes_gcm_encrypt(plain, total_plain, key, buffer + 4, tag);
+
+    memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+    int packet_len = enc_len + GCM_TAG_LEN;
+    uint32_t net_len = htonl(packet_len);
+    memcpy(buffer, &net_len, 4);
+
+    int total = 4 + packet_len;
+    if (write(fd, buffer, total) != total) {
+        // Write failed
+    }
+}
+
+void send_packet_binary(int fd, int cmd_id, const unsigned char *payload, int payload_len, unsigned char *key) {
+    unsigned char buffer[MAX_BUFFER];
+    unsigned char tag[GCM_TAG_LEN];
+    unsigned char plain[MAX_BUFFER];
+
+    plain[0] = cmd_id;
+    memcpy(&plain[1], &payload_len, 4);
+    if (payload && payload_len > 0) memcpy(&plain[5], payload, payload_len);
+
+    int total_plain = 1 + 4 + payload_len;
+
     int enc_len = aes_gcm_encrypt(plain, total_plain, key, buffer + 4, tag);
 
     memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
@@ -1287,6 +1311,70 @@ void admin_export_public_key() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
+void admin_set_log_level() {
+    printf("\n");
+    printf("Log Levels:\n");
+    printf("  0: NONE (no logging)\n");
+    printf("  1: ERROR (only errors)\n");
+    printf("  2: WARNING (errors + warnings)\n");
+    printf("  3: INFO (errors + warnings + info) [default]\n");
+    printf("  4: DEBUG (everything)\n");
+    printf("\n");
+
+    char buf[10];
+    printf("Select level (0-4): ");
+    fflush(stdout);
+    if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+        printf("\n[!] Connection lost.\n");
+        exit(1);
+    }
+
+    int level = atoi(buf);
+    if (level < 0 || level > 4) {
+        printf("Invalid level.\n");
+        return;
+    }
+
+    // Send command to hub using encrypted packet
+    unsigned char payload[1];
+    payload[0] = (unsigned char)level;
+    send_packet_binary(g_fd, CMD_ADMIN_SET_LOG_LEVEL, payload, 1, g_key);
+
+    char response[1024];
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("[+] %s\n", response);
+}
+
+void admin_set_log_size_limit() {
+    printf("\nCurrent default: 10 MB\n");
+    printf("Enter log size limit in MB (1-1024): ");
+    fflush(stdout);
+
+    char buf[10];
+    if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+        printf("\n[!] Connection lost.\n");
+        exit(1);
+    }
+
+    int mb = atoi(buf);
+    if (mb < 1 || mb > 1024) {
+        printf("Invalid size (must be 1-1024 MB).\n");
+        return;
+    }
+
+    uint32_t bytes = (uint32_t)mb * 1024 * 1024;
+    uint32_t network_bytes = htonl(bytes);
+
+    // Send command to hub using encrypted packet
+    unsigned char payload[4];
+    memcpy(payload, &network_bytes, 4);
+    send_packet_binary(g_fd, CMD_ADMIN_SET_LOG_SIZE, payload, 4, g_key);
+
+    char response[1024];
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("[+] %s\n", response);
+}
+
 void menu_manage_admin_masks() {
     while (1) {
         printf("\n");
@@ -1583,7 +1671,9 @@ void menu_manage_peer_config() {
         printf("  7. Configure Automatic Purge\n");
         printf("  8. Export Private Key\n");
         printf("  9. Export Public Key\n");
-        printf(" 10. Back to Main Menu\n");
+        printf(" 10. Set Log Level\n");
+        printf(" 11. Set Log Size Limit\n");
+        printf(" 12. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1625,6 +1715,12 @@ void menu_manage_peer_config() {
                 admin_export_public_key();
                 break;
             case 10:
+                admin_set_log_level();
+                break;
+            case 11:
+                admin_set_log_size_limit();
+                break;
+            case 12:
                 return;  // Back to main menu
             default:
                 printf("Invalid choice.\n");

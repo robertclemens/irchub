@@ -12,6 +12,7 @@
 #include <fcntl.h>
 
 FILE *log_fp = NULL;
+hub_state_t *g_state = NULL;  // Global state pointer for use in hub_log() and other global functions
 
 void hub_log(const char *format, ...) {
     va_list args;
@@ -20,13 +21,76 @@ void hub_log(const char *format, ...) {
     char time_buf[32];
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", t);
 
-    if (log_fp) {
-        fprintf(log_fp, "[%s] ", time_buf);
-        va_start(args, format);
-        vfprintf(log_fp, format, args);
-        va_end(args);
-        fflush(log_fp);
+    // Check if logging disabled
+    if (!log_fp) {
+        // Try to open log file first
+        int fd = open(HUB_LOG_FILE, O_CREAT | O_APPEND | O_WRONLY, 0600);
+        if (fd >= 0) {
+            log_fp = fdopen(fd, "a");
+        } else {
+            log_fp = NULL;
+        }
+        if (!log_fp) {
+            return;  // Silent fail if can't open
+        }
     }
+
+    // Check if g_state exists and log level is NONE
+    if (g_state && g_state->log_level == LOG_NONE) {
+        return;
+    }
+
+    // Check if log file exists; if deleted, reopen it
+    struct stat st;
+    if (stat(HUB_LOG_FILE, &st) != 0) {
+        // File doesn't exist, close and reopen
+        if (log_fp) {
+            fclose(log_fp);
+            log_fp = NULL;
+        }
+    }
+
+    // Reopen if not open
+    if (!log_fp) {
+        int fd = open(HUB_LOG_FILE, O_CREAT | O_APPEND | O_WRONLY, 0600);
+        if (fd >= 0) {
+            log_fp = fdopen(fd, "a");
+        } else {
+            log_fp = NULL;
+        }
+        if (!log_fp) {
+            return;  // Silent fail if can't open
+        }
+    }
+
+    // Check file size using g_state->log_max_size if available
+    int log_max_size = (g_state && g_state->log_max_size > 0) ?
+                       g_state->log_max_size : HUB_LOG_FILE_SIZE;
+
+    struct stat file_stat;
+    if (stat(HUB_LOG_FILE, &file_stat) == 0 && file_stat.st_size >= log_max_size) {
+        // File exceeded size limit, truncate it
+        fclose(log_fp);
+        int fd = open(HUB_LOG_FILE, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (fd >= 0) {
+            log_fp = fdopen(fd, "a");  // Use "a" mode for fdopen after truncate
+        } else {
+            log_fp = NULL;
+        }
+        if (!log_fp) {
+            return;  // Silent fail if can't reopen
+        }
+        fprintf(log_fp, "[%s] Log file truncated (size limit reached)\n", time_buf);
+        fflush(log_fp);
+        return;
+    }
+
+    // Write log entry (log level filtering would be done by caller in Task 5)
+    fprintf(log_fp, "[%s] ", time_buf);
+    va_start(args, format);
+    vfprintf(log_fp, format, args);
+    va_end(args);
+    fflush(log_fp);
 }
 
 void handle_signal(int sig) {
@@ -419,6 +483,13 @@ int main(int argc, char *argv[]) {
     state.config_pass[sizeof(state.config_pass) - 1] = 0;
     state.running = true;
 
+    // Set global state pointer for use in hub_log() and other functions
+    g_state = &state;
+
+    // Initialize log defaults
+    state.log_level = LOG_INFO;      // Default to INFO level
+    state.log_max_size = HUB_LOG_FILE_SIZE;  // Default to 10MB
+
     if (argc >= 3 && strcmp(argv[2], "-setup") == 0) {
         char kp[256];
         printf("--- Setup ---\nPort: ");
@@ -469,7 +540,7 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    log_fp = fopen("irchub.log", "a");
+    log_fp = fopen(HUB_LOG_FILE, "a");
     if (daemon_mode) {
         printf("Starting in daemon mode...\n");
         daemonize();

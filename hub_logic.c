@@ -3745,6 +3745,39 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     return send_response(state, client, "ERROR: Missing IP pattern.");
   }
 
+        case CMD_ADMIN_SET_LOG_LEVEL: {
+            if (len < 1) {
+                send_response(state, client, "ERR:invalid payload");
+                break;
+            }
+            int level = (unsigned char)payload[0];
+            if (level > LOG_DEBUG) level = LOG_DEBUG;
+            if (level < LOG_NONE) level = LOG_NONE;
+            state->log_level = level;
+            char msg[64];
+            snprintf(msg, sizeof(msg), "OK:log_level set to %d", level);
+            send_response(state, client, msg);
+            break;
+        }
+
+        case CMD_ADMIN_SET_LOG_SIZE: {
+            if (len < 4) {
+                send_response(state, client, "ERR:invalid payload");
+                break;
+            }
+            // Payload: 4 bytes in network byte order (big-endian)
+            uint32_t size;
+            memcpy(&size, payload, 4);
+            size = ntohl(size);
+            if (size < 1024) size = 1024;  // Minimum 1KB
+            if (size > 1024*1024*1024) size = 1024*1024*1024;  // Maximum 1GB
+            state->log_max_size = (int)size;
+            char msg[64];
+            snprintf(msg, sizeof(msg), "OK:log_size set to %d", state->log_max_size);
+            send_response(state, client, msg);
+            break;
+        }
+
   default:
     return send_response(state, client, "ERROR: Unknown command.");
   }
