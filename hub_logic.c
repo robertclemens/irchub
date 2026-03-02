@@ -222,7 +222,7 @@ void cleanup_old_ip_limits(hub_state_t *state) {
 // Simple CIDR matching (supports /24, /16, /8 and exact match)
 static bool ip_matches_pattern(const char *ip, const char *pattern) {
     // Check for CIDR notation
-    char pattern_copy[128];
+    char pattern_copy[MAX_MASK_LEN];
     snprintf(pattern_copy, sizeof(pattern_copy), "%s", pattern);
 
     char *slash = strchr(pattern_copy, '/');
@@ -1215,7 +1215,7 @@ static bool store_global_entry_raw(hub_state_t *state, const char *key,
         match = true;
     } else {
       // List match: compare key and first part of value (before first |)
-      char stored_first[256], incoming_first[256];
+      char stored_first[1024], incoming_first[1024];
       const char *pipe = strchr(state->global_entries[i].value, '|');
       if (pipe) {
         size_t len = pipe - state->global_entries[i].value;
@@ -4051,6 +4051,10 @@ static void process_forward_op_grant(hub_state_t *state, hub_client_t *client,
   (void)client; // Not used - response goes to original requester
   // Payload format: request_id
   char request_id[64];
+  if (strlen(payload) >= sizeof(request_id)) {
+    hub_log("[HUB] OP_FORWARD_GRANT: oversized request_id, ignoring\n");
+    return;
+  }
   snprintf(request_id, sizeof(request_id), "%s", payload);
 
   hub_log("[HUB] Received OP_FORWARD_GRANT from peer for request id:%s\n",
@@ -4464,7 +4468,12 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               pass_buf[pass_len] = '\0';
             } else {
               // Old format without connection info
-              snprintf(pass_buf, sizeof(pass_buf), "%s", payload + 6);
+              if (strlen(payload + 6) >= sizeof(pass_buf)) {
+                pass_len = 0;
+                pass_buf[0] = '\0';
+              } else {
+                snprintf(pass_buf, sizeof(pass_buf), "%s", payload + 6);
+              }
             }
 
             if (strcmp(pass_buf, state->admin_password) == 0) {

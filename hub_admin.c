@@ -264,8 +264,12 @@ void bot_add() {
         if (priv_key) {
             *priv_key = 0;
             priv_key++;  // Now points to BASE64(full PEM)
-            
+
             char uuid[64];
+            if (strlen(uuid_start) >= sizeof(uuid)) {
+                printf("Error: invalid UUID in server response\n");
+                return;
+            }
             snprintf(uuid, sizeof(uuid), "%s", uuid_start);
             
             printf("\n╔══════════════════════════════════════════════════╗\n");
@@ -379,6 +383,10 @@ void bot_rekey() {
             priv_key++;
 
             char nick[64];
+            if (strlen(nick_start) >= sizeof(nick)) {
+                printf("Error: invalid nick in server response\n");
+                return;
+            }
             snprintf(nick, sizeof(nick), "%s", nick_start);
 
             printf("\n╔══════════════════════════════════════════════════╗\n");
