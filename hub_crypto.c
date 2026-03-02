@@ -46,6 +46,10 @@ unsigned char *base64_decode(const char *input, int *out_len) {
     BIO *b64, *bmem;
     int len = strlen(input);
     unsigned char *buffer = (unsigned char *)malloc(len);
+    if (!buffer) {
+        *out_len = 0;
+        return NULL;
+    }
     memset(buffer, 0, len);
 
     b64 = BIO_new(BIO_f_base64());
@@ -63,7 +67,7 @@ unsigned char *base64_decode(const char *input, int *out_len) {
 void generate_uuid_v4(char *buffer, size_t len) {
     unsigned char b[16];
     if (RAND_bytes(b, 16) != 1) {
-        for(int i=0; i<16; i++) b[i] = rand() % 255;
+        for (int i = 0; i < 16; i++) b[i] = (unsigned char)(rand() % 256);
     }
 
     b[6] = (b[6] & 0x0F) | 0x40;

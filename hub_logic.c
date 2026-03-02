@@ -113,8 +113,7 @@ static ip_rate_limit_t* find_or_create_ip_limit(hub_state_t *state, const char *
     // Create new entry if space available
     if (state->ip_limits_count < MAX_IP_RATE_LIMITS) {
         ip_rate_limit_t *entry = &state->ip_limits[state->ip_limits_count++];
-        strncpy(entry->ip, ip, sizeof(entry->ip) - 1);
-        entry->ip[sizeof(entry->ip) - 1] = '\0';
+        snprintf(entry->ip, sizeof(entry->ip), "%s", ip);
         entry->active_connections = 0;
         entry->failed_auth_count = 0;
         entry->last_failed_auth = 0;
@@ -224,8 +223,7 @@ void cleanup_old_ip_limits(hub_state_t *state) {
 static bool ip_matches_pattern(const char *ip, const char *pattern) {
     // Check for CIDR notation
     char pattern_copy[128];
-    strncpy(pattern_copy, pattern, sizeof(pattern_copy) - 1);
-    pattern_copy[sizeof(pattern_copy) - 1] = '\0';
+    snprintf(pattern_copy, sizeof(pattern_copy), "%s", pattern);
 
     char *slash = strchr(pattern_copy, '/');
     if (slash) {
@@ -270,8 +268,7 @@ static bool is_ip_in_list(hub_state_t *state, const char *ip, const char *list_k
                 memcpy(pattern, state->global_entries[i].value, len);
                 pattern[len] = '\0';
             } else {
-                strncpy(pattern, state->global_entries[i].value, sizeof(pattern) - 1);
-                pattern[sizeof(pattern) - 1] = '\0';
+                snprintf(pattern, sizeof(pattern), "%s", state->global_entries[i].value);
             }
 
             if (ip_matches_pattern(ip, pattern)) {
@@ -440,15 +437,14 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
 
     // Send encrypted challenge
     uint32_t net_len = htonl(enc_len);
-    if (write(client->fd, &net_len, 4) != 4 ||
-        write(client->fd, enc_challenge, enc_len) != enc_len) {
+    if (write(client->fd, &net_len, 4) != (ssize_t)4 ||
+        write(client->fd, enc_challenge, enc_len) != (ssize_t)enc_len) {
       hub_log("[HUB][ERROR] Failed to send challenge to %s\n", uuid);
       return false;
     }
 
     // Store UUID and update state
-    strncpy(client->id, uuid, sizeof(client->id) - 1);
-    client->id[sizeof(client->id) - 1] = '\0';
+    snprintf(client->id, sizeof(client->id), "%s", uuid);
     client->bot_auth_state = BOT_AUTH_CHALLENGE_SENT;
     client->last_seen = time(NULL);
 
@@ -504,8 +500,8 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
 
     // Send encrypted session key
     uint32_t net_len = htonl(enc_len);
-    if (write(client->fd, &net_len, 4) != 4 ||
-        write(client->fd, enc_session_key, enc_len) != enc_len) {
+    if (write(client->fd, &net_len, 4) != (ssize_t)4 ||
+        write(client->fd, enc_session_key, enc_len) != (ssize_t)enc_len) {
       hub_log("[HUB][ERROR] Failed to send session key to %s\n", client->id);
       return false;
     }
@@ -564,8 +560,7 @@ static void add_pending_bot(hub_state_t *state, const char *uuid,
   memcpy(p->ip, ip, copy_ip_len);
   p->ip[copy_ip_len] = '\0';
 
-  strncpy(p->nick, "Unknown", sizeof(p->nick) - 1);
-  p->nick[sizeof(p->nick) - 1] = '\0';
+  snprintf(p->nick, sizeof(p->nick), "Unknown");
   p->last_attempt = time(NULL);
 }
 
@@ -619,7 +614,7 @@ static void broadcast_new_key(hub_state_t *state, const char *new_priv_key, cons
         uint32_t net_len = htonl(packet_len);
         memcpy(buffer, &net_len, 4);
 
-        if (write(c->fd, buffer, 4 + packet_len) == (4 + packet_len)) {
+        if (write(c->fd, buffer, 4 + packet_len) == (ssize_t)(4 + packet_len)) {
           hub_count++;
         }
       }
@@ -639,8 +634,7 @@ static void hub_state_add_bot_memory(hub_state_t *state, const char *uuid,
     int idx = state->bot_count++;
     bot_config_t *b = &state->bots[idx];
     memset(b, 0, sizeof(bot_config_t));
-    strncpy(b->uuid, uuid, sizeof(b->uuid) - 1);
-    b->uuid[sizeof(b->uuid) - 1] = 0;
+    snprintf(b->uuid, sizeof(b->uuid), "%s", uuid);
     b->last_sync_time = 0;
 
     time_t now = time(NULL);
@@ -926,8 +920,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
   hub_log("[HUB] Processing config push from %s\n", client->id);
 
   char work_buf[MAX_BUFFER];
-  strncpy(work_buf, payload, sizeof(work_buf) - 1);
-  work_buf[sizeof(work_buf) - 1] = '\0';
+  snprintf(work_buf, sizeof(work_buf), "%s", payload);
 
   char *saveptr;
   char *line = strtok_r(work_buf, "\n", &saveptr);
@@ -1047,8 +1040,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
       if (parsed < 1) {
         // Fallback: no delimiter found, treat entire data as password
-        strncpy(pass, data, MAX_PASS - 1);
-        pass[MAX_PASS - 1] = '\0';
+        snprintf(pass, MAX_PASS, "%s", data);
         ts = time(NULL);
       } else if (parsed < 2 || ts <= 0) {
         // Password found but no valid timestamp
@@ -1072,8 +1064,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
       if (parsed < 1) {
         // Fallback: no delimiter found, treat entire data as password
-        strncpy(pass, data, MAX_PASS - 1);
-        pass[MAX_PASS - 1] = '\0';
+        snprintf(pass, MAX_PASS, "%s", data);
         ts = time(NULL);
       } else if (parsed < 2 || ts <= 0) {
         // Password found but no valid timestamp
@@ -1233,9 +1224,8 @@ static bool store_global_entry_raw(hub_state_t *state, const char *key,
         memcpy(stored_first, state->global_entries[i].value, len);
         stored_first[len] = 0;
       } else {
-        strncpy(stored_first, state->global_entries[i].value,
-                sizeof(stored_first) - 1);
-        stored_first[sizeof(stored_first) - 1] = 0;
+        snprintf(stored_first, sizeof(stored_first), "%s",
+                 state->global_entries[i].value);
       }
       const char *incoming_pipe = strchr(value, '|');
       if (incoming_pipe) {
@@ -1245,8 +1235,7 @@ static bool store_global_entry_raw(hub_state_t *state, const char *key,
         memcpy(incoming_first, value, len);
         incoming_first[len] = 0;
       } else {
-        strncpy(incoming_first, value, sizeof(incoming_first) - 1);
-        incoming_first[sizeof(incoming_first) - 1] = 0;
+        snprintf(incoming_first, sizeof(incoming_first), "%s", value);
       }
       if (strcmp(state->global_entries[i].key, key) == 0 &&
           strcmp(stored_first, incoming_first) == 0) {
@@ -1426,12 +1415,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
         char *p3 = strrchr(p2 + 1, '|');
         if (p3) {
           *p3 = 0;
-          strncpy(uuid, ptr, sizeof(uuid) - 1);
-          uuid[sizeof(uuid) - 1] = 0;
-          strncpy(key, p1 + 1, sizeof(key) - 1);
-          key[sizeof(key) - 1] = 0;
-          strncpy(val, p2 + 1, sizeof(val) - 1);
-          val[sizeof(val) - 1] = 0;
+          snprintf(uuid, sizeof(uuid), "%s", ptr);
+          snprintf(key, sizeof(key), "%s", p1 + 1);
+          snprintf(val, sizeof(val), "%s", p2 + 1);
           ts = atol(p3 + 1);
 
           // For c/m/o keys, parse the combined value format
@@ -1527,7 +1513,7 @@ static bool send_response(hub_state_t *state, hub_client_t *client,
     memcpy(buffer, &net_len, 4);
 
     if (write(client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) !=
-        (4 + enc_len + GCM_TAG_LEN)) {
+        (ssize_t)(4 + enc_len + GCM_TAG_LEN)) {
       hub_disconnect_client(state, client);
       return false;
     }
@@ -1551,7 +1537,7 @@ static bool send_pong(hub_state_t *state, hub_client_t *c) {
     memcpy(buffer, &net_len, 4);
 
     if (write(c->fd, buffer, 4 + enc_len + GCM_TAG_LEN) !=
-        (4 + enc_len + GCM_TAG_LEN)) {
+        (ssize_t)(4 + enc_len + GCM_TAG_LEN)) {
       hub_disconnect_client(state, c);
       return false;
     }
@@ -1756,8 +1742,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       char nick[64] = "Unknown";
       for (int i = 0; i < bot->entry_count; i++) {
         if (strcmp(bot->entries[i].key, "n") == 0) {
-          strncpy(nick, bot->entries[i].value, sizeof(nick) - 1);
-          nick[sizeof(nick) - 1] = 0;
+          snprintf(nick, sizeof(nick), "%s", bot->entries[i].value);
           break;
         }
       }
@@ -2043,8 +2028,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       char nick[32] = "Unknown";
       for (int k = 0; k < b->entry_count; k++) {
         if (strcmp(b->entries[k].key, "n") == 0) {
-          strncpy(nick, b->entries[k].value, sizeof(nick) - 1);
-          nick[sizeof(nick) - 1] = 0;
+          snprintf(nick, sizeof(nick), "%s", b->entries[k].value);
           break;
         }
       }
@@ -2141,15 +2125,13 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       if (strlen(payload) < 4) {
         int idx = atoi(payload);
         if (idx > 0 && idx <= state->pending_count) {
-          strncpy(target_uuid, state->pending[idx - 1].uuid,
-                  sizeof(target_uuid) - 1);
-          target_uuid[sizeof(target_uuid) - 1] = 0;
+          snprintf(target_uuid, sizeof(target_uuid), "%s",
+                   state->pending[idx - 1].uuid);
         } else {
           return send_response(state, client, "ERROR: Invalid Index.");
         }
       } else {
-        strncpy(target_uuid, payload, sizeof(target_uuid) - 1);
-        target_uuid[sizeof(target_uuid) - 1] = 0;
+        snprintf(target_uuid, sizeof(target_uuid), "%s", payload);
       }
 
       if (target_uuid[0]) {
@@ -2203,10 +2185,9 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   case CMD_ADMIN_CREATE_BOT: {
     char nick[64];
     if (payload && strlen(payload) > 0) {
-      strncpy(nick, payload, sizeof(nick) - 1);
-      nick[sizeof(nick) - 1] = 0;
+      snprintf(nick, sizeof(nick), "%s", payload);
     } else {
-      strcpy(nick, "UnnamedBot");
+      snprintf(nick, sizeof(nick), "UnnamedBot");
     }
 
     char *uuid = NULL, *priv_key = NULL, *pub_key = NULL;
@@ -3540,8 +3521,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       }
 
       // Update bind_ip in memory
-      strncpy(state->bind_ip, payload, sizeof(state->bind_ip) - 1);
-      state->bind_ip[sizeof(state->bind_ip) - 1] = '\0';
+      snprintf(state->bind_ip, sizeof(state->bind_ip), "%s", payload);
 
       // Save to config
       hub_config_write(state);
@@ -3561,8 +3541,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   case CMD_ADMIN_SET_HUB_NAME: {
     if (payload && strlen(payload) > 0) {
       // Update hub friendly name in memory
-      strncpy(state->hub_friendly_name, payload, sizeof(state->hub_friendly_name) - 1);
-      state->hub_friendly_name[sizeof(state->hub_friendly_name) - 1] = '\0';
+      snprintf(state->hub_friendly_name, sizeof(state->hub_friendly_name), "%s", payload);
 
       // Save to config
       hub_config_write(state);
@@ -3633,8 +3612,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                 memcpy(pattern, state->global_entries[i].value, len);
                 pattern[len] = '\0';
             } else {
-                strncpy(pattern, state->global_entries[i].value, sizeof(pattern) - 1);
-                pattern[sizeof(pattern) - 1] = '\0';
+                snprintf(pattern, sizeof(pattern), "%s",
+                         state->global_entries[i].value);
             }
 
             offset += snprintf(list + offset, MAX_BUFFER - offset,
@@ -3702,8 +3681,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                 memcpy(pattern, state->global_entries[i].value, len);
                 pattern[len] = '\0';
             } else {
-                strncpy(pattern, state->global_entries[i].value, sizeof(pattern) - 1);
-                pattern[sizeof(pattern) - 1] = '\0';
+                snprintf(pattern, sizeof(pattern), "%s",
+                         state->global_entries[i].value);
             }
 
             offset += snprintf(list + offset, MAX_BUFFER - offset,
@@ -3974,8 +3953,8 @@ static void process_forward_op_request(hub_state_t *state,
       if (strcmp(state->bots[i].uuid, requester_uuid) == 0) {
         for (int j = 0; j < state->bots[i].entry_count; j++) {
           if (strcmp(state->bots[i].entries[j].key, "h") == 0) {
-            strncpy(requester_hostmask, state->bots[i].entries[j].value,
-                    sizeof(requester_hostmask) - 1);
+            snprintf(requester_hostmask, sizeof(requester_hostmask), "%s",
+                     state->bots[i].entries[j].value);
             break;
           }
         }
@@ -4072,8 +4051,7 @@ static void process_forward_op_grant(hub_state_t *state, hub_client_t *client,
   (void)client; // Not used - response goes to original requester
   // Payload format: request_id
   char request_id[64];
-  strncpy(request_id, payload, 63);
-  request_id[63] = '\0';
+  snprintf(request_id, sizeof(request_id), "%s", payload);
 
   hub_log("[HUB] Received OP_FORWARD_GRANT from peer for request id:%s\n",
           request_id);
@@ -4288,8 +4266,8 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
       if (strcmp(state->bots[i].uuid, client->id) == 0) {
         for (int j = 0; j < state->bots[i].entry_count; j++) {
           if (strcmp(state->bots[i].entries[j].key, "h") == 0) {
-            strncpy(requester_hostmask, state->bots[i].entries[j].value,
-                    sizeof(requester_hostmask) - 1);
+            snprintf(requester_hostmask, sizeof(requester_hostmask), "%s",
+                     state->bots[i].entries[j].value);
             break;
           }
         }
@@ -4486,15 +4464,13 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               pass_buf[pass_len] = '\0';
             } else {
               // Old format without connection info
-              strncpy(pass_buf, payload + 6, sizeof(pass_buf) - 1);
-              pass_buf[sizeof(pass_buf) - 1] = '\0';
+              snprintf(pass_buf, sizeof(pass_buf), "%s", payload + 6);
             }
 
             if (strcmp(pass_buf, state->admin_password) == 0) {
               client->type = CLIENT_ADMIN;
               client->authenticated = true;
-              strncpy(client->id, "ADMIN", sizeof(client->id) - 1);
-              client->id[sizeof(client->id) - 1] = 0;
+              snprintf(client->id, sizeof(client->id), "ADMIN");
 
               // Parse and store connection IP:port if available
               if (pipe) {
@@ -4690,15 +4666,14 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
 
           // Send encrypted challenge
           uint32_t net_len_send = htonl(enc_len);
-          if (write(client->fd, &net_len_send, 4) != 4 ||
-              write(client->fd, enc_challenge, enc_len) != enc_len) {
+          if (write(client->fd, &net_len_send, 4) != (ssize_t)4 ||
+              write(client->fd, enc_challenge, enc_len) != (ssize_t)enc_len) {
             hub_log("[HUB][ERROR] Failed to send challenge\n");
             hub_disconnect_client(state, client);
             return false;
           }
 
-          strncpy(client->id, uuid, sizeof(client->id) - 1);
-          client->id[sizeof(client->id) - 1] = '\0';
+          snprintf(client->id, sizeof(client->id), "%s", uuid);
           client->bot_auth_state = BOT_AUTH_CHALLENGE_SENT;
           client->last_seen = time(NULL);
 
@@ -4752,8 +4727,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
 
           // Send encrypted session key
           uint32_t net_len_send = htonl(enc_len);
-          if (write(client->fd, &net_len_send, 4) != 4 ||
-              write(client->fd, enc_session, enc_len) != enc_len) {
+          if (write(client->fd, &net_len_send, 4) != (ssize_t)4 ||
+              write(client->fd, enc_session, enc_len) != (ssize_t)enc_len) {
             hub_log("[HUB][ERROR] Failed to send session key\n");
             hub_disconnect_client(state, client);
             return false;

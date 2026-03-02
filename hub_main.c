@@ -166,14 +166,14 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c) {
     }
 
     uint32_t net_len = htonl(enc_len);
-    if (write(c->fd, &net_len, 4) != 4) {
+    if (write(c->fd, &net_len, 4) != (ssize_t)4) {
         hub_log("[PEER] Handshake header write failed\n");
         secure_wipe(pack, sizeof(pack));
         hub_disconnect_client(state, c);
         return;
     }
-    
-    if (write(c->fd, enc, enc_len) != enc_len) {
+
+    if (write(c->fd, enc, enc_len) != (ssize_t)enc_len) {
         hub_log("[PEER] Handshake body write failed\n");
         secure_wipe(pack, sizeof(pack));
         hub_disconnect_client(state, c);
@@ -212,7 +212,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c) {
     uint32_t nl = htonl(packet_len);
     memcpy(buffer, &nl, 4);
     
-    if (write(c->fd, buffer, 4 + packet_len) != (4 + packet_len)) {
+    if (write(c->fd, buffer, 4 + packet_len) != (ssize_t)(4 + packet_len)) {
         hub_log("[PEER] Sync write failed\n");
         hub_disconnect_client(state, c);
     } else {
@@ -237,7 +237,7 @@ bool send_ping(hub_client_t *c) {
         uint32_t net_len = htonl(packet_len);
         memcpy(buffer, &net_len, 4);
         
-        if (write(c->fd, buffer, 4 + packet_len) != (4 + packet_len)) {
+        if (write(c->fd, buffer, 4 + packet_len) != (ssize_t)(4 + packet_len)) {
             return false;
         }
     }
@@ -299,7 +299,7 @@ void hub_maintenance(hub_state_t *state) {
                     uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
                     memcpy(buffer, &net_len, 4);
                     
-                    if (write(c->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
+                    if (write(c->fd, buffer, 4 + enc_len + GCM_TAG_LEN) == (ssize_t)(4 + enc_len + GCM_TAG_LEN)) {
                         sync_count++;
                     }
                 }
@@ -415,8 +415,7 @@ void hub_check_peers(hub_state_t *state) {
                     }
                     
                     c->fd = sockfd;
-                    strncpy(c->ip, state->peers[i].ip, sizeof(c->ip) - 1);
-                    c->ip[sizeof(c->ip) - 1] = 0;
+                    snprintf(c->ip, sizeof(c->ip), "%s", state->peers[i].ip);
                     c->type = CLIENT_HUB;
                     c->last_seen = time(NULL);
 c->last_pong_sent = 0;
@@ -479,8 +478,7 @@ int main(int argc, char *argv[]) {
 
     hub_state_t state;
     memset(&state, 0, sizeof(state));
-    strncpy(state.config_pass, argv[1], sizeof(state.config_pass) - 1);
-    state.config_pass[sizeof(state.config_pass) - 1] = 0;
+    snprintf(state.config_pass, sizeof(state.config_pass), "%s", argv[1]);
     state.running = true;
 
     // Set global state pointer for use in hub_log() and other functions
@@ -497,7 +495,7 @@ int main(int argc, char *argv[]) {
 
         printf("Bind IP (default 0.0.0.0): ");
         if (scanf("%63s", state.bind_ip) != 1) {
-            strncpy(state.bind_ip, "0.0.0.0", sizeof(state.bind_ip) - 1);
+            snprintf(state.bind_ip, sizeof(state.bind_ip), "0.0.0.0");
         }
         state.bind_ip[sizeof(state.bind_ip) - 1] = 0;
 
@@ -577,8 +575,7 @@ int main(int argc, char *argv[]) {
 
     // Set default bind_ip if not configured
     if (!state.bind_ip[0]) {
-        strncpy(state.bind_ip, "127.0.0.1", sizeof(state.bind_ip) - 1);
-        state.bind_ip[sizeof(state.bind_ip) - 1] = 0;
+        snprintf(state.bind_ip, sizeof(state.bind_ip), "127.0.0.1");
     }
 
     if (!state.private_key_pem) {
@@ -652,8 +649,7 @@ int main(int argc, char *argv[]) {
 
             if (new_fd >= 0) {
                 char incoming_ip[64];
-                strncpy(incoming_ip, inet_ntoa(ca.sin_addr), sizeof(incoming_ip) - 1);
-                incoming_ip[sizeof(incoming_ip) - 1] = '\0';
+                snprintf(incoming_ip, sizeof(incoming_ip), "%s", inet_ntoa(ca.sin_addr));
 
                 // Check access lists first
                 if (!check_ip_access_lists(&state, incoming_ip)) {
@@ -666,8 +662,7 @@ int main(int argc, char *argv[]) {
                     hub_client_t *c = calloc(1, sizeof(hub_client_t));
                     if (c) {
                         c->fd = new_fd;
-                        strncpy(c->ip, incoming_ip, sizeof(c->ip) - 1);
-                        c->ip[sizeof(c->ip) - 1] = 0;
+                        snprintf(c->ip, sizeof(c->ip), "%s", incoming_ip);
                         c->last_seen = time(NULL);
                         c->last_pong_sent = 0;
                         state.clients[state.client_count++] = c;

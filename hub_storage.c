@@ -12,8 +12,7 @@ static bot_config_t *get_or_create_bot(hub_state_t *state, const char *uuid) {
   if (state->bot_count < MAX_BOTS) {
     bot_config_t *b = &state->bots[state->bot_count++];
     memset(b, 0, sizeof(bot_config_t));
-    strncpy(b->uuid, uuid, sizeof(b->uuid) - 1);
-    b->uuid[sizeof(b->uuid) - 1] = 0;
+    snprintf(b->uuid, sizeof(b->uuid), "%s", uuid);
     b->is_active = true;
     return b;
   }
@@ -31,8 +30,7 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
   // Sanitize op parameter - strip leading and trailing pipes from malformed input
   char clean_op[16] = "";
   if (op) {
-    strncpy(clean_op, op, sizeof(clean_op) - 1);
-    clean_op[sizeof(clean_op) - 1] = '\0';
+    snprintf(clean_op, sizeof(clean_op), "%s", op);
     // Strip leading pipes
     char *op_start = clean_op;
     while (*op_start == '|') {
@@ -67,8 +65,7 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
     snprintf(combined_value, sizeof(combined_value), "%s|%s|%s", value,
              extra ? extra : "", safe_op);
   } else {
-    strncpy(combined_value, value, sizeof(combined_value) - 1);
-    combined_value[sizeof(combined_value) - 1] = 0;
+    snprintf(combined_value, sizeof(combined_value), "%s", value);
   }
 
   bool is_singleton = (strcmp(key, "a") == 0 || strcmp(key, "p") == 0);
@@ -89,9 +86,8 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
         memcpy(stored_first, state->global_entries[i].value, len);
         stored_first[len] = 0;
       } else {
-        strncpy(stored_first, state->global_entries[i].value,
-                sizeof(stored_first) - 1);
-        stored_first[sizeof(stored_first) - 1] = 0;
+        snprintf(stored_first, sizeof(stored_first), "%s",
+                 state->global_entries[i].value);
       }
       if (strcmp(state->global_entries[i].key, key) == 0 &&
           strcmp(stored_first, value) == 0) {
@@ -120,8 +116,7 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
   if (state->global_entry_count < MAX_BOT_ENTRIES) {
     hub_log("[STORAGE] Global %s=%s: NEW entry ts=%ld\n", key, value, (long)ts);
     config_entry_t *e = &state->global_entries[state->global_entry_count++];
-    strncpy(e->key, key, sizeof(e->key) - 1);
-    e->key[sizeof(e->key) - 1] = 0;
+    snprintf(e->key, sizeof(e->key), "%s", key);
     size_t len = strlen(combined_value);
     if (len >= sizeof(e->value))
       len = sizeof(e->value) - 1;
@@ -179,8 +174,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
   // Sanitize op parameter - strip leading and trailing pipes from malformed input
   char clean_op[16] = "";
   if (op) {
-    strncpy(clean_op, op, sizeof(clean_op) - 1);
-    clean_op[sizeof(clean_op) - 1] = '\0';
+    snprintf(clean_op, sizeof(clean_op), "%s", op);
     // Strip leading pipes
     char *op_start = clean_op;
     while (*op_start == '|') {
@@ -219,8 +213,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
              extra ? extra : "", safe_op);
   } else {
     // Simple value (a, p, h)
-    strncpy(combined_value, value, sizeof(combined_value) - 1);
-    combined_value[sizeof(combined_value) - 1] = 0;
+    snprintf(combined_value, sizeof(combined_value), "%s", value);
   }
 
   // Determine Type: Singleton or List
@@ -254,8 +247,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
         memcpy(stored_first, b->entries[i].value, len);
         stored_first[len] = 0;
       } else {
-        strncpy(stored_first, b->entries[i].value, sizeof(stored_first) - 1);
-        stored_first[sizeof(stored_first) - 1] = 0;
+        snprintf(stored_first, sizeof(stored_first), "%s", b->entries[i].value);
       }
 
       if (strcmp(b->entries[i].key, key) == 0 &&
@@ -304,8 +296,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
   // New Entry
   if (b->entry_count < MAX_BOT_ENTRIES) {
     config_entry_t *e = &b->entries[b->entry_count++];
-    strncpy(e->key, key, sizeof(e->key) - 1);
-    e->key[sizeof(e->key) - 1] = 0;
+    snprintf(e->key, sizeof(e->key), "%s", key);
     size_t len = strlen(combined_value);
     if (len >= sizeof(e->value))
       len = sizeof(e->value) - 1;
@@ -385,8 +376,7 @@ int hub_storage_get_full_list(hub_state_t *state, char *buffer, int max_len) {
     char nick[32] = "Unknown";
     for (int k = 0; k < b->entry_count; k++) {
       if (strcmp(b->entries[k].key, "n") == 0) {
-        strncpy(nick, b->entries[k].value, sizeof(nick) - 1);
-        nick[sizeof(nick) - 1] = 0;
+        snprintf(nick, sizeof(nick), "%s", b->entries[k].value);
         break;
       }
     }

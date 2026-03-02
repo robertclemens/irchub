@@ -31,10 +31,10 @@ int recv_all(int socket, void *buffer, size_t length) {
     char *ptr = (char *)buffer;
     while (bytes_read < length) {
         ssize_t n = read(socket, ptr + bytes_read, length - bytes_read);
-        if (n <= 0) return n;
+        if (n <= 0) return (int)n;
         bytes_read += n;
     }
-    return bytes_read;
+    return (int)bytes_read;
 }
 
 void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
@@ -50,6 +50,7 @@ void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
     int total_plain = 1 + 4 + payload_len;
 
     int enc_len = aes_gcm_encrypt(plain, total_plain, key, buffer + 4, tag);
+    if (enc_len <= 0) return;
 
     memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
     int packet_len = enc_len + GCM_TAG_LEN;
@@ -57,7 +58,7 @@ void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
     memcpy(buffer, &net_len, 4);
 
     int total = 4 + packet_len;
-    if (write(fd, buffer, total) != total) {
+    if (write(fd, buffer, total) != (ssize_t)total) {
         // Write failed
     }
 }
@@ -74,6 +75,7 @@ void send_packet_binary(int fd, int cmd_id, const unsigned char *payload, int pa
     int total_plain = 1 + 4 + payload_len;
 
     int enc_len = aes_gcm_encrypt(plain, total_plain, key, buffer + 4, tag);
+    if (enc_len <= 0) return;
 
     memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
     int packet_len = enc_len + GCM_TAG_LEN;
@@ -81,7 +83,7 @@ void send_packet_binary(int fd, int cmd_id, const unsigned char *payload, int pa
     memcpy(buffer, &net_len, 4);
 
     int total = 4 + packet_len;
-    if (write(fd, buffer, total) != total) {
+    if (write(fd, buffer, total) != (ssize_t)total) {
         // Write failed
     }
 }
@@ -185,19 +187,19 @@ void read_response(int fd, unsigned char *key, char *out_buf, int max_len) {
     while (1) {
         uint32_t net_len;
         if (recv_all(fd, &net_len, 4) != 4) {
-            strcpy(out_buf, "Error: Connection lost");
+            snprintf(out_buf, max_len, "Error: Connection lost");
             return;
         }
-        
+
         int len = ntohl(net_len);
         if (len > MAX_BUFFER || len < GCM_TAG_LEN + 5) {
-            strcpy(out_buf, "Error: Invalid packet");
+            snprintf(out_buf, max_len, "Error: Invalid packet");
             return;
         }
 
         unsigned char enc_buf[MAX_BUFFER];
         if (recv_all(fd, enc_buf, len) != len) {
-            strcpy(out_buf, "Error: Connection lost");
+            snprintf(out_buf, max_len, "Error: Connection lost");
             return;
         }
 
@@ -215,11 +217,10 @@ void read_response(int fd, unsigned char *key, char *out_buf, int max_len) {
                 continue;
             }
             plain[plain_len] = 0;
-            strncpy(out_buf, (char*)plain, max_len - 1);
-            out_buf[max_len - 1] = 0;
+            snprintf(out_buf, max_len, "%s", (char*)plain);
             return;
         } else {
-            strcpy(out_buf, "Error: Decryption failed");
+            snprintf(out_buf, max_len, "Error: Decryption failed");
             return;
         }
     }
@@ -265,8 +266,7 @@ void bot_add() {
             priv_key++;  // Now points to BASE64(full PEM)
             
             char uuid[64];
-            strncpy(uuid, uuid_start, sizeof(uuid) - 1);
-            uuid[sizeof(uuid) - 1] = '\0';
+            snprintf(uuid, sizeof(uuid), "%s", uuid_start);
             
             printf("\n╔══════════════════════════════════════════════════╗\n");
             printf("║             BOT CREATED SUCCESSFULLY             ║\n");
@@ -285,15 +285,16 @@ void bot_add() {
             for (int i = 0; i < total_parts; i++) {
                 size_t start = i * 250;
                 size_t len = (start + 250 > key_len) ? (key_len - start) : 250;
-                
+
                 char chunk[260];
                 memset(chunk, 0, sizeof(chunk));
-                strncpy(chunk, priv_key + start, len);
-                
+                memcpy(chunk, priv_key + start, len);
+                chunk[len] = '\0';
+
                 printf("/msg %s <hash> sethubkey %d/%d:%s\n",
                        nick, i+1, total_parts, chunk);
             }
-            
+
             printf("\n/msg %s <hash> setuuid %s\n", nick, uuid);
             printf("/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
             
@@ -378,8 +379,7 @@ void bot_rekey() {
             priv_key++;
 
             char nick[64];
-            strncpy(nick, nick_start, sizeof(nick) - 1);
-            nick[sizeof(nick) - 1] = '\0';
+            snprintf(nick, sizeof(nick), "%s", nick_start);
 
             printf("\n╔══════════════════════════════════════════════════╗\n");
             printf("║              BOT REKEYED SUCCESSFULLY            ║\n");
@@ -409,7 +409,8 @@ void bot_rekey() {
 
                     char chunk[260];
                     memset(chunk, 0, sizeof(chunk));
-                    strncpy(chunk, priv_key + start, len);
+                    memcpy(chunk, priv_key + start, len);
+                    chunk[len] = '\0';
 
                     printf("/msg %s <hash> sethubkey %d/%d:%s\n",
                            nick, i+1, total_parts, chunk);
@@ -884,13 +885,11 @@ void admin_purge_tombstones() {
 
     switch(opt) {
         case 1:
-            strncpy(payload, "immediate", sizeof(payload) - 1);
-            payload[sizeof(payload) - 1] = '\0';
+            snprintf(payload, sizeof(payload), "immediate");
             proceed = get_confirmation("Purge ALL tombstoned entries immediately?");
             break;
         case 2:
-            strncpy(payload, "30", sizeof(payload) - 1);
-            payload[sizeof(payload) - 1] = '\0';
+            snprintf(payload, sizeof(payload), "30");
             proceed = get_confirmation("Purge tombstones older than 30 days?");
             break;
         case 3: {
@@ -1792,7 +1791,7 @@ int main(int argc, char *argv[]) {
     }
 
     uint32_t net_len = htonl(enc_len);
-    if (write(fd, &net_len, 4) != 4 || write(fd, enc, enc_len) != enc_len) {
+    if (write(fd, &net_len, 4) != (ssize_t)4 || write(fd, enc, enc_len) != (ssize_t)enc_len) {
         perror("Send failed");
         close(fd);
         return 1;

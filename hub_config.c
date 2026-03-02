@@ -317,20 +317,16 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       if (strcmp(k, "port") == 0) {
         state->port = atoi(v);
       } else if (strcmp(k, "bind_ip") == 0) {
-        strncpy(state->bind_ip, v, sizeof(state->bind_ip) - 1);
-        state->bind_ip[sizeof(state->bind_ip) - 1] = 0;
+        snprintf(state->bind_ip, sizeof(state->bind_ip), "%s", v);
       } else if (strcmp(k, "uuid") == 0) {
-        strncpy(state->hub_uuid, v, sizeof(state->hub_uuid) - 1);
-        state->hub_uuid[sizeof(state->hub_uuid) - 1] = 0;
+        snprintf(state->hub_uuid, sizeof(state->hub_uuid), "%s", v);
       } else if (strcmp(k, "hub_name") == 0) {
         // Only update if value is non-empty to prevent blanking out existing name
         if (v && v[0]) {
-          strncpy(state->hub_friendly_name, v, sizeof(state->hub_friendly_name) - 1);
-          state->hub_friendly_name[sizeof(state->hub_friendly_name) - 1] = 0;
+          snprintf(state->hub_friendly_name, sizeof(state->hub_friendly_name), "%s", v);
         }
       } else if (strcmp(k, "admin") == 0) {
-        strncpy(state->admin_password, v, sizeof(state->admin_password) - 1);
-        state->admin_password[sizeof(state->admin_password) - 1] = 0;
+        snprintf(state->admin_password, sizeof(state->admin_password), "%s", v);
       } else if (strcmp(k, "purge_days") == 0) {
         state->purge_days_setting = atoi(v);
         if (state->purge_days_setting < 0) state->purge_days_setting = 0;
@@ -379,30 +375,27 @@ bool hub_config_load(hub_state_t *state, const char *password) {
             }
 
             // Store peer data
-            strncpy(state->peers[state->peer_count].ip, ip,
-                    sizeof(state->peers[state->peer_count].ip) - 1);
-            state->peers[state->peer_count].ip[sizeof(state->peers[state->peer_count].ip) - 1] = 0;
+            snprintf(state->peers[state->peer_count].ip,
+                     sizeof(state->peers[state->peer_count].ip), "%s", ip);
 
             state->peers[state->peer_count].port = atoi(port_str);
 
-            strncpy(state->peers[state->peer_count].uuid, uuid_str,
-                    sizeof(state->peers[state->peer_count].uuid) - 1);
-            state->peers[state->peer_count].uuid[sizeof(state->peers[state->peer_count].uuid) - 1] = 0;
+            snprintf(state->peers[state->peer_count].uuid,
+                     sizeof(state->peers[state->peer_count].uuid), "%s", uuid_str);
 
             // Only copy friendly_name if it's non-empty
             if (name_str && name_str[0]) {
-              strncpy(state->peers[state->peer_count].friendly_name, name_str,
-                      sizeof(state->peers[state->peer_count].friendly_name) - 1);
-              state->peers[state->peer_count].friendly_name[sizeof(state->peers[state->peer_count].friendly_name) - 1] = 0;
+              snprintf(state->peers[state->peer_count].friendly_name,
+                       sizeof(state->peers[state->peer_count].friendly_name),
+                       "%s", name_str);
             }
 
             state->peers[state->peer_count].fd = -1;
             state->peer_count++;
           } else {
             // Old format: peer|ip|port (for backward compatibility)
-            strncpy(state->peers[state->peer_count].ip, ip,
-                    sizeof(state->peers[state->peer_count].ip) - 1);
-            state->peers[state->peer_count].ip[sizeof(state->peers[state->peer_count].ip) - 1] = 0;
+            snprintf(state->peers[state->peer_count].ip,
+                     sizeof(state->peers[state->peer_count].ip), "%s", ip);
             state->peers[state->peer_count].port = atoi(port_str);
             state->peers[state->peer_count].fd = -1;
             state->peer_count++;

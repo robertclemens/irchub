@@ -65,7 +65,12 @@ int main(int argc, char *argv[]) {
 
     fseek(fp, SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN, SEEK_SET);
     unsigned char *ciphertext = malloc(cipher_len);
-    
+    if (!ciphertext) {
+        fprintf(stderr, "Error: Memory allocation failed\n");
+        fclose(fp);
+        return 1;
+    }
+
     if (fread(ciphertext, 1, cipher_len, fp) != (size_t)cipher_len) {
         fprintf(stderr, "Error: Read failed\n");
         free(ciphertext);
@@ -91,9 +96,22 @@ int main(int argc, char *argv[]) {
     secure_wipe(password, sizeof(password));
 
     unsigned char *plaintext = malloc(cipher_len + 1);
+    if (!plaintext) {
+        fprintf(stderr, "Error: Memory allocation failed\n");
+        secure_wipe(key, sizeof(key));
+        free(ciphertext);
+        return 1;
+    }
     int len, plain_len;
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    
+    if (!ctx) {
+        fprintf(stderr, "Error: Failed to create cipher context\n");
+        secure_wipe(key, sizeof(key));
+        free(ciphertext);
+        free(plaintext);
+        return 1;
+    }
+
     EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv);
     EVP_DecryptUpdate(ctx, plaintext, &plain_len, ciphertext, cipher_len);
     EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
@@ -103,10 +121,11 @@ int main(int argc, char *argv[]) {
         EVP_CIPHER_CTX_free(ctx);
         secure_wipe(key, sizeof(key));
         free(ciphertext);
+        secure_wipe(plaintext, plain_len);
         free(plaintext);
         return 1;
     }
-    
+
     plain_len += len;
     plaintext[plain_len] = 0;
     EVP_CIPHER_CTX_free(ctx);
