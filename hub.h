@@ -39,6 +39,7 @@
 #define MAX_PENDING_OP_REQUESTS 50
 #define PBKDF2_ITERATIONS 100000 // NEW: For password-based key derivation
 #define HUB_PID_FILE ".irchub.pid"
+#define CONFIG_PASS_ENV_VAR "HUB_PASS"
 #define HUB_CONFIG_PURGE_DAYS_KEY "purge_days"
 #define HUB_LOG_FILE ".irchub.log"
 #define HUB_LOG_FILE_SIZE (10 * 1024 * 1024)  // 10MB
