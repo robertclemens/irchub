@@ -53,7 +53,7 @@ INCLUDES = -I/usr/include -I/usr/local/include
 LIBS = -lssl -lcrypto -lpthread
 
 # Linker flags
-LDFLAGS = -L/usr/lib -L/usr/local/lib
+LDFLAGS =
 
 # ============================================================================
 # Build Modes
@@ -239,7 +239,7 @@ keygen.c:
 	@echo '    free(pub_pem);' >> keygen.c
 	@echo '    ' >> keygen.c
 	@echo '    printf("\\nDone! You can now run setup:\\n");' >> keygen.c
-	@echo '    printf("  ./bin/irchub <password> -setup\\n");' >> keygen.c
+	@echo '    printf("  ./bin/irchub -setup\\n");' >> keygen.c
 	@echo '    return 0;' >> keygen.c
 	@echo '}' >> keygen.c
 	@echo "Created keygen.c"
@@ -270,8 +270,8 @@ install: all
 	@echo ""
 	@echo "First-time setup:"
 	@echo "  1. Generate keys: $(BINDIR)/hub_keygen"
-	@echo "  2. Run setup: $(BINDIR)/irchub <password> -setup"
-	@echo "  3. Start hub: $(BINDIR)/irchub <password>"
+	@echo "  2. Run setup: $(BINDIR)/irchub -setup"
+	@echo "  3. Set env and start: export HUB_PASS=<password> && $(BINDIR)/irchub"
 	@echo ""
 	@echo "Utilities:"
 	@echo "  - Admin client: $(BINDIR)/hub_admin <ip> <port> <pub.pem>"
@@ -302,12 +302,13 @@ test: debug
 # Memory leak detection with Valgrind
 valgrind: debug
 	@echo "Running Valgrind memory check..."
+	@echo "Note: set HUB_PASS before running the hub binary"
 	@valgrind --leak-check=full \
 	          --show-leak-kinds=all \
 	          --track-origins=yes \
 	          --verbose \
 	          --log-file=valgrind-hub.log \
-	          $(HUB_TARGET) test_password &
+	          $(HUB_TARGET) &
 	@echo "Valgrind output will be in valgrind-hub.log"
 
 # Static analysis with cppcheck (if available)
@@ -376,8 +377,8 @@ help:
 	@echo ""
 	@echo "After building:"
 	@echo "  ./bin/hub_keygen                    # Generate keys"
-	@echo "  ./bin/irchub mypass -setup          # Initial setup"
-	@echo "  ./bin/irchub mypass                 # Run hub"
+	@echo "  ./bin/irchub -setup                          # Initial setup"
+	@echo "  export HUB_PASS=mypass && ./bin/irchub       # Run hub"
 	@echo "  ./bin/hub_admin 127.0.0.1 6667 hub_public.pem  # Admin client"
 	@echo ""
 
