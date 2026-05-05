@@ -442,22 +442,25 @@ c->last_pong_sent = 0;
 
 static void read_pass_hidden(const char *prompt, char *buf, size_t len) {
     struct termios oldt, newt;
+    int is_tty = (tcgetattr(STDIN_FILENO, &oldt) == 0);
     printf("%s", prompt);
     fflush(stdout);
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~ECHO;
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    if (is_tty) {
+        newt = oldt;
+        newt.c_lflag &= ~(tcflag_t)(ECHO | ECHONL);
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    }
     if (!fgets(buf, (int)len, stdin)) buf[0] = 0;
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    if (is_tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    }
     printf("\n");
     buf[strcspn(buf, "\n")] = 0;
 }
 
 int main(int argc, char *argv[]) {
     bool setup_mode = false;
-    int i;
-    for (i = 1; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-setup") == 0) setup_mode = true;
     }
 
@@ -493,9 +496,10 @@ int main(int argc, char *argv[]) {
         }
 
         printf("Friendly Name: ");
-        if (scanf("%63s", state.hub_friendly_name) != 1) return 1;
-        state.hub_friendly_name[sizeof(state.hub_friendly_name) - 1] = 0;
-        while ((ch = getchar()) != '\n' && ch != EOF);
+        fflush(stdout);
+        if (fgets(state.hub_friendly_name, sizeof(state.hub_friendly_name), stdin)) {
+            state.hub_friendly_name[strcspn(state.hub_friendly_name, "\n")] = 0;
+        }
 
         generate_uuid_v4(state.hub_uuid, sizeof(state.hub_uuid));
         printf("Generated UUID: %s\n", state.hub_uuid);
@@ -519,7 +523,6 @@ int main(int argc, char *argv[]) {
                     printf("Key generation failed.\n");
                     return 1;
                 }
-                state.private_key_pem = priv_pem;
                 state.priv_key = load_private_key_from_memory(priv_pem);
                 free(pub_pem);
                 if (!state.priv_key) {
@@ -528,6 +531,7 @@ int main(int argc, char *argv[]) {
                     free(priv_pem);
                     return 1;
                 }
+                state.private_key_pem = priv_pem;
                 printf("[+] Keypair generated.\n");
             } else {
                 char kp_path[256];
@@ -549,16 +553,21 @@ int main(int argc, char *argv[]) {
                     fseek(f, 0, SEEK_END);
                     {
                         long s = ftell(f);
+                        if (s < 0) {
+                            printf("Error: could not determine key file size.\n");
+                            fclose(f);
+                            return 1;
+                        }
                         fseek(f, 0, SEEK_SET);
-                        state.private_key_pem = malloc(s + 1);
+                        state.private_key_pem = malloc((size_t)s + 1);
                         if (!state.private_key_pem ||
-                            fread(state.private_key_pem, 1, s, f) != (size_t)s) {
+                            fread(state.private_key_pem, 1, (size_t)s, f) != (size_t)s) {
                             printf("Error reading key file.\n");
                             if (state.private_key_pem) free(state.private_key_pem);
                             fclose(f);
                             return 1;
                         }
-                        state.private_key_pem[s] = 0;
+                        state.private_key_pem[(size_t)s] = 0;
                     }
                     fclose(f);
                 }
@@ -587,6 +596,8 @@ int main(int argc, char *argv[]) {
         }
 
         hub_config_write(&state);
+        secure_wipe(state.config_pass, sizeof(state.config_pass));
+        secure_wipe(state.admin_password, sizeof(state.admin_password));
         printf("Done.\n");
 
         if (state.priv_key) EVP_PKEY_free(state.priv_key);

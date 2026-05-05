@@ -151,17 +151,18 @@ bool wait_for_input_or_socket(char *buf, size_t len) {
 
 void get_password_secure(const char *prompt, char *buf, size_t len) {
     struct termios oldt, newt;
+    int is_tty = (tcgetattr(STDIN_FILENO, &oldt) == 0);
     printf("%s", prompt);
     fflush(stdout);
-    
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~ECHO;
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    
-    if (!fgets(buf, len, stdin)) buf[0] = 0;
-    
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    if (is_tty) {
+        newt = oldt;
+        newt.c_lflag &= ~(tcflag_t)(ECHO | ECHONL);
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    }
+    if (!fgets(buf, (int)len, stdin)) buf[0] = 0;
+    if (is_tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    }
     printf("\n");
     buf[strcspn(buf, "\n")] = 0;
 }
