@@ -2,10 +2,10 @@
 
 #########################################################################################
 # Set your variables
-CONFIG_PASS="configpassword"
+export HUB_PASS="configpasswordhere"
 PID_FILE=".irchub.pid"
 
-# CONFIG_PASS is the config encryption password
+# HUB_PASS is the config encryption password (read by irchub via getenv)
 # PID_FILE must match hub.h #define HUB_PID_FILE
 #########################################################################################
 
@@ -14,19 +14,16 @@ cd "$(dirname "$0")"
 
 # Check if the PID file exists
 if [ -e "$PID_FILE" ]; then
-    # If the PID file exists, check if the process is still running
     PID=$(cat "$PID_FILE")
     if ps -p "$PID" > /dev/null 2>&1; then
         echo "Hub is already running (PID: $PID). Exiting."
         exit 1
     else
-        # The process is not running, but the PID file was left behind. Remove it.
         echo "Found stale PID file. Removing."
         rm -f "$PID_FILE"
     fi
 fi
 
-# Run the hub
-./irchub "$CONFIG_PASS" &
+./irchub &
 
 echo "Hub started (PID: $!)"

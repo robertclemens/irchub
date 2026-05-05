@@ -45,6 +45,6 @@ int main(int argc, char *argv[]) {
     free(pub_pem);
     
     printf("\nDone! You can now run setup:\n");
-    printf("  ./bin/irchub <password> -setup\n");
+    printf("  ./bin/irchub -setup\n");
     return 0;
 }
