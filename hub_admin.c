@@ -279,40 +279,56 @@ void bot_add() {
             printf("Bot Name: %s\n", nick);
             printf("UUID:     %s\n\n", uuid);
             
-            size_t key_len = strlen(priv_key);
-            int total_parts = (key_len + 249) / 250;
-            
-            printf("Private key: %zu chars → %d parts\n\n", key_len, total_parts);
-            printf("COPY AND PASTE THESE COMMANDS:\n");
-            printf("═══════════════════════════════════════════════════\n\n");
-            
-            for (int i = 0; i < total_parts; i++) {
-                size_t start = i * 250;
-                size_t len = (start + 250 > key_len) ? (key_len - start) : 250;
+            printf("\nKey Distribution:\n");
+            printf("  1. Export to file\n");
+            printf("  2. Show private key (base64)\n");
+            printf("  3. Show IRC sethubkey commands\n\n");
 
-                char chunk[260];
-                memset(chunk, 0, sizeof(chunk));
-                memcpy(chunk, priv_key + start, len);
-                chunk[len] = '\0';
+            char kd_buf[10];
+            get_input("Choice: ", kd_buf, sizeof(kd_buf));
+            int kd_choice = atoi(kd_buf);
 
-                printf("/msg %s <hash> sethubkey %d/%d:%s\n",
-                       nick, i+1, total_parts, chunk);
-            }
-
-            printf("\n/msg %s <hash> setuuid %s\n", nick, uuid);
-            printf("/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
-            
-            printf("═══════════════════════════════════════════════════\n");
-            printf("After all parts: Bot will auto-reconnect to hub.\n\n");
-            
-            // FIXED: Save backup as base64 encoded (matches IRC output)
-            char fname[128];
-            snprintf(fname, sizeof(fname), "bot_%s_priv_key.b64", nick);
-            FILE *f = fopen(fname, "w");
-            if (f) {
-                fprintf(f, "%s\n", priv_key);
-                fclose(f);
-                printf("[Backup saved: %s (BASE64 encoded)]\n\n", fname);
+            switch (kd_choice) {
+                case 1: {
+                    char fname[128];
+                    snprintf(fname, sizeof(fname), "bot_%s_priv_key.b64", nick);
+                    FILE *kf = fopen(fname, "w");
+                    if (kf) {
+                        fprintf(kf, "%s\n", priv_key);
+                        fclose(kf);
+                        printf("[Saved: %s]\n", fname);
+                    } else {
+                        printf("Error: could not create file.\n");
+                    }
+                    break;
+                }
+                case 2:
+                    printf("\nPrivate Key (base64):\n%s\n", priv_key);
+                    break;
+                case 3: {
+                    size_t key_len = strlen(priv_key);
+                    int total_parts = (int)((key_len + 249) / 250);
+                    printf("Private key: %zu chars, %d parts\n\n", key_len, total_parts);
+                    printf("COPY AND PASTE THESE COMMANDS:\n");
+                    printf("===================================================\n\n");
+                    for (int i = 0; i < total_parts; i++) {
+                        size_t start = (size_t)i * 250;
+                        size_t clen = (start + 250 > key_len) ? (key_len - start) : 250;
+                        char chunk[260];
+                        memset(chunk, 0, sizeof(chunk));
+                        memcpy(chunk, priv_key + start, clen);
+                        chunk[clen] = '\0';
+                        printf("/msg %s <hash> sethubkey %d/%d:%s\n",
+                               nick, i + 1, total_parts, chunk);
+                    }
+                    printf("\n/msg %s <hash> setuuid %s\n", nick, uuid);
+                    printf("/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
+                    printf("===================================================\n");
+                    break;
+                }
+                default:
+                    printf("Invalid choice.\n");
+                    break;
             }
             
             secure_wipe(response, sizeof(response));
