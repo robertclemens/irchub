@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <fcntl.h>
+#include <termios.h>
 
 FILE *log_fp = NULL;
 hub_state_t *g_state = NULL;  // Global state pointer for use in hub_log() and other global functions
@@ -439,66 +440,174 @@ c->last_pong_sent = 0;
 }
 
 
+static void read_pass_hidden(const char *prompt, char *buf, size_t len) {
+    struct termios oldt, newt;
+    printf("%s", prompt);
+    fflush(stdout);
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~ECHO;
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    if (!fgets(buf, (int)len, stdin)) buf[0] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    printf("\n");
+    buf[strcspn(buf, "\n")] = 0;
+}
+
 int main(int argc, char *argv[]) {
+    bool setup_mode = false;
+    int i;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-setup") == 0) setup_mode = true;
+    }
+
     hub_state_t state;
     memset(&state, 0, sizeof(state));
     state.running = true;
-
-    // Set global state pointer for use in hub_log() and other functions
     g_state = &state;
+    state.log_level = LOG_INFO;
+    state.log_max_size = HUB_LOG_FILE_SIZE;
 
-    // Initialize log defaults
-    state.log_level = LOG_INFO;      // Default to INFO level
-    state.log_max_size = HUB_LOG_FILE_SIZE;  // Default to 10MB
+    if (setup_mode) {
+        int ch;
 
-    if (argc >= 3 && strcmp(argv[2], "-setup") == 0) {
-        char kp[256];
-        printf("--- Setup ---\nPort: ");
+        printf("--- Setup ---\n");
+
+        printf("Port: ");
         if (scanf("%d", &state.port) != 1) return 1;
+        while ((ch = getchar()) != '\n' && ch != EOF);
 
         printf("Bind IP (default 0.0.0.0): ");
-        if (scanf("%63s", state.bind_ip) != 1) {
-            snprintf(state.bind_ip, sizeof(state.bind_ip), "0.0.0.0");
+        fflush(stdout);
+        {
+            char bind_buf[65];
+            memset(bind_buf, 0, sizeof(bind_buf));
+            if (fgets(bind_buf, sizeof(bind_buf), stdin)) {
+                bind_buf[strcspn(bind_buf, "\n")] = 0;
+            }
+            if (bind_buf[0] == 0) {
+                snprintf(state.bind_ip, sizeof(state.bind_ip), "0.0.0.0");
+            } else {
+                snprintf(state.bind_ip, sizeof(state.bind_ip), "%s", bind_buf);
+            }
         }
-        state.bind_ip[sizeof(state.bind_ip) - 1] = 0;
 
         printf("Friendly Name: ");
         if (scanf("%63s", state.hub_friendly_name) != 1) return 1;
         state.hub_friendly_name[sizeof(state.hub_friendly_name) - 1] = 0;
+        while ((ch = getchar()) != '\n' && ch != EOF);
 
-        // Generate UUID for this hub
         generate_uuid_v4(state.hub_uuid, sizeof(state.hub_uuid));
         printf("Generated UUID: %s\n", state.hub_uuid);
 
-        printf("PrivKey Path: ");
-        if (scanf("%255s", kp) != 1) return 1;
+        read_pass_hidden("Config Password: ", state.config_pass, sizeof(state.config_pass));
 
-        printf("Admin Pass: ");
-        if (scanf("%127s", state.admin_password) != 1) return 1;
-        
-        FILE *f = fopen(kp, "rb");
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            long s = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            
-            state.private_key_pem = malloc(s + 1);
-            if (!state.private_key_pem || fread(state.private_key_pem, 1, s, f) != (size_t)s) {
-                printf("Error reading key file.\n");
-                if(state.private_key_pem) free(state.private_key_pem);
-                fclose(f);
-                return 1;
+        printf("\nHub Keypair:\n");
+        printf("  1. Generate new keypair\n");
+        printf("  2. Use existing key file\n");
+        printf("Choice: ");
+        fflush(stdout);
+        {
+            int kp_choice = 0;
+            if (scanf("%d", &kp_choice) != 1) kp_choice = 2;
+            while ((ch = getchar()) != '\n' && ch != EOF);
+
+            if (kp_choice == 1) {
+                char *priv_pem = NULL, *pub_pem = NULL;
+                printf("[*] Generating RSA-2048 keypair...\n");
+                if (!hub_crypto_generate_keypair(&priv_pem, &pub_pem)) {
+                    printf("Key generation failed.\n");
+                    return 1;
+                }
+                state.private_key_pem = priv_pem;
+                state.priv_key = load_private_key_from_memory(priv_pem);
+                free(pub_pem);
+                if (!state.priv_key) {
+                    printf("Failed to load generated key.\n");
+                    secure_wipe(priv_pem, strlen(priv_pem));
+                    free(priv_pem);
+                    return 1;
+                }
+                printf("[+] Keypair generated.\n");
+            } else {
+                char kp_path[256];
+                memset(kp_path, 0, sizeof(kp_path));
+                printf("Private Key File Path: ");
+                fflush(stdout);
+                if (!fgets(kp_path, sizeof(kp_path), stdin)) {
+                    printf("Read error.\n");
+                    return 1;
+                }
+                kp_path[strcspn(kp_path, "\n")] = 0;
+
+                {
+                    FILE *f = fopen(kp_path, "rb");
+                    if (!f) {
+                        printf("Key file not found.\n");
+                        return 1;
+                    }
+                    fseek(f, 0, SEEK_END);
+                    {
+                        long s = ftell(f);
+                        fseek(f, 0, SEEK_SET);
+                        state.private_key_pem = malloc(s + 1);
+                        if (!state.private_key_pem ||
+                            fread(state.private_key_pem, 1, s, f) != (size_t)s) {
+                            printf("Error reading key file.\n");
+                            if (state.private_key_pem) free(state.private_key_pem);
+                            fclose(f);
+                            return 1;
+                        }
+                        state.private_key_pem[s] = 0;
+                    }
+                    fclose(f);
+                }
+                state.priv_key = load_private_key_from_memory(state.private_key_pem);
+                if (!state.priv_key) {
+                    printf("Failed to load private key.\n");
+                    secure_wipe(state.private_key_pem, strlen(state.private_key_pem));
+                    free(state.private_key_pem);
+                    return 1;
+                }
             }
-            state.private_key_pem[s] = 0;
-            fclose(f);
-        } else {
-            printf("Key file not found.\n");
-            return 1;
         }
-        
+
+        {
+            char admin_pass1[MAX_PASS], admin_pass2[MAX_PASS];
+            do {
+                read_pass_hidden("Admin Password: ", admin_pass1, sizeof(admin_pass1));
+                read_pass_hidden("Confirm Admin Password: ", admin_pass2, sizeof(admin_pass2));
+                if (strcmp(admin_pass1, admin_pass2) != 0) {
+                    printf("Passwords do not match. Try again.\n");
+                }
+            } while (strcmp(admin_pass1, admin_pass2) != 0);
+            snprintf(state.admin_password, sizeof(state.admin_password), "%s", admin_pass1);
+            secure_wipe(admin_pass1, sizeof(admin_pass1));
+            secure_wipe(admin_pass2, sizeof(admin_pass2));
+        }
+
         hub_config_write(&state);
         printf("Done.\n");
+
+        if (state.priv_key) EVP_PKEY_free(state.priv_key);
+        if (state.private_key_pem) {
+            secure_wipe(state.private_key_pem, strlen(state.private_key_pem));
+            free(state.private_key_pem);
+        }
         return 0;
+    }
+
+    /* Normal mode: read password from environment */
+    {
+        const char *env_pass = getenv(CONFIG_PASS_ENV_VAR);
+        if (!env_pass || !env_pass[0]) {
+            fprintf(stderr, "Error: %s environment variable is not set.\n",
+                    CONFIG_PASS_ENV_VAR);
+            fprintf(stderr, "Set it before starting: export %s=<password>\n",
+                    CONFIG_PASS_ENV_VAR);
+            return 1;
+        }
+        snprintf(state.config_pass, sizeof(state.config_pass), "%s", env_pass);
     }
 
     log_fp = fopen(HUB_LOG_FILE, "a");
@@ -546,9 +655,11 @@ int main(int argc, char *argv[]) {
     state.priv_key = load_private_key_from_memory(state.private_key_pem);
     if (!state.priv_key) {
         hub_log("[ERROR] Failed to load private key\n");
+        secure_wipe(state.private_key_pem, strlen(state.private_key_pem));
+        free(state.private_key_pem);
         return 1;
     }
-    
+
     hub_log("[HUB] Started on port %d (PID: %d)\n", state.port, getpid());
 
     state.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
