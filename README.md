@@ -2,14 +2,16 @@
 
 A hub server for coordinating networks of IRC bots. irchub handles centralized key management, encrypted configuration distribution, bot provisioning, and inter-hub mesh networking — so your bots always have up-to-date credentials and settings without manual intervention.
 
+> **Companion project:** irchub is designed to work with [ircbot](https://github.com/robertclemens/ircbot/) — a C-based IRC bot that connects to irchub for secure configuration sync, op coordination, and inter-bot communication. You need both projects to run a complete setup.
+
 ## Overview
 
-irchub sits between your IRC bots and your admin console. Each bot authenticates to the hub using an RSA-2048 keypair. The hub distributes encrypted configuration (channels, admin masks, oper credentials, passwords) to all connected bots and keeps everything synchronized across multiple hub instances via a peer mesh.
+irchub sits between your IRC bots and your admin console. Each [ircbot](https://github.com/robertclemens/ircbot/) instance authenticates to the hub using an RSA-2048 keypair. The hub distributes encrypted configuration (channels, admin masks, oper credentials, passwords) to all connected bots and keeps everything synchronized across multiple hub instances via a peer mesh.
 
 ```
-hub_admin ──► irchub ──► Bot A
-                    └──► Bot B
-                    └──► irchub (peer) ──► Bot C
+hub_admin ──► irchub ──► ircbot A
+                    └──► ircbot B
+                    └──► irchub (peer) ──► ircbot C
 ```
 
 **Key capabilities:**
@@ -31,6 +33,17 @@ hub_admin ──► irchub ──► Bot A
 | `bin/keygen` | RSA-2048 keypair generator |
 | `bin/hub_decrypt` | Decrypt and inspect config file |
 | `bin/hub_encrypt` | Re-encrypt a config file |
+
+## Companion Project: ircbot
+
+irchub is the hub — [ircbot](https://github.com/robertclemens/ircbot/) is the bot. The two projects are built to work together:
+
+- **[ircbot](https://github.com/robertclemens/ircbot/)** connects to irchub on startup, authenticates with its RSA keypair, and receives its full configuration (channels to join, passwords, admin masks) automatically.
+- When a bot's config changes (new channel, password rotation, rekey), the hub pushes the update to all connected bots in real time.
+- Bots request op grants through the hub, which coordinates across the mesh so any bot can grant ops to any other bot regardless of which hub they are connected to.
+- Commands to the bot are authenticated using time-based hashes, and the hub distributes the shared secret needed to verify them.
+
+You provision bots and manage the network entirely through `hub_admin` — you never need to manually edit bot config files.
 
 ## Dependencies
 
