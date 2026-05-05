@@ -1,47 +1,71 @@
 #ifndef HUB_H
 #define HUB_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/select.h>
-#include <sys/time.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/rsa.h>
-#include <openssl/pem.h>
-#include <time.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/ssl.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
 
 #define HUB_CONFIG_FILE ".irchub.cnf"
 #define MAX_CLIENTS 100
 #define MAX_BOTS 100
 #define MAX_PEERS 10
 #define MAX_CHAN 65
+#define MAX_NICK 32
 #define MAX_KEY 31
-#define MAX_MASK_LEN 128
+#define MAX_MASK_LEN 256
 #define MAX_PASS 128
 #define MAX_BUFFER 16384
-#define SALT_SIZE 16  // FIXED: Increased from 8 to 16 bytes (128 bits)
+#define SALT_SIZE 16 // FIXED: Increased from 8 to 16 bytes (128 bits)
 #define GCM_IV_LEN 12
 #define GCM_TAG_LEN 16
 #define HEADER_SIZE 4
 #define MAX_PENDING_BOTS 10
-#define PBKDF2_ITERATIONS 100000  // NEW: For password-based key derivation
+#define MAX_PENDING_OP_REQUESTS 50
+#define PBKDF2_ITERATIONS 100000 // NEW: For password-based key derivation
+#define HUB_PID_FILE ".irchub.pid"
+#define CONFIG_PASS_ENV_VAR "HUB_PASS"
+#define HUB_CONFIG_PURGE_DAYS_KEY "purge_days"
+#define HUB_LOG_FILE ".irchub.log"
+#define HUB_LOG_FILE_SIZE (10 * 1024 * 1024)  // 10MB
+
+// Log levels
+#define LOG_NONE    0
+#define LOG_ERROR   1
+#define LOG_WARNING 2
+#define LOG_INFO    3
+#define LOG_DEBUG   4
+
+// Rate Limiting Settings
+#define MAX_IP_RATE_LIMITS 500
+#define MAX_CONNECTIONS_PER_IP 5
+#define MAX_FAILED_AUTH_ATTEMPTS 3
+#define FAILED_AUTH_BLOCK_DURATION 300  // 5 minutes
+#define FAILED_AUTH_RESET_TIME 3600     // 1 hour
+#define MAX_RECENT_PURGES 5             // Track recent PURGE cutoffs to prevent loops
+#define PURGE_DEDUP_WINDOW 60            // Seconds to remember PURGE (prevents loops)
 
 // Timeout Settings
 #define PING_INTERVAL 60
 #define CLIENT_TIMEOUT 180
 #define CONNECT_TIMEOUT 5
 #define PEER_RECONNECT_INTERVAL 120
+#define CONFIG_SYNC_INTERVAL 300
 
 // Protocol Commands
 #define CMD_PING 0x01
@@ -49,154 +73,286 @@
 #define CMD_CONFIG_PULL 0x03
 #define CMD_CONFIG_DATA 0x04
 #define CMD_UPDATE_PUBKEY 0x05
-#define CMD_PEER_SYNC     0x06
+#define CMD_PEER_SYNC 0x06
 #define CMD_MESH_STATE 0x07
+#define CMD_INVITE_REQUEST 0x09 // Bot -> Hub: Request invite for nick into channel
 
-#define CMD_ADMIN_AUTH          0x10
-#define CMD_ADMIN_LIST_FULL     0x11
-#define CMD_ADMIN_ADD           0x12
-#define CMD_ADMIN_DEL           0x13
-#define CMD_ADMIN_REGEN_KEYS    0x14
-#define CMD_ADMIN_LIST_SUMMARY  0x15
-#define CMD_ADMIN_GET_PENDING   0x16
-#define CMD_ADMIN_APPROVE       0x17
-#define CMD_ADMIN_ADD_PEER      0x18
-#define CMD_ADMIN_LIST_PEERS    0x19
-#define CMD_ADMIN_DEL_PEER      0x1A
-#define CMD_ADMIN_GET_PUBKEY    0x1B
-#define CMD_ADMIN_SET_PRIVKEY   0x1C
-#define CMD_ADMIN_GET_PRIVKEY   0x1D
-#define CMD_ADMIN_SET_PUBKEY    0x1E
-#define CMD_ADMIN_SYNC_MESH     0x1F
-#define CMD_ADMIN_CREATE_BOT    0x32  // 50 decimal
-#define CMD_ADMIN_REKEY_BOT     0x20  // Generate new bot keypair
-#define CMD_ADMIN_DISCONNECT_BOT 0x21  // Force disconnect bot
-#define CMD_ADMIN_BOT_STATUS    0x22  // Get bot connection info
+#define CMD_ADMIN_AUTH 0x10
+#define CMD_ADMIN_LIST_FULL 0x11
+#define CMD_ADMIN_ADD 0x12
+#define CMD_ADMIN_DEL 0x13
+#define CMD_ADMIN_REGEN_KEYS 0x14
+#define CMD_ADMIN_LIST_SUMMARY 0x15
+#define CMD_ADMIN_GET_PENDING 0x16
+#define CMD_ADMIN_APPROVE 0x17
+#define CMD_ADMIN_ADD_PEER 0x18
+#define CMD_ADMIN_LIST_PEERS 0x19
+#define CMD_ADMIN_DEL_PEER 0x1A
+#define CMD_ADMIN_GET_PUBKEY 0x1B
+#define CMD_ADMIN_SET_PRIVKEY 0x1C
+#define CMD_ADMIN_GET_PRIVKEY 0x1D
+#define CMD_ADMIN_SET_PUBKEY 0x1E
+#define CMD_ADMIN_SYNC_MESH 0x1F
+#define CMD_ADMIN_CREATE_BOT 0x32     // 50 decimal
+#define CMD_ADMIN_REKEY_BOT 0x20      // Generate new bot keypair
+#define CMD_ADMIN_DISCONNECT_BOT 0x21 // Force disconnect bot
+#define CMD_ADMIN_BOT_STATUS 0x22     // Get bot connection info
+#define CMD_BOT_KEY_UPDATE 0x40       // Hub -> Bot: New private key update
+
+// Global Config Management Commands
+#define CMD_ADMIN_LIST_CHANNELS 0x23  // List all channels
+#define CMD_ADMIN_ADD_CHANNEL 0x24    // Add channel
+#define CMD_ADMIN_DEL_CHANNEL 0x25    // Remove channel
+#define CMD_ADMIN_LIST_MASKS 0x26     // List admin masks
+#define CMD_ADMIN_ADD_MASK 0x27       // Add admin mask
+#define CMD_ADMIN_DEL_MASK 0x2B       // Remove admin mask
+#define CMD_ADMIN_LIST_OPERS 0x2C     // List oper masks
+#define CMD_ADMIN_ADD_OPER 0x2D       // Add oper mask
+#define CMD_ADMIN_DEL_OPER 0x2E       // Remove oper mask
+#define CMD_ADMIN_SET_ADMIN_PASS 0x2F // Change admin password
+#define CMD_ADMIN_SET_BOT_PASS 0x30   // Change bot password
+#define CMD_ADMIN_OP_USER 0x31        // Op a user in a channel
+
+// Bot-to-Bot Op Commands (via Hub)
+#define CMD_OP_REQUEST 0x28 // Bot -> Hub: Request ops from another bot
+#define CMD_OP_GRANT 0x29   // Hub -> Bot: Grant ops to requesting bot
+#define CMD_OP_FAILED 0x2A  // Hub -> Bot: Op request failed
+#define CMD_OP_FORWARD_REQUEST 0x33 // Hub -> Hub: Forward OP request to peer
+#define CMD_OP_FORWARD_GRANT 0x34   // Hub -> Hub: Forward grant response back
+#define CMD_OP_FORWARD_FAILED 0x35  // Hub -> Hub: Forward failure back
+#define CMD_PEER_REKEY_BOT 0x42     // Hub -> Hub: Forward bot rekey to peer
+
+// Tombstone Purge Commands
+#define CMD_ADMIN_PURGE_TOMBSTONES 0x36 // Purge tombstoned entries (payload: days or "immediate")
+#define CMD_ADMIN_SET_PURGE_DAYS 0x41   // Configure automatic purge (payload: days, 0=disabled)
+
+// Bind IP and IP Access Control Commands
+#define CMD_ADMIN_SET_BIND_IP 0x37
+#define CMD_ADMIN_LIST_ALLOWLIST 0x38
+#define CMD_ADMIN_ADD_ALLOWLIST 0x39
+#define CMD_ADMIN_DEL_ALLOWLIST 0x3A
+#define CMD_ADMIN_LIST_DENYLIST 0x3B
+#define CMD_ADMIN_ADD_DENYLIST 0x3C
+#define CMD_ADMIN_DEL_DENYLIST 0x3D
+#define CMD_ADMIN_SET_HUB_NAME 0x3E
+#define CMD_ADMIN_SET_BIND_PORT 0x3F
+#define CMD_ADMIN_SET_LOG_LEVEL 0x43    // Set log level (payload: level 0-4)
+#define CMD_ADMIN_SET_LOG_SIZE  0x44    // Set log size limit (payload: size in bytes)
 
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
 
 typedef struct {
-    char key[32];
-    char value[1024];
-    time_t timestamp;
+  char key[32];
+  char value[1024];
+  time_t timestamp;
 } config_entry_t;
 
 typedef struct {
-    char uuid[64];
-    config_entry_t entries[MAX_BOT_ENTRIES];
-    int entry_count;
-    bool is_active;
-    time_t last_sync_time;
+  char uuid[64];
+  config_entry_t entries[MAX_BOT_ENTRIES];
+  int entry_count;
+  bool is_active;
+  time_t last_sync_time;
 } bot_config_t;
 
 typedef struct {
-    char uuid[64];
-    char nick[32];
-    char ip[64];
-    time_t last_attempt;
+  char uuid[64];
+  char nick[32];
+  char ip[64];
+  time_t last_attempt;
 } pending_bot_t;
 
 typedef struct {
-    char ip[64];
-    int port;
-    bool connected;
-    int fd;
-    int remote_connected_count;
-    int remote_total_peers;
-    time_t last_mesh_report;
-    char last_gossip[1024];
+  char request_id[64];     // Unique ID for this request
+  char requester_uuid[64]; // UUID of bot requesting ops
+  char target_uuid[64];    // UUID of bot that should grant ops
+  char channel[MAX_CHAN];  // Channel where ops are needed
+  int origin_fd;           // FD to send response back to (-1 if local bot)
+  time_t timestamp;        // When request was created
+  bool active;             // Whether this slot is in use
+} pending_op_request_t;
+
+typedef struct {
+  char ip[64];
+  int active_connections;    // Current active connections from this IP
+  int failed_auth_count;     // Failed authentication attempts
+  time_t last_failed_auth;   // Timestamp of last failed auth
+  time_t blocked_until;      // Temporary block expiration (0 if not blocked)
+  time_t first_seen;         // For cleanup of old entries
+} ip_rate_limit_t;
+
+typedef struct {
+  char ip[64];              // Configured/advertised IP
+  int port;
+  char uuid[64];            // Remote peer's UUID
+  char friendly_name[64];   // Remote peer's friendly name
+  char remote_ip[64];       // Actual connection IP (from socket)
+  bool connected;
+  int fd;
+  int remote_connected_count;
+  int remote_total_peers;
+  time_t last_mesh_report;
+  char last_gossip[1024];
 } hub_peer_config_t;
 
 typedef enum { CLIENT_BOT, CLIENT_ADMIN, CLIENT_HUB } client_type_t;
 
 typedef enum {
-    BOT_AUTH_IDLE = 0,
-    BOT_AUTH_UUID_RECEIVED,
-    BOT_AUTH_CHALLENGE_SENT,
-    BOT_AUTH_SIGNATURE_RECEIVED,
-    BOT_AUTH_COMPLETE
+  BOT_AUTH_IDLE = 0,
+  BOT_AUTH_UUID_RECEIVED,
+  BOT_AUTH_CHALLENGE_SENT,
+  BOT_AUTH_SIGNATURE_RECEIVED,
+  BOT_AUTH_COMPLETE
 } bot_auth_state_t;
 
 typedef struct {
-    int fd;
-    char ip[64];
-    char id[64];
-    unsigned char session_key[32];
-    bool authenticated;
-    client_type_t type;
-    time_t last_seen;
-    time_t last_pong_sent;
-    unsigned char recv_buf[MAX_BUFFER];
-    bot_auth_state_t bot_auth_state;
-    unsigned char challenge[32];  
+  int fd;
+  char ip[64];
+  char id[64];
+  unsigned char session_key[32];
+  bool authenticated;
+  client_type_t type;
+  time_t last_seen;
+  time_t last_pong_sent;
+  unsigned char recv_buf[MAX_BUFFER];
+  bot_auth_state_t bot_auth_state;
+  unsigned char challenge[32];
   int recv_len;
+  char admin_connect_ip[64];   // IP that hub_admin used to connect
+  int admin_connect_port;      // Port that hub_admin used to connect
 } hub_client_t;
 
+// Track recently processed PURGE messages to prevent feedback loops
 typedef struct {
-    int listen_fd;
-    int port;
-    char admin_password[128];
-    char config_pass[128];
+  time_t cutoff;       // PURGE cutoff timestamp
+  time_t received_at;  // When this PURGE was received/processed
+} recent_purge_t;
 
-    char *private_key_pem;
-    char *public_key_pem;
-    EVP_PKEY *priv_key;  // FIXED: Changed from RSA* to EVP_PKEY*
+typedef struct {
+  int listen_fd;
+  int port;
+  char bind_ip[64];          // IP this hub advertises itself as in mesh
+  char hub_uuid[64];         // This hub's UUID
+  char hub_friendly_name[64]; // This hub's friendly name
+  char admin_password[128];
+  char config_pass[128];
 
-    hub_client_t *clients[MAX_CLIENTS];
-    int client_count;
+  char *private_key_pem;
+  char *public_key_pem;
+  EVP_PKEY *priv_key; // FIXED: Changed from RSA* to EVP_PKEY*
 
-    bot_config_t bots[MAX_BOTS];
-    int bot_count;
+  hub_client_t *clients[MAX_CLIENTS];
+  int client_count;
 
-    hub_peer_config_t peers[MAX_PEERS];
-    int peer_count;
+  bot_config_t bots[MAX_BOTS];
+  int bot_count;
 
-    pending_bot_t pending[MAX_PENDING_BOTS];
-    int pending_head;
-    int pending_count;
+  // GLOBAL CONFIG STORE (Shared by all bots)
+  config_entry_t global_entries[MAX_BOT_ENTRIES];
+  int global_entry_count;
 
-    volatile bool running;
+  hub_peer_config_t peers[MAX_PEERS];
+  int peer_count;
+
+  pending_bot_t pending[MAX_PENDING_BOTS];
+  int pending_head;
+  int pending_count;
+
+  pending_op_request_t pending_op_requests[MAX_PENDING_OP_REQUESTS];
+
+  ip_rate_limit_t ip_limits[MAX_IP_RATE_LIMITS];
+  int ip_limits_count;
+
+  int purge_days_setting;  // Days threshold for tombstone purge (0 = disabled)
+  int pid_fd;  // File descriptor for PID file lock
+  volatile bool running;
+
+  // PURGE deduplication: prevent feedback loops in peer mesh
+  recent_purge_t recent_purges[MAX_RECENT_PURGES];
+  int recent_purge_count;
+  time_t last_scheduled_purge;  // Timestamp of last scheduled purge this hub initiated
+
+  int log_level;       // Current log level (LOG_NONE, LOG_ERROR, etc.)
+  int log_max_size;    // Max log file size in bytes (default 10MB)
 } hub_state_t;
 
 // --- Prototypes ---
 void hub_log(const char *format, ...);
+
+// Log level filtering macros - these check the log level before calling hub_log
+#define hub_log_error(format, ...) \
+    do { if (g_state && g_state->log_level >= LOG_ERROR) hub_log("[ERROR] " format, ##__VA_ARGS__); } while(0)
+#define hub_log_warning(format, ...) \
+    do { if (g_state && g_state->log_level >= LOG_WARNING) hub_log("[WARNING] " format, ##__VA_ARGS__); } while(0)
+#define hub_log_info(format, ...) \
+    do { if (g_state && g_state->log_level >= LOG_INFO) hub_log("[INFO] " format, ##__VA_ARGS__); } while(0)
+#define hub_log_debug(format, ...) \
+    do { if (g_state && g_state->log_level >= LOG_DEBUG) hub_log("[DEBUG] " format, ##__VA_ARGS__); } while(0)
+
 bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);
 
 // FIXED: Updated crypto function signatures
 EVP_PKEY *load_private_key_from_memory(const char *pem_data);
 bool hub_crypto_generate_keypair(char **priv_pem_out, char **pub_pem_out);
-int evp_private_decrypt(EVP_PKEY *pkey, const unsigned char *enc, int enc_len, unsigned char *dec);
-int evp_public_encrypt(EVP_PKEY *pkey, const unsigned char *plain, int plain_len, unsigned char *enc);
+int evp_private_decrypt(EVP_PKEY *pkey, const unsigned char *enc, int enc_len,
+                        unsigned char *dec);
+int evp_public_encrypt(EVP_PKEY *pkey, const unsigned char *plain,
+                       int plain_len, unsigned char *enc);
 
-// FIXED: Simplified - removed AAD parameters (not needed since we encrypt everything)
+// FIXED: Simplified - removed AAD parameters (not needed since we encrypt
+// everything)
 int aes_gcm_decrypt(const unsigned char *input, int input_len,
-                    const unsigned char *key, unsigned char *output, 
+                    const unsigned char *key, unsigned char *output,
                     unsigned char *tag);
 int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
-                    const unsigned char *key, unsigned char *output, 
+                    const unsigned char *key, unsigned char *output,
                     unsigned char *tag);
+
+// Rate limiting and IP access control functions
+bool is_ip_allowed(hub_state_t *state, const char *ip);
+void increment_active_connections(hub_state_t *state, const char *ip);
+void decrement_active_connections(hub_state_t *state, const char *ip);
+void cleanup_old_ip_limits(hub_state_t *state);
+bool check_ip_access_lists(hub_state_t *state, const char *ip);
 
 void hub_storage_init(void);
 bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
-                               const char *key, const char *value,
-                               const char *extra, const char *op, 
-                               time_t ts);
+                              const char *key, const char *value,
+                              const char *extra, const char *op, time_t ts);
+bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
+                                     const char *value, const char *extra,
+                                     const char *op, time_t ts);
 bool hub_storage_delete(hub_state_t *state, const char *uuid);
 int hub_storage_get_full_list(hub_state_t *state, char *buffer, int max_len);
 int hub_storage_get_summary_list(hub_state_t *state, char *buffer, int max_len);
 
 void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len);
-void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload, int exclude_fd);
+void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
+                              char *buffer, int max_len);
+void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
+                                 int exclude_fd);
+
+// cutoff==0: purge all tombstones; cutoff>0: purge tombstones older than cutoff
+int hub_execute_purge(hub_state_t *state, time_t cutoff,
+                      char *log_out, int log_max_len);
+
+// Leader election: Check if this hub should initiate scheduled purges
+// (Hub with smallest UUID in connected mesh leads)
+bool hub_should_initiate_scheduled_purge(hub_state_t *state);
 
 bool hub_handle_client_data(hub_state_t *state, hub_client_t *client);
+bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
+                               unsigned char *data, int packet_len);
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c);
 void hub_broadcast_mesh_state(hub_state_t *state);
 
 // NEW: Crypto utility functions
-bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64, char **out_pub_b64);
+bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
+                                   char **out_pub_b64);
 void secure_wipe(void *ptr, size_t len);
+void generate_uuid_v4(char *buffer, size_t len);
 
 char *base64_encode(const unsigned char *input, int length);
 unsigned char *base64_decode(const char *input, int *out_len);

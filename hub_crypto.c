@@ -46,6 +46,10 @@ unsigned char *base64_decode(const char *input, int *out_len) {
     BIO *b64, *bmem;
     int len = strlen(input);
     unsigned char *buffer = (unsigned char *)malloc(len);
+    if (!buffer) {
+        *out_len = 0;
+        return NULL;
+    }
     memset(buffer, 0, len);
 
     b64 = BIO_new(BIO_f_base64());
@@ -63,7 +67,7 @@ unsigned char *base64_decode(const char *input, int *out_len) {
 void generate_uuid_v4(char *buffer, size_t len) {
     unsigned char b[16];
     if (RAND_bytes(b, 16) != 1) {
-        for(int i=0; i<16; i++) b[i] = rand() % 255;
+        for (int i = 0; i < 16; i++) b[i] = (unsigned char)(rand() % 256);
     }
 
     b[6] = (b[6] & 0x0F) | 0x40;
@@ -153,7 +157,7 @@ EVP_PKEY *load_private_key_from_memory(const char *pem_data) {
     
     // ADDED: Validate key size
     if (EVP_PKEY_bits(pkey) < 2048) {
-        fprintf(stderr, "Key size too small: %d bits (minimum 2048)\n", 
+        hub_log("Key size too small: %d bits (minimum 2048)\n",
                 EVP_PKEY_bits(pkey));
         EVP_PKEY_free(pkey);
         return NULL;
@@ -230,7 +234,7 @@ int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
 
     // ADDED: Minimum size check
     if (input_len < GCM_IV_LEN) {
-        fprintf(stderr, "Input too small for IV\n");
+        hub_log("Input too small for IV\n");
         return -1;
     }
 
@@ -250,7 +254,7 @@ int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
     if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag)) goto err;
     
     if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) <= 0) {
-        fprintf(stderr, "GCM tag verification failed\n");
+        hub_log("GCM tag verification failed\n");
         goto err;
     }
     plaintext_len += len;

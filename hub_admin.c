@@ -16,6 +16,12 @@
 int g_fd = -1;
 unsigned char g_key[32];
 
+// Stub hub_log for hub_crypto.c (hub_admin doesn't use file logging)
+void hub_log(const char *format, ...) {
+    (void)format;
+    // No-op: hub_admin doesn't log to file
+}
+
 // ============================================================================
 // NETWORK & CRYPTO HELPERS
 // ============================================================================
@@ -25,10 +31,10 @@ int recv_all(int socket, void *buffer, size_t length) {
     char *ptr = (char *)buffer;
     while (bytes_read < length) {
         ssize_t n = read(socket, ptr + bytes_read, length - bytes_read);
-        if (n <= 0) return n;
+        if (n <= 0) return (int)n;
         bytes_read += n;
     }
-    return bytes_read;
+    return (int)bytes_read;
 }
 
 void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
@@ -42,8 +48,9 @@ void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
     if (payload) memcpy(&plain[5], payload, payload_len);
 
     int total_plain = 1 + 4 + payload_len;
-    
+
     int enc_len = aes_gcm_encrypt(plain, total_plain, key, buffer + 4, tag);
+    if (enc_len <= 0) return;
 
     memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
     int packet_len = enc_len + GCM_TAG_LEN;
@@ -51,7 +58,32 @@ void send_packet(int fd, int cmd_id, const char *payload, unsigned char *key) {
     memcpy(buffer, &net_len, 4);
 
     int total = 4 + packet_len;
-    if (write(fd, buffer, total) != total) {
+    if (write(fd, buffer, total) != (ssize_t)total) {
+        // Write failed
+    }
+}
+
+void send_packet_binary(int fd, int cmd_id, const unsigned char *payload, int payload_len, unsigned char *key) {
+    unsigned char buffer[MAX_BUFFER];
+    unsigned char tag[GCM_TAG_LEN];
+    unsigned char plain[MAX_BUFFER];
+
+    plain[0] = cmd_id;
+    memcpy(&plain[1], &payload_len, 4);
+    if (payload && payload_len > 0) memcpy(&plain[5], payload, payload_len);
+
+    int total_plain = 1 + 4 + payload_len;
+
+    int enc_len = aes_gcm_encrypt(plain, total_plain, key, buffer + 4, tag);
+    if (enc_len <= 0) return;
+
+    memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
+    int packet_len = enc_len + GCM_TAG_LEN;
+    uint32_t net_len = htonl(packet_len);
+    memcpy(buffer, &net_len, 4);
+
+    int total = 4 + packet_len;
+    if (write(fd, buffer, total) != (ssize_t)total) {
         // Write failed
     }
 }
@@ -119,17 +151,18 @@ bool wait_for_input_or_socket(char *buf, size_t len) {
 
 void get_password_secure(const char *prompt, char *buf, size_t len) {
     struct termios oldt, newt;
+    int is_tty = (tcgetattr(STDIN_FILENO, &oldt) == 0);
     printf("%s", prompt);
     fflush(stdout);
-    
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~ECHO;
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    
-    if (!fgets(buf, len, stdin)) buf[0] = 0;
-    
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    if (is_tty) {
+        newt = oldt;
+        newt.c_lflag &= ~(tcflag_t)(ECHO | ECHONL);
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    }
+    if (!fgets(buf, (int)len, stdin)) buf[0] = 0;
+    if (is_tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    }
     printf("\n");
     buf[strcspn(buf, "\n")] = 0;
 }
@@ -155,19 +188,19 @@ void read_response(int fd, unsigned char *key, char *out_buf, int max_len) {
     while (1) {
         uint32_t net_len;
         if (recv_all(fd, &net_len, 4) != 4) {
-            strcpy(out_buf, "Error: Connection lost");
+            snprintf(out_buf, max_len, "Error: Connection lost");
             return;
         }
-        
+
         int len = ntohl(net_len);
         if (len > MAX_BUFFER || len < GCM_TAG_LEN + 5) {
-            strcpy(out_buf, "Error: Invalid packet");
+            snprintf(out_buf, max_len, "Error: Invalid packet");
             return;
         }
 
         unsigned char enc_buf[MAX_BUFFER];
         if (recv_all(fd, enc_buf, len) != len) {
-            strcpy(out_buf, "Error: Connection lost");
+            snprintf(out_buf, max_len, "Error: Connection lost");
             return;
         }
 
@@ -185,11 +218,10 @@ void read_response(int fd, unsigned char *key, char *out_buf, int max_len) {
                 continue;
             }
             plain[plain_len] = 0;
-            strncpy(out_buf, (char*)plain, max_len - 1);
-            out_buf[max_len - 1] = 0;
+            snprintf(out_buf, max_len, "%s", (char*)plain);
             return;
         } else {
-            strcpy(out_buf, "Error: Decryption failed");
+            snprintf(out_buf, max_len, "Error: Decryption failed");
             return;
         }
     }
@@ -206,6 +238,7 @@ void bot_list() {
     printf("\n%s\n", response);
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -232,10 +265,13 @@ void bot_add() {
         if (priv_key) {
             *priv_key = 0;
             priv_key++;  // Now points to BASE64(full PEM)
-            
+
             char uuid[64];
-            strncpy(uuid, uuid_start, sizeof(uuid) - 1);
-            uuid[sizeof(uuid) - 1] = '\0';
+            if (strlen(uuid_start) >= sizeof(uuid)) {
+                printf("Error: invalid UUID in server response\n");
+                return;
+            }
+            snprintf(uuid, sizeof(uuid), "%s", uuid_start);
             
             printf("\n╔══════════════════════════════════════════════════╗\n");
             printf("║             BOT CREATED SUCCESSFULLY             ║\n");
@@ -244,39 +280,56 @@ void bot_add() {
             printf("Bot Name: %s\n", nick);
             printf("UUID:     %s\n\n", uuid);
             
-            size_t key_len = strlen(priv_key);
-            int total_parts = (key_len + 249) / 250;
-            
-            printf("Private key: %zu chars → %d parts\n\n", key_len, total_parts);
-            printf("COPY AND PASTE THESE COMMANDS:\n");
-            printf("═══════════════════════════════════════════════════\n\n");
-            
-            for (int i = 0; i < total_parts; i++) {
-                size_t start = i * 250;
-                size_t len = (start + 250 > key_len) ? (key_len - start) : 250;
-                
-                char chunk[260];
-                memset(chunk, 0, sizeof(chunk));
-                strncpy(chunk, priv_key + start, len);
-                
-                printf("/msg %s <hash> sethubkey %d/%d:%s\n",
-                       nick, i+1, total_parts, chunk);
-            }
-            
-            printf("\n/msg %s <hash> setuuid %s\n", nick, uuid);
-            printf("/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
-            
-            printf("═══════════════════════════════════════════════════\n");
-            printf("After all parts: Bot will auto-reconnect to hub.\n\n");
-            
-            // FIXED: Save backup as base64 encoded (matches IRC output)
-            char fname[128];
-            snprintf(fname, sizeof(fname), "bot_%s_priv_key.b64", nick);
-            FILE *f = fopen(fname, "w");
-            if (f) {
-                fprintf(f, "%s\n", priv_key);
-                fclose(f);
-                printf("[Backup saved: %s (BASE64 encoded)]\n\n", fname);
+            printf("\nKey Distribution:\n");
+            printf("  1. Export to file\n");
+            printf("  2. Show private key (base64)\n");
+            printf("  3. Show IRC sethubkey commands\n\n");
+
+            char kd_buf[10];
+            get_input("Choice: ", kd_buf, sizeof(kd_buf));
+            int kd_choice = atoi(kd_buf);
+
+            switch (kd_choice) {
+                case 1: {
+                    char fname[128];
+                    snprintf(fname, sizeof(fname), "bot_%s_priv_key.b64", nick);
+                    FILE *kf = fopen(fname, "w");
+                    if (kf) {
+                        fprintf(kf, "%s\n", priv_key);
+                        fclose(kf);
+                        printf("[Saved: %s]\n", fname);
+                    } else {
+                        printf("Error: could not create file.\n");
+                    }
+                    break;
+                }
+                case 2:
+                    printf("\nPrivate Key (base64):\n%s\n", priv_key);
+                    break;
+                case 3: {
+                    size_t key_len = strlen(priv_key);
+                    int total_parts = (int)((key_len + 249) / 250);
+                    printf("Private key: %zu chars, %d parts\n\n", key_len, total_parts);
+                    printf("COPY AND PASTE THESE COMMANDS:\n");
+                    printf("===================================================\n\n");
+                    for (int i = 0; i < total_parts; i++) {
+                        size_t start = (size_t)i * 250;
+                        size_t clen = (start + 250 > key_len) ? (key_len - start) : 250;
+                        char chunk[260];
+                        memset(chunk, 0, sizeof(chunk));
+                        memcpy(chunk, priv_key + start, clen);
+                        chunk[clen] = '\0';
+                        printf("/msg %s <hash> sethubkey %d/%d:%s\n",
+                               nick, i + 1, total_parts, chunk);
+                    }
+                    printf("\n/msg %s <hash> setuuid %s\n", nick, uuid);
+                    printf("/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
+                    printf("===================================================\n");
+                    break;
+                }
+                default:
+                    printf("Invalid choice.\n");
+                    break;
             }
             
             secure_wipe(response, sizeof(response));
@@ -288,6 +341,7 @@ void bot_add() {
     }
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -309,6 +363,7 @@ void bot_remove() {
     }
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -339,55 +394,86 @@ void bot_rekey() {
     if (strncmp(response, "SUCCESS|", 8) == 0) {
         char *nick_start = response + 8;
         char *priv_key = strchr(nick_start, '|');
-        
+
         if (priv_key) {
             *priv_key = 0;
             priv_key++;
-            
+
             char nick[64];
-            strncpy(nick, nick_start, sizeof(nick) - 1);
-            nick[sizeof(nick) - 1] = '\0';
-            
+            if (strlen(nick_start) >= sizeof(nick)) {
+                printf("Error: invalid nick in server response\n");
+                return;
+            }
+            snprintf(nick, sizeof(nick), "%s", nick_start);
+
             printf("\n╔══════════════════════════════════════════════════╗\n");
             printf("║              BOT REKEYED SUCCESSFULLY            ║\n");
             printf("╚══════════════════════════════════════════════════╝\n\n");
-            
+
             printf("UUID: %s\n", uuid);
             printf("Nick: %s\n\n", nick);
-            
-            size_t key_len = strlen(priv_key);
-            int total_parts = (key_len + 249) / 250;
-            
-            printf("New private key: %zu chars → %d parts\n\n", key_len, total_parts);
-            printf("COPY AND PASTE THESE COMMANDS:\n");
-            printf("═══════════════════════════════════════════════════\n\n");
-            
-            for (int i = 0; i < total_parts; i++) {
-                size_t start = i * 250;
-                size_t len = (start + 250 > key_len) ? (key_len - start) : 250;
-                
-                char chunk[260];
-                memset(chunk, 0, sizeof(chunk));
-                strncpy(chunk, priv_key + start, len);
-                
-                printf("/msg %s <hash> sethubkey %d/%d:%s\n",
-                       nick, i+1, total_parts, chunk);
+
+            // Check if bot was auto-updated (connected)
+            if (strncmp(priv_key, "AUTO-UPDATED", 12) == 0) {
+                printf("✓ Bot was connected - keys automatically updated!\n");
+                printf("✓ Bot has been disconnected and will reconnect with new keys.\n");
+                printf("✓ No manual intervention required.\n\n");
+            } else {
+                // Manual update required (bot was not connected)
+                printf("Bot was NOT connected - manual update required.\n\n");
+
+                printf("\nKey Distribution:\n");
+                printf("  1. Export to file\n");
+                printf("  2. Show private key (base64)\n");
+                printf("  3. Show IRC sethubkey commands\n\n");
+
+                char kd_buf[10];
+                get_input("Choice: ", kd_buf, sizeof(kd_buf));
+                int kd_choice = atoi(kd_buf);
+
+                switch (kd_choice) {
+                    case 1: {
+                        char fname[128];
+                        snprintf(fname, sizeof(fname), "bot_%s_priv_key_REKEY.b64", nick);
+                        FILE *kf = fopen(fname, "w");
+                        if (kf) {
+                            fprintf(kf, "%s\n", priv_key);
+                            fclose(kf);
+                            printf("[Saved: %s]\n", fname);
+                        } else {
+                            printf("Error: could not create file.\n");
+                        }
+                        break;
+                    }
+                    case 2:
+                        printf("\nPrivate Key (base64):\n%s\n", priv_key);
+                        break;
+                    case 3: {
+                        size_t key_len = strlen(priv_key);
+                        int total_parts = (int)((key_len + 249) / 250);
+                        printf("Private key: %zu chars, %d parts\n\n", key_len, total_parts);
+                        printf("COPY AND PASTE THESE COMMANDS:\n");
+                        printf("===================================================\n\n");
+                        for (int i = 0; i < total_parts; i++) {
+                            size_t start = (size_t)i * 250;
+                            size_t clen = (start + 250 > key_len) ? (key_len - start) : 250;
+                            char chunk[260];
+                            memset(chunk, 0, sizeof(chunk));
+                            memcpy(chunk, priv_key + start, clen);
+                            chunk[clen] = '\0';
+                            printf("/msg %s <hash> sethubkey %d/%d:%s\n",
+                                   nick, i + 1, total_parts, chunk);
+                        }
+                        printf("\n/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
+                        printf("===================================================\n");
+                        break;
+                    }
+                    default:
+                        printf("Invalid choice.\n");
+                        break;
+                }
             }
-            
-            printf("\n/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
-            
-            printf("═══════════════════════════════════════════════════\n\n");
-            
-            // Save new key backup
-            char fname[128];
-            snprintf(fname, sizeof(fname), "bot_%s_priv_key_REKEY.b64", nick);
-            FILE *f = fopen(fname, "w");
-            if (f) {
-                fprintf(f, "%s\n", priv_key);
-                fclose(f);
-                printf("[New key backup: %s]\n\n", fname);
-            }
-            
+
             secure_wipe(response, sizeof(response));
         }
     } else {
@@ -395,6 +481,7 @@ void bot_rekey() {
     }
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -412,29 +499,34 @@ void peer_list() {
     printf("%s\n", response);
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
 void peer_add() {
     char response[MAX_BUFFER];
-    char ip[64], port[10];
-    
+    char ip[64], port[10], uuid[64], name[64];
+
     printf("\n═══════════════════════════════════════════════════\n");
     printf("                   ADD PEER HUB\n");
-    printf("═══════════════════════════════════════════════════\n\n");
-    
+    printf("═══════════════════════════════════════════════════\n");
+    printf("NOTE: Friendly name will be auto-populated from gossip\n\n");
+
     get_input("Peer IP: ", ip, sizeof(ip));
     get_input("Peer Port: ", port, sizeof(port));
-    
-    char payload[128];
-    snprintf(payload, sizeof(payload), "%s:%s", ip, port);
-    
+    get_input("Peer UUID: ", uuid, sizeof(uuid));
+    get_input("Friendly Name (optional, auto-syncs): ", name, sizeof(name));
+
+    char payload[256];
+    snprintf(payload, sizeof(payload), "%s:%s:%s:%s", ip, port, uuid, name);
+
     send_packet(g_fd, CMD_ADMIN_ADD_PEER, payload, g_key);
     read_response(g_fd, g_key, response, sizeof(response));
     printf("\nHub: %s\n", response);
-    
+
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -458,6 +550,7 @@ void peer_remove() {
     }
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -471,6 +564,7 @@ void peer_force_sync() {
     printf("Hub: %s\n", response);
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
@@ -533,8 +627,974 @@ void peer_rekey_hubs() {
     }
     
     printf("\nPress Enter to continue...");
+    fflush(stdout);
     char dummy[10];
     wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+// ============================================================================
+// ADMIN COMMANDS FUNCTIONS
+// ============================================================================
+
+void admin_op_user() {
+    char response[MAX_BUFFER];
+    char nick[64], channel[64];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                     OP USER\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+
+    get_input("Nick to OP: ", nick, sizeof(nick));
+    get_input("Channel: ", channel, sizeof(channel));
+
+    if (strlen(nick) > 0 && strlen(channel) > 0) {
+        char payload[256];
+        snprintf(payload, sizeof(payload), "%s|%s", nick, channel);
+
+        printf("[*] Sending op request to hub...\n");
+        send_packet(g_fd, CMD_ADMIN_OP_USER, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_list_masks() {
+    char response[MAX_BUFFER];
+
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_LIST_MASKS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_add_mask() {
+    char response[MAX_BUFFER];
+    char mask[256];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                  ADD ADMIN MASK\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Format examples:\n");
+    printf("  *!*@*.example.com\n");
+    printf("  nick!*@*\n");
+    printf("  *!user@host.com\n\n");
+
+    get_input("Admin Mask: ", mask, sizeof(mask));
+
+    if (strlen(mask) > 0) {
+        send_packet(g_fd, CMD_ADMIN_ADD_MASK, mask, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_del_mask() {
+    char response[MAX_BUFFER];
+
+    send_packet(g_fd, CMD_ADMIN_LIST_MASKS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\n%s\n", response);
+
+    char mask[256];
+    get_input("Mask to REMOVE (or blank to cancel): ", mask, sizeof(mask));
+
+    if (strlen(mask) > 0 && get_confirmation("Remove this admin mask?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_MASK, mask, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_list_opers() {
+    char response[MAX_BUFFER];
+
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_LIST_OPERS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_add_oper() {
+    char response[MAX_BUFFER];
+    char mask[256], pass[128];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                  ADD OPER MASK\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+
+    get_input("Oper Mask: ", mask, sizeof(mask));
+    get_password_secure("Oper Password: ", pass, sizeof(pass));
+
+    if (strlen(mask) > 0 && strlen(pass) > 0) {
+        char payload[512];
+        snprintf(payload, sizeof(payload), "%s|%s", mask, pass);
+
+        send_packet(g_fd, CMD_ADMIN_ADD_OPER, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+
+        secure_wipe(pass, sizeof(pass));
+        secure_wipe(payload, sizeof(payload));
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_del_oper() {
+    char response[MAX_BUFFER];
+
+    send_packet(g_fd, CMD_ADMIN_LIST_OPERS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\n%s\n", response);
+
+    char mask[256];
+    get_input("Oper Mask to REMOVE (or blank to cancel): ", mask, sizeof(mask));
+
+    if (strlen(mask) > 0 && get_confirmation("Remove this oper mask?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_OPER, mask, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_list_channels() {
+    char response[MAX_BUFFER];
+
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_LIST_CHANNELS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_add_channel() {
+    char response[MAX_BUFFER];
+    char chan[64], key[64];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                   ADD CHANNEL\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+
+    get_input("Channel Name: ", chan, sizeof(chan));
+    get_input("Channel Key (or blank): ", key, sizeof(key));
+
+    if (strlen(chan) > 0) {
+        char payload[256];
+        if (strlen(key) > 0) {
+            snprintf(payload, sizeof(payload), "%s|%s", chan, key);
+        } else {
+            snprintf(payload, sizeof(payload), "%s|", chan);
+        }
+
+        send_packet(g_fd, CMD_ADMIN_ADD_CHANNEL, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_del_channel() {
+    char response[MAX_BUFFER];
+
+    send_packet(g_fd, CMD_ADMIN_LIST_CHANNELS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\n%s\n", response);
+
+    char chan[64];
+    get_input("Channel to REMOVE (or blank to cancel): ", chan, sizeof(chan));
+
+    if (strlen(chan) > 0 && get_confirmation("Remove this channel from all bots?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_CHANNEL, chan, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_change_admin_password() {
+    char response[MAX_BUFFER];
+    char pass[128];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("             CHANGE ADMIN PASSWORD\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+
+    get_password_secure("New Admin Password: ", pass, sizeof(pass));
+
+    if (strlen(pass) > 0 && get_confirmation("Update admin password?")) {
+        send_packet(g_fd, CMD_ADMIN_SET_ADMIN_PASS, pass, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    secure_wipe(pass, sizeof(pass));
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_change_bot_password() {
+    char response[MAX_BUFFER];
+    char pass[128];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("              CHANGE BOT PASSWORD\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("This will update the bot communication password\n");
+    printf("synced to all bots.\n\n");
+
+    get_password_secure("New Bot Password: ", pass, sizeof(pass));
+
+    if (strlen(pass) > 0 && get_confirmation("Update bot password on all bots?")) {
+        send_packet(g_fd, CMD_ADMIN_SET_BOT_PASS, pass, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    secure_wipe(pass, sizeof(pass));
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_purge_tombstones() {
+    char response[MAX_BUFFER];
+    char choice[10];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("             PURGE TOMBSTONED ENTRIES\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("This will permanently remove deleted (tombstoned)\n");
+    printf("channels, admin masks, and oper masks.\n\n");
+    printf("  1. Immediate purge (all tombstones)\n");
+    printf("  2. Time-based purge (default: 30 days)\n");
+    printf("  3. Custom time-based purge\n");
+    printf("  4. Cancel\n\n");
+
+    get_input("Select option: ", choice, sizeof(choice));
+    int opt = atoi(choice);
+
+    char payload[64] = "";
+    bool proceed = false;
+
+    switch(opt) {
+        case 1:
+            snprintf(payload, sizeof(payload), "immediate");
+            proceed = get_confirmation("Purge ALL tombstoned entries immediately?");
+            break;
+        case 2:
+            snprintf(payload, sizeof(payload), "30");
+            proceed = get_confirmation("Purge tombstones older than 30 days?");
+            break;
+        case 3: {
+            char days[10];
+            get_input("Enter number of days: ", days, sizeof(days));
+            int d = atoi(days);
+            if (d > 0) {
+                snprintf(payload, sizeof(payload), "%d", d);
+                char confirm_msg[128];
+                snprintf(confirm_msg, sizeof(confirm_msg),
+                         "Purge tombstones older than %d days?", d);
+                proceed = get_confirmation(confirm_msg);
+            } else {
+                printf("Invalid number of days.\n");
+            }
+            break;
+        }
+        case 4:
+            printf("Cancelled.\n");
+            break;
+        default:
+            printf("Invalid option.\n");
+            break;
+    }
+
+    if (proceed) {
+        printf("\n[*] Sending purge request to hub...\n");
+        send_packet(g_fd, CMD_ADMIN_PURGE_TOMBSTONES, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub Response:\n%s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_configure_auto_purge() {
+    char response[MAX_BUFFER];
+    char days_input[10];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("         CONFIGURE AUTOMATIC PURGE\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Configure automatic daily purging of old tombstones.\n");
+    printf("Tombstones are deleted channels, masks, and opers.\n\n");
+    printf("Enter number of days (tombstones older than this\n");
+    printf("will be purged daily), or 0 to disable:\n\n");
+
+    get_input("Days (0 to disable): ", days_input, sizeof(days_input));
+    int days = atoi(days_input);
+
+    if (days < 0) {
+        printf("Invalid input. Must be 0 or positive number.\n");
+        printf("\nPress Enter to continue...");
+        fflush(stdout);
+        char dummy[10];
+        wait_for_input_or_socket(dummy, sizeof(dummy));
+        return;
+    }
+
+    char payload[16];
+    snprintf(payload, sizeof(payload), "%d", days);
+
+    printf("\n[*] Sending configuration to hub...\n");
+    send_packet(g_fd, CMD_ADMIN_SET_PURGE_DAYS, payload, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\nHub Response:\n%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_list_allowlist() {
+    char response[MAX_BUFFER];
+
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_LIST_ALLOWLIST, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_add_allowlist() {
+    char response[MAX_BUFFER];
+    char ip_pattern[256];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("              ADD IP TO ALLOWLIST\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Format examples:\n");
+    printf("  192.168.1.5       - Single IP\n");
+    printf("  192.168.1.0/24    - Subnet (CIDR notation)\n");
+    printf("  10.0.0.0/8        - Large network\n\n");
+
+    get_input("IP or CIDR pattern: ", ip_pattern, sizeof(ip_pattern));
+
+    if (strlen(ip_pattern) > 0) {
+        send_packet(g_fd, CMD_ADMIN_ADD_ALLOWLIST, ip_pattern, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_del_allowlist() {
+    char response[MAX_BUFFER];
+
+    send_packet(g_fd, CMD_ADMIN_LIST_ALLOWLIST, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\n%s\n", response);
+
+    char ip_pattern[256];
+    get_input("IP/CIDR to REMOVE (or blank to cancel): ", ip_pattern, sizeof(ip_pattern));
+
+    if (strlen(ip_pattern) > 0 && get_confirmation("Remove this allowlist entry?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_ALLOWLIST, ip_pattern, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_list_denylist() {
+    char response[MAX_BUFFER];
+
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_LIST_DENYLIST, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_add_denylist() {
+    char response[MAX_BUFFER];
+    char ip_pattern[256];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("              ADD IP TO DENYLIST\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Format examples:\n");
+    printf("  192.168.1.5       - Single IP\n");
+    printf("  192.168.1.0/24    - Subnet (CIDR notation)\n");
+    printf("  10.0.0.0/8        - Large network\n\n");
+
+    get_input("IP or CIDR pattern: ", ip_pattern, sizeof(ip_pattern));
+
+    if (strlen(ip_pattern) > 0) {
+        send_packet(g_fd, CMD_ADMIN_ADD_DENYLIST, ip_pattern, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_del_denylist() {
+    char response[MAX_BUFFER];
+
+    send_packet(g_fd, CMD_ADMIN_LIST_DENYLIST, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\n%s\n", response);
+
+    char ip_pattern[256];
+    get_input("IP/CIDR to REMOVE (or blank to cancel): ", ip_pattern, sizeof(ip_pattern));
+
+    if (strlen(ip_pattern) > 0 && get_confirmation("Remove this denylist entry?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_DENYLIST, ip_pattern, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void menu_manage_allowlist() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║            MANAGE IP ALLOWLIST                   ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. List Allowlist\n");
+        printf("  2. Add IP to Allowlist\n");
+        printf("  3. Remove IP from Allowlist\n");
+        printf("  4. Back to Manage Peer Config\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1: admin_list_allowlist(); break;
+            case 2: admin_add_allowlist(); break;
+            case 3: admin_del_allowlist(); break;
+            case 4: return;
+            default: printf("Invalid choice.\n"); break;
+        }
+    }
+}
+
+void menu_manage_denylist() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║            MANAGE IP DENYLIST                    ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. List Denylist\n");
+        printf("  2. Add IP to Denylist\n");
+        printf("  3. Remove IP from Denylist\n");
+        printf("  4. Back to Admin Commands\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1: admin_list_denylist(); break;
+            case 2: admin_add_denylist(); break;
+            case 3: admin_del_denylist(); break;
+            case 4: return;
+            default: printf("Invalid choice.\n"); break;
+        }
+    }
+}
+
+void admin_set_bind_ip() {
+    char response[MAX_BUFFER];
+    char ip[64];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                SET BIND IP ADDRESS\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Set the IP address this hub binds to:\n");
+    printf("  0.0.0.0      - Bind to all interfaces (default)\n");
+    printf("  127.0.0.1    - Localhost only\n");
+    printf("  192.168.x.x  - Specific interface\n\n");
+    printf("NOTE: Hub restart required for changes to take effect.\n\n");
+
+    get_input("Bind IP: ", ip, sizeof(ip));
+
+    if (strlen(ip) > 0) {
+        send_packet(g_fd, CMD_ADMIN_SET_BIND_IP, ip, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_set_hub_name() {
+    char response[MAX_BUFFER];
+    char name[64];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                   SET HUB NAME\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Set a friendly name for this hub.\n");
+    printf("This name will be synced across the mesh network.\n\n");
+
+    get_input("Hub Name: ", name, sizeof(name));
+
+    if (strlen(name) > 0) {
+        send_packet(g_fd, CMD_ADMIN_SET_HUB_NAME, name, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_set_bind_port() {
+    char response[MAX_BUFFER];
+    char port[10];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                 SET BIND PORT\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Set the port this hub listens on (1-65535).\n");
+    printf("NOTE: Hub restart required for changes to take effect.\n\n");
+
+    get_input("Bind Port: ", port, sizeof(port));
+
+    if (strlen(port) > 0) {
+        send_packet(g_fd, CMD_ADMIN_SET_BIND_PORT, port, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_export_private_key() {
+    char response[MAX_BUFFER];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("              EXPORT PRIVATE KEY\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("⚠️  WARNING: Keep this key secure!\n");
+    printf("This private key is used for hub-to-hub authentication.\n\n");
+
+    if (!get_confirmation("Export private key?")) {
+        return;
+    }
+
+    send_packet(g_fd, CMD_ADMIN_GET_PRIVKEY, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+
+    if (strncmp(response, "ERROR", 5) == 0) {
+        printf("\n%s\n", response);
+    } else {
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        char fname[64];
+        strftime(fname, sizeof(fname), "hub_private_%Y%m%d_%H%M%S.pem", t);
+
+        FILE *f = fopen(fname, "w");
+        if (f) {
+            fputs(response, f);
+            fclose(f);
+            printf("\n[PRIVATE KEY SAVED: %s]\n\n", fname);
+            printf("Private key has been exported to:\n%s\n", fname);
+        } else {
+            printf("\nFailed to save private key to file.\n");
+        }
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_export_public_key() {
+    char response[MAX_BUFFER];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("               EXPORT PUBLIC KEY\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("This public key is used for hub_admin authentication.\n\n");
+
+    send_packet(g_fd, CMD_ADMIN_GET_PUBKEY, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+
+    if (strncmp(response, "ERROR", 5) == 0) {
+        printf("\n%s\n", response);
+    } else {
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        char fname[64];
+        strftime(fname, sizeof(fname), "hub_public_%Y%m%d_%H%M%S.pem", t);
+
+        FILE *f = fopen(fname, "w");
+        if (f) {
+            fputs(response, f);
+            fclose(f);
+            printf("\n[PUBLIC KEY SAVED: %s]\n\n", fname);
+            printf("Public key has been exported to:\n%s\n", fname);
+            printf("\nUse this key with hub_admin:\n");
+            printf("  ./hub_admin <ip> <port> %s\n", fname);
+        } else {
+            printf("\nFailed to save public key to file.\n");
+        }
+    }
+
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void admin_set_log_level() {
+    printf("\n");
+    printf("Log Levels:\n");
+    printf("  0: NONE (no logging)\n");
+    printf("  1: ERROR (only errors)\n");
+    printf("  2: WARNING (errors + warnings)\n");
+    printf("  3: INFO (errors + warnings + info) [default]\n");
+    printf("  4: DEBUG (everything)\n");
+    printf("\n");
+
+    char buf[10];
+    printf("Select level (0-4): ");
+    fflush(stdout);
+    if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+        printf("\n[!] Connection lost.\n");
+        exit(1);
+    }
+
+    int level = atoi(buf);
+    if (level < 0 || level > 4) {
+        printf("Invalid level.\n");
+        return;
+    }
+
+    // Send command to hub using encrypted packet
+    unsigned char payload[1];
+    payload[0] = (unsigned char)level;
+    send_packet_binary(g_fd, CMD_ADMIN_SET_LOG_LEVEL, payload, 1, g_key);
+
+    char response[1024];
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("[+] %s\n", response);
+}
+
+void admin_set_log_size_limit() {
+    printf("\nCurrent default: 10 MB\n");
+    printf("Enter log size limit in MB (1-1024): ");
+    fflush(stdout);
+
+    char buf[10];
+    if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+        printf("\n[!] Connection lost.\n");
+        exit(1);
+    }
+
+    int mb = atoi(buf);
+    if (mb < 1 || mb > 1024) {
+        printf("Invalid size (must be 1-1024 MB).\n");
+        return;
+    }
+
+    uint32_t bytes = (uint32_t)mb * 1024 * 1024;
+    uint32_t network_bytes = htonl(bytes);
+
+    // Send command to hub using encrypted packet
+    unsigned char payload[4];
+    memcpy(payload, &network_bytes, 4);
+    send_packet_binary(g_fd, CMD_ADMIN_SET_LOG_SIZE, payload, 4, g_key);
+
+    char response[1024];
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("[+] %s\n", response);
+}
+
+void menu_manage_admin_masks() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║              MANAGE ADMIN MASKS                  ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. List Admin Masks\n");
+        printf("  2. Add Admin Mask\n");
+        printf("  3. Del Admin Mask\n");
+        printf("  4. Back to Admin Commands\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1:
+                admin_list_masks();
+                break;
+            case 2:
+                admin_add_mask();
+                break;
+            case 3:
+                admin_del_mask();
+                break;
+            case 4:
+                return;
+            default:
+                printf("Invalid choice.\n");
+                break;
+        }
+    }
+}
+
+void menu_manage_oper_masks() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║              MANAGE OPER MASKS                   ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. List Oper Masks\n");
+        printf("  2. Add Oper Mask\n");
+        printf("  3. Del Oper Mask\n");
+        printf("  4. Back to Admin Commands\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1:
+                admin_list_opers();
+                break;
+            case 2:
+                admin_add_oper();
+                break;
+            case 3:
+                admin_del_oper();
+                break;
+            case 4:
+                return;
+            default:
+                printf("Invalid choice.\n");
+                break;
+        }
+    }
+}
+
+void menu_manage_channels() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║               MANAGE CHANNELS                    ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. List Channels\n");
+        printf("  2. Add Channel\n");
+        printf("  3. Del Channel\n");
+        printf("  4. Back to Admin Commands\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1:
+                admin_list_channels();
+                break;
+            case 2:
+                admin_add_channel();
+                break;
+            case 3:
+                admin_del_channel();
+                break;
+            case 4:
+                return;
+            default:
+                printf("Invalid choice.\n");
+                break;
+        }
+    }
+}
+
+void menu_admin_commands() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║               ADMIN COMMANDS                     ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. Op User\n");
+        printf("  2. Manage Admin Masks\n");
+        printf("  3. Manage Oper Masks\n");
+        printf("  4. Manage Channels\n");
+        printf("  5. Change Admin Password\n");
+        printf("  6. Change Bot Password\n");
+        printf("  7. Back to Main Menu\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1:
+                admin_op_user();
+                break;
+            case 2:
+                menu_manage_admin_masks();
+                break;
+            case 3:
+                menu_manage_oper_masks();
+                break;
+            case 4:
+                menu_manage_channels();
+                break;
+            case 5:
+                admin_change_admin_password();
+                break;
+            case 6:
+                admin_change_bot_password();
+                break;
+            case 7:
+                return;
+            default:
+                printf("Invalid choice.\n");
+                break;
+        }
+    }
 }
 
 // ============================================================================
@@ -587,11 +1647,11 @@ void menu_manage_bots() {
     }
 }
 
-void menu_manage_peers() {
+void menu_manage_peer_connections() {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
-        printf("║             MANAGE PEERS (HUBS)                  ║\n");
+        printf("║          MANAGE PEER CONNECTIONS                 ║\n");
         printf("╚══════════════════════════════════════════════════╝\n");
         printf("\n");
         printf("  1. List Peers (Mesh Matrix)\n");
@@ -603,15 +1663,15 @@ void menu_manage_peers() {
         printf("\n");
         printf("Select: ");
         fflush(stdout);
-        
+
         char buf[10];
         if (!wait_for_input_or_socket(buf, sizeof(buf))) {
             printf("\n[!] Connection lost.\n");
             exit(1);
         }
-        
+
         int choice = atoi(buf);
-        
+
         switch(choice) {
             case 1:
                 peer_list();
@@ -629,6 +1689,80 @@ void menu_manage_peers() {
                 peer_rekey_hubs();
                 break;
             case 6:
+                return;  // Back to main menu
+            default:
+                printf("Invalid choice.\n");
+                break;
+        }
+    }
+}
+
+void menu_manage_peer_config() {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║            MANAGE PEER CONFIG                    ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. Set Hub Name\n");
+        printf("  2. Set Bind IP\n");
+        printf("  3. Set Bind Port\n");
+        printf("  4. Manage IP Allowlist\n");
+        printf("  5. Manage IP Denylist\n");
+        printf("  6. Purge Tombstones\n");
+        printf("  7. Configure Automatic Purge\n");
+        printf("  8. Export Private Key\n");
+        printf("  9. Export Public Key\n");
+        printf(" 10. Set Log Level\n");
+        printf(" 11. Set Log Size Limit\n");
+        printf(" 12. Back to Main Menu\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        int choice = atoi(buf);
+
+        switch(choice) {
+            case 1:
+                admin_set_hub_name();
+                break;
+            case 2:
+                admin_set_bind_ip();
+                break;
+            case 3:
+                admin_set_bind_port();
+                break;
+            case 4:
+                menu_manage_allowlist();
+                break;
+            case 5:
+                menu_manage_denylist();
+                break;
+            case 6:
+                admin_purge_tombstones();
+                break;
+            case 7:
+                admin_configure_auto_purge();
+                break;
+            case 8:
+                admin_export_private_key();
+                break;
+            case 9:
+                admin_export_public_key();
+                break;
+            case 10:
+                admin_set_log_level();
+                break;
+            case 11:
+                admin_set_log_size_limit();
+                break;
+            case 12:
                 return;  // Back to main menu
             default:
                 printf("Invalid choice.\n");
@@ -683,7 +1817,7 @@ int main(int argc, char *argv[]) {
 
     unsigned char pack[256];
     memcpy(pack, g_key, 32);
-    int msg_len = snprintf((char*)pack + 32, 220, "ADMIN %s", auth_pass);
+    int msg_len = snprintf((char*)pack + 32, 220, "ADMIN %s|%s:%s", auth_pass, argv[1], argv[2]);
     
     secure_wipe(auth_pass, sizeof(auth_pass));
 
@@ -700,7 +1834,7 @@ int main(int argc, char *argv[]) {
     }
 
     uint32_t net_len = htonl(enc_len);
-    if (write(fd, &net_len, 4) != 4 || write(fd, enc, enc_len) != enc_len) {
+    if (write(fd, &net_len, 4) != (ssize_t)4 || write(fd, enc, enc_len) != (ssize_t)enc_len) {
         perror("Send failed");
         close(fd);
         return 1;
@@ -716,8 +1850,10 @@ int main(int argc, char *argv[]) {
         printf("╚══════════════════════════════════════════════════╝\n");
         printf("\n");
         printf("  1. Manage Bots\n");
-        printf("  2. Manage Peers (Hubs)\n");
-        printf("  3. Exit\n");
+        printf("  2. Manage Peer Connections\n");
+        printf("  3. Manage Peer Config\n");
+        printf("  4. Admin Commands\n");
+        printf("  5. Exit\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -729,22 +1865,30 @@ int main(int argc, char *argv[]) {
         }
 
         int choice = atoi(buf);
-        
+
         switch(choice) {
             case 1:
                 menu_manage_bots();
                 break;
-                
+
             case 2:
-                menu_manage_peers();
+                menu_manage_peer_connections();
                 break;
-                
+
             case 3:
+                menu_manage_peer_config();
+                break;
+
+            case 4:
+                menu_admin_commands();
+                break;
+
+            case 5:
                 printf("\nExiting...\n");
                 secure_wipe(g_key, sizeof(g_key));
                 close(fd);
                 return 0;
-                
+
             default:
                 printf("Invalid choice.\n");
                 break;

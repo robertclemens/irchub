@@ -2,6 +2,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// Stub hub_log for hub_crypto.c (keygen doesn't use file logging)
+void hub_log(const char *format, ...) {
+    (void)format;
+}
+
 int main(int argc, char *argv[]) {
     char *priv_pem = NULL, *pub_pem = NULL;
     
@@ -40,6 +45,6 @@ int main(int argc, char *argv[]) {
     free(pub_pem);
     
     printf("\nDone! You can now run setup:\n");
-    printf("  ./bin/irchub <password> -setup\n");
+    printf("  ./bin/irchub -setup\n");
     return 0;
 }

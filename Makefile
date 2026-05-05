@@ -24,17 +24,20 @@ OBJ_DIR = $(BUILD_DIR)/obj
 HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c
 ADMIN_SOURCES = hub_admin.c hub_crypto.c
 DECRYPT_SOURCES = hub_decrypt.c hub_crypto.c
+ENCRYPT_SOURCES = hub_encrypt.c hub_crypto.c
 
 # Object files
 HUB_OBJECTS = $(HUB_SOURCES:%.c=$(OBJ_DIR)/%.o)
 ADMIN_OBJECTS = $(ADMIN_SOURCES:%.c=$(OBJ_DIR)/%.o)
 DECRYPT_OBJECTS = $(DECRYPT_SOURCES:%.c=$(OBJ_DIR)/%.o)
+ENCRYPT_OBJECTS = $(ENCRYPT_SOURCES:%.c=$(OBJ_DIR)/%.o)
 
 # Executables
 HUB_TARGET = $(BIN_DIR)/irchub
 ADMIN_TARGET = $(BIN_DIR)/hub_admin
 KEYGEN_TARGET = $(BIN_DIR)/keygen
 DECRYPT_TARGET = $(BIN_DIR)/hub_decrypt
+ENCRYPT_TARGET = $(BIN_DIR)/hub_encrypt
 
 # ============================================================================
 # Compiler Flags
@@ -50,7 +53,7 @@ INCLUDES = -I/usr/include -I/usr/local/include
 LIBS = -lssl -lcrypto -lpthread
 
 # Linker flags
-LDFLAGS = -L/usr/lib -L/usr/local/lib
+LDFLAGS =
 
 # ============================================================================
 # Build Modes
@@ -89,7 +92,7 @@ endif
         directories debug release production check-openssl keygen
 
 # Default target
-all: directories check-openssl $(HUB_TARGET) $(ADMIN_TARGET) $(KEYGEN_TARGET) $(DECRYPT_TARGET)
+all: directories check-openssl $(HUB_TARGET) $(ADMIN_TARGET) $(KEYGEN_TARGET) $(DECRYPT_TARGET) $(ENCRYPT_TARGET)
 
 # Create necessary directories
 directories:
@@ -150,6 +153,16 @@ $(DECRYPT_TARGET): $(DECRYPT_OBJECTS)
 	@echo ""
 
 # ============================================================================
+# Config Encryption Utility
+# ============================================================================
+
+$(ENCRYPT_TARGET): $(ENCRYPT_OBJECTS)
+	@echo "Linking $@..."
+	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+	@echo "Built: $@ (mode: $(BUILD_MODE))"
+	@echo ""
+
+# ============================================================================
 # Object Files
 # ============================================================================
 
@@ -182,6 +195,11 @@ keygen.c:
 	@echo '#include "hub.h"' > keygen.c
 	@echo '#include <stdio.h>' >> keygen.c
 	@echo '#include <stdlib.h>' >> keygen.c
+	@echo '' >> keygen.c
+	@echo '// Stub hub_log for hub_crypto.c (keygen doesn'"'"'t use file logging)' >> keygen.c
+	@echo 'void hub_log(const char *format, ...) {' >> keygen.c
+	@echo '    (void)format;' >> keygen.c
+	@echo '}' >> keygen.c
 	@echo '' >> keygen.c
 	@echo 'int main(int argc, char *argv[]) {' >> keygen.c
 	@echo '    char *priv_pem = NULL, *pub_pem = NULL;' >> keygen.c
@@ -221,7 +239,7 @@ keygen.c:
 	@echo '    free(pub_pem);' >> keygen.c
 	@echo '    ' >> keygen.c
 	@echo '    printf("\\nDone! You can now run setup:\\n");' >> keygen.c
-	@echo '    printf("  ./bin/irchub <password> -setup\\n");' >> keygen.c
+	@echo '    printf("  ./bin/irchub -setup\\n");' >> keygen.c
 	@echo '    return 0;' >> keygen.c
 	@echo '}' >> keygen.c
 	@echo "Created keygen.c"
@@ -247,16 +265,18 @@ install: all
 	@install -m 0755 $(ADMIN_TARGET) $(BINDIR)/hub_admin
 	@install -m 0755 $(KEYGEN_TARGET) $(BINDIR)/hub_keygen
 	@install -m 0755 $(DECRYPT_TARGET) $(BINDIR)/hub_decrypt
+	@install -m 0755 $(ENCRYPT_TARGET) $(BINDIR)/hub_encrypt
 	@echo "Installed to $(PREFIX)"
 	@echo ""
 	@echo "First-time setup:"
 	@echo "  1. Generate keys: $(BINDIR)/hub_keygen"
-	@echo "  2. Run setup: $(BINDIR)/irchub <password> -setup"
-	@echo "  3. Start hub: $(BINDIR)/irchub <password>"
+	@echo "  2. Run setup: $(BINDIR)/irchub -setup"
+	@echo "  3. Set env and start: export HUB_PASS=<password> && $(BINDIR)/irchub"
 	@echo ""
 	@echo "Utilities:"
 	@echo "  - Admin client: $(BINDIR)/hub_admin <ip> <port> <pub.pem>"
 	@echo "  - Decrypt config: $(BINDIR)/hub_decrypt [config_file]"
+	@echo "  - Encrypt config: $(BINDIR)/hub_encrypt [input_file] [output_file]"
 	@echo ""
 
 uninstall:
@@ -265,6 +285,7 @@ uninstall:
 	@rm -f $(BINDIR)/hub_admin
 	@rm -f $(BINDIR)/hub_keygen
 	@rm -f $(BINDIR)/hub_decrypt
+	@rm -f $(BINDIR)/hub_encrypt
 	@echo "Uninstalled from $(PREFIX)"
 	@echo "Note: Config files in $(SYSCONFDIR) and logs in $(LOGDIR) were not removed"
 
@@ -281,12 +302,13 @@ test: debug
 # Memory leak detection with Valgrind
 valgrind: debug
 	@echo "Running Valgrind memory check..."
+	@echo "Note: set HUB_PASS before running the hub binary"
 	@valgrind --leak-check=full \
 	          --show-leak-kinds=all \
 	          --track-origins=yes \
 	          --verbose \
 	          --log-file=valgrind-hub.log \
-	          $(HUB_TARGET) test_password &
+	          $(HUB_TARGET) &
 	@echo "Valgrind output will be in valgrind-hub.log"
 
 # Static analysis with cppcheck (if available)
@@ -355,8 +377,8 @@ help:
 	@echo ""
 	@echo "After building:"
 	@echo "  ./bin/hub_keygen                    # Generate keys"
-	@echo "  ./bin/irchub mypass -setup          # Initial setup"
-	@echo "  ./bin/irchub mypass                 # Run hub"
+	@echo "  ./bin/irchub -setup                          # Initial setup"
+	@echo "  export HUB_PASS=mypass && ./bin/irchub       # Run hub"
 	@echo "  ./bin/hub_admin 127.0.0.1 6667 hub_public.pem  # Admin client"
 	@echo ""
 
