@@ -438,47 +438,10 @@ c->last_pong_sent = 0;
     }
 }
 
-void daemonize() {
-    pid_t pid = fork();
-    if (pid < 0) exit(1);
-    if (pid > 0) exit(0);
-    
-    if (setsid() < 0) exit(1);
-    
-    pid = fork();
-    if (pid < 0) exit(1);
-    if (pid > 0) exit(0);
-    
-    umask(0);
-    if (chdir("/") < 0) exit(1);
-    
-    close(STDIN_FILENO);
-    close(STDOUT_FILENO);
-    close(STDERR_FILENO);
-    
-    int x = open("/dev/null", O_RDWR);
-    if (x != -1) {
-        dup2(x, STDIN_FILENO);
-        dup2(x, STDOUT_FILENO);
-        dup2(x, STDERR_FILENO);
-        if (x > 2) close(x);
-    }
-}
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        printf("Usage: ./irchub <pass> [-setup] [-d]\n");
-        return 1;
-    }
-
-    bool daemon_mode = false;
-    for(int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-d") == 0) daemon_mode = true;
-    }
-
     hub_state_t state;
     memset(&state, 0, sizeof(state));
-    snprintf(state.config_pass, sizeof(state.config_pass), "%s", argv[1]);
     state.running = true;
 
     // Set global state pointer for use in hub_log() and other functions
@@ -539,10 +502,6 @@ int main(int argc, char *argv[]) {
     }
 
     log_fp = fopen(HUB_LOG_FILE, "a");
-    if (daemon_mode) {
-        printf("Starting in daemon mode...\n");
-        daemonize();
-    }
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_signal);
@@ -567,7 +526,7 @@ int main(int argc, char *argv[]) {
     state.pid_fd = pid_fd;
 
     if (!hub_config_load(&state, state.config_pass)) {
-        if (!daemon_mode) printf("Config load failed. Run -setup.\n");
+        printf("Config load failed. Run -setup.\n");
         if (log_fp) fprintf(log_fp, "Config load failed.\n");
         remove(HUB_PID_FILE);
         return 1;
