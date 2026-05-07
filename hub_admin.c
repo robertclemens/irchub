@@ -6,6 +6,7 @@
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <openssl/rand.h>
+#include <openssl/evp.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <signal.h>
@@ -602,7 +603,7 @@ void peer_rekey_hubs() {
         time_t now = time(NULL);
         struct tm *t = localtime(&now);
         char fname[64];
-        strftime(fname, sizeof(fname), "hub_public_%Y%m%d_%H%M%S.pem", t);
+        strftime(fname, sizeof(fname), "hub_public_%Y%m%d_%H%M%S.b64", t);
         
         FILE *f = fopen(fname, "w");
         if (f) {
@@ -1296,7 +1297,7 @@ void admin_export_private_key() {
         time_t now = time(NULL);
         struct tm *t = localtime(&now);
         char fname[64];
-        strftime(fname, sizeof(fname), "hub_private_%Y%m%d_%H%M%S.pem", t);
+        strftime(fname, sizeof(fname), "hub_private_%Y%m%d_%H%M%S.b64", t);
 
         FILE *f = fopen(fname, "w");
         if (f) {
@@ -1332,7 +1333,7 @@ void admin_export_public_key() {
         time_t now = time(NULL);
         struct tm *t = localtime(&now);
         char fname[64];
-        strftime(fname, sizeof(fname), "hub_public_%Y%m%d_%H%M%S.pem", t);
+        strftime(fname, sizeof(fname), "hub_public_%Y%m%d_%H%M%S.b64", t);
 
         FILE *f = fopen(fname, "w");
         if (f) {
@@ -1777,23 +1778,36 @@ void menu_manage_peer_config() {
 
 int main(int argc, char *argv[]) {
     if (argc != 4) {
-        printf("Usage: ./hub_admin <ip> <port> <pub.pem>\n");
+        printf("Usage: ./hub_admin <ip> <port> <pub.b64>\n");
         return 1;
     }
 
-    FILE *f = fopen(argv[3], "rb");
+    // Load hub's X25519 public key from base64 file (hub_public.b64)
+    FILE *f = fopen(argv[3], "r");
     if (!f) {
         perror("Failed to open key file");
         return 1;
     }
-    
-    EVP_PKEY *pub_key = PEM_read_PUBKEY(f, NULL, NULL, NULL);
-    fclose(f);
-    
-    if (!pub_key) {
-        fprintf(stderr, "Failed to load public key\n");
+    char b64line[128] = {0};
+    if (!fgets(b64line, sizeof(b64line), f)) {
+        fprintf(stderr, "Failed to read key file\n");
+        fclose(f);
         return 1;
     }
+    fclose(f);
+    b64line[strcspn(b64line, "\r\n")] = 0;
+
+    int dec_len = 0;
+    unsigned char *pub_combined = base64_decode(b64line, &dec_len);
+    if (!pub_combined || dec_len != 64) {
+        fprintf(stderr, "Invalid key file: expected 64-byte Curve25519 pub key (88 chars base64)\n");
+        if (pub_combined) free(pub_combined);
+        return 1;
+    }
+    // We only need the X25519 public key (bytes 32-63)
+    unsigned char hub_x25519_pub[32];
+    memcpy(hub_x25519_pub, pub_combined + 32, 32);
+    free(pub_combined);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr = {
@@ -1801,37 +1815,80 @@ int main(int argc, char *argv[]) {
         .sin_port = htons(atoi(argv[2]))
     };
     inet_pton(AF_INET, argv[1], &addr.sin_addr);
-    
+
     if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         perror("Connect failed");
-        EVP_PKEY_free(pub_key);
         return 1;
     }
 
     signal(SIGPIPE, SIG_IGN);
     g_fd = fd;
-    RAND_bytes(g_key, 32);
 
     char auth_pass[128];
     get_password_secure("Admin Password: ", auth_pass, sizeof(auth_pass));
 
-    unsigned char pack[256];
-    memcpy(pack, g_key, 32);
-    int msg_len = snprintf((char*)pack + 32, 220, "ADMIN %s|%s:%s", auth_pass, argv[1], argv[2]);
-    
+    // Build auth plaintext (no session key prefix — sealed-box derives it)
+    unsigned char plain[256];
+    int msg_len = snprintf((char*)plain, sizeof(plain), "ADMIN %s|%s:%s",
+                           auth_pass, argv[1], argv[2]);
     secure_wipe(auth_pass, sizeof(auth_pass));
 
-    unsigned char enc[512];
-    int enc_len = evp_public_encrypt(pub_key, pack, 32 + msg_len + 1, enc);
-    
-    EVP_PKEY_free(pub_key);
-    secure_wipe(pack, sizeof(pack));
+    // Generate ephemeral X25519, derive session key, seal the plaintext
+    unsigned char eph_priv[32], eph_pub[32];
+    {
+        EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+        EVP_PKEY *pk = NULL;
+        size_t len = 32;
+        bool ok = ctx && EVP_PKEY_keygen_init(ctx) > 0
+                      && EVP_PKEY_keygen(ctx, &pk) > 0
+                      && EVP_PKEY_get_raw_private_key(pk, eph_priv, &len) > 0 && len == 32
+                      && EVP_PKEY_get_raw_public_key(pk, eph_pub, &len) > 0 && len == 32;
+        if (pk)  EVP_PKEY_free(pk);
+        if (ctx) EVP_PKEY_CTX_free(ctx);
+        if (!ok) {
+            fprintf(stderr, "Ephemeral X25519 keygen failed\n");
+            secure_wipe(eph_priv, 32);
+            close(fd);
+            return 1;
+        }
+    }
 
-    if (enc_len <= 0) {
-        fprintf(stderr, "Encryption failed\n");
+    unsigned char shared[32], session_key[32];
+    if (!hub_crypto_x25519_derive(eph_priv, hub_x25519_pub, shared)) {
+        fprintf(stderr, "X25519 derive failed\n");
+        secure_wipe(eph_priv, 32);
         close(fd);
         return 1;
     }
+    secure_wipe(eph_priv, 32);
+
+    static const unsigned char ADMIN_INFO[] = "irchub-admin-session-v1";
+    if (!hub_crypto_hkdf_sha256(shared, 32, eph_pub, 32,
+                                ADMIN_INFO, sizeof(ADMIN_INFO) - 1,
+                                session_key, 32)) {
+        fprintf(stderr, "HKDF failed\n");
+        secure_wipe(shared, 32);
+        close(fd);
+        return 1;
+    }
+    secure_wipe(shared, 32);
+    memcpy(g_key, session_key, 32);
+    secure_wipe(session_key, 32);
+
+    // Encrypt plaintext using AES-256-GCM with g_key
+    unsigned char enc[512];
+    unsigned char tag[GCM_TAG_LEN];
+    // Layout: eph_pub(32) || iv(GCM_IV_LEN) || ct || tag
+    memcpy(enc, eph_pub, 32);
+    int ct_len = aes_gcm_encrypt(plain, msg_len + 1, g_key, enc + 32, tag);
+    secure_wipe(plain, sizeof(plain));
+    if (ct_len <= 0) {
+        fprintf(stderr, "AES-GCM encryption failed\n");
+        close(fd);
+        return 1;
+    }
+    memcpy(enc + 32 + ct_len, tag, GCM_TAG_LEN);
+    int enc_len = 32 + ct_len + GCM_TAG_LEN;
 
     uint32_t net_len = htonl(enc_len);
     if (write(fd, &net_len, 4) != (ssize_t)4 || write(fd, enc, enc_len) != (ssize_t)enc_len) {
@@ -1840,7 +1897,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("[+] Authenticated to hub.\n");
+    printf("[+] Authenticated to hub (Curve25519).\n");
 
     // MAIN MENU LOOP
     while (1) {

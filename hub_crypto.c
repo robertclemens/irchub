@@ -5,14 +5,10 @@
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
-#include <openssl/bn.h> 
-#include <openssl/rsa.h>
-#include <openssl/pem.h>
 #include <openssl/evp.h>
 #include <openssl/err.h>
 #include <openssl/kdf.h>
 
-// NEW: Secure memory wiping function
 void secure_wipe(void *ptr, size_t len) {
     if (!ptr) return;
     volatile unsigned char *p = ptr;
@@ -60,6 +56,11 @@ unsigned char *base64_decode(const char *input, int *out_len) {
     *out_len = BIO_read(bmem, buffer, len);
     BIO_free_all(bmem);
 
+    if (*out_len <= 0) {
+        free(buffer);
+        *out_len = 0;
+        return NULL;
+    }
     return buffer;
 }
 
@@ -73,166 +74,167 @@ void generate_uuid_v4(char *buffer, size_t len) {
     b[6] = (b[6] & 0x0F) | 0x40;
     b[8] = (b[8] & 0x3F) | 0x80;
 
-    snprintf(buffer, len, 
+    snprintf(buffer, len,
         "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
 }
 
-// FIXED: Modernized RSA key generation using EVP API
-bool hub_crypto_generate_keypair(char **priv_pem_out, char **pub_pem_out) {
+// --- Curve25519 Keypair Generation ---
+bool hub_crypto_generate_combined_keypair(unsigned char priv_out[64],
+                                          unsigned char pub_out[64]) {
     EVP_PKEY_CTX *ctx = NULL;
-    EVP_PKEY *pkey = NULL;
-    BIO *bio_priv = NULL;
-    BIO *bio_pub = NULL;
-    bool success = false;
+    EVP_PKEY *ed = NULL, *x = NULL;
+    size_t len;
+    bool ok = false;
 
-    // Create context for RSA key generation
-    ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
-    if (!ctx) goto cleanup;
+    // Ed25519
+    ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+    if (!ctx || EVP_PKEY_keygen_init(ctx) <= 0) goto out;
+    if (EVP_PKEY_keygen(ctx, &ed) <= 0) goto out;
+    len = 32;
+    if (EVP_PKEY_get_raw_private_key(ed, priv_out, &len) <= 0 || len != 32) goto out;
+    len = 32;
+    if (EVP_PKEY_get_raw_public_key(ed, pub_out, &len) <= 0 || len != 32) goto out;
+    EVP_PKEY_CTX_free(ctx); ctx = NULL;
 
-    if (EVP_PKEY_keygen_init(ctx) <= 0) goto cleanup;
-    if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0) goto cleanup;
+    // X25519
+    ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    if (!ctx || EVP_PKEY_keygen_init(ctx) <= 0) goto out;
+    if (EVP_PKEY_keygen(ctx, &x) <= 0) goto out;
+    len = 32;
+    if (EVP_PKEY_get_raw_private_key(x, priv_out + 32, &len) <= 0 || len != 32) goto out;
+    len = 32;
+    if (EVP_PKEY_get_raw_public_key(x, pub_out + 32, &len) <= 0 || len != 32) goto out;
 
-    // Generate key
-    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) goto cleanup;
-
-    // Export private key
-    bio_priv = BIO_new(BIO_s_mem());
-    if (!bio_priv) goto cleanup;
-    
-    if (!PEM_write_bio_PrivateKey(bio_priv, pkey, NULL, NULL, 0, NULL, NULL)) {
-        goto cleanup;
-    }
-
-    BUF_MEM *bptr_priv;
-    BIO_get_mem_ptr(bio_priv, &bptr_priv);
-    *priv_pem_out = malloc(bptr_priv->length + 1);
-    if (!*priv_pem_out) goto cleanup;
-    
-    memcpy(*priv_pem_out, bptr_priv->data, bptr_priv->length);
-    (*priv_pem_out)[bptr_priv->length] = 0;
-
-    // Export public key
-    bio_pub = BIO_new(BIO_s_mem());
-    if (!bio_pub) goto cleanup;
-    
-    if (!PEM_write_bio_PUBKEY(bio_pub, pkey)) goto cleanup;
-
-    BUF_MEM *bptr_pub;
-    BIO_get_mem_ptr(bio_pub, &bptr_pub);
-    *pub_pem_out = malloc(bptr_pub->length + 1);
-    if (!*pub_pem_out) {
-        free(*priv_pem_out);
-        *priv_pem_out = NULL;
-        goto cleanup;
-    }
-    
-    memcpy(*pub_pem_out, bptr_pub->data, bptr_pub->length);
-    (*pub_pem_out)[bptr_pub->length] = 0;
-
-    success = true;
-
-cleanup:
-    if (bio_priv) BIO_free(bio_priv);
-    if (bio_pub) BIO_free(bio_pub);
-    if (pkey) EVP_PKEY_free(pkey);
+    ok = true;
+out:
+    if (ed)  EVP_PKEY_free(ed);
+    if (x)   EVP_PKEY_free(x);
     if (ctx) EVP_PKEY_CTX_free(ctx);
-    
-    return success;
+    if (!ok) { secure_wipe(priv_out, 64); memset(pub_out, 0, 64); }
+    return ok;
 }
 
-// FIXED: Load private key using EVP API
-EVP_PKEY *load_private_key_from_memory(const char *pem_data) {
-    BIO *bio = BIO_new_mem_buf((void*)pem_data, -1);
-    if (!bio) return NULL;
-    
-    EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
-    BIO_free(bio);
-    
-    if (!pkey) {
-        ERR_print_errors_fp(stderr);
-        return NULL;
-    }
-    
-    // ADDED: Validate key size
-    if (EVP_PKEY_bits(pkey) < 2048) {
-        hub_log("Key size too small: %d bits (minimum 2048)\n",
-                EVP_PKEY_bits(pkey));
-        EVP_PKEY_free(pkey);
-        return NULL;
-    }
-    
-    return pkey;
+void hub_crypto_split_combined(const unsigned char in[64],
+                               unsigned char ed_out[32],
+                               unsigned char x_out[32]) {
+    memcpy(ed_out, in,      32);
+    memcpy(x_out,  in + 32, 32);
 }
 
-// FIXED: Modern EVP-based private decryption
-int evp_private_decrypt(EVP_PKEY *pkey, const unsigned char *enc, 
-                        int enc_len, unsigned char *dec) {
+bool hub_crypto_ed25519_sign(const unsigned char ed_priv[32],
+                             const unsigned char *msg, size_t msg_len,
+                             unsigned char sig_out[64]) {
+    EVP_PKEY *pk = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, ed_priv, 32);
+    if (!pk) return false;
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    bool ok = false;
+    size_t siglen = 64;
+    if (md && EVP_DigestSignInit(md, NULL, NULL, NULL, pk) == 1
+           && EVP_DigestSign(md, sig_out, &siglen, msg, msg_len) == 1
+           && siglen == 64)
+        ok = true;
+    if (md) EVP_MD_CTX_free(md);
+    EVP_PKEY_free(pk);
+    return ok;
+}
+
+bool hub_crypto_ed25519_verify(const unsigned char ed_pub[32],
+                               const unsigned char *msg, size_t msg_len,
+                               const unsigned char sig[64]) {
+    EVP_PKEY *pk = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, ed_pub, 32);
+    if (!pk) return false;
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    bool ok = false;
+    if (md && EVP_DigestVerifyInit(md, NULL, NULL, NULL, pk) == 1
+           && EVP_DigestVerify(md, sig, 64, msg, msg_len) == 1)
+        ok = true;
+    if (md) EVP_MD_CTX_free(md);
+    EVP_PKEY_free(pk);
+    return ok;
+}
+
+bool hub_crypto_x25519_derive(const unsigned char x_priv[32],
+                              const unsigned char x_peer_pub[32],
+                              unsigned char shared_out[32]) {
+    EVP_PKEY *priv = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, x_priv, 32);
+    EVP_PKEY *peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, x_peer_pub, 32);
     EVP_PKEY_CTX *ctx = NULL;
-    size_t outlen;
-    int ret = -1;
-
-    ctx = EVP_PKEY_CTX_new(pkey, NULL);
-    if (!ctx) goto cleanup;
-
-    if (EVP_PKEY_decrypt_init(ctx) <= 0) goto cleanup;
-    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) goto cleanup;
-
-    // Determine buffer size
-    if (EVP_PKEY_decrypt(ctx, NULL, &outlen, enc, enc_len) <= 0) goto cleanup;
-
-    // Perform decryption
-    if (EVP_PKEY_decrypt(ctx, dec, &outlen, enc, enc_len) <= 0) {
-        ERR_print_errors_fp(stderr);
-        goto cleanup;
+    bool ok = false;
+    size_t len = 32;
+    if (priv && peer) {
+        ctx = EVP_PKEY_CTX_new(priv, NULL);
+        if (ctx && EVP_PKEY_derive_init(ctx) == 1
+                && EVP_PKEY_derive_set_peer(ctx, peer) == 1
+                && EVP_PKEY_derive(ctx, shared_out, &len) == 1
+                && len == 32)
+            ok = true;
     }
-
-    ret = (int)outlen;
-
-cleanup:
-    if (ctx) EVP_PKEY_CTX_free(ctx);
-    return ret;
+    if (ctx)  EVP_PKEY_CTX_free(ctx);
+    if (priv) EVP_PKEY_free(priv);
+    if (peer) EVP_PKEY_free(peer);
+    if (!ok)  memset(shared_out, 0, 32);
+    return ok;
 }
 
-// FIXED: Modern EVP-based public encryption
-int evp_public_encrypt(EVP_PKEY *pkey, const unsigned char *plain, 
-                       int plain_len, unsigned char *enc) {
-    EVP_PKEY_CTX *ctx = NULL;
-    size_t outlen;
-    int ret = -1;
-
-    ctx = EVP_PKEY_CTX_new(pkey, NULL);
-    if (!ctx) goto cleanup;
-
-    if (EVP_PKEY_encrypt_init(ctx) <= 0) goto cleanup;
-    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) goto cleanup;
-
-    // Determine buffer size
-    if (EVP_PKEY_encrypt(ctx, NULL, &outlen, plain, plain_len) <= 0) goto cleanup;
-
-    // Perform encryption
-    if (EVP_PKEY_encrypt(ctx, enc, &outlen, plain, plain_len) <= 0) {
-        ERR_print_errors_fp(stderr);
-        goto cleanup;
-    }
-
-    ret = (int)outlen;
-
-cleanup:
-    if (ctx) EVP_PKEY_CTX_free(ctx);
-    return ret;
+bool hub_crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
+                            const unsigned char *salt, size_t salt_len,
+                            const unsigned char *info, size_t info_len,
+                            unsigned char *out, size_t out_len) {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+    bool ok = false;
+    size_t outlen = out_len;
+    if (!ctx) return false;
+    if (EVP_PKEY_derive_init(ctx) == 1
+        && EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha256()) == 1
+        && EVP_PKEY_CTX_set1_hkdf_salt(ctx, salt, (int)salt_len) == 1
+        && EVP_PKEY_CTX_set1_hkdf_key(ctx, ikm, (int)ikm_len) == 1
+        && EVP_PKEY_CTX_add1_hkdf_info(ctx, info, (int)info_len) == 1
+        && EVP_PKEY_derive(ctx, out, &outlen) == 1
+        && outlen == out_len)
+        ok = true;
+    EVP_PKEY_CTX_free(ctx);
+    if (!ok) memset(out, 0, out_len);
+    return ok;
 }
 
-// FIXED: Simplified - no AAD needed (command byte is encrypted)
+// --- Bot Credential Generation ---
+bool hub_crypto_generate_bot_creds(char **out_uuid,
+                                   char **out_priv_b64,
+                                   char **out_pub_b64) {
+    *out_uuid = NULL; *out_priv_b64 = NULL; *out_pub_b64 = NULL;
+    unsigned char priv[64], pub[64];
+
+    *out_uuid = malloc(37);
+    if (!*out_uuid) return false;
+    generate_uuid_v4(*out_uuid, 37);
+
+    if (!hub_crypto_generate_combined_keypair(priv, pub)) goto fail;
+
+    *out_priv_b64 = base64_encode(priv, 64);
+    *out_pub_b64  = base64_encode(pub,  64);
+    secure_wipe(priv, 64);
+    if (!*out_priv_b64 || !*out_pub_b64) goto fail;
+    return true;
+
+fail:
+    secure_wipe(priv, 64);
+    if (*out_uuid)     { free(*out_uuid);     *out_uuid     = NULL; }
+    if (*out_priv_b64) { secure_wipe(*out_priv_b64, strlen(*out_priv_b64));
+                         free(*out_priv_b64); *out_priv_b64 = NULL; }
+    if (*out_pub_b64)  { free(*out_pub_b64);  *out_pub_b64  = NULL; }
+    return false;
+}
+
+// --- AES-256-GCM ---
 int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
-                    const unsigned char *key, unsigned char *plaintext, 
+                    const unsigned char *key, unsigned char *plaintext,
                     unsigned char *tag) {
     EVP_CIPHER_CTX *ctx = NULL;
     int len, plaintext_len;
     unsigned char iv[GCM_IV_LEN];
 
-    // ADDED: Minimum size check
     if (input_len < GCM_IV_LEN) {
         hub_log("Input too small for IV\n");
         return -1;
@@ -243,16 +245,16 @@ int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
     int ciphertext_len = input_len - GCM_IV_LEN;
 
     if (!(ctx = EVP_CIPHER_CTX_new())) return -1;
-    
+
     if (!EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto err;
     if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL)) goto err;
     if (!EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv)) goto err;
 
     if (!EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len)) goto err;
     plaintext_len = len;
-    
+
     if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag)) goto err;
-    
+
     if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) <= 0) {
         hub_log("GCM tag verification failed\n");
         goto err;
@@ -261,15 +263,14 @@ int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
 
     EVP_CIPHER_CTX_free(ctx);
     return plaintext_len;
-    
+
 err:
     if (ctx) EVP_CIPHER_CTX_free(ctx);
     return -1;
 }
 
-// FIXED: Simplified - no AAD needed
 int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
-                    const unsigned char *key, unsigned char *output, 
+                    const unsigned char *key, unsigned char *output,
                     unsigned char *tag) {
     EVP_CIPHER_CTX *ctx = NULL;
     int len, ciphertext_len;
@@ -287,88 +288,16 @@ int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
 
     if (1 != EVP_EncryptUpdate(ctx, cipher_ptr, &len, plain, plain_len)) goto err;
     ciphertext_len = len;
-    
+
     if (1 != EVP_EncryptFinal_ex(ctx, cipher_ptr + len, &len)) goto err;
     ciphertext_len += len;
-    
+
     if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag)) goto err;
 
     EVP_CIPHER_CTX_free(ctx);
     return ciphertext_len + GCM_IV_LEN;
-    
+
 err:
     if (ctx) EVP_CIPHER_CTX_free(ctx);
     return -1;
-}
-
-// FIXED: Updated to use EVP API
-bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
-                                    char **out_pub_b64) {
-    EVP_PKEY_CTX *ctx = NULL;
-    EVP_PKEY *pkey = NULL;
-    BIO *bio_priv = NULL;
-    BIO *bio_pub = NULL;
-    bool success = false;
-
-    // 1. Generate UUID
-    *out_uuid = malloc(37);
-    if (!*out_uuid) return false;
-    generate_uuid_v4(*out_uuid, 37);
-
-    // 2. Generate RSA Keypair using EVP API
-    ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
-    if (!ctx) goto cleanup;
-
-    if (EVP_PKEY_keygen_init(ctx) <= 0) goto cleanup;
-    if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0) goto cleanup;
-    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) goto cleanup;
-
-    // 3. Export Private Key -> Base64(FULL PEM WITH HEADERS)
-    bio_priv = BIO_new(BIO_s_mem());
-    if (!bio_priv) goto cleanup;
-    
-    if (!PEM_write_bio_PrivateKey(bio_priv, pkey, NULL, NULL, 0, NULL, NULL)) {
-        goto cleanup;
-    }
-
-    char *priv_data;
-    long priv_len = BIO_get_mem_data(bio_priv, &priv_data);
-    *out_priv_b64 = base64_encode((unsigned char*)priv_data, priv_len);
-    if (!*out_priv_b64) goto cleanup;
-
-    // 4. Export Public Key -> Base64(FULL PEM WITH HEADERS)
-    bio_pub = BIO_new(BIO_s_mem());
-    if (!bio_pub) goto cleanup;
-    
-    if (!PEM_write_bio_PUBKEY(bio_pub, pkey)) goto cleanup;
-
-    char *pub_data;
-    long pub_len = BIO_get_mem_data(bio_pub, &pub_data);
-    *out_pub_b64 = base64_encode((unsigned char*)pub_data, pub_len);
-    if (!*out_pub_b64) goto cleanup;
-
-    success = true;
-
-cleanup:
-    if (!success) {
-        if (*out_uuid) {
-            free(*out_uuid);
-            *out_uuid = NULL;
-        }
-        if (*out_priv_b64) {
-            secure_wipe(*out_priv_b64, strlen(*out_priv_b64));
-            free(*out_priv_b64);
-            *out_priv_b64 = NULL;
-        }
-        if (*out_pub_b64) {
-            free(*out_pub_b64);
-            *out_pub_b64 = NULL;
-        }
-    }
-    if (bio_priv) BIO_free(bio_priv);
-    if (bio_pub) BIO_free(bio_pub);
-    if (pkey) EVP_PKEY_free(pkey);
-    if (ctx) EVP_PKEY_CTX_free(ctx);
-    
-    return success;
 }

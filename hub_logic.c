@@ -1,7 +1,6 @@
 #include "hub.h"
 #include <arpa/inet.h>
 #include <errno.h>
-#include <openssl/bio.h>
 #include <openssl/rand.h>
 
 static void send_config_to_bot(hub_state_t *state, hub_client_t *client);
@@ -308,218 +307,199 @@ bool check_ip_access_lists(hub_state_t *state, const char *ip) {
     return true;
 }
 
-// ============ ADD THESE THREE FUNCTIONS HERE ============
-
-// Load bot's public key from hub config
-static EVP_PKEY *load_bot_public_key(hub_state_t *state, const char *uuid) {
+// Load bot's combined 64-byte public key from hub config
+static bool load_bot_combined_pub(hub_state_t *state, const char *uuid,
+                                  unsigned char out[64]) {
   for (int i = 0; i < state->bot_count; i++) {
-    if (strcmp(state->bots[i].uuid, uuid) == 0) {
-      for (int j = 0; j < state->bots[i].entry_count; j++) {
-        if (strcmp(state->bots[i].entries[j].key, "pub") == 0) {
-          int pem_len = 0;
-          unsigned char *pem_data =
-              base64_decode(state->bots[i].entries[j].value, &pem_len);
-          if (!pem_data)
-            return NULL;
-
-          BIO *bio = BIO_new_mem_buf(pem_data, pem_len);
-          EVP_PKEY *pub_key = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
-          BIO_free(bio);
-          free(pem_data);
-          return pub_key;
-        }
-      }
+    if (strcmp(state->bots[i].uuid, uuid) != 0) continue;
+    for (int j = 0; j < state->bots[i].entry_count; j++) {
+      if (strcmp(state->bots[i].entries[j].key, "pub") != 0) continue;
+      int dec_len = 0;
+      unsigned char *dec = base64_decode(state->bots[i].entries[j].value, &dec_len);
+      if (!dec) return false;
+      if (dec_len != 64) { secure_wipe(dec, dec_len); free(dec); return false; }
+      memcpy(out, dec, 64);
+      secure_wipe(dec, 64);
+      free(dec);
+      return true;
     }
   }
-  return NULL;
+  return false;
 }
-
-static int rsa_encrypt_with_bot_pubkey(EVP_PKEY *pub_key,
-                                       const unsigned char *plain,
-                                       int plain_len, unsigned char *enc_out) {
-  EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pub_key, NULL);
-  int result = -1;
-
-  if (ctx && EVP_PKEY_encrypt_init(ctx) > 0) {
-    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) > 0) {
-      size_t out_len;
-      if (EVP_PKEY_encrypt(ctx, NULL, &out_len, plain, plain_len) > 0) {
-        if (EVP_PKEY_encrypt(ctx, enc_out, &out_len, plain, plain_len) > 0) {
-          result = (int)out_len;
-        }
-      }
-    }
-  }
-
-  if (ctx)
-    EVP_PKEY_CTX_free(ctx);
-  return result;
-}
-
-static bool verify_signature_with_bot_pubkey(EVP_PKEY *pub_key,
-                                             const unsigned char *data,
-                                             int data_len,
-                                             const unsigned char *sig,
-                                             size_t sig_len) {
-  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-  bool valid = false;
-
-  if (EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pub_key) > 0) {
-    if (EVP_DigestVerifyUpdate(ctx, data, data_len) > 0) {
-      if (EVP_DigestVerifyFinal(ctx, sig, sig_len) == 1) {
-        valid = true;
-      }
-    }
-  }
-
-  EVP_MD_CTX_free(ctx);
-  return valid;
-}
-
-// ============ END OF NEW HELPER FUNCTIONS ============
-// REPLACEMENT for bot authentication section in hub_handle_client_data()
-// Insert this where it currently handles "ADMIN", "HUB", or bot UUID
-// authentication
 
 bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
                                unsigned char *data, int packet_len) {
 
   // PHASE 1: Receive UUID (plaintext)
   if (!client->authenticated && client->bot_auth_state == BOT_AUTH_IDLE) {
-    // Packet contains plaintext UUID
+    if (packet_len < 1 || packet_len > 63) return false;
     char uuid[64];
-    int copy_len = (packet_len < 63) ? packet_len : 63;
-    memcpy(uuid, data, copy_len);
-    uuid[copy_len] = '\0';
+    memcpy(uuid, data, packet_len);
+    uuid[packet_len] = '\0';
 
     hub_log("[HUB] Bot auth attempt from %s with UUID: %s\n", client->ip, uuid);
 
-    // Check if bot exists and is authorized
     bool authorized = false;
     for (int i = 0; i < state->bot_count; i++) {
-      if (strcmp(state->bots[i].uuid, uuid) == 0) {
-        authorized = true;
-        break;
-      }
+      if (strcmp(state->bots[i].uuid, uuid) == 0 &&
+          state->bots[i].is_active) { authorized = true; break; }
     }
 
     if (!authorized) {
       hub_log("[HUB] Unauthorized bot UUID: %s from %s\n", uuid, client->ip);
       add_pending_bot(state, uuid, client->ip);
       record_failed_auth(state, client->ip);
-      return false; // Disconnect
-    }
-
-    // Load bot's public key
-    EVP_PKEY *pub_key = load_bot_public_key(state, uuid);
-    if (!pub_key) {
-      hub_log("[HUB][ERROR] No public key found for bot %s\n", uuid);
       return false;
     }
 
-    // Generate random challenge
+    // Generate challenge + ephemeral X25519 keypair
     if (RAND_bytes(client->challenge, 32) != 1) {
-      EVP_PKEY_free(pub_key);
       hub_log("[HUB][ERROR] Failed to generate challenge\n");
       return false;
     }
 
-    // Encrypt challenge with bot's public key
-    unsigned char enc_challenge[512];
-    int enc_len = rsa_encrypt_with_bot_pubkey(pub_key, client->challenge, 32,
-                                              enc_challenge);
-    EVP_PKEY_free(pub_key);
+    unsigned char eph_pub[32];
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    EVP_PKEY *pk = NULL;
+    size_t len = 32;
+    bool ok = ctx && EVP_PKEY_keygen_init(ctx) > 0
+                  && EVP_PKEY_keygen(ctx, &pk) > 0
+                  && EVP_PKEY_get_raw_private_key(pk, client->bot_eph_x25519_priv, &len) > 0
+                  && len == 32
+                  && EVP_PKEY_get_raw_public_key(pk, eph_pub, &len) > 0
+                  && len == 32;
+    if (pk)  EVP_PKEY_free(pk);
+    if (ctx) EVP_PKEY_CTX_free(ctx);
+    if (!ok) { secure_wipe(client->bot_eph_x25519_priv, 32);
+               hub_log("[HUB][ERROR] Ephemeral X25519 keygen failed\n"); return false; }
+    client->bot_eph_priv_set = true;
 
-    if (enc_len <= 0) {
-      hub_log("[HUB][ERROR] Failed to encrypt challenge for %s\n", uuid);
-      return false;
-    }
+    // Send: challenge_32 || eph_pub_32 (raw 64 bytes, length-prefixed)
+    unsigned char out_buf[64];
+    memcpy(out_buf,      client->challenge, 32);
+    memcpy(out_buf + 32, eph_pub,           32);
 
-    // Send encrypted challenge
-    uint32_t net_len = htonl(enc_len);
-    if (write(client->fd, &net_len, 4) != (ssize_t)4 ||
-        write(client->fd, enc_challenge, enc_len) != (ssize_t)enc_len) {
+    uint32_t nl = htonl(64);
+    if (write(client->fd, &nl, 4) != 4 ||
+        write(client->fd, out_buf, 64) != 64) {
       hub_log("[HUB][ERROR] Failed to send challenge to %s\n", uuid);
       return false;
     }
 
-    // Store UUID and update state
     snprintf(client->id, sizeof(client->id), "%s", uuid);
     client->bot_auth_state = BOT_AUTH_CHALLENGE_SENT;
     client->last_seen = time(NULL);
 
-    hub_log("[HUB] Sent challenge to bot %s\n", uuid);
-    return true; // Continue
+    hub_log("[HUB] Sent Curve25519 challenge to bot %s\n", uuid);
+    return true;
   }
 
-  // PHASE 2: Receive signature
-  else if (!client->authenticated &&
-           client->bot_auth_state == BOT_AUTH_CHALLENGE_SENT) {
-    // Packet contains signature
-    hub_log("[HUB] Received signature from bot %s (%d bytes)\n", client->id,
-            packet_len);
+  // PHASE 2: Receive 64-byte Ed25519 signature
+  if (!client->authenticated &&
+      client->bot_auth_state == BOT_AUTH_CHALLENGE_SENT) {
+    hub_log("[HUB] Received signature from bot %s (%d bytes)\n", client->id, packet_len);
 
-    // Load bot's public key
-    EVP_PKEY *pub_key = load_bot_public_key(state, client->id);
-    if (!pub_key) {
-      hub_log("[HUB][ERROR] No public key found for bot %s\n", client->id);
+    if (packet_len != 64 || !client->bot_eph_priv_set) {
+      hub_log("[HUB][ERROR] Bad signature size or state from %s\n", client->id);
       return false;
     }
 
-    // Verify signature
-    bool valid = verify_signature_with_bot_pubkey(pub_key, client->challenge,
-                                                  32, data, packet_len);
+    unsigned char bot_combined[64], bot_ed_pub[32], bot_x_pub[32];
+    if (!load_bot_combined_pub(state, client->id, bot_combined)) {
+      hub_log("[HUB][ERROR] No public key for bot %s\n", client->id);
+      return false;
+    }
+    hub_crypto_split_combined(bot_combined, bot_ed_pub, bot_x_pub);
 
-    if (!valid) {
-      EVP_PKEY_free(pub_key);
+    if (!hub_crypto_ed25519_verify(bot_ed_pub, client->challenge, 32, data)) {
       hub_log("[HUB][ERROR] Invalid signature from bot %s\n", client->id);
       record_failed_auth(state, client->ip);
+      secure_wipe(bot_combined, 64);
       return false;
     }
 
-    hub_log("[HUB] Signature verified for bot %s\n", client->id);
-
-    // Generate session key
-    if (RAND_bytes(client->session_key, 32) != 1) {
-      EVP_PKEY_free(pub_key);
-      hub_log("[HUB][ERROR] Failed to generate session key\n");
+    unsigned char shared[32];
+    if (!hub_crypto_x25519_derive(client->bot_eph_x25519_priv, bot_x_pub, shared)) {
+      hub_log("[HUB][ERROR] X25519 derive failed for %s\n", client->id);
+      secure_wipe(bot_combined, 64);
       return false;
     }
 
-    // Encrypt session key with bot's public key
-    unsigned char enc_session_key[512];
-    int enc_len = rsa_encrypt_with_bot_pubkey(pub_key, client->session_key, 32,
-                                              enc_session_key);
-    EVP_PKEY_free(pub_key);
-
-    if (enc_len <= 0) {
-      hub_log("[HUB][ERROR] Failed to encrypt session key for %s\n",
-              client->id);
+    unsigned char info[96];
+    int info_len = snprintf((char *)info, sizeof(info),
+                            "irchub-bot-session-v1|%s", client->id);
+    bool ok = hub_crypto_hkdf_sha256(shared, 32,
+                                     client->challenge, 32,
+                                     info, (size_t)info_len,
+                                     client->session_key, 32);
+    secure_wipe(shared, 32);
+    secure_wipe(client->bot_eph_x25519_priv, 32);
+    client->bot_eph_priv_set = false;
+    secure_wipe(bot_combined, 64);
+    if (!ok) {
+      hub_log("[HUB][ERROR] HKDF failed for %s\n", client->id);
       return false;
     }
 
-    // Send encrypted session key
-    uint32_t net_len = htonl(enc_len);
-    if (write(client->fd, &net_len, 4) != (ssize_t)4 ||
-        write(client->fd, enc_session_key, enc_len) != (ssize_t)enc_len) {
-      hub_log("[HUB][ERROR] Failed to send session key to %s\n", client->id);
+    // Send 1-byte ACK
+    unsigned char ack = 0x01;
+    uint32_t nl = htonl(1);
+    if (write(client->fd, &nl, 4) != 4 ||
+        write(client->fd, &ack, 1) != 1) {
+      hub_log("[HUB][ERROR] Failed to send ACK to %s\n", client->id);
       return false;
     }
 
-    // Mark as authenticated
     client->type = CLIENT_BOT;
     client->authenticated = true;
     client->bot_auth_state = BOT_AUTH_COMPLETE;
     client->last_seen = time(NULL);
 
-    // Update "seen" timestamp on successful authentication
     hub_storage_update_entry(state, client->id, "seen", "", "", "", client->last_seen);
 
-    hub_log("[HUB] Bot %s authenticated successfully\n", client->id);
-    return true; // Continue
+    hub_log("[HUB] Bot %s authenticated (Curve25519)\n", client->id);
+    return true;
   }
 
-  return false; // Invalid state
+  return false;
+}
+
+// Sealed-box open: eph_pub(32) || IV(GCM_IV_LEN) || ct(N) || tag(GCM_TAG_LEN)
+static int hub_seal_open(hub_state_t *state,
+                         const unsigned char *in, int in_len,
+                         const unsigned char *info, size_t info_len,
+                         unsigned char *plain_out, int plain_max,
+                         unsigned char session_key_out[32]) {
+    if (in_len < 32 + GCM_IV_LEN + GCM_TAG_LEN) return -1;
+    const unsigned char *eph_pub = in;
+    const unsigned char *iv      = in + 32;
+    const unsigned char *ct      = in + 32 + GCM_IV_LEN;
+    int ct_len                   = in_len - 32 - GCM_IV_LEN - GCM_TAG_LEN;
+    const unsigned char *tag_ptr = in + in_len - GCM_TAG_LEN;
+    if (ct_len < 0 || ct_len > plain_max) return -1;
+
+    unsigned char shared[32], session_key[32];
+    if (!hub_crypto_x25519_derive(state->hub_x25519_priv, eph_pub, shared)) return -1;
+    bool ok = hub_crypto_hkdf_sha256(shared, 32, eph_pub, 32,
+                                     info, info_len, session_key, 32);
+    secure_wipe(shared, 32);
+    if (!ok) return -1;
+
+    unsigned char tmp[MAX_BUFFER];
+    if (GCM_IV_LEN + ct_len > (int)sizeof(tmp)) { secure_wipe(session_key, 32); return -1; }
+    memcpy(tmp,              iv, GCM_IV_LEN);
+    memcpy(tmp + GCM_IV_LEN, ct, ct_len);
+
+    unsigned char tag_buf[GCM_TAG_LEN];
+    memcpy(tag_buf, tag_ptr, GCM_TAG_LEN);
+    int pl = aes_gcm_decrypt(tmp, GCM_IV_LEN + ct_len,
+                             session_key, plain_out, tag_buf);
+    secure_wipe(tmp, GCM_IV_LEN + ct_len);
+    if (pl <= 0) { secure_wipe(session_key, 32); return -1; }
+
+    memcpy(session_key_out, session_key, 32);
+    secure_wipe(session_key, 32);
+    return pl;
 }
 
 static void add_pending_bot(hub_state_t *state, const char *uuid,
@@ -2221,111 +2201,141 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     return true;
 
   case CMD_ADMIN_REGEN_KEYS: {
-    char *priv = NULL, *pub = NULL;
-    if (hub_crypto_generate_keypair(&priv, &pub)) {
-      // Send new private and public keys to all peer hubs (they share the same keys)
-      broadcast_new_key(state, priv, pub);
+    unsigned char priv64[64], pub64[64];
+    if (hub_crypto_generate_combined_keypair(priv64, pub64)) {
+      char *priv_b64 = base64_encode(priv64, 64);
+      char *pub_b64  = base64_encode(pub64,  64);
+      secure_wipe(priv64, 64);
 
-      if (state->private_key_pem) {
-        secure_wipe(state->private_key_pem, strlen(state->private_key_pem));
-        free(state->private_key_pem);
+      if (!priv_b64 || !pub_b64) {
+        if (priv_b64) { secure_wipe(priv_b64, strlen(priv_b64)); free(priv_b64); }
+        if (pub_b64)  free(pub_b64);
+        return send_response(state, client, "ERROR: Base64 encoding failed.");
       }
-      if (state->public_key_pem)
-        free(state->public_key_pem);
-      if (state->priv_key)
-        EVP_PKEY_free(state->priv_key);
 
-      state->private_key_pem = priv;
-      state->public_key_pem = pub;
-      state->priv_key = load_private_key_from_memory(priv);
+      // Update in-memory state directly from the generated keys (priv64/pub64
+      // are still available here; only the encoded base64 copies were made)
+      hub_crypto_split_combined(pub64, state->hub_ed25519_pub, state->hub_x25519_pub);
+      {
+        unsigned char priv_raw[64];
+        int dec_len = 0;
+        unsigned char *dec = base64_decode(priv_b64, &dec_len);
+        if (dec && dec_len == 64) {
+          hub_crypto_split_combined(dec, state->hub_ed25519_priv, state->hub_x25519_priv);
+          secure_wipe(dec, 64);
+        }
+        if (dec) free(dec);
+        secure_wipe(priv_raw, 64);
+      }
+      state->hub_keys_loaded = true;
+
+      broadcast_new_key(state, priv_b64, pub_b64);
       hub_config_write(state);
 
-      // Disconnect all peer hubs so they reconnect with new keys
-      int disconnected = 0;
+      // Disconnect peer hubs so they reconnect with new key
       for (int i = 0; i < state->client_count; i++) {
         if (state->clients[i]->type == CLIENT_HUB) {
-          hub_log("[HUB] Disconnecting peer hub %s for rekey\n", state->clients[i]->ip);
           hub_disconnect_client(state, state->clients[i]);
-          disconnected++;
-          i--; // Adjust index since client_count decreased
+          i--;
         }
       }
-      hub_log("[HUB] Disconnected %d peer hubs for rekey\n", disconnected);
 
       time_t now = time(NULL);
       struct tm *t = localtime(&now);
       char f[64];
-      strftime(f, sizeof(f), "%Y%m%d%H%M_pub.pem", t);
+      strftime(f, sizeof(f), "%Y%m%d%H%M_pub.b64", t);
       FILE *fp = fopen(f, "w");
-      if (fp) {
-        fputs(pub, fp);
-        fclose(fp);
-      }
-      return send_response(state, client, pub);
+      if (fp) { fprintf(fp, "%s\n", pub_b64); fclose(fp); }
+
+      bool ok = send_response(state, client, pub_b64);
+      secure_wipe(priv_b64, strlen(priv_b64));
+      free(priv_b64); free(pub_b64);
+      return ok;
     }
     return send_response(state, client, "ERROR: Key generation failed.");
   }
 
   case CMD_ADMIN_GET_PUBKEY: {
-    char *pub = state->public_key_pem;
-    if (!pub && state->priv_key) {
-      BIO *bio = BIO_new(BIO_s_mem());
-      if (bio && PEM_write_bio_PUBKEY(bio, state->priv_key)) {
-        int len = BIO_pending(bio);
-        char *pem = malloc(len + 1);
-        if (pem) {
-          BIO_read(bio, pem, len);
-          pem[len] = 0;
-          state->public_key_pem = pem;
-          pub = pem;
-        }
-        BIO_free(bio);
-      }
-    }
-    if (pub)
-      return send_response(state, client, pub);
-    return send_response(state, client, "ERROR: No Key Available.");
+    if (!state->hub_keys_loaded)
+      return send_response(state, client, "ERROR: No Key Available.");
+    unsigned char pub64[64];
+    memcpy(pub64,      state->hub_ed25519_pub, 32);
+    memcpy(pub64 + 32, state->hub_x25519_pub,  32);
+    char *pub_b64 = base64_encode(pub64, 64);
+    if (!pub_b64) return send_response(state, client, "ERROR: Encoding failed.");
+    bool ok = send_response(state, client, pub_b64);
+    free(pub_b64);
+    return ok;
   }
 
   case CMD_ADMIN_SET_PRIVKEY:
-    if (payload && strlen(payload) > 10) {
-      EVP_PKEY *new_pkey = load_private_key_from_memory(payload);
-      if (new_pkey) {
-        if (state->private_key_pem) {
-          secure_wipe(state->private_key_pem, strlen(state->private_key_pem));
-          free(state->private_key_pem);
-        }
-        if (state->public_key_pem) {
-          free(state->public_key_pem);
-          state->public_key_pem = NULL;
-        }
-        if (state->priv_key)
-          EVP_PKEY_free(state->priv_key);
-
-        state->private_key_pem = strdup(payload);
-        state->priv_key = new_pkey;
-        hub_config_write(state);
-        return send_response(state, client,
-                             "SUCCESS: Private Key Imported & Saved.");
+    if (payload && strlen(payload) >= COMBINED_KEY_B64) {
+      int dec_len = 0;
+      unsigned char *dec = base64_decode(payload, &dec_len);
+      if (!dec || dec_len != 64) {
+        if (dec) free(dec);
+        return send_response(state, client, "ERROR: Invalid Curve25519 key (need 64-byte base64).");
       }
-      return send_response(state, client, "ERROR: Invalid PEM Data.");
+      // Validate: try loading each half
+      EVP_PKEY *ep = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, dec, 32);
+      EVP_PKEY *xp = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, dec + 32, 32);
+      if (!ep || !xp) {
+        if (ep) EVP_PKEY_free(ep);
+        if (xp) EVP_PKEY_free(xp);
+        secure_wipe(dec, 64); free(dec);
+        return send_response(state, client, "ERROR: Invalid key material.");
+      }
+      EVP_PKEY_free(ep); EVP_PKEY_free(xp);
+      hub_crypto_split_combined(dec, state->hub_ed25519_priv, state->hub_x25519_priv);
+
+      // Derive public keys from private
+      unsigned char pub64[64];
+      size_t len = 32;
+      EVP_PKEY *e2 = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, dec, 32);
+      EVP_PKEY *x2 = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, dec + 32, 32);
+      if (e2 && x2) {
+        EVP_PKEY_get_raw_public_key(e2, pub64, &len);
+        len = 32;
+        EVP_PKEY_get_raw_public_key(x2, pub64 + 32, &len);
+        memcpy(state->hub_ed25519_pub, pub64, 32);
+        memcpy(state->hub_x25519_pub,  pub64 + 32, 32);
+      }
+      if (e2) EVP_PKEY_free(e2);
+      if (x2) EVP_PKEY_free(x2);
+      secure_wipe(dec, 64); free(dec);
+      state->hub_keys_loaded = true;
+      hub_config_write(state);
+      return send_response(state, client, "SUCCESS: Private Key Imported & Saved.");
     }
-    return send_response(state, client, "ERROR: Empty Payload.");
+    return send_response(state, client, "ERROR: Empty or short payload.");
 
   case CMD_ADMIN_GET_PRIVKEY:
-    if (state->private_key_pem) {
-      return send_response(state, client, state->private_key_pem);
+    if (state->hub_keys_loaded) {
+      unsigned char priv64[64];
+      memcpy(priv64,      state->hub_ed25519_priv, 32);
+      memcpy(priv64 + 32, state->hub_x25519_priv,  32);
+      char *priv_b64 = base64_encode(priv64, 64);
+      secure_wipe(priv64, 64);
+      if (!priv_b64) return send_response(state, client, "ERROR: Encoding failed.");
+      bool ok = send_response(state, client, priv_b64);
+      secure_wipe(priv_b64, strlen(priv_b64));
+      free(priv_b64);
+      return ok;
     }
     return send_response(state, client, "ERROR: No Private Key in Memory.");
 
   case CMD_ADMIN_SET_PUBKEY:
-    if (payload && strlen(payload) > 10) {
-      if (state->public_key_pem)
-        free(state->public_key_pem);
-      state->public_key_pem = strdup(payload);
+    if (payload && strlen(payload) >= COMBINED_KEY_B64) {
+      int dec_len = 0;
+      unsigned char *dec = base64_decode(payload, &dec_len);
+      if (!dec || dec_len != 64) {
+        if (dec) free(dec);
+        return send_response(state, client, "ERROR: Invalid Curve25519 public key.");
+      }
+      hub_crypto_split_combined(dec, state->hub_ed25519_pub, state->hub_x25519_pub);
+      free(dec);
       hub_config_write(state);
-      return send_response(state, client,
-                           "SUCCESS: Public Key Imported & Saved.");
+      return send_response(state, client, "SUCCESS: Public Key Imported & Saved.");
     }
     return send_response(state, client, "ERROR: Empty Payload.");
 
@@ -4423,10 +4433,10 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
     // AUTHENTICATION PHASE
     // ========================================================================
     if (!client->authenticated) {
-      // Detect packet type: Bot UUID (plaintext, 36-64 chars,
-      // alphanumeric+hyphens)
+      // Detect packet type: Bot UUID (plaintext, 36 chars, hex+hyphens)
+      // or mid-handshake bot packet (64-byte sig or eph_pub response)
       bool looks_like_uuid = false;
-      if (packet_len >= 36 && packet_len <= 64) {
+      if (packet_len >= 36 && packet_len <= 36) {
         looks_like_uuid = true;
         for (int i = 0; i < packet_len && looks_like_uuid; i++) {
           char c = data[i];
@@ -4437,40 +4447,59 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
         }
       }
 
-      // Bot authentication (plaintext UUID or signature)
+      // Route to bot auth handler (UUID or mid-handshake)
       if (looks_like_uuid || client->bot_auth_state != BOT_AUTH_IDLE) {
-        goto bot_authentication;
+        if (!handle_bot_authentication(state, client, data, packet_len)) {
+          hub_disconnect_client(state, client);
+          return false;
+        }
+        goto packet_consumed;
       }
 
-      // Try RSA decryption (for ADMIN and HUB peer auth)
-      if (packet_len > 32 && packet_len <= 512) {
-        unsigned char dec[512];
-        int dec_len =
-            evp_private_decrypt(state->priv_key, data, packet_len, dec);
+      // Sealed-box decrypt for ADMIN and HUB peer auth
+      // Packet layout: eph_pub(32) || IV(GCM_IV_LEN) || ct(N) || tag(GCM_TAG_LEN)
+      if (packet_len >= 32 + GCM_IV_LEN + GCM_TAG_LEN && packet_len <= MAX_BUFFER) {
+        static const unsigned char ADMIN_INFO[] = "irchub-admin-session-v1";
+        static const unsigned char PEER_INFO[]  = "irchub-peer-session-v1";
 
-        if (dec_len > 32) {
-          memcpy(client->session_key, dec, 32);
-          char *payload = (char *)dec + 32;
-          dec[dec_len] = 0;
+        unsigned char plain[MAX_BUFFER];
+        unsigned char session_key[32];
+
+        int pl = hub_seal_open(state, data, packet_len,
+                               ADMIN_INFO, sizeof(ADMIN_INFO) - 1,
+                               plain, sizeof(plain) - 1, session_key);
+        bool tried_admin = (pl > 0 && pl >= 5 && memcmp(plain, "ADMIN", 5) == 0);
+
+        if (pl <= 0 || !tried_admin) {
+          // Retry under PEER_INFO
+          secure_wipe(session_key, 32);
+          int pl2 = hub_seal_open(state, data, packet_len,
+                                  PEER_INFO, sizeof(PEER_INFO) - 1,
+                                  plain, sizeof(plain) - 1, session_key);
+          if (pl2 > 0) pl = pl2;
+          else if (!tried_admin) pl = -1;
+        }
+
+        if (pl > 0) {
+          memcpy(client->session_key, session_key, 32);
+          secure_wipe(session_key, 32);
+          plain[pl] = 0;
+          char *payload = (char *)plain;
 
           // ADMIN Authentication
           if (strncmp(payload, "ADMIN", 5) == 0) {
-            // Parse: "ADMIN password|connect_ip:connect_port"
             char *pipe = strchr(payload + 6, '|');
             char pass_buf[128];
             int pass_len;
 
             if (pipe) {
-              // Extract password (everything between "ADMIN " and "|")
               pass_len = pipe - (payload + 6);
               if (pass_len >= (int)sizeof(pass_buf)) pass_len = sizeof(pass_buf) - 1;
               memcpy(pass_buf, payload + 6, pass_len);
               pass_buf[pass_len] = '\0';
             } else {
-              // Old format without connection info
               if (strlen(payload + 6) >= sizeof(pass_buf)) {
-                pass_len = 0;
-                pass_buf[0] = '\0';
+                pass_len = 0; pass_buf[0] = '\0';
               } else {
                 snprintf(pass_buf, sizeof(pass_buf), "%s", payload + 6);
               }
@@ -4481,7 +4510,6 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               client->authenticated = true;
               snprintf(client->id, sizeof(client->id), "ADMIN");
 
-              // Parse and store connection IP:port if available
               if (pipe) {
                 char *colon = strchr(pipe + 1, ':');
                 if (colon) {
@@ -4500,11 +4528,11 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 client->admin_connect_port = 0;
               }
 
-              hub_log("[HUB] Admin Login: %s\n", client->ip);
+              hub_log("[HUB] Admin Login (Curve25519): %s\n", client->ip);
             } else {
               hub_log("[HUB] Failed admin auth from %s\n", client->ip);
               record_failed_auth(state, client->ip);
-              secure_wipe(dec, sizeof(dec));
+              secure_wipe(plain, sizeof(plain));
               hub_disconnect_client(state, client);
               return false;
             }
@@ -4517,9 +4545,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             memset(peer_name, 0, sizeof(peer_name));
             memset(peer_bind_ip, 0, sizeof(peer_bind_ip));
 
-            // Parse: HUB <password> <port> <uuid> <friendly_name> <bind_ip>
             int args = sscanf(payload + 4, "%127s %d %63s %63s %63s",
-                            pass, &claimed_port, peer_uuid, peer_name, peer_bind_ip);
+                              pass, &claimed_port, peer_uuid, peer_name, peer_bind_ip);
 
             if (args >= 1 && strcmp(pass, state->admin_password) == 0) {
               client->type = CLIENT_HUB;
@@ -4527,235 +4554,82 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               bool is_authorized_peer = false;
               int peer_idx = -1;
 
-              // Find and validate peer by UUID (primary) or IP:port (fallback)
               for (int p = 0; p < state->peer_count; p++) {
-                // UUID-based matching (preferred)
                 if (args >= 3 && peer_uuid[0] && state->peers[p].uuid[0]) {
                   if (strcmp(state->peers[p].uuid, peer_uuid) == 0) {
-                    peer_idx = p;
-                    is_authorized_peer = true;
-                    break;
+                    peer_idx = p; is_authorized_peer = true; break;
                   }
-                }
-                // Fallback to IP:port matching for backward compatibility
-                else {
+                } else {
                   bool ip_match = (strcmp(state->peers[p].ip, client->ip) == 0 ||
                                    strcmp(state->bind_ip, client->ip) == 0);
-
                   if (ip_match && claimed_port > 0 && state->peers[p].port == claimed_port) {
-                    peer_idx = p;
-                    is_authorized_peer = true;
-                    break;
+                    peer_idx = p; is_authorized_peer = true; break;
                   }
                 }
               }
 
               if (!is_authorized_peer) {
                 hub_log("[HUB] Unauthorized peer from %s (UUID: %s)\n",
-                       client->ip, peer_uuid[0] ? peer_uuid : "none");
-                secure_wipe(dec, sizeof(dec));
+                        client->ip, peer_uuid[0] ? peer_uuid : "none");
+                secure_wipe(plain, sizeof(plain));
                 hub_disconnect_client(state, client);
                 return false;
               }
 
-              // UUID mismatch check - disconnect if UUIDs don't match
               if (args >= 3 && peer_uuid[0] && state->peers[peer_idx].uuid[0]) {
                 if (strcmp(state->peers[peer_idx].uuid, peer_uuid) != 0) {
-                  hub_log("[HUB] UUID mismatch for peer %s (expected: %s, got: %s)\n",
-                         client->ip, state->peers[peer_idx].uuid, peer_uuid);
-                  secure_wipe(dec, sizeof(dec));
+                  hub_log("[HUB] UUID mismatch for peer %s\n", client->ip);
+                  secure_wipe(plain, sizeof(plain));
                   hub_disconnect_client(state, client);
                   return false;
                 }
               }
 
-              // Update peer connection info
               client->authenticated = true;
               state->peers[peer_idx].connected = true;
               state->peers[peer_idx].fd = client->fd;
-
-              // Store actual connection IP (from socket)
               snprintf(state->peers[peer_idx].remote_ip,
-                      sizeof(state->peers[peer_idx].remote_ip), "%s", client->ip);
+                       sizeof(state->peers[peer_idx].remote_ip), "%s", client->ip);
 
-              // Don't overwrite friendly_name from handshake - config is source of truth
-              // Only update if it's currently empty AND handshake provides one
               if (!state->peers[peer_idx].friendly_name[0] && args >= 4 && peer_name[0]) {
                 snprintf(state->peers[peer_idx].friendly_name,
-                        sizeof(state->peers[peer_idx].friendly_name), "%s", peer_name);
+                         sizeof(state->peers[peer_idx].friendly_name), "%s", peer_name);
               }
 
               snprintf(client->id, sizeof(client->id), "%s",
-                      state->peers[peer_idx].friendly_name[0] ?
-                      state->peers[peer_idx].friendly_name :
-                      (peer_name[0] ? peer_name : "HUB-PEER"));
+                       state->peers[peer_idx].friendly_name[0] ?
+                       state->peers[peer_idx].friendly_name :
+                       (peer_name[0] ? peer_name : "HUB-PEER"));
               client->id[sizeof(client->id) - 1] = 0;
 
-              // Send initial sync (existing code)...
-              hub_log("[HUB] Peer connected: %s (%s)\n",
-                     peer_name[0] ? peer_name : client->ip,
-                     peer_uuid[0] ? peer_uuid : "no-uuid");
+              hub_log("[HUB] Peer connected (Curve25519): %s (%s)\n",
+                      peer_name[0] ? peer_name : client->ip,
+                      peer_uuid[0] ? peer_uuid : "no-uuid");
             } else {
               hub_log("[HUB] Failed peer auth from %s\n", client->ip);
               record_failed_auth(state, client->ip);
-              secure_wipe(dec, sizeof(dec));
+              secure_wipe(plain, sizeof(plain));
               hub_disconnect_client(state, client);
               return false;
             }
           } else {
-            // Unknown RSA payload
-            secure_wipe(dec, sizeof(dec));
+            secure_wipe(plain, sizeof(plain));
             hub_disconnect_client(state, client);
             return false;
           }
 
-          secure_wipe(dec, sizeof(dec));
+          secure_wipe(plain, sizeof(plain));
         } else {
-          // RSA decrypt failed - treat as bot auth (plaintext UUID or
-          // signature)
-          goto bot_authentication;
+          secure_wipe(session_key, 32);
+          // Sealed-box failed — fall through to bot auth
+          if (!handle_bot_authentication(state, client, data, packet_len)) {
+            hub_disconnect_client(state, client);
+            return false;
+          }
         }
       } else {
-      // Packet too small/large for RSA - must be bot auth
-      bot_authentication:
-
-        // PHASE 1: Receive plaintext UUID
-        if (client->bot_auth_state == BOT_AUTH_IDLE) {
-          char uuid[64];
-          int copy_len = (packet_len < 63) ? packet_len : 63;
-          memcpy(uuid, data, copy_len);
-          uuid[copy_len] = '\0';
-
-          hub_log("[HUB] Bot auth: UUID=%s from %s\n", uuid, client->ip);
-
-          // Check authorization
-          bool authorized = false;
-          for (int i = 0; i < state->bot_count; i++) {
-            if (strcmp(state->bots[i].uuid, uuid) == 0 &&
-                state->bots[i].is_active) {
-              authorized = true;
-              break;
-            }
-          }
-
-          if (!authorized) {
-            hub_log("[HUB] Unauthorized bot: %s\n", uuid);
-            add_pending_bot(state, uuid, client->ip);
-            hub_disconnect_client(state, client);
-            return false;
-          }
-
-          // Load bot's public key
-          EVP_PKEY *pub_key = load_bot_public_key(state, uuid);
-          if (!pub_key) {
-            hub_log("[HUB][ERROR] No public key for bot %s\n", uuid);
-            hub_disconnect_client(state, client);
-            return false;
-          }
-
-          // Generate challenge
-          if (RAND_bytes(client->challenge, 32) != 1) {
-            EVP_PKEY_free(pub_key);
-            hub_log("[HUB][ERROR] Failed to generate challenge\n");
-            hub_disconnect_client(state, client);
-            return false;
-          }
-
-          // Encrypt challenge with bot's public key
-          unsigned char enc_challenge[512];
-          int enc_len = rsa_encrypt_with_bot_pubkey(pub_key, client->challenge,
-                                                    32, enc_challenge);
-          EVP_PKEY_free(pub_key);
-
-          if (enc_len <= 0) {
-            hub_log("[HUB][ERROR] Failed to encrypt challenge\n");
-            hub_disconnect_client(state, client);
-            return false;
-          }
-
-          // Send encrypted challenge
-          uint32_t net_len_send = htonl(enc_len);
-          if (write(client->fd, &net_len_send, 4) != (ssize_t)4 ||
-              write(client->fd, enc_challenge, enc_len) != (ssize_t)enc_len) {
-            hub_log("[HUB][ERROR] Failed to send challenge\n");
-            hub_disconnect_client(state, client);
-            return false;
-          }
-
-          snprintf(client->id, sizeof(client->id), "%s", uuid);
-          client->bot_auth_state = BOT_AUTH_CHALLENGE_SENT;
-          client->last_seen = time(NULL);
-
-          hub_log("[HUB] Challenge sent to bot %s\n", uuid);
-        }
-        // PHASE 2: Receive signature
-        else if (client->bot_auth_state == BOT_AUTH_CHALLENGE_SENT) {
-          hub_log("[HUB] Received signature from %s (%d bytes)\n", client->id,
-                  packet_len);
-
-          // Load bot's public key
-          EVP_PKEY *pub_key = load_bot_public_key(state, client->id);
-          if (!pub_key) {
-            hub_log("[HUB][ERROR] No public key for %s\n", client->id);
-            hub_disconnect_client(state, client);
-            return false;
-          }
-
-          // Verify signature
-          bool valid = verify_signature_with_bot_pubkey(
-              pub_key, client->challenge, 32, data, packet_len);
-
-          if (!valid) {
-            EVP_PKEY_free(pub_key);
-            hub_log("[HUB][ERROR] Invalid signature from %s\n", client->id);
-            hub_disconnect_client(state, client);
-            return false;
-          }
-
-          hub_log("[HUB] Signature verified for %s\n", client->id);
-
-          // Generate session key
-          if (RAND_bytes(client->session_key, 32) != 1) {
-            EVP_PKEY_free(pub_key);
-            hub_log("[HUB][ERROR] Failed to generate session key\n");
-            hub_disconnect_client(state, client);
-            return false;
-          }
-
-          // Encrypt session key
-          unsigned char enc_session[512];
-          int enc_len = rsa_encrypt_with_bot_pubkey(
-              pub_key, client->session_key, 32, enc_session);
-          EVP_PKEY_free(pub_key);
-
-          if (enc_len <= 0) {
-            hub_log("[HUB][ERROR] Failed to encrypt session key\n");
-            hub_disconnect_client(state, client);
-            return false;
-          }
-
-          // Send encrypted session key
-          uint32_t net_len_send = htonl(enc_len);
-          if (write(client->fd, &net_len_send, 4) != (ssize_t)4 ||
-              write(client->fd, enc_session, enc_len) != (ssize_t)enc_len) {
-            hub_log("[HUB][ERROR] Failed to send session key\n");
-            hub_disconnect_client(state, client);
-            return false;
-          }
-
-          // Mark authenticated
-          client->type = CLIENT_BOT;
-          client->authenticated = true;
-          client->bot_auth_state = BOT_AUTH_COMPLETE;
-          client->last_seen = time(NULL);
-
-          // Update "seen" timestamp on successful authentication
-          hub_storage_update_entry(state, client->id, "seen", "", "", "", client->last_seen);
-
-          send_config_to_bot(state, client);
-          hub_log("[HUB] Bot %s authenticated successfully\n", client->id);
-        } else {
-          hub_log("[HUB][ERROR] Invalid auth state from %s\n", client->ip);
+        // Short packet — must be bot UUID or mid-handshake
+        if (!handle_bot_authentication(state, client, data, packet_len)) {
           hub_disconnect_client(state, client);
           return false;
         }
@@ -4867,64 +4741,43 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                   }
                 }
               } else if (cmd == CMD_UPDATE_PUBKEY) {
-                // Peer hub sent us the new shared private and public keys after rekey
-                // Payload format: "PRIVKEY|||PUBKEY"
+                // Peer hub sent new shared keypair: "<priv_b64>|||<pub_b64>"
                 if (payload_ptr && strlen(payload_ptr) > 0) {
-                  hub_log("[HUB] Received key update from peer %s\n", client->ip);
+                  hub_log("[HUB] Received Curve25519 key update from peer %s\n", client->ip);
+                  char *sep = strstr(payload_ptr, "|||");
+                  if (sep) {
+                    size_t priv_b64_len = sep - payload_ptr;
+                    char priv_b64[128] = {0};
+                    char pub_b64[128]  = {0};
+                    if (priv_b64_len < sizeof(priv_b64) && strlen(sep + 3) < sizeof(pub_b64)) {
+                      memcpy(priv_b64, payload_ptr, priv_b64_len);
+                      snprintf(pub_b64, sizeof(pub_b64), "%s", sep + 3);
 
-                  // Parse the combined payload
-                  char *separator = strstr(payload_ptr, "|||");
-                  if (separator) {
-                    // Split into private and public keys
-                    size_t priv_len = separator - payload_ptr;
-                    char *new_priv_pem = malloc(priv_len + 1);
-                    char *new_pub_pem = strdup(separator + 3); // Skip "|||"
-
-                    if (new_priv_pem && new_pub_pem) {
-                      memcpy(new_priv_pem, payload_ptr, priv_len);
-                      new_priv_pem[priv_len] = '\0';
-
-                      // Validate the new private key
-                      EVP_PKEY *new_pkey = load_private_key_from_memory(new_priv_pem);
-                      if (new_pkey) {
-                        // Save the new private and public keys
-                        if (state->private_key_pem) {
-                          secure_wipe(state->private_key_pem, strlen(state->private_key_pem));
-                          free(state->private_key_pem);
-                        }
-                        if (state->public_key_pem) {
-                          free(state->public_key_pem);
-                        }
-                        if (state->priv_key) {
-                          EVP_PKEY_free(state->priv_key);
-                        }
-
-                        state->private_key_pem = new_priv_pem;
-                        state->public_key_pem = new_pub_pem;
-                        state->priv_key = new_pkey;
+                      int pl = 0, publ = 0;
+                      unsigned char *pd = base64_decode(priv_b64, &pl);
+                      unsigned char *pubp = base64_decode(pub_b64, &publ);
+                      if (pd && pl == 64 && pubp && publ == 64) {
+                        hub_crypto_split_combined(pd, state->hub_ed25519_priv, state->hub_x25519_priv);
+                        hub_crypto_split_combined(pubp, state->hub_ed25519_pub, state->hub_x25519_pub);
+                        state->hub_keys_loaded = true;
+                        secure_wipe(pd, 64);
                         hub_config_write(state);
-
-                        hub_log("[HUB] Updated private and public keys from peer rekey, disconnecting all peers\n");
-
-                        // Disconnect all peer hubs so they reconnect with new keys
+                        hub_log("[HUB] Applied new Curve25519 mesh keypair from peer\n");
+                        if (pd) free(pd);
+                        if (pubp) free(pubp);
+                        // Disconnect peers so they reconnect with new key
                         for (int i = 0; i < state->client_count; i++) {
                           if (state->clients[i]->type == CLIENT_HUB) {
                             hub_disconnect_client(state, state->clients[i]);
-                            i--; // Adjust index since client_count decreased
+                            i--;
                           }
                         }
-
                         return false;
                       } else {
-                        hub_log("[HUB] Failed to load new private key from peer %s\n", client->ip);
-                        secure_wipe(new_priv_pem, strlen(new_priv_pem));
-                        free(new_priv_pem);
-                        free(new_pub_pem);
+                        hub_log("[HUB] Invalid Curve25519 key update from peer %s\n", client->ip);
                       }
-                    } else {
-                      hub_log("[HUB] Failed to allocate memory for keys\n");
-                      if (new_priv_pem) free(new_priv_pem);
-                      if (new_pub_pem) free(new_pub_pem);
+                      if (pd) { secure_wipe(pd, pl); free(pd); }
+                      if (pubp) free(pubp);
                     }
                   } else {
                     hub_log("[HUB] Invalid key update format from peer %s\n", client->ip);
@@ -4941,6 +4794,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
       }
     }
 
+    packet_consumed:;
     // Remove processed packet from buffer
     int consumed = 4 + packet_len;
     int remaining = client->recv_len - consumed;

@@ -7,8 +7,6 @@
 #include <netinet/in.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/rsa.h>
 #include <openssl/ssl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -43,6 +41,13 @@
 #define HUB_CONFIG_PURGE_DAYS_KEY "purge_days"
 #define HUB_LOG_FILE ".irchub.log"
 #define HUB_LOG_FILE_SIZE (10 * 1024 * 1024)  // 10MB
+
+// Curve25519 key constants
+#define ED25519_KEY_LEN    32
+#define X25519_KEY_LEN     32
+#define ED25519_SIG_LEN    64
+#define COMBINED_KEY_LEN   64
+#define COMBINED_KEY_B64   88
 
 // Log levels
 #define LOG_NONE    0
@@ -220,6 +225,8 @@ typedef struct {
   unsigned char recv_buf[MAX_BUFFER];
   bot_auth_state_t bot_auth_state;
   unsigned char challenge[32];
+  unsigned char bot_eph_x25519_priv[32];
+  bool bot_eph_priv_set;
   int recv_len;
   char admin_connect_ip[64];   // IP that hub_admin used to connect
   int admin_connect_port;      // Port that hub_admin used to connect
@@ -240,9 +247,11 @@ typedef struct {
   char admin_password[128];
   char config_pass[128];
 
-  char *private_key_pem;
-  char *public_key_pem;
-  EVP_PKEY *priv_key; // FIXED: Changed from RSA* to EVP_PKEY*
+  unsigned char hub_ed25519_priv[32];
+  unsigned char hub_ed25519_pub[32];
+  unsigned char hub_x25519_priv[32];
+  unsigned char hub_x25519_pub[32];
+  bool hub_keys_loaded;
 
   hub_client_t *clients[MAX_CLIENTS];
   int client_count;
@@ -295,16 +304,27 @@ void hub_log(const char *format, ...);
 bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);
 
-// FIXED: Updated crypto function signatures
-EVP_PKEY *load_private_key_from_memory(const char *pem_data);
-bool hub_crypto_generate_keypair(char **priv_pem_out, char **pub_pem_out);
-int evp_private_decrypt(EVP_PKEY *pkey, const unsigned char *enc, int enc_len,
-                        unsigned char *dec);
-int evp_public_encrypt(EVP_PKEY *pkey, const unsigned char *plain,
-                       int plain_len, unsigned char *enc);
+// Curve25519 crypto functions
+bool hub_crypto_generate_combined_keypair(unsigned char priv_out[64],
+                                          unsigned char pub_out[64]);
+void hub_crypto_split_combined(const unsigned char in[64],
+                               unsigned char ed_out[32],
+                               unsigned char x_out[32]);
+bool hub_crypto_ed25519_sign(const unsigned char ed_priv[32],
+                             const unsigned char *msg, size_t msg_len,
+                             unsigned char sig_out[64]);
+bool hub_crypto_ed25519_verify(const unsigned char ed_pub[32],
+                               const unsigned char *msg, size_t msg_len,
+                               const unsigned char sig[64]);
+bool hub_crypto_x25519_derive(const unsigned char x_priv[32],
+                              const unsigned char x_peer_pub[32],
+                              unsigned char shared_out[32]);
+bool hub_crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
+                            const unsigned char *salt, size_t salt_len,
+                            const unsigned char *info, size_t info_len,
+                            unsigned char *out, size_t out_len);
 
-// FIXED: Simplified - removed AAD parameters (not needed since we encrypt
-// everything)
+// AES-GCM
 int aes_gcm_decrypt(const unsigned char *input, int input_len,
                     const unsigned char *key, unsigned char *output,
                     unsigned char *tag);
@@ -350,7 +370,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c);
 void hub_broadcast_mesh_state(hub_state_t *state);
 
-// NEW: Crypto utility functions
+// Bot credential generation
 bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
                                    char **out_pub_b64);
 void secure_wipe(void *ptr, size_t len);

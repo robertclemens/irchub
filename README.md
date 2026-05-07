@@ -6,7 +6,7 @@ A hub server for coordinating networks of IRC bots. irchub handles centralized k
 
 ## Overview
 
-irchub sits between your IRC bots and your admin console. Each [ircbot](https://github.com/robertclemens/ircbot/) instance authenticates to the hub using an RSA-2048 keypair. The hub distributes encrypted configuration (channels, admin masks, oper credentials, passwords) to all connected bots and keeps everything synchronized across multiple hub instances via a peer mesh.
+irchub sits between your IRC bots and your admin console. Each [ircbot](https://github.com/robertclemens/ircbot/) instance authenticates to the hub using a Curve25519 keypair. The hub distributes encrypted configuration (channels, admin masks, oper credentials, passwords) to all connected bots and keeps everything synchronized across multiple hub instances via a peer mesh.
 
 ```
 hub_admin ──► irchub ──► ircbot A
@@ -16,7 +16,7 @@ hub_admin ──► irchub ──► ircbot A
 
 **Key capabilities:**
 
-- **Bot provisioning** — generate RSA keypairs and deliver credentials to bots via IRC
+- **Bot provisioning** — generate Curve25519 keypairs and deliver credentials to bots via IRC
 - **Encrypted config sync** — AES-256-GCM encrypted configuration pushed to all bots on connect and periodically
 - **Peer mesh** — multiple hub instances synchronize state; leader election prevents duplicate operations
 - **Admin console** — interactive TUI (`hub_admin`) for managing bots, channels, masks, and opers
@@ -30,7 +30,7 @@ hub_admin ──► irchub ──► ircbot A
 |--------|---------|
 | `irchub` | Hub server |
 | `hub_admin` | Interactive admin console |
-| `keygen` | RSA-2048 keypair generator |
+| `keygen` | Curve25519 keypair generator |
 | `hub_decrypt` | Decrypt and inspect config file |
 | `hub_encrypt` | Re-encrypt a config file |
 
@@ -40,7 +40,7 @@ Built binaries are placed in `bin/`. Install them wherever suits your setup — 
 
 irchub is the hub — [ircbot](https://github.com/robertclemens/ircbot/) is the bot. The two projects are built to work together:
 
-- **[ircbot](https://github.com/robertclemens/ircbot/)** connects to irchub on startup, authenticates with its RSA keypair, and receives its full configuration (channels to join, passwords, admin masks) automatically.
+- **[ircbot](https://github.com/robertclemens/ircbot/)** connects to irchub on startup, authenticates with its Curve25519 keypair, and receives its full configuration (channels to join, passwords, admin masks) automatically.
 - When a bot's config changes (new channel, password rotation, rekey), the hub pushes the update to all connected bots in real time.
 - Bots request op grants through the hub, which coordinates across the mesh so any bot can grant ops to any other bot regardless of which hub they are connected to.
 - Commands to the bot are authenticated using time-based hashes, and the hub distributes the shared secret needed to verify them.
@@ -113,7 +113,7 @@ You will be prompted for:
 | **Bind IP** | Interface to bind to — press Enter to default to `0.0.0.0` (all interfaces) |
 | **Friendly Name** | Human-readable name for this hub instance |
 | **Config Password** | Password used to encrypt the config file (hidden input) |
-| **Hub Keypair** | Choose `1` to generate a new RSA-2048 keypair inline, or `2` to load an existing PEM file |
+| **Hub Keypair** | Choose `1` to generate a new Curve25519 keypair inline, or `2` to load an existing `.b64` file |
 | **Admin Password** | Password required by `hub_admin` to connect (hidden, confirmed twice) |
 
 Setup writes the encrypted config file (`.irchub.cnf`) and exits. The hub does not start automatically.
@@ -167,7 +167,7 @@ Replace `/full/path/to/irchub` with the absolute path to the binary. Note that c
 The admin console connects to a running hub. It requires the hub's public key (PEM) for the encrypted handshake:
 
 ```bash
-./hub_admin <hub-ip> <hub-port> <hub_public.pem>
+./hub_admin <hub-ip> <hub-port> <hub_public.b64>
 ```
 
 To obtain the public key from a running hub, connect with `hub_admin`, go to **Manage Peer Config → Export Public Key**, and save the file.
@@ -188,7 +188,7 @@ IRC HUB ADMIN CONSOLE
 
 1. **Manage Bots → Add Bot**
 2. Enter the bot's IRC nickname
-3. The hub generates an RSA keypair and UUID
+3. The hub generates a Curve25519 keypair and UUID
 4. Choose how to distribute the private key:
    - **Export to file** — saves `bot_<nick>_priv_key.b64`
    - **Show private key** — prints the base64 key to the terminal
@@ -196,9 +196,7 @@ IRC HUB ADMIN CONSOLE
 
 The IRC commands look like:
 ```
-/msg <botnick> <hash> sethubkey 1/3:<chunk>
-/msg <botnick> <hash> sethubkey 2/3:<chunk>
-/msg <botnick> <hash> sethubkey 3/3:<chunk>
+/msg <botnick> <hash> sethubkey <88-char-base64-Curve25519-key>
 /msg <botnick> <hash> setuuid <uuid>
 /msg <botnick> <hash> +hub <hub_ip>:<hub_port>
 ```
@@ -266,13 +264,13 @@ Re-encrypts a plaintext config file. Useful for migrating or restoring configs.
 ./keygen [private-key-out] [public-key-out]
 ```
 
-Generates an RSA-2048 keypair. Defaults to `hub_private.pem` and `hub_public.pem`. Useful if you want to pre-generate a key before running `-setup` with option 2.
+Generates a Curve25519 keypair (Ed25519 + X25519). Defaults to `hub_private.b64` and `hub_public.b64`. Useful if you want to pre-generate a key before running `-setup` with option 2.
 
 ## Security Notes
 
 - The config password is never passed on the command line or stored in an environment variable. It is read from `.irchub.pass` (if present) or prompted on stdin at startup.
 - `.irchub.pass` is AES-256-GCM encrypted and machine-bound — it cannot be decrypted on a different host. The file must be owned by the current user with permissions `0600`; any deviation is rejected and irchub falls back to the stdin prompt.
-- All bot-to-hub communication is encrypted with AES-256-GCM using per-session keys negotiated via RSA-2048.
+- All bot-to-hub communication is encrypted with AES-256-GCM using per-session keys negotiated via Curve25519 (sealed-box).
 - Failed authentication attempts are tracked per IP. After 3 failures the IP is blocked for 5 minutes; the failure counter resets after 1 hour. These thresholds are compile-time constants (`MAX_FAILED_AUTH_ATTEMPTS`, `FAILED_AUTH_BLOCK_DURATION`, `FAILED_AUTH_RESET_TIME` in `hub.h`) — adjust and rebuild to change them. Specific IPs and ranges can be permanently allowed or blocked at runtime via **Manage Peer Config → Manage IP Allowlist / Manage IP Denylist** in `hub_admin` (supports CIDR notation).
 - Each IP is limited to 5 simultaneous connections (`MAX_CONNECTIONS_PER_IP` in `hub.h` — compile-time constant).
 - Private key material is wiped from memory (`secure_wipe`) as soon as it is no longer needed.
@@ -322,8 +320,8 @@ kill $(cat .irchub.pid)
 # */5 * * * * /full/path/to/irchub
 
 # Connect admin console (needs hub's public key)
-#./hub_admin <hub ip> <hub port> <public key file>
-./hub_admin 127.0.0.1 6697 hub_public.pem
+#./hub_admin <hub ip> <hub port> <public key b64>
+./hub_admin 127.0.0.1 6697 hub_public.b64
 
 # View logs (if logging has been turned on)
 tail -f .irchub.log

@@ -188,62 +188,8 @@ production:
 # Utility Tools
 # ============================================================================
 
-# Create keygen.c if it doesn't exist
-keygen: keygen.c $(KEYGEN_TARGET)
-
-keygen.c:
-	@echo "Creating keygen.c utility..."
-	@echo '#include "hub.h"' > keygen.c
-	@echo '#include <stdio.h>' >> keygen.c
-	@echo '#include <stdlib.h>' >> keygen.c
-	@echo '' >> keygen.c
-	@echo '// Stub hub_log for hub_crypto.c (keygen doesn'"'"'t use file logging)' >> keygen.c
-	@echo 'void hub_log(const char *format, ...) {' >> keygen.c
-	@echo '    (void)format;' >> keygen.c
-	@echo '}' >> keygen.c
-	@echo '' >> keygen.c
-	@echo 'int main(int argc, char *argv[]) {' >> keygen.c
-	@echo '    char *priv_pem = NULL, *pub_pem = NULL;' >> keygen.c
-	@echo '    ' >> keygen.c
-	@echo '    printf("Generating RSA-2048 keypair...\\n");' >> keygen.c
-	@echo '    ' >> keygen.c
-	@echo '    if (!hub_crypto_generate_keypair(&priv_pem, &pub_pem)) {' >> keygen.c
-	@echo '        fprintf(stderr, "Key generation failed\\n");' >> keygen.c
-	@echo '        return 1;' >> keygen.c
-	@echo '    }' >> keygen.c
-	@echo '    ' >> keygen.c
-	@echo '    const char *priv_file = (argc > 1) ? argv[1] : "hub_private.pem";' >> keygen.c
-	@echo '    const char *pub_file = (argc > 2) ? argv[2] : "hub_public.pem";' >> keygen.c
-	@echo '    ' >> keygen.c
-	@echo '    FILE *fp = fopen(priv_file, "w");' >> keygen.c
-	@echo '    if (!fp) {' >> keygen.c
-	@echo '        perror("Failed to create private key file");' >> keygen.c
-	@echo '        free(priv_pem); free(pub_pem);' >> keygen.c
-	@echo '        return 1;' >> keygen.c
-	@echo '    }' >> keygen.c
-	@echo '    fputs(priv_pem, fp);' >> keygen.c
-	@echo '    fclose(fp);' >> keygen.c
-	@echo '    printf("Private key written to: %s\\n", priv_file);' >> keygen.c
-	@echo '    ' >> keygen.c
-	@echo '    fp = fopen(pub_file, "w");' >> keygen.c
-	@echo '    if (!fp) {' >> keygen.c
-	@echo '        perror("Failed to create public key file");' >> keygen.c
-	@echo '        free(priv_pem); free(pub_pem);' >> keygen.c
-	@echo '        return 1;' >> keygen.c
-	@echo '    }' >> keygen.c
-	@echo '    fputs(pub_pem, fp);' >> keygen.c
-	@echo '    fclose(fp);' >> keygen.c
-	@echo '    printf("Public key written to: %s\\n", pub_file);' >> keygen.c
-	@echo '    ' >> keygen.c
-	@echo '    secure_wipe(priv_pem, strlen(priv_pem));' >> keygen.c
-	@echo '    free(priv_pem);' >> keygen.c
-	@echo '    free(pub_pem);' >> keygen.c
-	@echo '    ' >> keygen.c
-	@echo '    printf("\\nDone! You can now run setup:\\n");' >> keygen.c
-	@echo '    printf("  ./bin/irchub -setup\\n");' >> keygen.c
-	@echo '    return 0;' >> keygen.c
-	@echo '}' >> keygen.c
-	@echo "Created keygen.c"
+# keygen.c is hand-maintained (Curve25519); do not auto-generate
+keygen: $(KEYGEN_TARGET)
 
 # ============================================================================
 # Installation
@@ -327,7 +273,6 @@ clean:
 	@echo "Cleaning build files..."
 	@rm -rf $(BUILD_DIR)
 	@rm -rf $(BIN_DIR)
-	@rm -f keygen.c
 	@rm -f *.log
 	@echo "Clean complete"
 

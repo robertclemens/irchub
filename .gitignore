@@ -6,3 +6,5 @@ irchub
 .irchub.pid
 .irchub.*
 .claude
+*.b64
+docs

@@ -1,34 +1,11 @@
 #include "hub.h"
-#include <openssl/bio.h>
 #include <openssl/evp.h>
-#include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-
-// Helper to extract PubKey from EVP_PKEY
-static char *extract_pubkey(EVP_PKEY *pkey) {
-  BIO *bio = BIO_new(BIO_s_mem());
-  if (!bio)
-    return NULL;
-
-  if (!PEM_write_bio_PUBKEY(bio, pkey)) {
-    BIO_free(bio);
-    return NULL;
-  }
-
-  int len = BIO_pending(bio);
-  char *pem = malloc(len + 1);
-  if (pem) {
-    BIO_read(bio, pem, len);
-    pem[len] = 0;
-  }
-  BIO_free(bio);
-  return pem;
-}
 
 // FIXED: Replaced EVP_BytesToKey with PKCS5_PBKDF2_HMAC
 void hub_config_write(hub_state_t *state) {
@@ -70,32 +47,25 @@ void hub_config_write(hub_state_t *state) {
                state->peers[i].friendly_name[0] ? state->peers[i].friendly_name : "");
   }
 
-  if (state->private_key_pem) {
-    char *b64 = base64_encode((unsigned char *)state->private_key_pem,
-                              strlen(state->private_key_pem));
-    if (b64) {
-      SAFE_WRITE("key|%s\n", b64);
-      secure_wipe(b64, strlen(b64)); // ADDED: Wipe sensitive data
-      free(b64);
-    }
-  }
+  if (state->hub_keys_loaded) {
+    unsigned char priv64[64], pub64[64];
+    memcpy(priv64,      state->hub_ed25519_priv, 32);
+    memcpy(priv64 + 32, state->hub_x25519_priv,  32);
+    memcpy(pub64,       state->hub_ed25519_pub,  32);
+    memcpy(pub64 + 32,  state->hub_x25519_pub,   32);
 
-  if (state->priv_key) {
-    char *pub_pem = state->public_key_pem;
-    bool free_pub = false;
-    if (!pub_pem) {
-      pub_pem = extract_pubkey(state->priv_key);
-      free_pub = true;
+    char *priv_b64 = base64_encode(priv64, 64);
+    char *pub_b64  = base64_encode(pub64,  64);
+    if (priv_b64) {
+      SAFE_WRITE("key|%s\n", priv_b64);
+      secure_wipe(priv_b64, strlen(priv_b64));
+      free(priv_b64);
     }
-    if (pub_pem) {
-      char *b64 = base64_encode((unsigned char *)pub_pem, strlen(pub_pem));
-      if (b64) {
-        SAFE_WRITE("pub|%s\n", b64);
-        free(b64);
-      }
-      if (free_pub)
-        free(pub_pem);
+    if (pub_b64) {
+      SAFE_WRITE("pub|%s\n", pub_b64);
+      free(pub_b64);
     }
+    secure_wipe(priv64, 64);
   }
 
   // NEW: Write Global Entries (skip h and n which are hub-only metadata)
@@ -296,10 +266,6 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   // Parse configuration
   state->bot_count = 0;
   state->peer_count = 0;
-  if (state->public_key_pem) {
-    free(state->public_key_pem);
-    state->public_key_pem = NULL;
-  }
 
   char *saveptr;
   char *line = strtok_r((char *)plaintext, "\n", &saveptr);
@@ -333,26 +299,23 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       } else if (strcmp(k, "key") == 0) {
         int out;
         unsigned char *d = base64_decode(v, &out);
-        if (d) {
-          state->private_key_pem = malloc(out + 1);
-          if (state->private_key_pem) {
-            memcpy(state->private_key_pem, d, out);
-            state->private_key_pem[out] = 0;
-          }
-          secure_wipe(d, out); // ADDED: Wipe decoded key
-          free(d);
+        if (d && out == 64) {
+          memcpy(state->hub_ed25519_priv, d,      32);
+          memcpy(state->hub_x25519_priv,  d + 32, 32);
+          state->hub_keys_loaded = true;
+        } else if (d) {
+          hub_log("[HUB] Hub private key in config is not 64 bytes "
+                  "(legacy RSA?). Re-run -setup with a Curve25519 key.\n");
         }
+        if (d) { secure_wipe(d, out); free(d); }
       } else if (strcmp(k, "pub") == 0) {
         int out;
         unsigned char *d = base64_decode(v, &out);
-        if (d) {
-          state->public_key_pem = malloc(out + 1);
-          if (state->public_key_pem) {
-            memcpy(state->public_key_pem, d, out);
-            state->public_key_pem[out] = 0;
-          }
-          free(d);
+        if (d && out == 64) {
+          memcpy(state->hub_ed25519_pub, d,      32);
+          memcpy(state->hub_x25519_pub,  d + 32, 32);
         }
+        if (d) free(d);
       } else if (strcmp(k, "peer") == 0) {
         // Parse: peer|ip|port|uuid|friendly_name
         char *ip = v;

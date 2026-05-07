@@ -16,6 +16,7 @@
 #include <pwd.h>
 #include <sys/mman.h>
 
+
 FILE *log_fp = NULL;
 hub_state_t *g_state = NULL;  // Global state pointer for use in hub_log() and other global functions
 
@@ -165,57 +166,93 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
 
     // 4. Wipe sensitive data and free memory
     secure_wipe(c->session_key, sizeof(c->session_key));
+    secure_wipe(c->bot_eph_x25519_priv, sizeof(c->bot_eph_x25519_priv));
+    c->bot_eph_priv_set = false;
     secure_wipe(c->recv_buf, c->recv_len);
     free(c);
 }
 
-// FIXED: Updated to use EVP API
+// Sealed-box sender for peer and admin connections
+static int hub_seal_send(const unsigned char hub_x25519_pub[32],
+                         const unsigned char *plain_in, int plain_len,
+                         const unsigned char *info, size_t info_len,
+                         unsigned char *out, int out_max,
+                         unsigned char session_key_out[32]) {
+    if (out_max < 32 + GCM_IV_LEN + plain_len + GCM_TAG_LEN) return -1;
+
+    // Generate ephemeral X25519 keypair
+    unsigned char eph_priv[32], eph_pub[32];
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    EVP_PKEY *pk = NULL;
+    size_t len = 32;
+    bool ok = ctx && EVP_PKEY_keygen_init(ctx) > 0
+                  && EVP_PKEY_keygen(ctx, &pk) > 0
+                  && EVP_PKEY_get_raw_private_key(pk, eph_priv, &len) > 0 && len == 32
+                  && EVP_PKEY_get_raw_public_key(pk, eph_pub,  &len) > 0 && len == 32;
+    if (pk)  EVP_PKEY_free(pk);
+    if (ctx) EVP_PKEY_CTX_free(ctx);
+    if (!ok) { secure_wipe(eph_priv, 32); return -1; }
+
+    unsigned char shared[32];
+    ok = hub_crypto_x25519_derive(eph_priv, hub_x25519_pub, shared);
+    secure_wipe(eph_priv, 32);
+    if (!ok) return -1;
+
+    unsigned char session_key[32];
+    ok = hub_crypto_hkdf_sha256(shared, 32, eph_pub, 32, info, info_len, session_key, 32);
+    secure_wipe(shared, 32);
+    if (!ok) return -1;
+
+    memcpy(out, eph_pub, 32);
+    unsigned char tag[GCM_TAG_LEN];
+    int enc_len = aes_gcm_encrypt(plain_in, plain_len, session_key, out + 32, tag);
+    if (enc_len <= 0) { secure_wipe(session_key, 32); return -1; }
+    memcpy(out + 32 + enc_len, tag, GCM_TAG_LEN);
+
+    memcpy(session_key_out, session_key, 32);
+    secure_wipe(session_key, 32);
+    return 32 + enc_len + GCM_TAG_LEN;
+}
+
 void hub_peer_handshake(hub_state_t *state, hub_client_t *c) {
-    RAND_bytes(c->session_key, 32);
-    
+    if (!state->hub_keys_loaded) {
+        hub_log("[PEER] No Curve25519 keys loaded; cannot handshake\n");
+        hub_disconnect_client(state, c);
+        return;
+    }
+
     unsigned char pack[256];
-    memcpy(pack, c->session_key, 32);
-    
-    int msg_len = snprintf((char*)pack + 32, 220, "HUB %s %d %s %s %s",
-                          state->admin_password, state->port,
-                          state->hub_uuid, state->hub_friendly_name, state->bind_ip);
-    if (msg_len < 0 || msg_len >= 220) {
+    int msg_len = snprintf((char*)pack, sizeof(pack), "HUB %s %d %s %s %s",
+                           state->admin_password, state->port,
+                           state->hub_uuid, state->hub_friendly_name, state->bind_ip);
+    if (msg_len < 0 || msg_len >= (int)sizeof(pack)) {
         hub_log("[PEER] Handshake message too long\n");
         hub_disconnect_client(state, c);
         return;
     }
-    
-    unsigned char enc[512];
-    
-    // FIXED: Use EVP API instead of deprecated RSA functions
-    int enc_len = evp_public_encrypt(state->priv_key, pack, 
-                                     32 + msg_len + 1, enc);
+
+    unsigned char enc[MAX_BUFFER];
+    static const unsigned char PEER_INFO[] = "irchub-peer-session-v1";
+    int enc_len = hub_seal_send(state->hub_x25519_pub,
+                                pack, msg_len + 1,
+                                PEER_INFO, sizeof(PEER_INFO) - 1,
+                                enc, sizeof(enc), c->session_key);
+    secure_wipe(pack, sizeof(pack));
 
     if (enc_len <= 0) {
-        hub_log("[PEER] Encryption failed\n");
-        secure_wipe(pack, sizeof(pack));
+        hub_log("[PEER] Sealed-box encryption failed\n");
         hub_disconnect_client(state, c);
         return;
     }
 
     uint32_t net_len = htonl(enc_len);
-    if (write(c->fd, &net_len, 4) != (ssize_t)4) {
-        hub_log("[PEER] Handshake header write failed\n");
-        secure_wipe(pack, sizeof(pack));
+    if (write(c->fd, &net_len, 4) != (ssize_t)4 ||
+        write(c->fd, enc, enc_len) != (ssize_t)enc_len) {
+        hub_log("[PEER] Handshake write failed\n");
         hub_disconnect_client(state, c);
         return;
     }
 
-    if (write(c->fd, enc, enc_len) != (ssize_t)enc_len) {
-        hub_log("[PEER] Handshake body write failed\n");
-        secure_wipe(pack, sizeof(pack));
-        hub_disconnect_client(state, c);
-        return;
-    }
-    
-    // Wipe sensitive handshake data
-    secure_wipe(pack, sizeof(pack));
-    
     c->authenticated = true;
     
     // Send initial sync
@@ -696,17 +733,13 @@ int main(int argc, char *argv[]) {
 
         read_pass_hidden("Config Password: ", state.config_pass, sizeof(state.config_pass));
 
-        printf("\nHub Keypair:\n");
+        printf("\nHub Keypair (Curve25519):\n");
         printf("  1. Generate new keypair\n");
-        printf("     Use this for your first hub deployment. A fresh RSA-2048\n");
-        printf("     keypair will be generated and stored in the config.\n");
+        printf("     Fresh Curve25519 keypair (Ed25519 + X25519) for first deployment.\n");
         printf("\n");
-        printf("  2. Use existing key file\n");
-        printf("     Use this if you are adding a secondary hub to an existing\n");
-        printf("     mesh. All hubs in a mesh must share the same keypair so\n");
-        printf("     that peer authentication and config sync work correctly.\n");
-        printf("     Provide the path to the private key PEM file from your\n");
-        printf("     primary hub.\n");
+        printf("  2. Use existing key file (hub_private.b64)\n");
+        printf("     For secondary hubs joining an existing mesh — all hubs share\n");
+        printf("     the same Curve25519 keypair.  Provide path to hub_private.b64.\n");
         printf("Choice: ");
         fflush(stdout);
         {
@@ -715,26 +748,21 @@ int main(int argc, char *argv[]) {
             while ((ch = getchar()) != '\n' && ch != EOF);
 
             if (kp_choice == 1) {
-                char *priv_pem = NULL, *pub_pem = NULL;
-                printf("[*] Generating RSA-2048 keypair...\n");
-                if (!hub_crypto_generate_keypair(&priv_pem, &pub_pem)) {
+                unsigned char priv64[64], pub64[64];
+                printf("[*] Generating Curve25519 keypair (Ed25519 + X25519)...\n");
+                if (!hub_crypto_generate_combined_keypair(priv64, pub64)) {
                     printf("Key generation failed.\n");
                     return 1;
                 }
-                state.priv_key = load_private_key_from_memory(priv_pem);
-                free(pub_pem);
-                if (!state.priv_key) {
-                    printf("Failed to load generated key.\n");
-                    secure_wipe(priv_pem, strlen(priv_pem));
-                    free(priv_pem);
-                    return 1;
-                }
-                state.private_key_pem = priv_pem;
-                printf("[+] Keypair generated.\n");
+                hub_crypto_split_combined(priv64, state.hub_ed25519_priv, state.hub_x25519_priv);
+                hub_crypto_split_combined(pub64,  state.hub_ed25519_pub,  state.hub_x25519_pub);
+                state.hub_keys_loaded = true;
+                secure_wipe(priv64, 64);
+                printf("[+] Curve25519 keypair generated.\n");
             } else {
                 char kp_path[256];
                 memset(kp_path, 0, sizeof(kp_path));
-                printf("Private Key File Path: ");
+                printf("Private Key File Path (hub_private.b64): ");
                 fflush(stdout);
                 if (!fgets(kp_path, sizeof(kp_path), stdin)) {
                     printf("Read error.\n");
@@ -742,40 +770,47 @@ int main(int argc, char *argv[]) {
                 }
                 kp_path[strcspn(kp_path, "\n")] = 0;
 
-                {
-                    FILE *f = fopen(kp_path, "rb");
-                    if (!f) {
-                        printf("Key file not found.\n");
-                        return 1;
-                    }
-                    fseek(f, 0, SEEK_END);
-                    {
-                        long s = ftell(f);
-                        if (s < 0) {
-                            printf("Error: could not determine key file size.\n");
-                            fclose(f);
-                            return 1;
-                        }
-                        fseek(f, 0, SEEK_SET);
-                        state.private_key_pem = malloc((size_t)s + 1);
-                        if (!state.private_key_pem ||
-                            fread(state.private_key_pem, 1, (size_t)s, f) != (size_t)s) {
-                            printf("Error reading key file.\n");
-                            if (state.private_key_pem) free(state.private_key_pem);
-                            fclose(f);
-                            return 1;
-                        }
-                        state.private_key_pem[(size_t)s] = 0;
-                    }
-                    fclose(f);
-                }
-                state.priv_key = load_private_key_from_memory(state.private_key_pem);
-                if (!state.priv_key) {
-                    printf("Failed to load private key.\n");
-                    secure_wipe(state.private_key_pem, strlen(state.private_key_pem));
-                    free(state.private_key_pem);
+                FILE *f = fopen(kp_path, "r");
+                if (!f) {
+                    printf("Key file not found: %s\n", kp_path);
                     return 1;
                 }
+                char b64line[128] = {0};
+                if (!fgets(b64line, sizeof(b64line), f)) {
+                    printf("Error reading key file.\n");
+                    fclose(f);
+                    return 1;
+                }
+                fclose(f);
+                b64line[strcspn(b64line, "\r\n")] = 0;
+
+                int dec_len = 0;
+                unsigned char *dec = base64_decode(b64line, &dec_len);
+                if (!dec || dec_len != 64) {
+                    printf("Invalid key file: need 64-byte Curve25519 key (88 chars base64).\n");
+                    printf("This does not look like a hub_private.b64 file.\n");
+                    if (dec) free(dec);
+                    return 1;
+                }
+                hub_crypto_split_combined(dec, state.hub_ed25519_priv, state.hub_x25519_priv);
+
+                // Derive public keys
+                EVP_PKEY *ep = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, dec, 32);
+                EVP_PKEY *xp = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, dec + 32, 32);
+                secure_wipe(dec, 64); free(dec);
+                if (!ep || !xp) {
+                    if (ep) EVP_PKEY_free(ep);
+                    if (xp) EVP_PKEY_free(xp);
+                    printf("Failed to load Curve25519 key material.\n");
+                    return 1;
+                }
+                size_t len = 32;
+                EVP_PKEY_get_raw_public_key(ep, state.hub_ed25519_pub, &len);
+                len = 32;
+                EVP_PKEY_get_raw_public_key(xp, state.hub_x25519_pub, &len);
+                EVP_PKEY_free(ep); EVP_PKEY_free(xp);
+                state.hub_keys_loaded = true;
+                printf("[+] Curve25519 keypair loaded from %s.\n", kp_path);
             }
         }
 
@@ -798,11 +833,8 @@ int main(int argc, char *argv[]) {
         secure_wipe(state.admin_password, sizeof(state.admin_password));
         printf("Done.\n");
 
-        if (state.priv_key) EVP_PKEY_free(state.priv_key);
-        if (state.private_key_pem) {
-            secure_wipe(state.private_key_pem, strlen(state.private_key_pem));
-            free(state.private_key_pem);
-        }
+        secure_wipe(state.hub_ed25519_priv, 32);
+        secure_wipe(state.hub_x25519_priv,  32);
         return 0;
     }
 
@@ -894,17 +926,8 @@ int main(int argc, char *argv[]) {
         snprintf(state.bind_ip, sizeof(state.bind_ip), "127.0.0.1");
     }
 
-    if (!state.private_key_pem) {
-        hub_log("[ERROR] No private key in config\n");
-        return 1;
-    }
-    
-    // FIXED: Load key using EVP API
-    state.priv_key = load_private_key_from_memory(state.private_key_pem);
-    if (!state.priv_key) {
-        hub_log("[ERROR] Failed to load private key\n");
-        secure_wipe(state.private_key_pem, strlen(state.private_key_pem));
-        free(state.private_key_pem);
+    if (!state.hub_keys_loaded) {
+        hub_log("[ERROR] No Curve25519 keypair in config. Re-run -setup.\n");
         return 1;
     }
 
@@ -1032,12 +1055,8 @@ int main(int argc, char *argv[]) {
     }
     remove(HUB_PID_FILE);
 
-    if (state.priv_key) EVP_PKEY_free(state.priv_key);
-    if (state.private_key_pem) {
-        secure_wipe(state.private_key_pem, strlen(state.private_key_pem));
-        free(state.private_key_pem);
-    }
-    if (state.public_key_pem) free(state.public_key_pem);
+    secure_wipe(state.hub_ed25519_priv, 32);
+    secure_wipe(state.hub_x25519_priv,  32);
 
     return 0;
 }
