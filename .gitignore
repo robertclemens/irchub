@@ -4,3 +4,5 @@ bin
 irchub
 .irchub.cnf
 .irchub.pid
+.irchub.*
+.claude
