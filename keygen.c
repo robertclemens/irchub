@@ -38,7 +38,7 @@ int main(int argc, char *argv[]) {
         free(priv_b64); free(pub_b64);
         return 1;
     }
-    fprintf(fp, "%s\n", priv_b64);
+    fprintf(fp, "%s", priv_b64);
     fclose(fp);
     printf("Private key written to: %s\n", priv_file);
 
@@ -49,7 +49,7 @@ int main(int argc, char *argv[]) {
         free(priv_b64); free(pub_b64);
         return 1;
     }
-    fprintf(fp, "%s\n", pub_b64);
+    fprintf(fp, "%s", pub_b64);
     fclose(fp);
     printf("Public key written to: %s\n", pub_file);
 
@@ -58,8 +58,8 @@ int main(int argc, char *argv[]) {
     free(pub_b64);
 
     printf("\nDone! You can now run setup:\n");
-    printf("  ./bin/irchub -setup\n");
+    printf("  ./irchub -setup\n");
     printf("\nUse hub_public.b64 with hub_admin:\n");
-    printf("  ./bin/hub_admin <ip> <port> hub_public.b64\n");
+    printf("  ./hub_admin <ip> <port> hub_public.b64\n");
     return 0;
 }

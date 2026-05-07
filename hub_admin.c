@@ -296,7 +296,7 @@ void bot_add() {
                     snprintf(fname, sizeof(fname), "bot_%s_priv_key.b64", nick);
                     FILE *kf = fopen(fname, "w");
                     if (kf) {
-                        fprintf(kf, "%s\n", priv_key);
+                        fprintf(kf, "%s", priv_key);
                         fclose(kf);
                         printf("[Saved: %s]\n", fname);
                     } else {
@@ -438,7 +438,7 @@ void bot_rekey() {
                         snprintf(fname, sizeof(fname), "bot_%s_priv_key_REKEY.b64", nick);
                         FILE *kf = fopen(fname, "w");
                         if (kf) {
-                            fprintf(kf, "%s\n", priv_key);
+                            fprintf(kf, "%s", priv_key);
                             fclose(kf);
                             printf("[Saved: %s]\n", fname);
                         } else {

@@ -764,14 +764,14 @@ int main(int argc, char *argv[]) {
                 if (priv_b64 && pub_b64) {
                     FILE *fp = fopen("hub_private.b64", "w");
                     if (fp) {
-                        fprintf(fp, "%s\n", priv_b64);
+                        fprintf(fp, "%s", priv_b64);
                         fclose(fp);
                         chmod("hub_private.b64", 0600);
                         printf("[+] Private key saved to: hub_private.b64\n");
                     }
                     FILE *fpu = fopen("hub_public.b64", "w");
                     if (fpu) {
-                        fprintf(fpu, "%s\n", pub_b64);
+                        fprintf(fpu, "%s", pub_b64);
                         fclose(fpu);
                         printf("[+] Public key saved to:  hub_public.b64\n");
                     }

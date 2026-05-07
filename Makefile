@@ -322,10 +322,10 @@ help:
 	@echo "  make install PREFIX=/opt/irchub  # Install to /opt"
 	@echo ""
 	@echo "After building:"
-	@echo "  ./bin/hub_keygen                    # Generate keys"
-	@echo "  ./bin/irchub -setup                          # Initial setup"
-	@echo "  export HUB_PASS=mypass && ./bin/irchub       # Run hub"
-	@echo "  ./bin/hub_admin 127.0.0.1 6667 hub_public.pem  # Admin client"
+	@echo "  hub_keygen                    # Generate keys"
+	@echo "  irchub -setup                          # Initial setup"
+	@echo "  export HUB_PASS=mypass && irchub       # Run hub"
+	@echo "  hub_admin 127.0.0.1 6667 hub_public.pem  # Admin client"
 	@echo ""
 
 # ============================================================================
@@ -353,7 +353,7 @@ package: production
 	@echo "Creating package $(PACKAGE_NAME)..."
 	@mkdir -p $(PACKAGE_DIR)/bin
 	@mkdir -p $(PACKAGE_DIR)/doc
-	@cp $(BIN_DIR)/* $(PACKAGE_DIR)/bin/
+	@cp $(BIN_DIR)/* $(PACKAGE_DIR
 	@cp README.md $(PACKAGE_DIR)/doc/ 2>/dev/null || true
 	@echo "Installation: make install" > $(PACKAGE_DIR)/INSTALL
 	@cd $(BUILD_DIR) && tar czf $(PACKAGE_NAME).tar.gz $(PACKAGE_NAME)

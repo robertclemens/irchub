@@ -2245,7 +2245,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       char f[64];
       strftime(f, sizeof(f), "%Y%m%d%H%M_pub.b64", t);
       FILE *fp = fopen(f, "w");
-      if (fp) { fprintf(fp, "%s\n", pub_b64); fclose(fp); }
+      if (fp) { fprintf(fp, "%s", pub_b64); fclose(fp); }
 
       bool ok = send_response(state, client, pub_b64);
       secure_wipe(priv_b64, strlen(priv_b64));
