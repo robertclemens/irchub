@@ -757,6 +757,28 @@ int main(int argc, char *argv[]) {
                 hub_crypto_split_combined(priv64, state.hub_ed25519_priv, state.hub_x25519_priv);
                 hub_crypto_split_combined(pub64,  state.hub_ed25519_pub,  state.hub_x25519_pub);
                 state.hub_keys_loaded = true;
+
+                // Export to files so user has them
+                char *priv_b64 = base64_encode(priv64, 64);
+                char *pub_b64  = base64_encode(pub64, 64);
+                if (priv_b64 && pub_b64) {
+                    FILE *fp = fopen("hub_private.b64", "w");
+                    if (fp) {
+                        fprintf(fp, "%s\n", priv_b64);
+                        fclose(fp);
+                        chmod("hub_private.b64", 0600);
+                        printf("[+] Private key saved to: hub_private.b64\n");
+                    }
+                    FILE *fpu = fopen("hub_public.b64", "w");
+                    if (fpu) {
+                        fprintf(fpu, "%s\n", pub_b64);
+                        fclose(fpu);
+                        printf("[+] Public key saved to:  hub_public.b64\n");
+                    }
+                }
+                if (priv_b64) free(priv_b64);
+                if (pub_b64)  free(pub_b64);
+
                 secure_wipe(priv64, 64);
                 printf("[+] Curve25519 keypair generated.\n");
             } else {
