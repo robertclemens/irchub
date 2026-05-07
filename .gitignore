@@ -7,4 +7,4 @@ irchub
 .irchub.*
 .claude
 *.b64
-docs
+docs/

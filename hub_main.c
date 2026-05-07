@@ -731,7 +731,23 @@ int main(int argc, char *argv[]) {
         generate_uuid_v4(state.hub_uuid, sizeof(state.hub_uuid));
         printf("Generated UUID: %s\n", state.hub_uuid);
 
-        read_pass_hidden("Config Password: ", state.config_pass, sizeof(state.config_pass));
+        {
+            char cfg_pass1[MAX_PASS], cfg_pass2[MAX_PASS];
+            do {
+                read_pass_hidden("Config Password: ", cfg_pass1, sizeof(cfg_pass1));
+                if (!cfg_pass1[0]) {
+                    printf("Password cannot be empty.\n");
+                    continue;
+                }
+                read_pass_hidden("Confirm Config Password: ", cfg_pass2, sizeof(cfg_pass2));
+                if (strcmp(cfg_pass1, cfg_pass2) != 0) {
+                    printf("Passwords do not match. Try again.\n");
+                }
+            } while (!cfg_pass1[0] || strcmp(cfg_pass1, cfg_pass2) != 0);
+            snprintf(state.config_pass, sizeof(state.config_pass), "%s", cfg_pass1);
+            secure_wipe(cfg_pass1, sizeof(cfg_pass1));
+            secure_wipe(cfg_pass2, sizeof(cfg_pass2));
+        }
 
         printf("\nHub Keypair (Curve25519):\n");
         printf("  1. Generate new keypair\n");
