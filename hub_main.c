@@ -7,10 +7,14 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <openssl/rand.h>
+#include <openssl/evp.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/utsname.h>
 #include <fcntl.h>
 #include <termios.h>
+#include <pwd.h>
+#include <sys/mman.h>
 
 FILE *log_fp = NULL;
 hub_state_t *g_state = NULL;  // Global state pointer for use in hub_log() and other global functions
@@ -92,6 +96,34 @@ void hub_log(const char *format, ...) {
     vfprintf(log_fp, format, args);
     va_end(args);
     fflush(log_fp);
+}
+
+static void daemonize(void) {
+    pid_t pid;
+
+    // First fork: detach from the calling process
+    pid = fork();
+    if (pid < 0) { perror("fork"); exit(1); }
+    if (pid > 0) exit(0);   // parent exits
+
+    // Become session leader, detach from controlling terminal
+    if (setsid() < 0) { perror("setsid"); exit(1); }
+
+    // Second fork: prevent re-acquisition of a controlling terminal
+    pid = fork();
+    if (pid < 0) { perror("fork"); exit(1); }
+    if (pid > 0) exit(0);   // intermediate parent exits
+
+    // Tighten umask; stay in the working directory so relative paths (.pid, .log) resolve
+    umask(0027);
+
+    // Redirect stdin/stdout/stderr to /dev/null
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull < 0) exit(1);
+    dup2(devnull, STDIN_FILENO);
+    dup2(devnull, STDOUT_FILENO);
+    dup2(devnull, STDERR_FILENO);
+    if (devnull > STDERR_FILENO) close(devnull);
 }
 
 void handle_signal(int sig) {
@@ -458,17 +490,175 @@ static void read_pass_hidden(const char *prompt, char *buf, size_t len) {
     buf[strcspn(buf, "\n")] = 0;
 }
 
+/* Build a key-derivation string from stable machine/user constants.
+ * None of these are secret, but together they are specific to this user
+ * on this filesystem — a copied .irchub.pass won't decrypt elsewhere. */
+static void passfile_build_context(char *buf, size_t len) {
+    struct stat home_st;
+    struct utsname uts;
+    struct passwd *pw = getpwuid(getuid());
+
+    memset(&home_st, 0, sizeof(home_st));
+    memset(&uts, 0, sizeof(uts));
+    if (pw && pw->pw_dir)
+        stat(pw->pw_dir, &home_st);
+    uname(&uts);
+
+    snprintf(buf, len, "%lu:%lu:%u:%u:%s",
+             (unsigned long)home_st.st_ino,
+             (unsigned long)home_st.st_dev,
+             (unsigned int)getuid(),
+             (unsigned int)getgid(),
+             uts.machine);
+}
+
+/* Derive a 32-byte AES key from context string + salt via PBKDF2-SHA256. */
+static bool passfile_derive_key(const char *ctx, const unsigned char *salt,
+                                unsigned char *key) {
+    return PKCS5_PBKDF2_HMAC(ctx, (int)strlen(ctx), salt, SALT_SIZE,
+                             PBKDF2_ITERATIONS, EVP_sha256(), 32, key) == 1;
+}
+
+/* File layout: [SALT_SIZE][IV+ciphertext from aes_gcm_encrypt][GCM_TAG_LEN]
+ * aes_gcm_encrypt prepends the random IV to its output automatically.
+ * aes_gcm_decrypt expects that same IV+ciphertext block as input.        */
+static bool passfile_create(const char *path, const char *password) {
+    unsigned char salt[SALT_SIZE];
+    unsigned char key[32];
+    unsigned char tag[GCM_TAG_LEN];
+    char ctx[256];
+    bool ok = false;
+
+    if (RAND_bytes(salt, sizeof(salt)) != 1) {
+        fprintf(stderr, "RNG failure.\n");
+        goto done;
+    }
+
+    passfile_build_context(ctx, sizeof(ctx));
+    if (!passfile_derive_key(ctx, salt, key)) {
+        fprintf(stderr, "Key derivation failed.\n");
+        goto done;
+    }
+
+    int pass_len = (int)strlen(password);
+    /* aes_gcm_encrypt output = GCM_IV_LEN (prepended) + ciphertext */
+    unsigned char *enc_buf = malloc((size_t)(GCM_IV_LEN + pass_len));
+    if (!enc_buf) goto done;
+
+    int enc_len = aes_gcm_encrypt((const unsigned char *)password, pass_len,
+                                  key, enc_buf, tag);
+    if (enc_len <= 0) {
+        fprintf(stderr, "Encryption failed.\n");
+        free(enc_buf);
+        goto done;
+    }
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { perror("open"); free(enc_buf); goto done; }
+
+    if (fchmod(fd, 0600) != 0) {
+        perror("fchmod"); close(fd); free(enc_buf); goto done;
+    }
+
+    ok = (write(fd, salt,    SALT_SIZE)   == SALT_SIZE &&
+          write(fd, enc_buf, enc_len)     == enc_len   &&
+          write(fd, tag,     GCM_TAG_LEN) == GCM_TAG_LEN);
+
+    if (!ok) perror("write .irchub.pass");
+    close(fd);
+    free(enc_buf);
+
+done:
+    secure_wipe(key, sizeof(key));
+    secure_wipe(ctx, sizeof(ctx));
+    return ok;
+}
+
+/* Returns true and populates out_pass on success.
+ * Rejects the file if permissions or ownership are wrong.              */
+static bool passfile_load(const char *path, char *out_pass, size_t out_len) {
+    struct stat st;
+    bool ok = false;
+
+    if (stat(path, &st) != 0) return false;
+
+    if (st.st_uid != getuid()) {
+        fprintf(stderr, "[WARN] .irchub.pass: wrong owner, ignoring.\n");
+        return false;
+    }
+    if ((st.st_mode & 0777) != 0600) {
+        fprintf(stderr, "[WARN] .irchub.pass: must be 0600, ignoring.\n");
+        return false;
+    }
+
+    /* Minimum valid size: salt + IV + 1 byte plaintext + tag */
+    int min_size = SALT_SIZE + GCM_IV_LEN + 1 + GCM_TAG_LEN;
+    if (st.st_size < min_size) return false;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+
+    size_t total = (size_t)st.st_size;
+    unsigned char *buf = malloc(total);
+    if (!buf) { close(fd); return false; }
+
+    if (read(fd, buf, total) != (ssize_t)total) {
+        close(fd); free(buf); return false;
+    }
+    close(fd);
+
+    /* Split: salt | IV+ciphertext | tag */
+    unsigned char *salt    = buf;
+    unsigned char *enc_blk = buf + SALT_SIZE;
+    int enc_len            = (int)(total - SALT_SIZE - GCM_TAG_LEN);
+    unsigned char *tag     = buf + SALT_SIZE + enc_len;
+
+    unsigned char key[32];
+    char ctx[256];
+    passfile_build_context(ctx, sizeof(ctx));
+    if (!passfile_derive_key(ctx, salt, key)) goto done;
+
+    /* mlock both buffers to prevent swapping during the decrypt window */
+    mlock(out_pass, out_len);
+    unsigned char *plain = malloc((size_t)enc_len);
+    if (!plain) goto done;
+    mlock(plain, (size_t)enc_len);
+
+    int dec_len = aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
+    if (dec_len > 0 && (size_t)dec_len < out_len) {
+        plain[dec_len] = 0;
+        memcpy(out_pass, plain, (size_t)dec_len + 1);
+        ok = true;
+    } else {
+        fprintf(stderr, "[WARN] .irchub.pass: decryption failed "
+                        "(wrong machine or tampered file), falling through.\n");
+    }
+
+    secure_wipe(plain, (size_t)enc_len);
+    munlock(plain, (size_t)enc_len);
+    free(plain);
+
+done:
+    secure_wipe(key, sizeof(key));
+    secure_wipe(ctx, sizeof(ctx));
+    munlock(out_pass, out_len);
+    free(buf);
+    return ok;
+}
+
 int main(int argc, char *argv[]) {
     bool setup_mode = false;
+    bool passfile_mode = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-setup") == 0) setup_mode = true;
+        if (strcmp(argv[i], "-p")     == 0) passfile_mode = true;
     }
 
     hub_state_t state;
     memset(&state, 0, sizeof(state));
     state.running = true;
     g_state = &state;
-    state.log_level = LOG_INFO;
+    state.log_level = HUB_DEFAULT_LOG_LEVEL;
     state.log_max_size = HUB_LOG_FILE_SIZE;
 
     if (setup_mode) {
@@ -508,7 +698,15 @@ int main(int argc, char *argv[]) {
 
         printf("\nHub Keypair:\n");
         printf("  1. Generate new keypair\n");
+        printf("     Use this for your first hub deployment. A fresh RSA-2048\n");
+        printf("     keypair will be generated and stored in the config.\n");
+        printf("\n");
         printf("  2. Use existing key file\n");
+        printf("     Use this if you are adding a secondary hub to an existing\n");
+        printf("     mesh. All hubs in a mesh must share the same keypair so\n");
+        printf("     that peer authentication and config sync work correctly.\n");
+        printf("     Provide the path to the private key PEM file from your\n");
+        printf("     primary hub.\n");
         printf("Choice: ");
         fflush(stdout);
         {
@@ -608,18 +806,54 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    /* Normal mode: read password from environment */
-    {
-        const char *env_pass = getenv(CONFIG_PASS_ENV_VAR);
-        if (!env_pass || !env_pass[0]) {
-            fprintf(stderr, "Error: %s environment variable is not set.\n",
-                    CONFIG_PASS_ENV_VAR);
-            fprintf(stderr, "Set it before starting: export %s=<password>\n",
-                    CONFIG_PASS_ENV_VAR);
-            return 1;
+    /* -p: create/replace .irchub.pass from an interactive password prompt */
+    if (passfile_mode) {
+        char pass1[MAX_PASS], pass2[MAX_PASS];
+        do {
+            read_pass_hidden("Config Password: ",         pass1, sizeof(pass1));
+            if (!pass1[0]) {
+                fprintf(stderr, "Password cannot be empty.\n");
+                return 1;
+            }
+            read_pass_hidden("Confirm Config Password: ", pass2, sizeof(pass2));
+            if (strcmp(pass1, pass2) != 0)
+                printf("Passwords do not match. Try again.\n");
+        } while (strcmp(pass1, pass2) != 0);
+
+        bool ok = passfile_create(HUB_PASS_FILE, pass1);
+        secure_wipe(pass1, sizeof(pass1));
+        secure_wipe(pass2, sizeof(pass2));
+        if (ok) {
+            printf("Saved: %s (0600, machine-bound)\n", HUB_PASS_FILE);
+            return 0;
         }
-        snprintf(state.config_pass, sizeof(state.config_pass), "%s", env_pass);
+        fprintf(stderr, "Failed to create %s.\n", HUB_PASS_FILE);
+        return 1;
     }
+
+    /* Refuse to proceed without a config — avoids prompting into a dead end */
+    if (access(HUB_CONFIG_FILE, F_OK) != 0) {
+        fprintf(stderr, "No config file found. First run: ./irchub -setup\n");
+        return 1;
+    }
+
+    /* Password resolution: .irchub.pass → env var → stdin prompt */
+    {
+        /* 1. Machine-bound password file */
+        if (!state.config_pass[0])
+            passfile_load(HUB_PASS_FILE, state.config_pass, sizeof(state.config_pass));
+
+        /* 2. Interactive prompt — only reached if no passfile */
+        if (!state.config_pass[0]) {
+            read_pass_hidden("Config Password: ", state.config_pass, sizeof(state.config_pass));
+            if (!state.config_pass[0]) {
+                fprintf(stderr, "No password provided.\n");
+                return 1;
+            }
+        }
+    }
+
+    daemonize();
 
     log_fp = fopen(HUB_LOG_FILE, "a");
 
@@ -646,11 +880,14 @@ int main(int argc, char *argv[]) {
     state.pid_fd = pid_fd;
 
     if (!hub_config_load(&state, state.config_pass)) {
+        secure_wipe(state.config_pass, sizeof(state.config_pass));
         printf("Config load failed. Run -setup.\n");
         if (log_fp) fprintf(log_fp, "Config load failed.\n");
         remove(HUB_PID_FILE);
         return 1;
     }
+    /* config_pass must remain in state for the lifetime of the daemon —
+     * hub_config_write() re-derives the AES key from it on every save.   */
 
     // Set default bind_ip if not configured
     if (!state.bind_ip[0]) {

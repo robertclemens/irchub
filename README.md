@@ -28,11 +28,13 @@ hub_admin ──► irchub ──► ircbot A
 
 | Binary | Purpose |
 |--------|---------|
-| `bin/irchub` | Hub server |
-| `bin/hub_admin` | Interactive admin console |
-| `bin/keygen` | RSA-2048 keypair generator |
-| `bin/hub_decrypt` | Decrypt and inspect config file |
-| `bin/hub_encrypt` | Re-encrypt a config file |
+| `irchub` | Hub server |
+| `hub_admin` | Interactive admin console |
+| `keygen` | RSA-2048 keypair generator |
+| `hub_decrypt` | Decrypt and inspect config file |
+| `hub_encrypt` | Re-encrypt a config file |
+
+Built binaries are placed in `bin/`. Install them wherever suits your setup — the examples below assume the binaries are on your `PATH` or you are running from the directory containing them.
 
 ## Companion Project: ircbot
 
@@ -51,7 +53,7 @@ You provision bots and manage the network entirely through `hub_admin` — you n
 |------------|---------|-------|
 | GCC | 7+ | C11 support required (`-std=c11`) |
 | OpenSSL | 1.1.1+ | `libssl`, `libcrypto` — EVP API required |
-| POSIX | — | Linux/Unix only (uses `termios`, `flock`, `POSIX sockets`) |
+| POSIX | — | Linux, FreeBSD, and other POSIX systems (uses `termios`, `flock`, POSIX sockets) |
 | GNU Make | 3.81+ | Build system |
 
 ### Debian / Ubuntu
@@ -97,8 +99,10 @@ make clean        # Remove build artifacts
 
 ### 1. Run setup
 
+Run from the directory where irchub will store its files (config, PID, log, and password files are all created relative to the working directory):
+
 ```bash
-./bin/irchub -setup
+./irchub -setup
 ```
 
 You will be prompted for:
@@ -114,21 +118,15 @@ You will be prompted for:
 
 Setup writes the encrypted config file (`.irchub.cnf`) and exits. The hub does not start automatically.
 
-### 2. Configure `run_hub.sh`
-
-Edit `run_hub.sh` and set `HUB_PASS` to the config password you chose during setup:
+### 2. Start the hub
 
 ```bash
-export HUB_PASS="your-config-password-here"
+./irchub
 ```
 
-### 3. Start the hub
+irchub daemonizes itself — it double-forks, detaches from the terminal, and writes its PID to `.irchub.pid`. The working directory is preserved so all relative file paths resolve correctly.
 
-```bash
-./run_hub.sh
-```
-
-The hub starts in the background. Logs are written to `.irchub.log`.
+By default, irchub prompts for the config password on stdin before daemonizing. If you are starting it interactively this is the safest option — the password is never stored anywhere and is only held in process memory for the duration of the initial config load.
 
 To stop the hub:
 
@@ -136,12 +134,40 @@ To stop the hub:
 kill $(cat .irchub.pid)
 ```
 
+### 3. Create a password file (optional — required for unattended start)
+
+By default a password must be typed each time irchub starts. To allow unattended or automated starts, create an encrypted machine-bound password file:
+
+```bash
+./irchub -p
+```
+
+This prompts for the config password (with confirmation), then writes `.irchub.pass` — an AES-256-GCM encrypted file readable only by the current user (`0600`). The encryption key is derived from stable properties of this machine and user account, so the file cannot be decrypted if copied to another host.
+
+When `.irchub.pass` is present and passes validation (correct ownership, `0600` permissions, GCM tag intact), irchub reads the password from it automatically and no interactive input is required. If the file is absent, has wrong permissions, or fails decryption, irchub falls back to the stdin prompt.
+
+### 4. Auto-start (optional — requires password file)
+
+A crontab entry can keep irchub running automatically. Because cron cannot provide interactive input, this requires `.irchub.pass` to exist (see step 3). irchub rejects duplicate starts via PID file locking, so running it on an interval is safe — if it is already running the new invocation exits immediately.
+
+Add a crontab entry that checks every 5 minutes:
+
+```bash
+crontab -e
+```
+
+```
+*/5 * * * * /full/path/to/irchub
+```
+
+Replace `/full/path/to/irchub` with the absolute path to the binary. Note that cron executes from your home directory by default — if your irchub files live in a subdirectory, place the binary there or ensure the config files (`.irchub.cnf`, `.irchub.pass`) exist in the directory cron will use as the working directory.
+
 ## Admin Console
 
 The admin console connects to a running hub. It requires the hub's public key (PEM) for the encrypted handshake:
 
 ```bash
-./bin/hub_admin <hub-ip> <hub-port> <hub_public.pem>
+./hub_admin <hub-ip> <hub-port> <hub_public.pem>
 ```
 
 To obtain the public key from a running hub, connect with `hub_admin`, go to **Manage Peer Config → Export Public Key**, and save the file.
@@ -221,7 +247,7 @@ The config file (`.irchub.cnf`) is AES-256-GCM encrypted with a key derived from
 ### Decrypt config (inspection / debugging)
 
 ```bash
-./bin/hub_decrypt [config-file]
+./hub_decrypt [config-file]
 ```
 
 Prompts for the config password and prints the plaintext config. Defaults to `.irchub.cnf` if no file is specified.
@@ -229,7 +255,7 @@ Prompts for the config password and prints the plaintext config. Defaults to `.i
 ### Encrypt config
 
 ```bash
-./bin/hub_encrypt <plaintext-file> <output-file>
+./hub_encrypt <plaintext-file> <output-file>
 ```
 
 Re-encrypts a plaintext config file. Useful for migrating or restoring configs.
@@ -237,17 +263,18 @@ Re-encrypts a plaintext config file. Useful for migrating or restoring configs.
 ### Generate keypair
 
 ```bash
-./bin/keygen [private-key-out] [public-key-out]
+./keygen [private-key-out] [public-key-out]
 ```
 
 Generates an RSA-2048 keypair. Defaults to `hub_private.pem` and `hub_public.pem`. Useful if you want to pre-generate a key before running `-setup` with option 2.
 
 ## Security Notes
 
-- The config password is never passed on the command line. It is set via the `HUB_PASS` environment variable (normal mode) or entered interactively (setup mode).
+- The config password is never passed on the command line or stored in an environment variable. It is read from `.irchub.pass` (if present) or prompted on stdin at startup.
+- `.irchub.pass` is AES-256-GCM encrypted and machine-bound — it cannot be decrypted on a different host. The file must be owned by the current user with permissions `0600`; any deviation is rejected and irchub falls back to the stdin prompt.
 - All bot-to-hub communication is encrypted with AES-256-GCM using per-session keys negotiated via RSA-2048.
-- Failed authentication attempts are tracked per IP. After 3 failures, the IP is blocked for 5 minutes.
-- Each IP is limited to 5 simultaneous connections.
+- Failed authentication attempts are tracked per IP. After 3 failures the IP is blocked for 5 minutes; the failure counter resets after 1 hour. These thresholds are compile-time constants (`MAX_FAILED_AUTH_ATTEMPTS`, `FAILED_AUTH_BLOCK_DURATION`, `FAILED_AUTH_RESET_TIME` in `hub.h`) — adjust and rebuild to change them. Specific IPs and ranges can be permanently allowed or blocked at runtime via **Manage Peer Config → Manage IP Allowlist / Manage IP Denylist** in `hub_admin` (supports CIDR notation).
+- Each IP is limited to 5 simultaneous connections (`MAX_CONNECTIONS_PER_IP` in `hub.h` — compile-time constant).
 - Private key material is wiped from memory (`secure_wipe`) as soon as it is no longer needed.
 
 ## Files
@@ -255,20 +282,22 @@ Generates an RSA-2048 keypair. Defaults to `hub_private.pem` and `hub_public.pem
 | File | Description |
 |------|-------------|
 | `.irchub.cnf` | Encrypted config file (created by `-setup`) |
-| `.irchub.pid` | PID file (created on start, removed on stop) |
+| `.irchub.pass` | Encrypted password file (created by `-p`, optional) |
+| `.irchub.pid` | PID file (created on start, removed on clean stop) |
 | `.irchub.log` | Log file (rotating, default 10 MB limit) |
-| `run_hub.sh` | Startup script — set `HUB_PASS` here |
+
+All files are created relative to the working directory at the time irchub is invoked.
 
 ## Log Levels
 
-Set via **Manage Peer Config → Set Log Level** in `hub_admin`:
+Logging is disabled by default. Set the level at runtime via **Manage Peer Config → Set Log Level** in `hub_admin`:
 
 | Level | Name | Output |
 |-------|------|--------|
-| 0 | NONE | No logging |
+| 0 | NONE | No logging (default) |
 | 1 | ERROR | Errors only |
-| 2 | WARNING | Errors + warnings |
-| 3 | INFO | Default — errors, warnings, info |
+| 2 | WARNING | Errors and warnings |
+| 3 | INFO | Errors, warnings, and info |
 | 4 | DEBUG | Everything |
 
 ## Quick Reference
@@ -278,20 +307,27 @@ Set via **Manage Peer Config → Set Log Level** in `hub_admin`:
 make
 
 # First-time setup
-./bin/irchub -setup
+./irchub -setup
 
-# Edit run_hub.sh, set HUB_PASS, then start
-./run_hub.sh
-
-# Connect admin console (needs hub's public key)
-./bin/hub_admin 127.0.0.1 6697 hub_public.pem
+# Start hub — prompts for password interactively
+./irchub
 
 # Stop hub
 kill $(cat .irchub.pid)
 
-# View logs
+# (Optional) Create encrypted password file for unattended start
+./irchub -p
+
+# (Optional) Auto-start via crontab — check every 5 minutes
+# */5 * * * * /full/path/to/irchub
+
+# Connect admin console (needs hub's public key)
+#./hub_admin <hub ip> <hub port> <public key file>
+./hub_admin 127.0.0.1 6697 hub_public.pem
+
+# View logs (if logging has been turned on)
 tail -f .irchub.log
 
 # Inspect config (debug)
-./bin/hub_decrypt
+./hub_decrypt
 ```

@@ -78,10 +78,11 @@ ifeq ($(BUILD_MODE),release)
 	LDFLAGS += -pie -Wl,-z,relro -Wl,-z,now
 endif
 
-# Production mode flags (maximum optimization)
+# Production mode flags — release hardening + maximum optimization
 ifeq ($(BUILD_MODE),production)
-	CFLAGS += -O3 -DNDEBUG -march=native -flto
-	LDFLAGS += -flto -s
+	CFLAGS += -O3 -DNDEBUG -march=native -flto=auto
+	CFLAGS += -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE
+	LDFLAGS += -flto=auto -s -pie -Wl,-z,relro -Wl,-z,now
 endif
 
 # ============================================================================
