@@ -73,7 +73,7 @@ endif
 
 # Release mode flags
 ifeq ($(BUILD_MODE),release)
-	CFLAGS += -O2 -DNDEBUG -D_FORTIFY_SOURCE=2
+	CFLAGS += -O2 -g -DNDEBUG -D_FORTIFY_SOURCE=2
 	CFLAGS += -fstack-protector-strong -fPIE
 	LDFLAGS += -pie -Wl,-z,relro -Wl,-z,now
 endif

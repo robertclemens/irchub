@@ -256,7 +256,6 @@ int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
     if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag)) goto err;
 
     if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) <= 0) {
-        hub_log("GCM tag verification failed\n");
         goto err;
     }
     plaintext_len += len;

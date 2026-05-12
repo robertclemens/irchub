@@ -35,6 +35,8 @@ void hub_config_write(hub_state_t *state) {
   SAFE_WRITE("uuid|%s\n", state->hub_uuid[0] ? state->hub_uuid : "");
   SAFE_WRITE("hub_name|%s\n", state->hub_friendly_name[0] ? state->hub_friendly_name : "");
   SAFE_WRITE("admin|%s\n", state->admin_password);
+  /* Persist Lamport seq so it survives restart and stays monotonic. */
+  SAFE_WRITE("lamport_seq|%llu\n", (unsigned long long)state->next_lamport_seq);
 
   // Write purge_days setting (only if enabled)
   if (state->purge_days_setting > 0) {
@@ -296,6 +298,14 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       } else if (strcmp(k, "purge_days") == 0) {
         state->purge_days_setting = atoi(v);
         if (state->purge_days_setting < 0) state->purge_days_setting = 0;
+      } else if (strcmp(k, "lamport_seq") == 0) {
+        unsigned long long loaded_seq = 0;
+        sscanf(v, "%llu", &loaded_seq);
+        /* Bump past max(saved_seq, time_based_floor) so seq stays monotonic
+         * even if the clock or the saved value lagged. Shift left 10 bits
+         * gives ~1024 seqs/second headroom before any real tick fires. */
+        uint64_t time_floor = ((uint64_t)time(NULL)) << 10;
+        state->next_lamport_seq = (loaded_seq > time_floor) ? loaded_seq : time_floor;
       } else if (strcmp(k, "key") == 0) {
         int out;
         unsigned char *d = base64_decode(v, &out);

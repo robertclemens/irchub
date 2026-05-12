@@ -86,8 +86,8 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
         memcpy(stored_first, state->global_entries[i].value, len);
         stored_first[len] = 0;
       } else {
-        snprintf(stored_first, sizeof(stored_first), "%s",
-                 state->global_entries[i].value);
+        snprintf(stored_first, sizeof(stored_first), "%.*s",
+                 (int)(sizeof(stored_first) - 1), state->global_entries[i].value);
       }
       if (strcmp(state->global_entries[i].key, key) == 0 &&
           strcmp(stored_first, value) == 0) {
@@ -247,7 +247,8 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
         memcpy(stored_first, b->entries[i].value, len);
         stored_first[len] = 0;
       } else {
-        snprintf(stored_first, sizeof(stored_first), "%s", b->entries[i].value);
+        snprintf(stored_first, sizeof(stored_first), "%.*s",
+                 (int)(sizeof(stored_first) - 1), b->entries[i].value);
       }
 
       if (strcmp(b->entries[i].key, key) == 0 &&
@@ -376,7 +377,8 @@ int hub_storage_get_full_list(hub_state_t *state, char *buffer, int max_len) {
     char nick[32] = "Unknown";
     for (int k = 0; k < b->entry_count; k++) {
       if (strcmp(b->entries[k].key, "n") == 0) {
-        snprintf(nick, sizeof(nick), "%s", b->entries[k].value);
+        snprintf(nick, sizeof(nick), "%.*s",
+                 (int)(sizeof(nick) - 1), b->entries[k].value);
         break;
       }
     }

@@ -28,6 +28,10 @@ void hub_log(const char *format, ...) {
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", t);
 
     // Check if logging disabled
+    if (g_state && g_state->log_level == LOG_NONE) {
+        return;
+    }
+
     if (!log_fp) {
         // Try to open log file first
         int fd = open(HUB_LOG_FILE, O_CREAT | O_APPEND | O_WRONLY, 0600);
@@ -39,11 +43,6 @@ void hub_log(const char *format, ...) {
         if (!log_fp) {
             return;  // Silent fail if can't open
         }
-    }
-
-    // Check if g_state exists and log level is NONE
-    if (g_state && g_state->log_level == LOG_NONE) {
-        return;
     }
 
     // Check if log file exists; if deleted, reopen it
@@ -130,7 +129,8 @@ static void daemonize(void) {
 void handle_signal(int sig) {
     (void)sig;
     if (log_fp) {
-        fprintf(log_fp, "[HUB] Shutting down signal received.\n");
+        if (!g_state || g_state->log_level != LOG_NONE)
+            fprintf(log_fp, "[HUB] Shutting down signal received.\n");
         fclose(log_fp);
     }
     remove(HUB_PID_FILE);
@@ -169,6 +169,9 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
     secure_wipe(c->bot_eph_x25519_priv, sizeof(c->bot_eph_x25519_priv));
     c->bot_eph_priv_set = false;
     secure_wipe(c->recv_buf, c->recv_len);
+    /* Free per-peer outbound queues + in-flight ciphertext.  Done after the
+     * fd is closed so no drain attempts can race. */
+    peer_queue_destroy(c);
     free(c);
 }
 
@@ -254,40 +257,30 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c) {
     }
 
     c->authenticated = true;
-    
-    // Send initial sync
-    unsigned char plain[MAX_BUFFER];
-    plain[0] = CMD_PEER_SYNC;
-    
-    hub_generate_sync_packet(state, (char*)plain + 5, MAX_BUFFER - 100);
-    
-    int payload_len = strlen((char*)plain + 5);
-    int total_plain = 1 + 4 + payload_len;
-    memcpy(&plain[1], &payload_len, 4);
-    
-    unsigned char buffer[MAX_BUFFER];
-    unsigned char tag[GCM_TAG_LEN];
-    
-    int cipher_len = aes_gcm_encrypt(plain, total_plain, c->session_key, 
-                                    buffer + 4, tag);
-    
-    if (cipher_len <= 0) {
-        hub_log("[PEER] Sync encryption failed\n");
-        hub_disconnect_client(state, c);
-        return;
-    }
-    
-    memcpy(buffer + 4 + cipher_len, tag, GCM_TAG_LEN);
-    int packet_len = cipher_len + GCM_TAG_LEN;
-    uint32_t nl = htonl(packet_len);
-    memcpy(buffer, &nl, 4);
-    
-    if (write(c->fd, buffer, 4 + packet_len) != (ssize_t)(4 + packet_len)) {
-        hub_log("[PEER] Sync write failed\n");
-        hub_disconnect_client(state, c);
-    } else {
-        hub_log("[PEER] Sent handshake & sync to %s\n", c->ip);
-        hub_broadcast_mesh_state(state);
+    hub_log("[PEER] Handshake complete with %s\n", c->ip);
+    /* Send a full config sync immediately via the BULK queue.  The queue
+     * enforces a per-peer byte budget (BULK_SOFT_BUDGET_BPS = 32 KB/s) so
+     * simultaneous startup of all 10 hubs no longer creates a cascade that
+     * fills socket buffers.  Each hub's BULK drain is naturally staggered
+     * by the select() cycle time.  This replaces the old approach of deferring
+     * the first sync to anti-entropy (up to 90 s wait). */
+    {
+        char full_sync[MAX_BUFFER];
+        hub_generate_sync_packet(state, full_sync, MAX_BUFFER - 100);
+        int sync_len = strlen(full_sync);
+        if (sync_len > 0) {
+            queued_msg_t *sync_msg = queued_msg_new(CMD_PEER_SYNC, LANE_BULK,
+                                                    (const unsigned char *)full_sync,
+                                                    sync_len);
+            if (sync_msg) {
+                queued_msg_set_coalesce(sync_msg, state->hub_uuid,
+                                        hub_next_lamport_seq(state),
+                                        "handshake_sync");
+                if (!peer_enqueue(c, sync_msg)) {
+                    hub_log("[PEER] Could not queue initial sync to %s\n", c->ip);
+                }
+            }
+        }
     }
 }
 
@@ -307,7 +300,11 @@ bool send_ping(hub_client_t *c) {
         uint32_t net_len = htonl(packet_len);
         memcpy(buffer, &net_len, 4);
         
-        if (write(c->fd, buffer, 4 + packet_len) != (ssize_t)(4 + packet_len)) {
+        ssize_t sent = send(c->fd, buffer, 4 + packet_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (sent != (ssize_t)(4 + packet_len)) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return true; // peer send buffer full but connection alive; skip ping
+            }
             return false;
         }
     }
@@ -323,16 +320,20 @@ void hub_maintenance(hub_state_t *state) {
     if (last_mesh_gossip == 0) last_mesh_gossip = now;
 
     // Existing mesh gossip...
-    if (now - last_mesh_gossip > 10) {
+    if (now - last_mesh_gossip > 5) {
         last_mesh_gossip = now;
         if (state->peer_count > 0) {
             hub_broadcast_mesh_state(state);
         }
     }
 
-    if (last_anti_entropy == 0) last_anti_entropy = now;
-    
-    // Existing anti-entropy...
+    /* First fire: stagger across hubs with a random 30-90 s window so all
+     * 10 hubs don't broadcast simultaneously on every restart. */
+    if (last_anti_entropy == 0) {
+        unsigned int jitter = 30 + (unsigned int)(rand() % 61); /* 30-90 s */
+        last_anti_entropy = now - (time_t)(MESH_ANTI_ENTROPY_INTERVAL - jitter);
+    }
+
     if ((now - last_anti_entropy) > MESH_ANTI_ENTROPY_INTERVAL) {
         last_anti_entropy = now;
         if (state->peer_count > 0) {
@@ -379,6 +380,14 @@ void hub_maintenance(hub_state_t *state) {
         if (sync_count > 0) {
             hub_log("[HUB] Requested config sync from %d bots\n", sync_count);
         }
+    }
+
+    // Debounced config write: flush at most once per CONFIG_WRITE_DEBOUNCE_S
+    if (state->config_dirty &&
+        (now - state->last_config_write) >= CONFIG_WRITE_DEBOUNCE_S) {
+        hub_config_write(state);
+        state->config_dirty = false;
+        state->last_config_write = now;
     }
 
     // IP limit cleanup every 5 minutes
@@ -718,7 +727,8 @@ int main(int argc, char *argv[]) {
             if (bind_buf[0] == 0) {
                 snprintf(state.bind_ip, sizeof(state.bind_ip), "0.0.0.0");
             } else {
-                snprintf(state.bind_ip, sizeof(state.bind_ip), "%s", bind_buf);
+                snprintf(state.bind_ip, sizeof(state.bind_ip), "%.*s",
+                         (int)(sizeof(state.bind_ip) - 1), bind_buf);
             }
         }
 
@@ -925,6 +935,10 @@ int main(int argc, char *argv[]) {
 
     daemonize();
 
+    /* Seed rand() after the double-fork so each hub process gets a different
+     * sequence — used to stagger anti-entropy timing across the mesh. */
+    srand((unsigned int)(time(NULL) ^ getpid()));
+
     log_fp = fopen(HUB_LOG_FILE, "a");
 
     signal(SIGPIPE, SIG_IGN);
@@ -958,6 +972,15 @@ int main(int argc, char *argv[]) {
     }
     /* config_pass must remain in state for the lifetime of the daemon —
      * hub_config_write() re-derives the AES key from it on every save.   */
+
+    /* Ensure next_lamport_seq is above the time-based floor even on first
+     * boot (when no lamport_seq key exists in config).  The config loader
+     * sets it if the key is present; this covers the first-boot case. */
+    {
+        uint64_t time_floor = ((uint64_t)time(NULL)) << 10;
+        if (state.next_lamport_seq < time_floor)
+            state.next_lamport_seq = time_floor;
+    }
 
     // Set default bind_ip if not configured
     if (!state.bind_ip[0]) {
@@ -1004,22 +1027,46 @@ int main(int argc, char *argv[]) {
         hub_check_peers(&state);
         hub_maintenance(&state);
 
-        fd_set read_fds;
+        fd_set read_fds, write_fds;
         FD_ZERO(&read_fds);
+        FD_ZERO(&write_fds);
         FD_SET(state.listen_fd, &read_fds);
         int max_fd = state.listen_fd;
 
         for (int i = 0; i < state.client_count; i++) {
-            if (state.clients[i]->fd > 0) {
-                FD_SET(state.clients[i]->fd, &read_fds);
-                if (state.clients[i]->fd > max_fd) {
-                    max_fd = state.clients[i]->fd;
+            hub_client_t *c = state.clients[i];
+            if (c->fd > 0) {
+                FD_SET(c->fd, &read_fds);
+                /* Only watch writability if the per-peer queue or in-flight
+                 * cipher buffer has bytes pending. Otherwise select() would
+                 * spin returning writable for every idle socket and waste
+                 * CPU — exactly the failure mode docs/cpu.md warned about. */
+                if (peer_has_pending_writes(c)) {
+                    FD_SET(c->fd, &write_fds);
+                }
+                if (c->fd > max_fd) {
+                    max_fd = c->fd;
                 }
             }
         }
 
-        struct timeval tv = {1, 0};
-        if (select(max_fd + 1, &read_fds, NULL, NULL, &tv) < 0) continue;
+        /* Short timeout (250 ms) so the drain loop and maintenance ticks
+         * don't stall when nothing is happening. Existing 1-second timeout
+         * was acceptable when there was no outbound queue to service; with
+         * queues we want to revisit drain opportunities promptly without
+         * busy-waiting. */
+        struct timeval tv = {0, 250 * 1000};
+        if (select(max_fd + 1, &read_fds, &write_fds, NULL, &tv) < 0) continue;
+
+        /* ---- Drain writable peers FIRST.  This keeps URGENT op-flow
+         * traffic prompt and prevents queues from accumulating across the
+         * read pass (which can itself enqueue more outbound traffic). ---- */
+        for (int i = 0; i < state.client_count; i++) {
+            hub_client_t *c = state.clients[i];
+            if (c->fd > 0 && FD_ISSET(c->fd, &write_fds)) {
+                peer_drain_writable(&state, c);
+            }
+        }
 
         if (FD_ISSET(state.listen_fd, &read_fds)) {
             struct sockaddr_in ca;

@@ -89,33 +89,39 @@ void send_packet_binary(int fd, int cmd_id, const unsigned char *payload, int pa
     }
 }
 
+/* Upper bound for any valid hub packet: 65536-byte plaintext + IV + tag */
+#define MAX_HUB_PACKET (65536 + GCM_IV_LEN + GCM_TAG_LEN + 64)
+
 bool process_incoming_packet() {
     uint32_t net_len;
     if (recv(g_fd, &net_len, 4, MSG_PEEK | MSG_DONTWAIT) != 4) return false;
 
     recv_all(g_fd, &net_len, 4);
     int len = ntohl(net_len);
-    
-    if (len > MAX_BUFFER || len < GCM_TAG_LEN + 5) return false;
 
-    unsigned char enc_buf[MAX_BUFFER];
-    if (recv_all(g_fd, enc_buf, len) != len) return false;
+    if (len < GCM_TAG_LEN + 5 || len > MAX_HUB_PACKET) return false;
+
+    unsigned char *enc_buf = malloc((size_t)len);
+    if (!enc_buf) return false;
+    if (recv_all(g_fd, enc_buf, len) != len) { free(enc_buf); return false; }
 
     unsigned char tag[GCM_TAG_LEN];
     memcpy(tag, enc_buf + len - GCM_TAG_LEN, GCM_TAG_LEN);
 
-    unsigned char plain[MAX_BUFFER];
-    
-    int plain_len = aes_gcm_decrypt(enc_buf, len - GCM_TAG_LEN, g_key, 
-                                   plain, tag);
+    unsigned char *plain = malloc((size_t)(len + 1));
+    if (!plain) { free(enc_buf); return false; }
 
+    int plain_len = aes_gcm_decrypt(enc_buf, len - GCM_TAG_LEN, g_key, plain, tag);
+    free(enc_buf);
+
+    bool result = false;
     if (plain_len > 0) {
-        if (plain[0] == CMD_PING) {
+        if (plain[0] == CMD_PING)
             send_packet(g_fd, CMD_PING, NULL, g_key);
-        }
-        return true;
+        result = true;
     }
-    return false;
+    free(plain);
+    return result;
 }
 
 // ============================================================================
@@ -194,13 +200,18 @@ void read_response(int fd, unsigned char *key, char *out_buf, int max_len) {
         }
 
         int len = ntohl(net_len);
-        if (len > MAX_BUFFER || len < GCM_TAG_LEN + 5) {
-            snprintf(out_buf, max_len, "Error: Invalid packet");
+        if (len < GCM_TAG_LEN + 5 || len > MAX_HUB_PACKET) {
+            snprintf(out_buf, max_len, "Error: Invalid packet (len=%d)", len);
             return;
         }
 
-        unsigned char enc_buf[MAX_BUFFER];
+        unsigned char *enc_buf = malloc((size_t)len);
+        if (!enc_buf) {
+            snprintf(out_buf, max_len, "Error: Out of memory");
+            return;
+        }
         if (recv_all(fd, enc_buf, len) != len) {
+            free(enc_buf);
             snprintf(out_buf, max_len, "Error: Connection lost");
             return;
         }
@@ -208,23 +219,31 @@ void read_response(int fd, unsigned char *key, char *out_buf, int max_len) {
         unsigned char tag[GCM_TAG_LEN];
         memcpy(tag, enc_buf + len - GCM_TAG_LEN, GCM_TAG_LEN);
 
-        unsigned char plain[MAX_BUFFER];
-        
-        int plain_len = aes_gcm_decrypt(enc_buf, len - GCM_TAG_LEN, key, 
-                                       plain, tag);
+        /* +1 for the NUL we write at plain[plain_len] */
+        unsigned char *plain = malloc((size_t)(len + 1));
+        if (!plain) {
+            free(enc_buf);
+            snprintf(out_buf, max_len, "Error: Out of memory");
+            return;
+        }
+
+        int plain_len = aes_gcm_decrypt(enc_buf, len - GCM_TAG_LEN, key, plain, tag);
+        free(enc_buf);
 
         if (plain_len > 0) {
             if (plain[0] == CMD_PING) {
+                free(plain);
                 send_packet(fd, CMD_PING, NULL, key);
                 continue;
             }
             plain[plain_len] = 0;
-            snprintf(out_buf, max_len, "%s", (char*)plain);
-            return;
-        } else {
-            snprintf(out_buf, max_len, "Error: Decryption failed");
+            snprintf(out_buf, max_len, "%s", (char *)plain);
+            free(plain);
             return;
         }
+        free(plain);
+        snprintf(out_buf, max_len, "Error: Decryption failed");
+        return;
     }
 }
 
@@ -492,13 +511,15 @@ void bot_rekey() {
 // ============================================================================
 
 void peer_list() {
-    char response[MAX_BUFFER];
-    
+    char *response = malloc(MAX_HUB_PACKET);
+    if (!response) { printf("Error: Out of memory\n"); return; }
+
     printf("\n");
     send_packet(g_fd, CMD_ADMIN_LIST_PEERS, NULL, g_key);
-    read_response(g_fd, g_key, response, sizeof(response));
+    read_response(g_fd, g_key, response, MAX_HUB_PACKET);
     printf("%s\n", response);
-    
+    free(response);
+
     printf("\nPress Enter to continue...");
     fflush(stdout);
     char dummy[10];
@@ -533,23 +554,25 @@ void peer_add() {
 }
 
 void peer_remove() {
-    char response[MAX_BUFFER];
-    
+    char *response = malloc(MAX_HUB_PACKET);
+    if (!response) { printf("Error: Out of memory\n"); return; }
+
     send_packet(g_fd, CMD_ADMIN_LIST_PEERS, NULL, g_key);
-    read_response(g_fd, g_key, response, sizeof(response));
+    read_response(g_fd, g_key, response, MAX_HUB_PACKET);
     printf("\n%s\n", response);
-    
+
     char idx[10];
     get_input("Enter Index to Remove (or blank to cancel): ", idx, sizeof(idx));
-    
+
     if (strlen(idx) > 0 && atoi(idx) > 0) {
         if (get_confirmation("Remove this peer?")) {
             send_packet(g_fd, CMD_ADMIN_DEL_PEER, idx, g_key);
-            read_response(g_fd, g_key, response, sizeof(response));
+            read_response(g_fd, g_key, response, MAX_HUB_PACKET);
             printf("Hub: %s\n", response);
         }
     }
-    
+
+    free(response);
     printf("\nPress Enter to continue...");
     fflush(stdout);
     char dummy[10];

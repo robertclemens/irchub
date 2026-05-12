@@ -56,7 +56,7 @@
 #define LOG_INFO    3
 #define LOG_DEBUG   4
 
-#define HUB_DEFAULT_LOG_LEVEL LOG_NONE
+#define HUB_DEFAULT_LOG_LEVEL LOG_DEBUG
 
 // Rate Limiting Settings
 #define MAX_IP_RATE_LIMITS 500
@@ -66,6 +66,10 @@
 #define FAILED_AUTH_RESET_TIME 3600     // 1 hour
 #define MAX_RECENT_PURGES 5             // Track recent PURGE cutoffs to prevent loops
 #define PURGE_DEDUP_WINDOW 60            // Seconds to remember PURGE (prevents loops)
+
+// OP_FORWARD_REQUEST deduplication — prevents packet storms
+#define OP_FORWARD_TTL_SECONDS 60        // Drop forwarded OP requests older than 60s
+#define MAX_SEEN_FORWARD_IDS   256       // LRU ring of recently-seen OP forward request IDs
 
 // Timeout Settings
 #define PING_INTERVAL 60
@@ -145,9 +149,30 @@
 #define CMD_ADMIN_SET_BIND_PORT 0x3F
 #define CMD_ADMIN_SET_LOG_LEVEL 0x43    // Set log level (payload: level 0-4)
 #define CMD_ADMIN_SET_LOG_SIZE  0x44    // Set log size limit (payload: size in bytes)
+#define CMD_BOT_DELTA           0x45    // Bot -> Hub: single-key change (mesh.md Phase 4)
 
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
+
+/* ==========================================================================
+ * Mesh transport tuning (see docs/mesh.md)
+ * ========================================================================== */
+#define LANE_COUNT                3
+#define MAX_QUEUE_PER_LANE        256          /* per peer/client, per lane */
+#define MAX_QUEUED_BYTES_PER_PEER (256 * 1024) /* hard cap across all lanes */
+#define MAX_DELTA_SEEN            8192
+#define BULK_SOFT_BUDGET_BPS      (32 * 1024)
+#define DELTA_HARD_BUDGET_BPS     (64 * 1024)
+#define BOT_DELTA_RATE_LIMIT      10           /* deltas/s/bot before suspect */
+#define BOT_DELTA_RATE_WINDOW     30           /* seconds */
+
+/* Lane indices (lower = higher priority). LANE_URGENT must be 0 so the drain
+ * loop can rely on numeric ordering. */
+typedef enum {
+  LANE_URGENT = 0,   /* CMD_OP_REQUEST/GRANT/FAILED, CMD_OP_FORWARD_*  */
+  LANE_DELTA  = 1,   /* small per-key deltas (b|uuid|h|...), global add/del */
+  LANE_BULK   = 2,   /* CMD_PEER_SYNC, CMD_MESH_STATE, CMD_CONFIG_DATA  */
+} lane_t;
 
 typedef struct {
   char key[32];
@@ -200,10 +225,31 @@ typedef struct {
   int remote_connected_count;
   int remote_total_peers;
   time_t last_mesh_report;
-  char last_gossip[1024];
+  char last_gossip[MAX_BUFFER];
 } hub_peer_config_t;
 
 typedef enum { CLIENT_BOT, CLIENT_ADMIN, CLIENT_HUB } client_type_t;
+
+/* Queued outbound message — pre-encryption.  payload is malloc'd. */
+typedef struct queued_msg {
+  uint8_t            cmd;                /* protocol opcode (CMD_*) */
+  lane_t             lane;               /* which lane this lives in (for accounting) */
+  /* Coalesce key: typically "<origin_hub_uuid>|<key>|<bot_uuid>" — up to
+   * 36 + 16 + 36 + separators ≈ 90 chars. Sized with headroom. */
+  char               coalesce_key[160];
+  uint64_t           lamport_seq;        /* monotonic per origin_hub_uuid */
+  char               origin_hub_uuid[64];
+  int                payload_len;
+  unsigned char     *payload;            /* malloc'd plaintext */
+  struct queued_msg *next;
+} queued_msg_t;
+
+typedef struct {
+  queued_msg_t *head;
+  queued_msg_t *tail;
+  int           count;
+  int           bytes;     /* sum of payload_len in this lane */
+} queue_lane_t;
 
 typedef enum {
   BOT_AUTH_IDLE = 0,
@@ -230,6 +276,21 @@ typedef struct {
   int recv_len;
   char admin_connect_ip[64];   // IP that hub_admin used to connect
   int admin_connect_port;      // Port that hub_admin used to connect
+
+  /* ---- Outbound queue (per-lane FIFOs, drained on POLLOUT) ---- */
+  queue_lane_t out_lanes[LANE_COUNT];
+  int          out_total_bytes;
+
+  /* In-flight cipher buffer for partial writes.  When non-empty the FD must
+   * be watched for writability until offset == len, before any new message
+   * is encrypted. */
+  unsigned char writing_buf[MAX_BUFFER + 64];
+  int           writing_len;
+  int           writing_offset;
+
+  /* Per-peer/client byte-rate accounting (1-second window). */
+  time_t        bw_window_start;
+  int           bw_bytes_in_window;
 } hub_client_t;
 
 // Track recently processed PURGE messages to prevent feedback loops
@@ -237,6 +298,20 @@ typedef struct {
   time_t cutoff;       // PURGE cutoff timestamp
   time_t received_at;  // When this PURGE was received/processed
 } recent_purge_t;
+
+// Track recently seen OP_FORWARD_REQUEST IDs to prevent packet storms
+typedef struct {
+  char   request_id[64]; // Unique request ID
+  time_t seen_at;        // When we first processed this request
+} seen_forward_t;
+
+/* Loop-prevention seen-set: highest lamport_seq observed per (origin, bot). */
+typedef struct {
+  char     origin_hub_uuid[64];
+  char     bot_uuid[64];
+  uint64_t max_seq_seen;
+  time_t   last_seen_at;
+} delta_seen_t;
 
 typedef struct {
   int listen_fd;
@@ -284,9 +359,32 @@ typedef struct {
   int recent_purge_count;
   time_t last_scheduled_purge;  // Timestamp of last scheduled purge this hub initiated
 
+  // OP_FORWARD_REQUEST deduplication: LRU ring prevents infinite re-broadcast storms
+  seen_forward_t seen_forwards[MAX_SEEN_FORWARD_IDS];
+  int seen_forward_head;  // Next slot to write (ring index)
+
   int log_level;       // Current log level (LOG_NONE, LOG_ERROR, etc.)
   int log_max_size;    // Max log file size in bytes (default 10MB)
+
+  /* Debounced config write: set dirty flag instead of writing immediately.
+   * hub_maintenance flushes at most once every CONFIG_WRITE_DEBOUNCE_S seconds.
+   * This prevents N PBKDF2(100K) calls when N peer syncs arrive in a burst. */
+  bool config_dirty;
+  time_t last_config_write;
+
+  /* Mesh transport: monotonic Lamport sequence stamped onto outgoing deltas
+   * (carried as the trailing field of the wire format). On load from disk we
+   * bump this past any plausibly recent value to keep monotonicity even if
+   * the system clock or stored value lags. */
+  uint64_t next_lamport_seq;
+
+  /* Loop prevention: deltas already observed per (origin_hub_uuid, bot_uuid).
+   * LRU-evicted past MAX_DELTA_SEEN. */
+  delta_seen_t delta_seen[MAX_DELTA_SEEN];
+  int          delta_seen_count;
 } hub_state_t;
+
+#define CONFIG_WRITE_DEBOUNCE_S 5
 
 // --- Prototypes ---
 void hub_log(const char *format, ...);
@@ -369,6 +467,45 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
                                unsigned char *data, int packet_len);
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c);
 void hub_broadcast_mesh_state(hub_state_t *state);
+
+/* ---- Mesh transport: per-peer outbound queue (see docs/mesh.md) ---- */
+
+/* Build a queued message from an opcode + plaintext payload.  Caller passes
+ * payload data which is copied; ownership of the returned struct is
+ * transferred to peer_enqueue.  Returns NULL on alloc failure. */
+queued_msg_t *queued_msg_new(uint8_t cmd, lane_t lane,
+                             const unsigned char *payload, int payload_len);
+void queued_msg_set_coalesce(queued_msg_t *m, const char *origin_hub_uuid,
+                             uint64_t lamport_seq, const char *coalesce_key);
+void queued_msg_free(queued_msg_t *m);
+
+/* Enqueue m on peer's lane.  Performs coalescing if m->coalesce_key[0] != 0
+ * and a same-key message exists in the lane (replaces in place, frees the
+ * passed-in m).  Returns true on success.  On URGENT lane overflow, returns
+ * false and the caller should treat the peer as failed. */
+bool peer_enqueue(hub_client_t *peer, queued_msg_t *m);
+
+/* Drain queued messages to the socket; called when select() reports
+ * writable.  Encrypts each message with peer->session_key just before send,
+ * tracks partial writes via peer->writing_*. */
+void peer_drain_writable(hub_state_t *state, hub_client_t *peer);
+
+/* True if peer has anything pending — either a partial in-flight write or
+ * any non-empty lane.  Used by main loop to decide whether to set POLLOUT. */
+bool peer_has_pending_writes(hub_client_t *peer);
+
+/* Free all queued messages (called from hub_disconnect_client). */
+void peer_queue_destroy(hub_client_t *peer);
+
+/* Allocate the next outgoing Lamport sequence number for this hub. */
+uint64_t hub_next_lamport_seq(hub_state_t *state);
+
+/* Loop-prevention seen-set helpers.  Returns true if (origin, bot, seq) is
+ * new (and updates the set); false if seq <= last seen. */
+bool hub_delta_seen_check_and_update(hub_state_t *state,
+                                     const char *origin_hub_uuid,
+                                     const char *bot_uuid,
+                                     uint64_t seq);
 
 // Bot credential generation
 bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
