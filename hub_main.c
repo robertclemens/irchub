@@ -700,7 +700,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "-p")     == 0) passfile_mode = true;
     }
 
-    hub_state_t state;
+    static hub_state_t state;
     memset(&state, 0, sizeof(state));
     state.running = true;
     g_state = &state;

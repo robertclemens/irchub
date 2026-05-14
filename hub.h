@@ -34,7 +34,7 @@
 #define GCM_TAG_LEN 16
 #define HEADER_SIZE 4
 #define MAX_PENDING_BOTS 10
-#define MAX_PENDING_OP_REQUESTS 50
+#define MAX_PENDING_OP_REQUESTS 500
 #define PBKDF2_ITERATIONS 100000 // NEW: For password-based key derivation
 #define HUB_PID_FILE ".irchub.pid"
 #define HUB_PASS_FILE ".irchub.pass"
