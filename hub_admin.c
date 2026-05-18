@@ -687,131 +687,199 @@ void admin_op_user() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_list_masks() {
-    char response[MAX_BUFFER];
+static void pause_and_continue(void) {
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
 
+/* ---- Admin management (v2: named records) ---- */
+
+void admin_list_admins(void) {
+    char response[MAX_BUFFER];
     printf("\n");
-    send_packet(g_fd, CMD_ADMIN_LIST_MASKS, NULL, g_key);
+    send_packet(g_fd, CMD_ADMIN_LIST_ADMINS, NULL, g_key);
     read_response(g_fd, g_key, response, sizeof(response));
     printf("%s\n", response);
-
-    printf("\nPress Enter to continue...");
-    fflush(stdout);
-    char dummy[10];
-    wait_for_input_or_socket(dummy, sizeof(dummy));
+    pause_and_continue();
 }
 
-void admin_add_mask() {
+void admin_add_admin_record(void) {
     char response[MAX_BUFFER];
-    char mask[256];
+    char name[64], pass[MAX_PASS], mask[256];
 
     printf("\n═══════════════════════════════════════════════════\n");
-    printf("                  ADD ADMIN MASK\n");
+    printf("                   ADD ADMIN\n");
     printf("═══════════════════════════════════════════════════\n\n");
-    printf("Format examples:\n");
-    printf("  *!*@*.example.com\n");
-    printf("  nick!*@*\n");
-    printf("  *!user@host.com\n\n");
+    printf("Friendly name (no spaces, e.g. robert): ");
+    get_input("Name: ", name, sizeof(name));
+    get_password_secure("Admin Password: ", pass, sizeof(pass));
+    printf("First usermask (e.g. nick!*@*.example.com): ");
+    get_input("Mask: ", mask, sizeof(mask));
 
-    get_input("Admin Mask: ", mask, sizeof(mask));
-
-    if (strlen(mask) > 0) {
-        send_packet(g_fd, CMD_ADMIN_ADD_MASK, mask, g_key);
+    if (strlen(name) > 0 && strlen(pass) > 0 && strlen(mask) > 0) {
+        char payload[MAX_BUFFER];
+        snprintf(payload, sizeof(payload), "%s|%s|%s", name, pass, mask);
+        send_packet(g_fd, CMD_ADMIN_ADD_ADMIN, payload, g_key);
         read_response(g_fd, g_key, response, sizeof(response));
         printf("\nHub: %s\n", response);
-    }
-
-    printf("\nPress Enter to continue...");
-    fflush(stdout);
-    char dummy[10];
-    wait_for_input_or_socket(dummy, sizeof(dummy));
-}
-
-void admin_del_mask() {
-    char response[MAX_BUFFER];
-
-    send_packet(g_fd, CMD_ADMIN_LIST_MASKS, NULL, g_key);
-    read_response(g_fd, g_key, response, sizeof(response));
-    printf("\n%s\n", response);
-
-    char mask[256];
-    get_input("Mask to REMOVE (or blank to cancel): ", mask, sizeof(mask));
-
-    if (strlen(mask) > 0 && get_confirmation("Remove this admin mask?")) {
-        send_packet(g_fd, CMD_ADMIN_DEL_MASK, mask, g_key);
-        read_response(g_fd, g_key, response, sizeof(response));
-        printf("Hub: %s\n", response);
-    }
-
-    printf("\nPress Enter to continue...");
-    fflush(stdout);
-    char dummy[10];
-    wait_for_input_or_socket(dummy, sizeof(dummy));
-}
-
-void admin_list_opers() {
-    char response[MAX_BUFFER];
-
-    printf("\n");
-    send_packet(g_fd, CMD_ADMIN_LIST_OPERS, NULL, g_key);
-    read_response(g_fd, g_key, response, sizeof(response));
-    printf("%s\n", response);
-
-    printf("\nPress Enter to continue...");
-    fflush(stdout);
-    char dummy[10];
-    wait_for_input_or_socket(dummy, sizeof(dummy));
-}
-
-void admin_add_oper() {
-    char response[MAX_BUFFER];
-    char mask[256], pass[128];
-
-    printf("\n═══════════════════════════════════════════════════\n");
-    printf("                  ADD OPER MASK\n");
-    printf("═══════════════════════════════════════════════════\n\n");
-
-    get_input("Oper Mask: ", mask, sizeof(mask));
-    get_password_secure("Oper Password: ", pass, sizeof(pass));
-
-    if (strlen(mask) > 0 && strlen(pass) > 0) {
-        char payload[512];
-        snprintf(payload, sizeof(payload), "%s|%s", mask, pass);
-
-        send_packet(g_fd, CMD_ADMIN_ADD_OPER, payload, g_key);
-        read_response(g_fd, g_key, response, sizeof(response));
-        printf("\nHub: %s\n", response);
-
         secure_wipe(pass, sizeof(pass));
         secure_wipe(payload, sizeof(payload));
     }
-
-    printf("\nPress Enter to continue...");
-    fflush(stdout);
-    char dummy[10];
-    wait_for_input_or_socket(dummy, sizeof(dummy));
+    pause_and_continue();
 }
 
-void admin_del_oper() {
+void admin_del_admin_record(void) {
     char response[MAX_BUFFER];
-
-    send_packet(g_fd, CMD_ADMIN_LIST_OPERS, NULL, g_key);
+    send_packet(g_fd, CMD_ADMIN_LIST_ADMINS, NULL, g_key);
     read_response(g_fd, g_key, response, sizeof(response));
     printf("\n%s\n", response);
 
-    char mask[256];
-    get_input("Oper Mask to REMOVE (or blank to cancel): ", mask, sizeof(mask));
-
-    if (strlen(mask) > 0 && get_confirmation("Remove this oper mask?")) {
-        send_packet(g_fd, CMD_ADMIN_DEL_OPER, mask, g_key);
+    char name[64];
+    get_input("Admin name to REMOVE (or blank to cancel): ", name, sizeof(name));
+    if (strlen(name) > 0 && get_confirmation("Remove this admin and all their masks?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_ADMIN, name, g_key);
         read_response(g_fd, g_key, response, sizeof(response));
         printf("Hub: %s\n", response);
     }
+    pause_and_continue();
+}
 
-    printf("\nPress Enter to continue...");
-    fflush(stdout);
-    char dummy[10];
-    wait_for_input_or_socket(dummy, sizeof(dummy));
+/* ---- Oper management (v2: named records) ---- */
+
+void admin_list_opers(void) {
+    char response[MAX_BUFFER];
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_LIST_OPERS_V2, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+    pause_and_continue();
+}
+
+void admin_add_oper_record(void) {
+    char response[MAX_BUFFER];
+    char name[64], pass[MAX_PASS], mask[256];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                    ADD OPER\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    get_input("Name: ", name, sizeof(name));
+    get_password_secure("Oper Password: ", pass, sizeof(pass));
+    get_input("First usermask (e.g. nick!*@hostname.com): ", mask, sizeof(mask));
+
+    if (strlen(name) > 0 && strlen(pass) > 0 && strlen(mask) > 0) {
+        char payload[MAX_BUFFER];
+        snprintf(payload, sizeof(payload), "%s|%s|%s", name, pass, mask);
+        send_packet(g_fd, CMD_ADMIN_ADD_OPER_RECORD, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+        secure_wipe(pass, sizeof(pass));
+        secure_wipe(payload, sizeof(payload));
+    }
+    pause_and_continue();
+}
+
+void admin_del_oper_record(void) {
+    char response[MAX_BUFFER];
+    send_packet(g_fd, CMD_ADMIN_LIST_OPERS_V2, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\n%s\n", response);
+
+    char name[64];
+    get_input("Oper name to REMOVE (or blank to cancel): ", name, sizeof(name));
+    if (strlen(name) > 0 && get_confirmation("Remove this oper and all their masks?")) {
+        send_packet(g_fd, CMD_ADMIN_DEL_OPER_RECORD, name, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+    pause_and_continue();
+}
+
+/* ---- Shared usermask management ---- */
+
+void admin_add_usermask(void) {
+    char response[MAX_BUFFER];
+    char name[64], mask[256];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("               ADD USERMASK TO USER\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    get_input("User name (admin or oper): ", name, sizeof(name));
+    get_input("New usermask (e.g. nick!*@*.example.com): ", mask, sizeof(mask));
+
+    if (strlen(name) > 0 && strlen(mask) > 0) {
+        char payload[512];
+        snprintf(payload, sizeof(payload), "%s|%s", name, mask);
+        send_packet(g_fd, CMD_ADMIN_ADD_USERMASK, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+    }
+    pause_and_continue();
+}
+
+void admin_del_usermask(void) {
+    char response[MAX_BUFFER];
+    char name[64], mask[256];
+
+    get_input("User name: ", name, sizeof(name));
+    if (strlen(name) > 0) {
+        char match_payload[64];
+        snprintf(match_payload, sizeof(match_payload), "%s", name);
+        send_packet(g_fd, CMD_ADMIN_MATCH, match_payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\n%s\n", response);
+    }
+    get_input("Mask to REMOVE (or blank to cancel): ", mask, sizeof(mask));
+    if (strlen(name) > 0 && strlen(mask) > 0 && get_confirmation("Remove this mask?")) {
+        char payload[512];
+        snprintf(payload, sizeof(payload), "%s|%s", name, mask);
+        send_packet(g_fd, CMD_ADMIN_DEL_USERMASK, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("Hub: %s\n", response);
+    }
+    pause_and_continue();
+}
+
+void admin_match_user(void) {
+    char response[MAX_BUFFER];
+    char name[64];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                    MATCH USER\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("Enter a name to show that user's records, or * for all users.\n");
+    printf("WARNING: * may produce many lines of output.\n\n");
+    get_input("Name or *: ", name, sizeof(name));
+
+    if (strlen(name) > 0) {
+        send_packet(g_fd, CMD_ADMIN_MATCH, name, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\n%s\n", response);
+    }
+    pause_and_continue();
+}
+
+void admin_change_userpass(void) {
+    char response[MAX_BUFFER];
+    char name[64], pass[MAX_PASS];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("               CHANGE USER PASSWORD\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    get_input("User name: ", name, sizeof(name));
+    get_password_secure("New Password: ", pass, sizeof(pass));
+
+    if (strlen(name) > 0 && strlen(pass) > 0) {
+        char payload[MAX_PASS + 70];
+        snprintf(payload, sizeof(payload), "%s|%s", name, pass);
+        send_packet(g_fd, CMD_ADMIN_SET_USERPASS, payload, g_key);
+        read_response(g_fd, g_key, response, sizeof(response));
+        printf("\nHub: %s\n", response);
+        secure_wipe(pass, sizeof(pass));
+        secure_wipe(payload, sizeof(payload));
+    }
+    pause_and_continue();
 }
 
 void admin_list_channels() {
@@ -1301,13 +1369,24 @@ void admin_set_bind_port() {
 void admin_export_private_key() {
     char response[MAX_BUFFER];
 
-    printf("\n═══════════════════════════════════════════════════\n");
-    printf("              EXPORT PRIVATE KEY\n");
-    printf("═══════════════════════════════════════════════════\n\n");
-    printf("⚠️  WARNING: Keep this key secure!\n");
-    printf("This private key is used for hub-to-hub authentication.\n\n");
+    printf("\n╔══════════════════════════════════════════════════╗\n");
+    printf("║           *** SECURITY WARNING ***               ║\n");
+    printf("║              EXPORT PRIVATE KEY                  ║\n");
+    printf("╚══════════════════════════════════════════════════╝\n\n");
+    printf("This is the hub's private key used for hub-to-hub\n");
+    printf("and hub_admin authentication. Anyone with this key\n");
+    printf("can authenticate to this hub.\n\n");
+    printf("  - Store it in a password manager or encrypted vault\n");
+    printf("  - Never share it over unencrypted channels\n");
+    printf("  - Keep a secure backup — losing it means re-keying\n");
+    printf("    all peer hubs and hub_admin installations\n\n");
 
-    if (!get_confirmation("Export private key?")) {
+    if (!get_confirmation("I understand the risks. Export private key?")) {
+        printf("Cancelled.\n");
+        printf("\nPress Enter to continue...");
+        fflush(stdout);
+        char dummy[10];
+        wait_for_input_or_socket(dummy, sizeof(dummy));
         return;
     }
 
@@ -1317,20 +1396,33 @@ void admin_export_private_key() {
     if (strncmp(response, "ERROR", 5) == 0) {
         printf("\n%s\n", response);
     } else {
-        time_t now = time(NULL);
-        struct tm *t = localtime(&now);
-        char fname[64];
-        strftime(fname, sizeof(fname), "hub_private_%Y%m%d_%H%M%S.b64", t);
+        printf("\n  1. Save to file\n");
+        printf("  2. Print to terminal only (do not write to disk)\n\n");
+        char choice[4];
+        get_input("Choice: ", choice, sizeof(choice));
 
-        FILE *f = fopen(fname, "w");
-        if (f) {
-            fputs(response, f);
-            fclose(f);
-            printf("\n[PRIVATE KEY SAVED: %s]\n\n", fname);
-            printf("Private key has been exported to:\n%s\n", fname);
+        if (atoi(choice) == 2) {
+            printf("\n══════════════════════ PRIVATE KEY ══════════════════════\n");
+            printf("%s\n", response);
+            printf("═════════════════════════════════════════════════════════\n");
+            printf("Copy and store this key securely before closing.\n");
         } else {
-            printf("\nFailed to save private key to file.\n");
+            time_t now = time(NULL);
+            struct tm *t = localtime(&now);
+            char fname[64];
+            strftime(fname, sizeof(fname), "hub_private_%Y%m%d_%H%M%S.b64", t);
+            FILE *f = fopen(fname, "w");
+            if (f) {
+                fputs(response, f);
+                fclose(f);
+                chmod(fname, 0600);
+                printf("\n[PRIVATE KEY SAVED: %s] (permissions: 0600)\n", fname);
+                printf("Move this file to secure storage and delete it from here.\n");
+            } else {
+                printf("\nFailed to save private key to file.\n");
+            }
         }
+        secure_wipe(response, strlen(response));
     }
 
     printf("\nPress Enter to continue...");
@@ -1345,7 +1437,10 @@ void admin_export_public_key() {
     printf("\n═══════════════════════════════════════════════════\n");
     printf("               EXPORT PUBLIC KEY\n");
     printf("═══════════════════════════════════════════════════\n\n");
-    printf("This public key is used for hub_admin authentication.\n\n");
+    printf("The public key is required by hub_admin to connect.\n");
+    printf("Share it with anyone who needs hub_admin access.\n\n");
+    printf("  1. Save to file\n");
+    printf("  2. Print to terminal only\n\n");
 
     send_packet(g_fd, CMD_ADMIN_GET_PUBKEY, NULL, g_key);
     read_response(g_fd, g_key, response, sizeof(response));
@@ -1353,21 +1448,30 @@ void admin_export_public_key() {
     if (strncmp(response, "ERROR", 5) == 0) {
         printf("\n%s\n", response);
     } else {
-        time_t now = time(NULL);
-        struct tm *t = localtime(&now);
-        char fname[64];
-        strftime(fname, sizeof(fname), "hub_public_%Y%m%d_%H%M%S.b64", t);
+        char choice[4];
+        get_input("Choice: ", choice, sizeof(choice));
 
-        FILE *f = fopen(fname, "w");
-        if (f) {
-            fputs(response, f);
-            fclose(f);
-            printf("\n[PUBLIC KEY SAVED: %s]\n\n", fname);
-            printf("Public key has been exported to:\n%s\n", fname);
-            printf("\nUse this key with hub_admin:\n");
-            printf("  ./hub_admin <ip> <port> %s\n", fname);
+        if (atoi(choice) == 2) {
+            printf("\n══════════════════════ PUBLIC KEY ═══════════════════════\n");
+            printf("%s\n", response);
+            printf("═════════════════════════════════════════════════════════\n");
+            printf("Usage: ./hub_admin <ip> <port> <key_file>\n");
+            printf("Save this string to a .b64 file and pass it as the third argument.\n");
         } else {
-            printf("\nFailed to save public key to file.\n");
+            time_t now = time(NULL);
+            struct tm *t = localtime(&now);
+            char fname[64];
+            strftime(fname, sizeof(fname), "hub_public_%Y%m%d_%H%M%S.b64", t);
+            FILE *f = fopen(fname, "w");
+            if (f) {
+                fputs(response, f);
+                fclose(f);
+                printf("\n[PUBLIC KEY SAVED: %s]\n\n", fname);
+                printf("Use with hub_admin:\n");
+                printf("  ./hub_admin <ip> <port> %s\n", fname);
+            } else {
+                printf("\nFailed to save public key to file.\n");
+            }
         }
     }
 
@@ -1441,17 +1545,21 @@ void admin_set_log_size_limit() {
     printf("[+] %s\n", response);
 }
 
-void menu_manage_admin_masks() {
+void menu_manage_admins(void) {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
-        printf("║              MANAGE ADMIN MASKS                  ║\n");
+        printf("║               MANAGE ADMINS                      ║\n");
         printf("╚══════════════════════════════════════════════════╝\n");
         printf("\n");
-        printf("  1. List Admin Masks\n");
-        printf("  2. Add Admin Mask\n");
-        printf("  3. Del Admin Mask\n");
-        printf("  4. Back to Admin Commands\n");
+        printf("  1. List Admins\n");
+        printf("  2. Add Admin\n");
+        printf("  3. Remove Admin\n");
+        printf("  4. Add Usermask to Admin/Oper\n");
+        printf("  5. Remove Usermask from Admin/Oper\n");
+        printf("  6. Change User Password\n");
+        printf("  7. Match User (show all records)\n");
+        printf("  8. Back\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1462,38 +1570,35 @@ void menu_manage_admin_masks() {
             exit(1);
         }
 
-        int choice = atoi(buf);
-
-        switch(choice) {
-            case 1:
-                admin_list_masks();
-                break;
-            case 2:
-                admin_add_mask();
-                break;
-            case 3:
-                admin_del_mask();
-                break;
-            case 4:
-                return;
-            default:
-                printf("Invalid choice.\n");
-                break;
+        switch(atoi(buf)) {
+            case 1: admin_list_admins();       break;
+            case 2: admin_add_admin_record();  break;
+            case 3: admin_del_admin_record();  break;
+            case 4: admin_add_usermask();      break;
+            case 5: admin_del_usermask();      break;
+            case 6: admin_change_userpass();   break;
+            case 7: admin_match_user();        break;
+            case 8: return;
+            default: printf("Invalid choice.\n"); break;
         }
     }
 }
 
-void menu_manage_oper_masks() {
+void menu_manage_opers(void) {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
-        printf("║              MANAGE OPER MASKS                   ║\n");
+        printf("║               MANAGE OPERS                       ║\n");
         printf("╚══════════════════════════════════════════════════╝\n");
         printf("\n");
-        printf("  1. List Oper Masks\n");
-        printf("  2. Add Oper Mask\n");
-        printf("  3. Del Oper Mask\n");
-        printf("  4. Back to Admin Commands\n");
+        printf("  1. List Opers\n");
+        printf("  2. Add Oper\n");
+        printf("  3. Remove Oper\n");
+        printf("  4. Add Usermask to Oper\n");
+        printf("  5. Remove Usermask from Oper\n");
+        printf("  6. Change Oper Password\n");
+        printf("  7. Match User (show all records)\n");
+        printf("  8. Back\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1504,23 +1609,16 @@ void menu_manage_oper_masks() {
             exit(1);
         }
 
-        int choice = atoi(buf);
-
-        switch(choice) {
-            case 1:
-                admin_list_opers();
-                break;
-            case 2:
-                admin_add_oper();
-                break;
-            case 3:
-                admin_del_oper();
-                break;
-            case 4:
-                return;
-            default:
-                printf("Invalid choice.\n");
-                break;
+        switch(atoi(buf)) {
+            case 1: admin_list_opers();         break;
+            case 2: admin_add_oper_record();    break;
+            case 3: admin_del_oper_record();    break;
+            case 4: admin_add_usermask();       break;
+            case 5: admin_del_usermask();       break;
+            case 6: admin_change_userpass();    break;
+            case 7: admin_match_user();         break;
+            case 8: return;
+            default: printf("Invalid choice.\n"); break;
         }
     }
 }
@@ -1575,12 +1673,11 @@ void menu_admin_commands() {
         printf("╚══════════════════════════════════════════════════╝\n");
         printf("\n");
         printf("  1. Op User\n");
-        printf("  2. Manage Admin Masks\n");
-        printf("  3. Manage Oper Masks\n");
+        printf("  2. Manage Admins\n");
+        printf("  3. Manage Opers\n");
         printf("  4. Manage Channels\n");
-        printf("  5. Change Admin Password\n");
-        printf("  6. Change Bot Password\n");
-        printf("  7. Back to Main Menu\n");
+        printf("  5. Change Bot Password\n");
+        printf("  6. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1598,21 +1695,18 @@ void menu_admin_commands() {
                 admin_op_user();
                 break;
             case 2:
-                menu_manage_admin_masks();
+                menu_manage_admins();
                 break;
             case 3:
-                menu_manage_oper_masks();
+                menu_manage_opers();
                 break;
             case 4:
                 menu_manage_channels();
                 break;
             case 5:
-                admin_change_admin_password();
-                break;
-            case 6:
                 admin_change_bot_password();
                 break;
-            case 7:
+            case 6:
                 return;
             default:
                 printf("Invalid choice.\n");
@@ -1739,7 +1833,8 @@ void menu_manage_peer_config() {
         printf("  9. Export Public Key\n");
         printf(" 10. Set Log Level\n");
         printf(" 11. Set Log Size Limit\n");
-        printf(" 12. Back to Main Menu\n");
+        printf(" 12. Change Hub Admin Password\n");
+        printf(" 13. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1787,6 +1882,9 @@ void menu_manage_peer_config() {
                 admin_set_log_size_limit();
                 break;
             case 12:
+                admin_change_admin_password();
+                break;
+            case 13:
                 return;  // Back to main menu
             default:
                 printf("Invalid choice.\n");

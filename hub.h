@@ -76,7 +76,6 @@
 #define CLIENT_TIMEOUT 180
 #define CONNECT_TIMEOUT 5
 #define PEER_RECONNECT_INTERVAL 120
-#define CONFIG_SYNC_INTERVAL 300
 
 // Protocol Commands
 #define CMD_PING 0x01
@@ -151,8 +150,23 @@
 #define CMD_ADMIN_SET_LOG_SIZE  0x44    // Set log size limit (payload: size in bytes)
 #define CMD_BOT_DELTA           0x45    // Bot -> Hub: single-key change (mesh.md Phase 4)
 
+// Named Admin/Oper/Usermask Commands (v2)
+#define CMD_ADMIN_ADD_ADMIN      0x46   // Create admin record + first mask (payload: name|pass|mask)
+#define CMD_ADMIN_DEL_ADMIN      0x47   // Soft-delete admin + all its m| lines (payload: name)
+#define CMD_ADMIN_ADD_OPER_RECORD 0x48  // Create oper record + first mask (payload: name|pass|mask)
+#define CMD_ADMIN_DEL_OPER_RECORD 0x49  // Soft-delete oper + all its m| lines (payload: name)
+#define CMD_ADMIN_ADD_USERMASK   0x4A   // Add mask to admin or oper by name (payload: name|mask)
+#define CMD_ADMIN_DEL_USERMASK   0x4B   // Soft-delete one mask for named user (payload: name|mask)
+#define CMD_ADMIN_SET_USERPASS   0x4C   // Change password for named user (payload: name|newpassword)
+#define CMD_ADMIN_MATCH          0x4D   // Query all records for user or * (payload: name or *)
+#define CMD_ADMIN_LIST_ADMINS    0x4E   // List all admin records
+#define CMD_ADMIN_LIST_OPERS_V2  0x4F   // List all oper records
+
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
+
+#define MAX_HUB_USER_RECORDS 40   // max combined admin + oper records
+#define MAX_HUB_USER_MASKS   200  // max total usermask records across all users
 
 /* ==========================================================================
  * Mesh transport tuning (see docs/mesh.md)
@@ -179,6 +193,24 @@ typedef struct {
   char value[1024];
   time_t timestamp;
 } config_entry_t;
+
+typedef struct {
+  char   uuid[37];
+  char   name[64];
+  char   password[MAX_PASS];
+  char   type;         /* 'a' = admin, 'o' = oper */
+  bool   is_active;    /* false when action == "del" */
+  time_t last_seen;
+  time_t timestamp;
+} hub_user_record_t;
+
+typedef struct {
+  char   uuid[37];     /* matches hub_user_record_t.uuid */
+  char   mask[MAX_MASK_LEN];
+  bool   is_active;    /* false when action == "del" */
+  time_t last_used;    /* 0 = never used */
+  time_t timestamp;
+} hub_mask_record_t;
 
 typedef struct {
   char uuid[64];
@@ -338,6 +370,12 @@ typedef struct {
   config_entry_t global_entries[MAX_BOT_ENTRIES];
   int global_entry_count;
 
+  // Named admin/oper records and their usermasks
+  hub_user_record_t user_records[MAX_HUB_USER_RECORDS];
+  int user_record_count;
+  hub_mask_record_t mask_records[MAX_HUB_USER_MASKS];
+  int mask_record_count;
+
   hub_peer_config_t peers[MAX_PEERS];
   int peer_count;
 
@@ -371,6 +409,7 @@ typedef struct {
    * This prevents N PBKDF2(100K) calls when N peer syncs arrive in a burst. */
   bool config_dirty;
   time_t last_config_write;
+  bool mesh_state_dirty; /* set on peer connect/disconnect; clears after gossip */
 
   /* Mesh transport: monotonic Lamport sequence stamped onto outgoing deltas
    * (carried as the trailing field of the wire format). On load from disk we

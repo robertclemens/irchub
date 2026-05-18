@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -70,16 +71,57 @@ void hub_config_write(hub_state_t *state) {
     secure_wipe(priv64, 64);
   }
 
-  // NEW: Write Global Entries (skip h and n which are hub-only metadata)
+  // Write Global Entries (skip h/n metadata and a/m/o which use typed arrays)
   for (int i = 0; i < state->global_entry_count; i++) {
-    // Skip h and n - these should not be in global entries
-    if (strcmp(state->global_entries[i].key, "h") == 0 ||
-        strcmp(state->global_entries[i].key, "n") == 0) {
+    const char *gk = state->global_entries[i].key;
+    if (strcmp(gk, "h") == 0 || strcmp(gk, "n") == 0 ||
+        strcmp(gk, "a") == 0 || strcmp(gk, "m") == 0 ||
+        strcmp(gk, "o") == 0) {
       continue;
     }
-    SAFE_WRITE("%s|%s|%ld\n", state->global_entries[i].key,
+    SAFE_WRITE("%s|%s|%ld\n", gk,
                state->global_entries[i].value,
                (long)state->global_entries[i].timestamp);
+  }
+
+  // Write named admin/oper records (a| and o| lines) — skip duplicates by type+name
+  char wr_seen_names[MAX_HUB_USER_RECORDS][64];
+  char wr_seen_types[MAX_HUB_USER_RECORDS];
+  int  wr_seen_count = 0;
+  for (int i = 0; i < state->user_record_count; i++) {
+    hub_user_record_t *u = &state->user_records[i];
+    bool dup = false;
+    for (int j = 0; j < wr_seen_count; j++) {
+      if (wr_seen_types[j] == u->type && strcasecmp(wr_seen_names[j], u->name) == 0) {
+        dup = true;
+        break;
+      }
+    }
+    if (dup) continue;
+    snprintf(wr_seen_names[wr_seen_count], sizeof(wr_seen_names[0]), "%s", u->name);
+    wr_seen_types[wr_seen_count] = u->type;
+    wr_seen_count++;
+    SAFE_WRITE("%c|%s|%s|%s|%s|%ld|%ld\n",
+               u->type, u->uuid, u->name, u->password,
+               u->is_active ? "add" : "del",
+               (long)u->last_seen, (long)u->timestamp);
+  }
+
+  // Write usermask records (m| lines) — skip masks with no surviving owner
+  for (int i = 0; i < state->mask_record_count; i++) {
+    hub_mask_record_t *m = &state->mask_records[i];
+    bool owned = false;
+    for (int j = 0; j < state->user_record_count; j++) {
+      if (strcmp(state->user_records[j].uuid, m->uuid) == 0) {
+        owned = true;
+        break;
+      }
+    }
+    if (!owned) continue;
+    SAFE_WRITE("m|%s|%s|%s|%ld|%ld\n",
+               m->uuid, m->mask,
+               m->is_active ? "add" : "del",
+               (long)m->last_used, (long)m->timestamp);
   }
 
   for (int i = 0; i < state->bot_count; i++) {
@@ -477,53 +519,209 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           }
         }
       }
-      // FIXED: Handle unprefixed global entries (c, m, o, a, p)
-      // These are written by hub_config_write() without a prefix
-      else if (strcmp(k, "c") == 0 || strcmp(k, "m") == 0 ||
-               strcmp(k, "o") == 0 || strcmp(k, "a") == 0 ||
-               strcmp(k, "p") == 0) {
-        // Parse: key|value|...|timestamp
+      // Handle a| o| m| lines (new typed arrays) and legacy c|/p| global entries
+      else if (strcmp(k, "a") == 0 || strcmp(k, "o") == 0) {
+        /* New format: uuid|name|password|add/del|last_seen|timestamp
+         * Old format: password|timestamp  (a only — no opers had this shape)
+         * Detect by checking if first field looks like a UUID. */
+        char first[40] = {0};
+        char *pipe1 = strchr(v, '|');
+        if (pipe1) {
+          size_t flen = (size_t)(pipe1 - v);
+          if (flen < sizeof(first)) { memcpy(first, v, flen); first[flen] = 0; }
+        }
+        bool is_new = (strlen(first) == 36 && first[8] == '-' &&
+                       first[13] == '-' && first[18] == '-' && first[23] == '-');
+
+        if (is_new && state->user_record_count < MAX_HUB_USER_RECORDS) {
+          /* New format: uuid|name|password|action|last_seen|timestamp */
+          hub_user_record_t *u = &state->user_records[state->user_record_count];
+          memset(u, 0, sizeof(*u));
+          char *p1 = strchr(v, '|');           /* after uuid */
+          char *p2 = p1 ? strchr(p1+1, '|') : NULL; /* after name */
+          char *p3 = p2 ? strchr(p2+1, '|') : NULL; /* after pass */
+          char *p4 = p3 ? strchr(p3+1, '|') : NULL; /* after action */
+          char *p5 = p4 ? strchr(p4+1, '|') : NULL; /* after last_seen */
+          if (p1 && p2 && p3 && p4 && p5) {
+            snprintf(u->uuid,     sizeof(u->uuid),     "%.*s", (int)(p1-v),    v);
+            snprintf(u->name,     sizeof(u->name),     "%.*s", (int)(p2-p1-1), p1+1);
+            snprintf(u->password, sizeof(u->password), "%.*s", (int)(p3-p2-1), p2+1);
+            u->type      = k[0];
+            u->is_active = (strncmp(p3+1, "add", 3) == 0);
+            u->last_seen = (time_t)atol(p4+1);
+            u->timestamp = (time_t)atol(p5+1);
+            state->user_record_count++;
+          }
+        }
+      } else if (strcmp(k, "m") == 0) {
+        /* New format: uuid|mask|add/del|last_used|timestamp
+         * Old format: mask|add/del|timestamp
+         * Detect by UUID in first field. */
+        char first[40] = {0};
+        char *pipe1 = strchr(v, '|');
+        if (pipe1) {
+          size_t flen = (size_t)(pipe1 - v);
+          if (flen < sizeof(first)) { memcpy(first, v, flen); first[flen] = 0; }
+        }
+        bool is_new = (strlen(first) == 36 && first[8] == '-' &&
+                       first[13] == '-' && first[18] == '-' && first[23] == '-');
+
+        if (is_new && state->mask_record_count < MAX_HUB_USER_MASKS) {
+          hub_mask_record_t *m = &state->mask_records[state->mask_record_count];
+          memset(m, 0, sizeof(*m));
+          char *p1 = strchr(v, '|');           /* after uuid */
+          char *p2 = p1 ? strchr(p1+1, '|') : NULL; /* after mask */
+          char *p3 = p2 ? strchr(p2+1, '|') : NULL; /* after action */
+          char *p4 = p3 ? strchr(p3+1, '|') : NULL; /* after last_used */
+          if (p1 && p2 && p3 && p4) {
+            snprintf(m->uuid,     sizeof(m->uuid),     "%.*s", (int)(p1-v),    v);
+            snprintf(m->mask,     sizeof(m->mask),     "%.*s", (int)(p2-p1-1), p1+1);
+            m->is_active = (strncmp(p2+1, "add", 3) == 0);
+            m->last_used = (time_t)atol(p3+1);
+            m->timestamp = (time_t)atol(p4+1);
+            state->mask_record_count++;
+          }
+        }
+      } else if (strcmp(k, "c") == 0) {
+        /* Channel entries: chan|key[|modes]|op|timestamp */
         char *s_ts = strrchr(v, '|');
         if (s_ts) {
           *s_ts = 0;
           long ts = atol(s_ts + 1);
-
-          if (strcmp(k, "c") == 0 || strcmp(k, "o") == 0) {
-            /* Format: chan|key[|modes]|op — use first pipe for chan,
-             * last pipe for op, middle portion = extra */
-            char *pipe1 = strchr(v, '|');
-            if (pipe1) {
-              *pipe1 = 0;
-              char *rest = pipe1 + 1;
-              char *last = strrchr(rest, '|');
-              if (last) {
-                *last = 0;
-                char *op = last + 1;
-                hub_storage_update_global_entry(state, k, v, rest, op, ts);
-              }
+          char *pipe1 = strchr(v, '|');
+          if (pipe1) {
+            *pipe1 = 0;
+            char *rest = pipe1 + 1;
+            char *last = strrchr(rest, '|');
+            if (last) {
+              *last = 0;
+              hub_storage_update_global_entry(state, k, v, rest, last + 1, ts);
             }
-          } else if (strcmp(k, "m") == 0) {
-            // Mask: value|op
-            char *pipe1 = strchr(v, '|');
-            if (pipe1) {
-              *pipe1 = 0;
-              char *value = v;
-              char *op = pipe1 + 1;
-              // Strip any trailing pipes from op (malformed config entries)
-              char *op_end = op + strlen(op);
-              while (op_end > op && *(op_end - 1) == '|') {
-                *(--op_end) = '\0';
-              }
-              hub_storage_update_global_entry(state, k, value, "", op, ts);
-            }
-          } else {
-            // Admin/Bot password: just value
-            hub_storage_update_global_entry(state, k, v, "", "", ts);
           }
+        }
+      } else if (strcmp(k, "p") == 0) {
+        /* Bot pass: value|timestamp */
+        char *s_ts = strrchr(v, '|');
+        if (s_ts) {
+          *s_ts = 0;
+          hub_storage_update_global_entry(state, k, v, "", "", atol(s_ts + 1));
         }
       }
     }
     line = strtok_r(NULL, "\n", &saveptr);
+  }
+
+  /* Deduplicate user records by name: for each name, keep the record with the
+   * highest last_seen (ties: highest timestamp; further ties: first loaded).
+   * Remap orphaned mask records to the surviving UUID and drop duplicates.
+   * This handles the case where multiple hubs independently migrated the same
+   * admin/oper name and synced their records here. */
+  {
+    hub_user_record_t dedup_users[MAX_HUB_USER_RECORDS];
+    hub_mask_record_t dedup_masks[MAX_HUB_USER_MASKS];
+    int dedup_user_count = 0, dedup_mask_count = 0;
+    char uuid_remap[MAX_HUB_USER_RECORDS][2][37]; /* [i][0]=old, [1]=new */
+    int remap_count = 0;
+
+    for (int i = 0; i < state->user_record_count; i++) {
+      hub_user_record_t *u = &state->user_records[i];
+      /* Check if a record with the same type+name already exists in dedup_users */
+      int existing = -1;
+      for (int j = 0; j < dedup_user_count; j++) {
+        if (dedup_users[j].type == u->type &&
+            strcasecmp(dedup_users[j].name, u->name) == 0) {
+          existing = j;
+          break;
+        }
+      }
+      if (existing < 0) {
+        /* First time we see this name: add to dedup set */
+        dedup_users[dedup_user_count++] = *u;
+      } else {
+        /* Duplicate name: keep the better record */
+        hub_user_record_t *winner = &dedup_users[existing];
+        hub_user_record_t *loser  = u;
+        bool incoming_wins = (u->last_seen > winner->last_seen) ||
+                             (u->last_seen == winner->last_seen &&
+                              u->timestamp > winner->timestamp) ||
+                             (u->last_seen == winner->last_seen &&
+                              u->timestamp == winner->timestamp &&
+                              strcmp(u->uuid, winner->uuid) < 0);
+        if (incoming_wins) {
+          /* Remap old winner's UUID → incoming's UUID */
+          if (remap_count < MAX_HUB_USER_RECORDS) {
+            snprintf(uuid_remap[remap_count][0], 37, "%s", winner->uuid);
+            snprintf(uuid_remap[remap_count][1], 37, "%s", u->uuid);
+            remap_count++;
+          }
+          *winner = *u;
+          loser = &state->user_records[i]; /* already u, but for clarity */
+        } else {
+          /* Remap incoming's UUID → winner's UUID */
+          if (remap_count < MAX_HUB_USER_RECORDS) {
+            snprintf(uuid_remap[remap_count][0], 37, "%s", u->uuid);
+            snprintf(uuid_remap[remap_count][1], 37, "%s", winner->uuid);
+            remap_count++;
+          }
+        }
+        (void)loser;
+        if (remap_count > 0) {
+          hub_log("[HUB] Dedup: merged duplicate '%s' %c record\n", u->name, u->type);
+        }
+      }
+    }
+
+    /* Remap, dedup, and drop orphaned masks */
+    for (int i = 0; i < state->mask_record_count; i++) {
+      hub_mask_record_t *m = &state->mask_records[i];
+      /* Apply UUID remapping (known loser → winner) */
+      for (int r = 0; r < remap_count; r++) {
+        if (strcmp(m->uuid, uuid_remap[r][0]) == 0) {
+          snprintf(m->uuid, sizeof(m->uuid), "%s", uuid_remap[r][1]);
+          break;
+        }
+      }
+      /* Drop masks whose UUID has no surviving owner */
+      bool has_owner = false;
+      for (int j = 0; j < dedup_user_count; j++) {
+        if (strcmp(dedup_users[j].uuid, m->uuid) == 0) {
+          has_owner = true;
+          break;
+        }
+      }
+      if (!has_owner) {
+        hub_log("[HUB] Dedup: dropped orphaned mask '%s' (UUID %s)\n",
+                m->mask, m->uuid);
+        continue;
+      }
+      /* Check for duplicate (same uuid+mask already in dedup_masks) */
+      bool dup = false;
+      for (int j = 0; j < dedup_mask_count; j++) {
+        if (strcmp(dedup_masks[j].uuid, m->uuid) == 0 &&
+            strcasecmp(dedup_masks[j].mask, m->mask) == 0) {
+          if (m->last_used > dedup_masks[j].last_used)
+            dedup_masks[j] = *m;
+          dup = true;
+          break;
+        }
+      }
+      if (!dup && dedup_mask_count < MAX_HUB_USER_MASKS)
+        dedup_masks[dedup_mask_count++] = *m;
+    }
+
+    if (dedup_user_count != state->user_record_count ||
+        dedup_mask_count  != state->mask_record_count) {
+      hub_log("[HUB] Config dedup: users %d->%d, masks %d->%d\n",
+              state->user_record_count, dedup_user_count,
+              state->mask_record_count, dedup_mask_count);
+      memcpy(state->user_records, dedup_users,
+             sizeof(hub_user_record_t) * (size_t)dedup_user_count);
+      state->user_record_count = dedup_user_count;
+      memcpy(state->mask_records, dedup_masks,
+             sizeof(hub_mask_record_t) * (size_t)dedup_mask_count);
+      state->mask_record_count = dedup_mask_count;
+      hub_config_write(state);
+    }
   }
 
   secure_wipe(plaintext, plain_len);

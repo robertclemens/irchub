@@ -45,14 +45,21 @@ void hub_log(const char *format, ...) {
         }
     }
 
-    // Check if log file exists; if deleted, reopen it
-    struct stat st;
-    if (stat(HUB_LOG_FILE, &st) != 0) {
-        // File doesn't exist, close and reopen
-        if (log_fp) {
-            fclose(log_fp);
-            log_fp = NULL;
-        }
+    // Check if the path still points to the same inode as our open fd.
+    // A plain stat() check misses the case where the file was deleted and
+    // recreated (different inode) — the old fd silently writes to the
+    // unlinked inode while the new path belongs to a different file.
+    struct stat st_path, st_fd;
+    bool need_reopen = false;
+    if (stat(HUB_LOG_FILE, &st_path) != 0) {
+        need_reopen = true;  // path gone
+    } else if (fstat(fileno(log_fp), &st_fd) != 0 ||
+               st_fd.st_ino != st_path.st_ino) {
+        need_reopen = true;  // path replaced with a different file
+    }
+    if (need_reopen) {
+        fclose(log_fp);
+        log_fp = NULL;
     }
 
     // Reopen if not open
@@ -149,6 +156,7 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
         if (state->peers[p].fd == c->fd && c->fd != -1) {
             state->peers[p].connected = false;
             state->peers[p].fd = -1;
+            state->mesh_state_dirty = true;
         }
     }
 
@@ -314,27 +322,32 @@ bool send_ping(hub_client_t *c) {
 void hub_maintenance(hub_state_t *state) {
     time_t now = time(NULL);
     static time_t last_anti_entropy = 0;
-    static time_t last_mesh_gossip = 0;
-    static time_t last_config_sync = 0;  // NEW
+    static time_t last_mesh_gossip  = 0;
+    static time_t last_client_scan  = 0;
+    static time_t last_ip_cleanup   = 0;
+    static time_t last_purge        = 0;
+    static time_t last_status_dump  = 0;
 
     if (last_mesh_gossip == 0) last_mesh_gossip = now;
+    if (last_client_scan == 0) last_client_scan = now;
+    if (last_ip_cleanup  == 0) last_ip_cleanup  = now;
+    if (last_status_dump == 0) last_status_dump = now;
 
-    // Existing mesh gossip...
-    if (now - last_mesh_gossip > 5) {
+    /* Mesh state gossip: every 5 min as heartbeat, or immediately when peer
+     * topology changes (connect/disconnect sets mesh_state_dirty). */
+    if (state->mesh_state_dirty || (now - last_mesh_gossip > 300)) {
         last_mesh_gossip = now;
-        if (state->peer_count > 0) {
+        state->mesh_state_dirty = false;
+        if (state->peer_count > 0)
             hub_broadcast_mesh_state(state);
-        }
     }
 
-    /* First fire: stagger across hubs with a random 30-90 s window so all
-     * 10 hubs don't broadcast simultaneously on every restart. */
+    /* Anti-entropy: stagger first fire 30–90 s, then every MESH_ANTI_ENTROPY_INTERVAL */
     if (last_anti_entropy == 0) {
-        unsigned int jitter = 30 + (unsigned int)(rand() % 61); /* 30-90 s */
+        unsigned int jitter = 30 + (unsigned int)(rand() % 61);
         last_anti_entropy = now - (time_t)(MESH_ANTI_ENTROPY_INTERVAL - jitter);
     }
-
-    if ((now - last_anti_entropy) > MESH_ANTI_ENTROPY_INTERVAL) {
+    if (now - last_anti_entropy > MESH_ANTI_ENTROPY_INTERVAL) {
         last_anti_entropy = now;
         if (state->peer_count > 0) {
             hub_log("[MESH] Running periodic anti-entropy sync...\n");
@@ -343,46 +356,8 @@ void hub_maintenance(hub_state_t *state) {
             hub_broadcast_sync_to_peers(state, full_sync, -1);
         }
     }
-    
-    // NEW: Bidirectional config sync every 5 minutes
-    if (last_config_sync == 0) last_config_sync = now;
-    
-    if ((now - last_config_sync) > CONFIG_SYNC_INTERVAL) {
-        last_config_sync = now;
-        
-        int sync_count = 0;
-        for (int i = 0; i < state->client_count; i++) {
-            hub_client_t *c = state->clients[i];
-            if (c->type == CLIENT_BOT && c->authenticated) {
-                // Send CONFIG_PULL to request fresh config
-                unsigned char buffer[MAX_BUFFER];
-                unsigned char plain[16];
-                unsigned char tag[GCM_TAG_LEN];
-                
-                plain[0] = CMD_CONFIG_PULL;
-                uint32_t zero = 0;
-                memcpy(&plain[1], &zero, 4);
-                
-                int enc_len = aes_gcm_encrypt(plain, 5, c->session_key, 
-                                             buffer + 4, tag);
-                if (enc_len > 0) {
-                    memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-                    uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
-                    memcpy(buffer, &net_len, 4);
-                    
-                    if (write(c->fd, buffer, 4 + enc_len + GCM_TAG_LEN) == (ssize_t)(4 + enc_len + GCM_TAG_LEN)) {
-                        sync_count++;
-                    }
-                }
-            }
-        }
-        
-        if (sync_count > 0) {
-            hub_log("[HUB] Requested config sync from %d bots\n", sync_count);
-        }
-    }
 
-    // Debounced config write: flush at most once per CONFIG_WRITE_DEBOUNCE_S
+    /* Config write debounce */
     if (state->config_dirty &&
         (now - state->last_config_write) >= CONFIG_WRITE_DEBOUNCE_S) {
         hub_config_write(state);
@@ -390,43 +365,27 @@ void hub_maintenance(hub_state_t *state) {
         state->last_config_write = now;
     }
 
-    // IP limit cleanup every 5 minutes
-    static time_t last_ip_cleanup = 0;
-    if (last_ip_cleanup == 0) last_ip_cleanup = now;
-    if (now - last_ip_cleanup > 300) {  // Every 5 minutes
+    /* IP rate-limit cleanup: every 5 minutes */
+    if (now - last_ip_cleanup > 300) {
         cleanup_old_ip_limits(state);
         last_ip_cleanup = now;
     }
 
-    // Scheduled tombstone purge (if configured)
-    // Only the elected leader hub initiates to prevent duplicate purges across mesh
-    static time_t last_purge = 0;
+    /* Scheduled tombstone purge: daily, leader only */
     if (state->purge_days_setting > 0) {
         if (last_purge == 0) last_purge = now;
-
-        // Run daily (86400 seconds)
         if (now - last_purge > 86400) {
             last_purge = now;
-
-            // Leader election: only hub with smallest UUID in mesh initiates
             if (hub_should_initiate_scheduled_purge(state)) {
                 hub_log("[HUB] Running scheduled purge (older than %d days)\n",
                         state->purge_days_setting);
-
                 char purge_log[MAX_BUFFER];
                 time_t cutoff = now - ((time_t)state->purge_days_setting * 86400);
-
-                int purged = hub_execute_purge(state, cutoff,
-                                                purge_log, sizeof(purge_log));
-
-                if (purged > 0) {
+                int purged = hub_execute_purge(state, cutoff, purge_log, sizeof(purge_log));
+                if (purged > 0)
                     hub_log("[HUB] Scheduled purge removed %d tombstones\n", purged);
-                }
-
-                // Broadcast PURGE|<cutoff> to peer hubs.
                 char sched_purge_msg[64];
-                snprintf(sched_purge_msg, sizeof(sched_purge_msg),
-                         "PURGE|%ld\n", (long)cutoff);
+                snprintf(sched_purge_msg, sizeof(sched_purge_msg), "PURGE|%ld\n", (long)cutoff);
                 hub_broadcast_sync_to_peers(state, sched_purge_msg, -1);
             } else {
                 hub_log("[HUB] Scheduled purge skipped (not elected leader in mesh)\n");
@@ -434,24 +393,74 @@ void hub_maintenance(hub_state_t *state) {
         }
     }
 
-    // Existing timeout/ping code...
-    for (int i = 0; i < state->client_count; i++) {
-        hub_client_t *c = state->clients[i];
-        
-        if ((now - c->last_seen) > CLIENT_TIMEOUT) {
-            hub_log("[HUB] Client %s timed out.\n", c->ip);
-            hub_disconnect_client(state, c);
-            i--;
-            continue;
-        }
-        
-        if (c->authenticated && (now - c->last_seen) > PING_INTERVAL) {
-            if (!send_ping(c)) {
-                hub_log("[WARN] Ping failed to %s. Disconnecting.\n", c->ip);
+    /* Client timeout/ping scan: every 5 s (was every 250 ms — no need to scan
+     * 50+ clients 4x/sec when the ping window is 60 s and timeout is 180 s). */
+    if (now - last_client_scan >= 5) {
+        last_client_scan = now;
+        for (int i = 0; i < state->client_count; i++) {
+            hub_client_t *c = state->clients[i];
+            if ((now - c->last_seen) > CLIENT_TIMEOUT) {
+                hub_log("[HUB] Client %s timed out.\n", c->ip);
                 hub_disconnect_client(state, c);
                 i--;
                 continue;
             }
+            if (c->authenticated && (now - c->last_seen) > PING_INTERVAL) {
+                if (!send_ping(c)) {
+                    hub_log("[WARN] Ping failed to %s. Disconnecting.\n", c->ip);
+                    hub_disconnect_client(state, c);
+                    i--;
+                    continue;
+                }
+            }
+        }
+    }
+
+    /* Periodic status dump: every 60 s at INFO level.
+     * One line showing all timer countdowns and current load so idle churn
+     * is visible without having to stare at top/perf. */
+    if (now - last_status_dump >= 60) {
+        last_status_dump = now;
+
+        int bot_count = 0, peer_count = 0, authing_count = 0;
+        for (int i = 0; i < state->client_count; i++) {
+            hub_client_t *c = state->clients[i];
+            if (c->type == CLIENT_BOT && c->authenticated)       bot_count++;
+            else if (c->type == CLIENT_HUB && c->authenticated)  peer_count++;
+            else                                                  authing_count++;
+        }
+
+        time_t gossip_in    = 300 - (now - last_mesh_gossip);
+        time_t entropy_in   = MESH_ANTI_ENTROPY_INTERVAL - (now - last_anti_entropy);
+        time_t scan_in      = 5 - (now - last_client_scan);
+        time_t ipcln_in     = 300 - (now - last_ip_cleanup);
+        time_t purge_in     = (state->purge_days_setting > 0 && last_purge > 0)
+                                ? (86400 - (now - last_purge)) : -1;
+        time_t peer_chk_in  = PEER_RECONNECT_INTERVAL; /* approximate */
+
+        if (gossip_in  < 0) gossip_in  = 0;
+        if (entropy_in < 0) entropy_in = 0;
+        if (scan_in    < 0) scan_in    = 0;
+        if (ipcln_in   < 0) ipcln_in   = 0;
+
+        if (purge_in >= 0) {
+            hub_log("[STATUS] clients=%d(bots=%d peers=%d authing=%d) "
+                    "dirty=%d "
+                    "gossip_in=%lds entropy_in=%lds scan_in=%lds "
+                    "ipcln_in=%lds peer_chk_in=%lds purge_in=%lds\n",
+                    state->client_count, bot_count, peer_count, authing_count,
+                    state->config_dirty,
+                    (long)gossip_in, (long)entropy_in, (long)scan_in,
+                    (long)ipcln_in, (long)peer_chk_in, (long)purge_in);
+        } else {
+            hub_log("[STATUS] clients=%d(bots=%d peers=%d authing=%d) "
+                    "dirty=%d "
+                    "gossip_in=%lds entropy_in=%lds scan_in=%lds "
+                    "ipcln_in=%lds peer_chk_in=%lds purge=off\n",
+                    state->client_count, bot_count, peer_count, authing_count,
+                    state->config_dirty,
+                    (long)gossip_in, (long)entropy_in, (long)scan_in,
+                    (long)ipcln_in, (long)peer_chk_in);
         }
     }
 }
@@ -502,7 +511,7 @@ c->last_pong_sent = 0;
                     
                     state->peers[i].connected = true;
                     state->peers[i].fd = sockfd;
-                    
+                    state->mesh_state_dirty = true;
                     hub_peer_handshake(state, c);
                 } else {
                     close(sockfd);
@@ -865,8 +874,8 @@ int main(int argc, char *argv[]) {
         {
             char admin_pass1[MAX_PASS], admin_pass2[MAX_PASS];
             do {
-                read_pass_hidden("Admin Password: ", admin_pass1, sizeof(admin_pass1));
-                read_pass_hidden("Confirm Admin Password: ", admin_pass2, sizeof(admin_pass2));
+                read_pass_hidden("Hub Admin Password (for CLI tool & peer auth): ", admin_pass1, sizeof(admin_pass1));
+                read_pass_hidden("Confirm Hub Admin Password: ", admin_pass2, sizeof(admin_pass2));
                 if (strcmp(admin_pass1, admin_pass2) != 0) {
                     printf("Passwords do not match. Try again.\n");
                 }
@@ -874,6 +883,83 @@ int main(int argc, char *argv[]) {
             snprintf(state.admin_password, sizeof(state.admin_password), "%s", admin_pass1);
             secure_wipe(admin_pass1, sizeof(admin_pass1));
             secure_wipe(admin_pass2, sizeof(admin_pass2));
+        }
+
+        /* Bot admin user setup — creates first a| and m| records */
+        printf("\n--- Bot Admin User Setup ---\n");
+        printf("This creates the first named admin for IRC bot command authentication.\n\n");
+        {
+            char bot_admin_name[64] = {0};
+            char bot_admin_pass1[MAX_PASS] = {0}, bot_admin_pass2[MAX_PASS] = {0};
+
+            /* Name */
+            while (bot_admin_name[0] == '\0') {
+                printf("Admin friendly name (no spaces, e.g. robert): ");
+                fflush(stdout);
+                if (!fgets(bot_admin_name, sizeof(bot_admin_name), stdin)) break;
+                bot_admin_name[strcspn(bot_admin_name, "\n")] = '\0';
+                if (strchr(bot_admin_name, ' ') || strchr(bot_admin_name, '|')) {
+                    printf("Name cannot contain spaces or '|'. Try again.\n");
+                    bot_admin_name[0] = '\0';
+                }
+            }
+
+            /* Password */
+            do {
+                read_pass_hidden("Admin Password: ", bot_admin_pass1, sizeof(bot_admin_pass1));
+                read_pass_hidden("Confirm Admin Password: ", bot_admin_pass2, sizeof(bot_admin_pass2));
+                if (strcmp(bot_admin_pass1, bot_admin_pass2) != 0)
+                    printf("Passwords do not match. Try again.\n");
+            } while (strcmp(bot_admin_pass1, bot_admin_pass2) != 0);
+
+            /* Generate UUID and create the user record first */
+            char new_uuid[37];
+            generate_uuid_v4(new_uuid, sizeof(new_uuid));
+            time_t now = time(NULL);
+
+            if (state.user_record_count < MAX_HUB_USER_RECORDS) {
+                hub_user_record_t *u = &state.user_records[state.user_record_count++];
+                memset(u, 0, sizeof(*u));
+                snprintf(u->uuid,     sizeof(u->uuid),     "%s", new_uuid);
+                snprintf(u->name,     sizeof(u->name),     "%s", bot_admin_name);
+                snprintf(u->password, sizeof(u->password), "%s", bot_admin_pass1);
+                u->type = 'a'; u->is_active = true; u->timestamp = now;
+            }
+            secure_wipe(bot_admin_pass1, sizeof(bot_admin_pass1));
+            secure_wipe(bot_admin_pass2, sizeof(bot_admin_pass2));
+
+            /* Collect usermasks in a loop */
+            int masks_added = 0;
+            printf("\nEnter usermasks for this admin (e.g. nick!*@*.example.com).\n");
+            printf("Press Enter with no mask when done (at least one required).\n\n");
+            while (state.mask_record_count < MAX_HUB_USER_MASKS) {
+                char mask_buf[MAX_MASK_LEN] = {0};
+                printf("Usermask %d%s: ", masks_added + 1,
+                       masks_added == 0 ? " (required)" : " (or Enter to finish)");
+                fflush(stdout);
+                if (!fgets(mask_buf, sizeof(mask_buf), stdin)) break;
+                mask_buf[strcspn(mask_buf, "\n")] = '\0';
+                if (mask_buf[0] == '\0') {
+                    if (masks_added == 0) {
+                        printf("At least one usermask is required.\n");
+                        continue;
+                    }
+                    break;
+                }
+                if (!strchr(mask_buf, '!') || !strchr(mask_buf, '@')) {
+                    printf("Invalid — mask must contain '!' and '@'. Try again.\n");
+                    continue;
+                }
+                hub_mask_record_t *m = &state.mask_records[state.mask_record_count++];
+                memset(m, 0, sizeof(*m));
+                snprintf(m->uuid, sizeof(m->uuid), "%s", new_uuid);
+                snprintf(m->mask, sizeof(m->mask), "%s", mask_buf);
+                m->is_active = true; m->timestamp = now;
+                masks_added++;
+            }
+
+            printf("[+] Bot admin '%s' created with %d usermask(s), UUID %s\n",
+                   bot_admin_name, masks_added, new_uuid);
         }
 
         hub_config_write(&state);

@@ -434,17 +434,42 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   int written;
   buffer[0] = 0;
 
-  // 1. Add Global Entries (c, m, o, a, p only - skip h and n which are hub-only)
+  // 1. Add Global Entries (channels, bot-pass; skip h/n/a/m/o — now in typed arrays)
   for (int i = 0; i < state->global_entry_count; i++) {
     config_entry_t *e = &state->global_entries[i];
-    // Skip h and n - these are hub-only metadata, not meant for bots
-    if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0) {
+    if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0 ||
+        strcmp(e->key, "a") == 0 || strcmp(e->key, "m") == 0 ||
+        strcmp(e->key, "o") == 0) {
       continue;
     }
     written = snprintf(buffer + offset, max_len - offset, "%s|%s|%ld\n", e->key,
                        e->value, (long)e->timestamp);
     if (written < 0 || written >= (max_len - offset))
       break;
+    offset += written;
+  }
+
+  // 1a. Add named admin/oper records (new format: a|/o| lines)
+  for (int i = 0; i < state->user_record_count; i++) {
+    hub_user_record_t *u = &state->user_records[i];
+    written = snprintf(buffer + offset, max_len - offset,
+                       "%c|%s|%s|%s|%s|%ld|%ld\n",
+                       u->type, u->uuid, u->name, u->password,
+                       u->is_active ? "add" : "del",
+                       (long)u->last_seen, (long)u->timestamp);
+    if (written < 0 || written >= (max_len - offset)) break;
+    offset += written;
+  }
+
+  // 1b. Add usermask records (new format: m| lines)
+  for (int i = 0; i < state->mask_record_count; i++) {
+    hub_mask_record_t *m = &state->mask_records[i];
+    written = snprintf(buffer + offset, max_len - offset,
+                       "m|%s|%s|%s|%ld|%ld\n",
+                       m->uuid, m->mask,
+                       m->is_active ? "add" : "del",
+                       (long)m->last_used, (long)m->timestamp);
+    if (written < 0 || written >= (max_len - offset)) break;
     offset += written;
   }
 

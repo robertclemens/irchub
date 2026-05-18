@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <openssl/rand.h>
+#include <strings.h>
 #include <sys/select.h>
 
 static void send_config_to_bot(hub_state_t *state, hub_client_t *client);
@@ -1357,66 +1358,112 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         }
       }
     } else if (type == 'm') {
-      // Mask: m|mask|add|timestamp
-      char mask[MAX_MASK_LEN], op[8];
-      long ts;
-      if (sscanf(data, "%127[^|]|%7[^|]|%ld", mask, op, &ts) == 3) {
-        bool accepted = hub_storage_update_entry(state, client->id, "m", mask, "", op, ts);
-        hub_log("[HUB-DEBUG] Mask %s: ts=%ld op=%s -> %s\n", mask, ts, op, accepted ? "ACCEPTED" : "REJECTED");
-        if (accepted) {
-          updates++;
-          int w = snprintf(sync_buffer + sync_offset,
-                           sizeof(sync_buffer) - sync_offset,
-                           "b|%s|m|%s|%s|%ld\n", client->id, mask, op, ts);
-          if (w > 0)
-            sync_offset += w;
-        }
-      }
-    } else if (type == 'o') {
-      // Oper: o|mask|password|add|timestamp
-      char mask[MAX_MASK_LEN], pass[MAX_PASS], op[8];
-      long ts;
-      if (sscanf(data, "%127[^|]|%127[^|]|%7[^|]|%ld", mask, pass, op, &ts) ==
-          4) {
-        // Validate password exists
-        if (pass[0] != '\0') {
-          bool accepted = hub_storage_update_entry(state, client->id, "o", mask, pass, op, ts);
-          hub_log("[HUB-DEBUG] Oper %s: ts=%ld op=%s -> %s\n", mask, ts, op, accepted ? "ACCEPTED" : "REJECTED");
-          if (accepted) {
-            updates++;
-            int w = snprintf(
-                sync_buffer + sync_offset, sizeof(sync_buffer) - sync_offset,
-                "b|%s|o|%s|%s|%s|%ld\n", client->id, mask, pass, op, ts);
-            if (w > 0)
-              sync_offset += w;
+      /* New format: uuid|mask|add/del|last_used|timestamp
+       * Old format: mask|add/del|timestamp (legacy, ignored — hub drives config) */
+      char first[40] = {0};
+      char *pf = strchr(data, '|');
+      if (pf) { size_t fl = (size_t)(pf-data); if (fl<sizeof(first)){memcpy(first,data,fl);first[fl]=0;} }
+      bool is_new_m = (strlen(first)==36 && first[8]=='-' && first[13]=='-' && first[18]=='-' && first[23]=='-');
+      if (is_new_m) {
+        char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
+        char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
+        if (p1&&p2&&p3&&p4) {
+          char uuid[37], mask_s[MAX_MASK_LEN], act[8];
+          long last_used, ts;
+          snprintf(uuid,   sizeof(uuid),   "%.*s",(int)(p1-data),data);
+          snprintf(mask_s, sizeof(mask_s), "%.*s",(int)(p2-p1-1),p1+1);
+          snprintf(act,    sizeof(act),    "%.*s",(int)(p3-p2-1),p2+1);
+          last_used = atol(p3+1);
+          ts        = atol(p4+1);
+          bool is_active = (strncmp(act,"add",3)==0);
+          /* Find or create mask record */
+          hub_mask_record_t *found_m = NULL;
+          for (int mi=0; mi<state->mask_record_count; mi++) {
+            if (strcmp(state->mask_records[mi].uuid,uuid)==0 &&
+                strcasecmp(state->mask_records[mi].mask,mask_s)==0) {
+              found_m = &state->mask_records[mi]; break;
+            }
           }
-        } else {
-          hub_log("[HUB-DEBUG] Oper %s: REJECTED (no password)\n", mask);
+          if (!found_m && state->mask_record_count < MAX_HUB_USER_MASKS) {
+            found_m = &state->mask_records[state->mask_record_count++];
+            memset(found_m,0,sizeof(*found_m));
+            snprintf(found_m->uuid,sizeof(found_m->uuid),"%s",uuid);
+            snprintf(found_m->mask,sizeof(found_m->mask),"%s",mask_s);
+          }
+          if (found_m && ts > found_m->timestamp) {
+            found_m->is_active = is_active;
+            if (last_used > found_m->last_used) found_m->last_used = last_used;
+            found_m->timestamp = ts;
+            state->config_dirty = true;
+            updates++;
+            int w = snprintf(sync_buffer+sync_offset, sizeof(sync_buffer)-sync_offset,
+                             "m|%s|%s|%s|%ld|%ld\n", uuid, mask_s, act, last_used, ts);
+            if (w>0) sync_offset += w;
+          }
         }
       }
-    } else if (type == 'a') {
-      // Admin password: a|password|timestamp
-      char pass[MAX_PASS];
-      long ts = 0;
-      int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
-      if (parsed < 1) {
-        // Fallback: no delimiter found, treat entire data as password
-        snprintf(pass, MAX_PASS, "%s", data);
-        ts = time(NULL);
-      } else if (parsed < 2 || ts <= 0) {
-        // Password found but no valid timestamp
-        ts = time(NULL);
-      }
-      bool accepted = hub_storage_update_entry(state, client->id, "a", pass, "", "", ts);
-      hub_log("[HUB-DEBUG] AdminPass: ts=%ld -> %s\n", ts, accepted ? "ACCEPTED" : "REJECTED");
-      if (accepted) {
-        updates++;
-        // Broadcast as global admin password update (WITHOUT b| prefix)
-        int w =
-            snprintf(sync_buffer + sync_offset,
-                     sizeof(sync_buffer) - sync_offset, "a|%s|%ld\n", pass, ts);
-        if (w > 0)
-          sync_offset += w;
+    } else if (type == 'o' || type == 'a') {
+      /* New format: uuid|name|password|add/del|last_seen|timestamp
+       * Old single-password format is ignored (hub is authoritative) */
+      char first_ao[40] = {0};
+      char *pfao = strchr(data, '|');
+      if (pfao) { size_t fl=(size_t)(pfao-data); if(fl<sizeof(first_ao)){memcpy(first_ao,data,fl);first_ao[fl]=0;} }
+      bool is_new_ao = (strlen(first_ao)==36 && first_ao[8]=='-' && first_ao[13]=='-' && first_ao[18]=='-' && first_ao[23]=='-');
+      if (is_new_ao) {
+        char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
+        char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
+        char *p5=p4?strchr(p4+1,'|'):NULL;
+        if (p1&&p2&&p3&&p4&&p5) {
+          char uuid[37], uname[64], upass[MAX_PASS], act[8];
+          long last_seen, ts;
+          snprintf(uuid,  sizeof(uuid),  "%.*s",(int)(p1-data),data);
+          snprintf(uname, sizeof(uname), "%.*s",(int)(p2-p1-1),p1+1);
+          snprintf(upass, sizeof(upass), "%.*s",(int)(p3-p2-1),p2+1);
+          snprintf(act,   sizeof(act),   "%.*s",(int)(p4-p3-1),p3+1);
+          last_seen = atol(p4+1); ts = atol(p5+1);
+          bool is_active = (strncmp(act,"add",3)==0);
+          hub_user_record_t *found_u = NULL;
+          for (int ui=0; ui<state->user_record_count; ui++) {
+            if (strcmp(state->user_records[ui].uuid,uuid)==0) {
+              found_u = &state->user_records[ui]; break;
+            }
+          }
+          if (!found_u && state->user_record_count < MAX_HUB_USER_RECORDS) {
+            found_u = &state->user_records[state->user_record_count++];
+            memset(found_u,0,sizeof(*found_u));
+            snprintf(found_u->uuid,sizeof(found_u->uuid),"%s",uuid);
+          }
+          /* If no UUID match, check for name collision before creating new record */
+          if (!found_u) {
+            for (int ui2=0; ui2<state->user_record_count; ui2++) {
+              if (state->user_records[ui2].type == type &&
+                  strcasecmp(state->user_records[ui2].name, uname) == 0) {
+                found_u = &state->user_records[ui2]; /* merge into existing */
+                break;
+              }
+            }
+            /* If still not found, allocate new slot */
+            if (!found_u && state->user_record_count < MAX_HUB_USER_RECORDS) {
+              found_u = &state->user_records[state->user_record_count++];
+              memset(found_u,0,sizeof(*found_u));
+              snprintf(found_u->uuid,sizeof(found_u->uuid),"%s",uuid);
+            }
+          }
+          if (found_u && ts > found_u->timestamp) {
+            snprintf(found_u->name,     sizeof(found_u->name),     "%s",uname);
+            snprintf(found_u->password, sizeof(found_u->password), "%s",upass);
+            found_u->type      = type;
+            found_u->is_active = is_active;
+            if (last_seen > found_u->last_seen) found_u->last_seen = last_seen;
+            found_u->timestamp = ts;
+            state->config_dirty = true;
+            updates++;
+            int w = snprintf(sync_buffer+sync_offset, sizeof(sync_buffer)-sync_offset,
+                             "%c|%s|%s|%s|%s|%ld|%ld\n",
+                             type, uuid, uname, upass, act, last_seen, ts);
+            if (w>0) sync_offset += w;
+          }
+        }
       }
     } else if (type == 'p') {
       // Bot password: p|password|timestamp
@@ -1515,9 +1562,11 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
   // Bot-specific h/n (like b|uuid|h|..., b|uuid|n|...) are synced in the bot loop below
   for (int i = 0; i < state->global_entry_count; i++) {
     config_entry_t *e = &state->global_entries[i];
-    // Skip local-only configuration: h/n (hub metadata), w/x (allowlist/denylist)
+    /* Skip local-only and entries now handled via typed arrays */
     if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0 ||
-        strcmp(e->key, "w") == 0 || strcmp(e->key, "x") == 0)
+        strcmp(e->key, "w") == 0 || strcmp(e->key, "x") == 0 ||
+        strcmp(e->key, "a") == 0 || strcmp(e->key, "o") == 0 ||
+        strcmp(e->key, "m") == 0)
       continue;
     if (max_len - offset <= 1)
       break;
@@ -1527,6 +1576,31 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
                        e->key, e->value, (long)e->timestamp);
     if (written < 0 || written >= (max_len - offset))
       break;
+    offset += written;
+  }
+
+  /* Include new-format user records so peer hubs share admin/oper records */
+  for (int i = 0; i < state->user_record_count; i++) {
+    hub_user_record_t *u = &state->user_records[i];
+    if (max_len - offset <= 1) break;
+    written = snprintf(buffer + offset, max_len - offset,
+                       "%c|%s|%s|%s|%s|%ld|%ld\n",
+                       u->type, u->uuid, u->name, u->password,
+                       u->is_active ? "add" : "del",
+                       (long)u->last_seen, (long)u->timestamp);
+    if (written < 0 || written >= (max_len - offset)) break;
+    offset += written;
+  }
+  /* Include new-format mask records */
+  for (int i = 0; i < state->mask_record_count; i++) {
+    hub_mask_record_t *m = &state->mask_records[i];
+    if (max_len - offset <= 1) break;
+    written = snprintf(buffer + offset, max_len - offset,
+                       "m|%s|%s|%s|%ld|%ld\n",
+                       m->uuid, m->mask,
+                       m->is_active ? "add" : "del",
+                       (long)m->last_used, (long)m->timestamp);
+    if (written < 0 || written >= (max_len - offset)) break;
     offset += written;
   }
 
@@ -1638,6 +1712,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
 
   char *line = strtok_r(work_buf, "\n", &saveptr);
   int updates = 0;
+  int bot_push_updates = 0; /* only keys bots actually consume; gates full config push */
   char forward_buf[MAX_BUFFER];
   int fwd_offset = 0;
   forward_buf[0] = 0;
@@ -1727,7 +1802,153 @@ static void process_peer_sync(hub_state_t *state, char *payload,
           key[key_len] = 0;
 
           if (is_global_key(key)) {
-            // Parse: key|value|timestamp (value may contain |)
+            /* Detect new-format user/mask records by UUID in first value field.
+             * New: a|uuid|name|pass|add/del|last_seen|ts  (7 pipe-fields)
+             *      o|uuid|name|pass|add/del|last_seen|ts
+             *      m|uuid|mask|add/del|last_used|ts        (6 pipe-fields)
+             * Route these to typed arrays; old-format goes to global_entries. */
+            bool is_user_key = (key[0]=='a' || key[0]=='o') && key[1]=='\0';
+            bool is_mask_key = key[0]=='m' && key[1]=='\0';
+
+            if (is_user_key || is_mask_key) {
+              /* Check if first value field looks like a UUID */
+              char *vstart = p1 + 1;
+              char *vp1 = strchr(vstart, '|');
+              char first_f[40] = {0};
+              if (vp1) {
+                size_t fl = (size_t)(vp1 - vstart);
+                if (fl < sizeof(first_f)) { memcpy(first_f, vstart, fl); first_f[fl]=0; }
+              }
+              bool is_new_fmt = (strlen(first_f)==36 && first_f[8]=='-' &&
+                                 first_f[13]=='-' && first_f[18]=='-' && first_f[23]=='-');
+
+              if (is_new_fmt && is_user_key) {
+                /* Parse: uuid|name|pass|add/del|last_seen|ts */
+                char *pp1=vp1, *pp2=pp1?strchr(pp1+1,'|'):NULL;
+                char *pp3=pp2?strchr(pp2+1,'|'):NULL, *pp4=pp3?strchr(pp3+1,'|'):NULL;
+                char *pp5=pp4?strchr(pp4+1,'|'):NULL;
+                if (pp1&&pp2&&pp3&&pp4&&pp5) {
+                  char uuid[37], uname[64], upass[MAX_PASS], act[8];
+                  long last_seen, ts;
+                  snprintf(uuid,  sizeof(uuid),  "%.*s",(int)(pp1-vstart),vstart);
+                  snprintf(uname, sizeof(uname), "%.*s",(int)(pp2-pp1-1),pp1+1);
+                  snprintf(upass, sizeof(upass), "%.*s",(int)(pp3-pp2-1),pp2+1);
+                  snprintf(act,   sizeof(act),   "%.*s",(int)(pp4-pp3-1),pp3+1);
+                  last_seen = atol(pp4+1); ts = atol(pp5+1);
+                  bool is_active = (strncmp(act,"add",3)==0);
+                  hub_user_record_t *found_u = NULL;
+                  for (int ui=0; ui<state->user_record_count; ui++)
+                    if (strcmp(state->user_records[ui].uuid,uuid)==0)
+                      { found_u=&state->user_records[ui]; break; }
+                  bool discard_incoming = false;
+                  if (!found_u) {
+                    /* No UUID match — check for name collision before inserting */
+                    for (int ni=0; ni<state->user_record_count; ni++) {
+                      hub_user_record_t *ex = &state->user_records[ni];
+                      if (ex->type == key[0] && strcasecmp(ex->name, uname) == 0) {
+                        bool incoming_wins = (last_seen > ex->last_seen) ||
+                            (last_seen == ex->last_seen && ts > ex->timestamp) ||
+                            (last_seen == ex->last_seen && ts == ex->timestamp &&
+                             strcmp(uuid, ex->uuid) < 0);
+                        if (incoming_wins) {
+                          hub_log("[MESH] Dedup: '%s' (%c) UUID collision resolved, adopting %s\n",
+                                  uname, key[0], uuid);
+                          /* Remap existing record's masks to the incoming UUID */
+                          for (int mi=0; mi<state->mask_record_count; mi++)
+                            if (strcmp(state->mask_records[mi].uuid, ex->uuid) == 0)
+                              snprintf(state->mask_records[mi].uuid, 37, "%s", uuid);
+                          /* Update the user record's own UUID so the next sync
+                           * finds it by UUID lookup and skips the name collision path */
+                          snprintf(ex->uuid, sizeof(ex->uuid), "%s", uuid);
+                          state->config_dirty = true;
+                          found_u = ex;
+                        } else {
+                          discard_incoming = true;
+                        }
+                        break;
+                      }
+                    }
+                  }
+                  if (!found_u && !discard_incoming &&
+                      state->user_record_count < MAX_HUB_USER_RECORDS) {
+                    found_u=&state->user_records[state->user_record_count++];
+                    memset(found_u,0,sizeof(*found_u));
+                    snprintf(found_u->uuid,sizeof(found_u->uuid),"%s",uuid);
+                  }
+                  if (!discard_incoming && found_u && ts > found_u->timestamp) {
+                    snprintf(found_u->name,     sizeof(found_u->name),    "%s",uname);
+                    snprintf(found_u->password, sizeof(found_u->password),"%s",upass);
+                    found_u->type      = key[0];
+                    found_u->is_active = is_active;
+                    if (last_seen > found_u->last_seen) found_u->last_seen = last_seen;
+                    found_u->timestamp = ts;
+                    state->config_dirty = true;
+                    updates++;
+                    if (fwd_offset < (int)sizeof(forward_buf) - 200) {
+                      int w = snprintf(forward_buf+fwd_offset,
+                                       sizeof(forward_buf)-fwd_offset,
+                                       "%s\n", line);
+                      if (w>0) fwd_offset += w;
+                    }
+                  }
+                }
+                line = strtok_r(NULL, "\n", &saveptr);
+                continue;
+              }
+
+              if (is_new_fmt && is_mask_key) {
+                /* Parse: uuid|mask|add/del|last_used|ts */
+                char *pp1=vp1, *pp2=pp1?strchr(pp1+1,'|'):NULL;
+                char *pp3=pp2?strchr(pp2+1,'|'):NULL, *pp4=pp3?strchr(pp3+1,'|'):NULL;
+                if (pp1&&pp2&&pp3&&pp4) {
+                  char uuid[37], mask_s[MAX_MASK_LEN], act[8];
+                  long last_used, ts;
+                  snprintf(uuid,   sizeof(uuid),   "%.*s",(int)(pp1-vstart),vstart);
+                  snprintf(mask_s, sizeof(mask_s), "%.*s",(int)(pp2-pp1-1),pp1+1);
+                  snprintf(act,    sizeof(act),    "%.*s",(int)(pp3-pp2-1),pp2+1);
+                  last_used = atol(pp3+1); ts = atol(pp4+1);
+                  bool is_active = (strncmp(act,"add",3)==0);
+                  /* Reject masks for unknown user UUIDs */
+                  bool uuid_known = false;
+                  for (int ui=0; ui<state->user_record_count; ui++)
+                    if (strcmp(state->user_records[ui].uuid,uuid)==0)
+                      { uuid_known=true; break; }
+                  if (!uuid_known) {
+                    line = strtok_r(NULL, "\n", &saveptr);
+                    continue;
+                  }
+                  hub_mask_record_t *found_m = NULL;
+                  for (int mi=0; mi<state->mask_record_count; mi++)
+                    if (strcmp(state->mask_records[mi].uuid,uuid)==0 &&
+                        strcasecmp(state->mask_records[mi].mask,mask_s)==0)
+                      { found_m=&state->mask_records[mi]; break; }
+                  if (!found_m && state->mask_record_count < MAX_HUB_USER_MASKS) {
+                    found_m=&state->mask_records[state->mask_record_count++];
+                    memset(found_m,0,sizeof(*found_m));
+                    snprintf(found_m->uuid,sizeof(found_m->uuid),"%s",uuid);
+                    snprintf(found_m->mask,sizeof(found_m->mask),"%s",mask_s);
+                  }
+                  if (found_m && ts > found_m->timestamp) {
+                    found_m->is_active = is_active;
+                    if (last_used > found_m->last_used) found_m->last_used = last_used;
+                    found_m->timestamp = ts;
+                    state->config_dirty = true;
+                    updates++;
+                    bot_push_updates++; /* mask record — bots need this */
+                    if (fwd_offset < (int)sizeof(forward_buf) - 200) {
+                      int w = snprintf(forward_buf+fwd_offset,
+                                       sizeof(forward_buf)-fwd_offset,
+                                       "%s\n", line);
+                      if (w>0) fwd_offset += w;
+                    }
+                  }
+                }
+                line = strtok_r(NULL, "\n", &saveptr);
+                continue;
+              }
+            }
+
+            /* Old-format or non-user global key: store in global_entries */
             char *p_last = strrchr(p1 + 1, '|');
             if (p_last && p_last > p1) {
               char val[1024];
@@ -1739,6 +1960,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
 
                 if (store_global_entry_raw(state, key, val, ts)) {
                   updates++;
+                  bot_push_updates++; /* channel/password/global — bots need this */
                   // Forward to other peers
                   if (sizeof(forward_buf) - fwd_offset > 1200) {
                     int w = snprintf(forward_buf + fwd_offset,
@@ -1774,6 +1996,26 @@ static void process_peer_sync(hub_state_t *state, char *payload,
       if (p2) {
         *p2 = 0;
         char *p3 = strrchr(p2 + 1, '|');
+        /* seen/t entries are 3-field: b|uuid|key|timestamp (no value).
+         * When p3 is NULL the timestamp sits at p2+1 and value is empty. */
+        if (!p3 && (strcmp(p1 + 1, "seen") == 0 || strcmp(p1 + 1, "t") == 0)) {
+          snprintf(uuid, sizeof(uuid), "%s", ptr);
+          snprintf(key,  sizeof(key),  "%s", p1 + 1);
+          val[0] = '\0';
+          ts = atol(p2 + 1);
+          if (hub_storage_update_entry(state, uuid, key, "", "", "", ts)) {
+            updates++;
+            if (sizeof(forward_buf) - fwd_offset > 200) {
+              int w = snprintf(forward_buf + fwd_offset,
+                               sizeof(forward_buf) - fwd_offset,
+                               "b|%s|%s|%ld\n", uuid, key, ts);
+              if (w > 0 && w < (int)(sizeof(forward_buf) - fwd_offset))
+                fwd_offset += w;
+            }
+          }
+          line = strtok_r(NULL, "\n", &saveptr);
+          continue;
+        }
         if (p3) {
           *p3 = 0;
           snprintf(uuid, sizeof(uuid), "%s", ptr);
@@ -1831,6 +2073,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
               parsed_extra,
               parsed_op, ts)) {
             updates++;
+            /* seen/t are hub-side metadata; bots don't consume them */
+            if (strcmp(key, "seen") != 0 && strcmp(key, "t") != 0)
+              bot_push_updates++;
 
             if (sizeof(forward_buf) - fwd_offset > 1200) {
               int w = snprintf(forward_buf + fwd_offset,
@@ -1849,14 +2094,14 @@ static void process_peer_sync(hub_state_t *state, char *payload,
 
   if (updates > 0) {
     state->config_dirty = true;
-    hub_log("[MESH] Synced %d entries from Peer.\n", updates);
+    hub_log("[MESH] Synced %d entries from Peer (%d bot-relevant).\n",
+            updates, bot_push_updates);
 
-    if (fwd_offset > 0) {
+    if (fwd_offset > 0)
       hub_broadcast_sync_to_peers(state, forward_buf, origin_fd);
-    }
 
-    // Broadcast full config to all connected bots to ensure they receive peer updates
-    broadcast_full_config_to_all_bots(state);
+    if (bot_push_updates > 0)
+      broadcast_full_config_to_all_bots(state);
   }
 }
 
@@ -1984,6 +2229,36 @@ int hub_execute_purge(hub_state_t *state, time_t cutoff,
   memcpy(state->global_entries, new_entries,
          sizeof(config_entry_t) * new_count);
   state->global_entry_count = new_count;
+
+  // --- Purge tombstoned user_records (admins/opers) ---
+  hub_user_record_t new_users[MAX_HUB_USER_RECORDS];
+  int new_user_count = 0;
+  for (int i = 0; i < state->user_record_count; i++) {
+    if (!state->user_records[i].is_active &&
+        (cutoff == 0 || state->user_records[i].timestamp < cutoff)) {
+      purged_count++;
+    } else {
+      if (new_user_count < MAX_HUB_USER_RECORDS)
+        new_users[new_user_count++] = state->user_records[i];
+    }
+  }
+  memcpy(state->user_records, new_users, sizeof(hub_user_record_t) * new_user_count);
+  state->user_record_count = new_user_count;
+
+  // --- Purge tombstoned mask_records ---
+  hub_mask_record_t new_masks[MAX_HUB_USER_MASKS];
+  int new_mask_count = 0;
+  for (int i = 0; i < state->mask_record_count; i++) {
+    if (!state->mask_records[i].is_active &&
+        (cutoff == 0 || state->mask_records[i].timestamp < cutoff)) {
+      purged_count++;
+    } else {
+      if (new_mask_count < MAX_HUB_USER_MASKS)
+        new_masks[new_mask_count++] = state->mask_records[i];
+    }
+  }
+  memcpy(state->mask_records, new_masks, sizeof(hub_mask_record_t) * new_mask_count);
+  state->mask_record_count = new_mask_count;
 
   // --- Purge tombstoned bots (d=1 entry present, regardless of is_active) ---
   // Heap-allocated: bot_config_t[MAX_BOTS] is ~6.8 MB, too large for the stack.
@@ -4180,6 +4455,280 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             break;
         }
 
+  /* ================================================================
+   * Named Admin/Oper/Usermask commands (v2)
+   * ================================================================ */
+
+  case CMD_ADMIN_LIST_ADMINS: {
+    char buf[4096];
+    int off = 0;
+    off += snprintf(buf + off, sizeof(buf) - off, "ADMINS:");
+    for (int i = 0; i < state->user_record_count; i++) {
+      hub_user_record_t *u = &state->user_records[i];
+      if (u->type != 'a') continue;
+      off += snprintf(buf + off, sizeof(buf) - off, " %s(%s)%s",
+                      u->name, u->uuid, u->is_active ? "" : "[del]");
+    }
+    return send_response(state, client, buf);
+  }
+
+  case CMD_ADMIN_LIST_OPERS_V2: {
+    char buf[4096];
+    int off = 0;
+    off += snprintf(buf + off, sizeof(buf) - off, "OPERS:");
+    for (int i = 0; i < state->user_record_count; i++) {
+      hub_user_record_t *u = &state->user_records[i];
+      if (u->type != 'o') continue;
+      off += snprintf(buf + off, sizeof(buf) - off, " %s(%s)%s",
+                      u->name, u->uuid, u->is_active ? "" : "[del]");
+    }
+    return send_response(state, client, buf);
+  }
+
+  case CMD_ADMIN_ADD_ADMIN:
+  case CMD_ADMIN_ADD_OPER_RECORD: {
+    if (!payload || !*payload)
+      return send_response(state, client, "ERR:missing payload");
+    char pname[64], ppass[MAX_PASS], pmask[MAX_MASK_LEN];
+    if (sscanf(payload, "%63[^|]|%127[^|]|%255s", pname, ppass, pmask) < 3)
+      return send_response(state, client, "ERR:syntax name|password|mask");
+    /* Validate name: no pipes, printable, reasonable length */
+    if (!pname[0] || strchr(pname,'|'))
+      return send_response(state, client, "ERR:invalid name");
+    /* Validate mask format */
+    if (!strchr(pmask,'!') || !strchr(pmask,'@'))
+      return send_response(state, client, "ERR:mask must contain ! and @");
+    /* Check name uniqueness across all a|/o| records */
+    for (int i = 0; i < state->user_record_count; i++) {
+      if (state->user_records[i].is_active &&
+          strcasecmp(state->user_records[i].name, pname) == 0)
+        return send_response(state, client, "ERR:name already exists");
+    }
+    if (state->user_record_count >= MAX_HUB_USER_RECORDS)
+      return send_response(state, client, "ERR:user record table full");
+    if (state->mask_record_count >= MAX_HUB_USER_MASKS)
+      return send_response(state, client, "ERR:mask record table full");
+    time_t now = time(NULL);
+    char new_uuid[37];
+    generate_uuid_v4(new_uuid, sizeof(new_uuid));
+    hub_user_record_t *u = &state->user_records[state->user_record_count++];
+    memset(u, 0, sizeof(*u));
+    snprintf(u->uuid,     sizeof(u->uuid),     "%s", new_uuid);
+    snprintf(u->name,     sizeof(u->name),     "%s", pname);
+    snprintf(u->password, sizeof(u->password), "%s", ppass);
+    u->type      = (cmd == CMD_ADMIN_ADD_ADMIN) ? 'a' : 'o';
+    u->is_active = true;
+    u->last_seen = 0;
+    u->timestamp = now;
+    hub_mask_record_t *m = &state->mask_records[state->mask_record_count++];
+    memset(m, 0, sizeof(*m));
+    snprintf(m->uuid, sizeof(m->uuid), "%s", new_uuid);
+    snprintf(m->mask, sizeof(m->mask), "%s", pmask);
+    m->is_active = true;
+    m->last_used = 0;
+    m->timestamp = now;
+    state->config_dirty = true;
+    /* Broadcast new records to bots */
+    char sync[MAX_BUFFER];
+    snprintf(sync, sizeof(sync), "%c|%s|%s|%s|add|0|%ld\n",
+             u->type, u->uuid, u->name, u->password, (long)now);
+    hub_broadcast_config_to_bots(state, sync);
+    hub_broadcast_sync_to_peers(state, sync, -1);
+    snprintf(sync, sizeof(sync), "m|%s|%s|add|0|%ld\n",
+             m->uuid, m->mask, (long)now);
+    hub_broadcast_config_to_bots(state, sync);
+    hub_broadcast_sync_to_peers(state, sync, -1);
+    char resp[512];
+    snprintf(resp, sizeof(resp), "SUCCESS: %s %s added with mask %s",
+             (u->type == 'a') ? "Admin" : "Oper", pname, pmask);
+    return send_response(state, client, resp);
+  }
+
+  case CMD_ADMIN_DEL_ADMIN:
+  case CMD_ADMIN_DEL_OPER_RECORD: {
+    if (!payload || !*payload)
+      return send_response(state, client, "ERR:missing name");
+    hub_user_record_t *target = NULL;
+    for (int i = 0; i < state->user_record_count; i++) {
+      if (state->user_records[i].is_active &&
+          strcasecmp(state->user_records[i].name, payload) == 0) {
+        target = &state->user_records[i];
+        break;
+      }
+    }
+    if (!target)
+      return send_response(state, client, "ERR:user not found");
+    time_t now = time(NULL);
+    target->is_active = false;
+    /* Soft-delete all masks owned by this uuid */
+    for (int i = 0; i < state->mask_record_count; i++) {
+      if (strcmp(state->mask_records[i].uuid, target->uuid) == 0)
+        state->mask_records[i].is_active = false;
+    }
+    state->config_dirty = true;
+    /* Broadcast tombstone */
+    char sync[MAX_BUFFER];
+    snprintf(sync, sizeof(sync), "%c|%s|%s|%s|del|%ld|%ld\n",
+             target->type, target->uuid, target->name, target->password,
+             (long)target->last_seen, (long)now);
+    hub_broadcast_config_to_bots(state, sync);
+    hub_broadcast_sync_to_peers(state, sync, -1);
+    char resp[512];
+    snprintf(resp, sizeof(resp), "SUCCESS: %s removed", payload);
+    return send_response(state, client, resp);
+  }
+
+  case CMD_ADMIN_ADD_USERMASK: {
+    if (!payload || !*payload)
+      return send_response(state, client, "ERR:missing payload");
+    char pname[64], pmask[MAX_MASK_LEN];
+    if (sscanf(payload, "%63[^|]|%255s", pname, pmask) < 2)
+      return send_response(state, client, "ERR:syntax name|mask");
+    if (!strchr(pmask,'!') || !strchr(pmask,'@'))
+      return send_response(state, client, "ERR:mask must contain ! and @");
+    hub_user_record_t *target = NULL;
+    for (int i = 0; i < state->user_record_count; i++) {
+      if (state->user_records[i].is_active &&
+          strcasecmp(state->user_records[i].name, pname) == 0) {
+        target = &state->user_records[i];
+        break;
+      }
+    }
+    if (!target)
+      return send_response(state, client, "ERR:user not found");
+    /* Check for duplicate active mask */
+    for (int i = 0; i < state->mask_record_count; i++) {
+      if (state->mask_records[i].is_active &&
+          strcmp(state->mask_records[i].uuid, target->uuid) == 0 &&
+          strcasecmp(state->mask_records[i].mask, pmask) == 0)
+        return send_response(state, client, "ERR:mask already exists");
+    }
+    if (state->mask_record_count >= MAX_HUB_USER_MASKS)
+      return send_response(state, client, "ERR:mask table full");
+    time_t now = time(NULL);
+    char tuuid_add[37];
+    snprintf(tuuid_add, sizeof(tuuid_add), "%s", target->uuid);
+    hub_mask_record_t *m = &state->mask_records[state->mask_record_count++];
+    memset(m, 0, sizeof(*m));
+    snprintf(m->uuid, sizeof(m->uuid), "%s", tuuid_add);
+    snprintf(m->mask, sizeof(m->mask), "%s", pmask);
+    m->is_active = true;
+    m->last_used = 0;
+    m->timestamp = now;
+    state->config_dirty = true;
+    char sync[MAX_BUFFER];
+    snprintf(sync, sizeof(sync), "m|%s|%s|add|0|%ld\n", m->uuid, m->mask, (long)now);
+    hub_broadcast_config_to_bots(state, sync);
+    hub_broadcast_sync_to_peers(state, sync, -1);
+    char resp[512];
+    snprintf(resp, sizeof(resp), "SUCCESS: mask %s added to %s", pmask, pname);
+    return send_response(state, client, resp);
+  }
+
+  case CMD_ADMIN_DEL_USERMASK: {
+    if (!payload || !*payload)
+      return send_response(state, client, "ERR:missing payload");
+    char pname[64], pmask[MAX_MASK_LEN];
+    if (sscanf(payload, "%63[^|]|%255s", pname, pmask) < 2)
+      return send_response(state, client, "ERR:syntax name|mask");
+    hub_user_record_t *target = NULL;
+    for (int i = 0; i < state->user_record_count; i++) {
+      if (state->user_records[i].is_active &&
+          strcasecmp(state->user_records[i].name, pname) == 0) {
+        target = &state->user_records[i];
+        break;
+      }
+    }
+    if (!target)
+      return send_response(state, client, "ERR:user not found");
+    hub_mask_record_t *found = NULL;
+    for (int i = 0; i < state->mask_record_count; i++) {
+      if (state->mask_records[i].is_active &&
+          strcmp(state->mask_records[i].uuid, target->uuid) == 0 &&
+          strcasecmp(state->mask_records[i].mask, pmask) == 0) {
+        found = &state->mask_records[i];
+        break;
+      }
+    }
+    if (!found)
+      return send_response(state, client, "ERR:mask not found");
+    time_t now = time(NULL);
+    found->is_active = false;
+    state->config_dirty = true;
+    char sync[MAX_BUFFER];
+    snprintf(sync, sizeof(sync), "m|%s|%s|del|%ld|%ld\n",
+             found->uuid, found->mask, (long)found->last_used, (long)now);
+    hub_broadcast_config_to_bots(state, sync);
+    hub_broadcast_sync_to_peers(state, sync, -1);
+    char resp[512];
+    snprintf(resp, sizeof(resp), "SUCCESS: mask %s removed from %s", pmask, pname);
+    return send_response(state, client, resp);
+  }
+
+  case CMD_ADMIN_SET_USERPASS: {
+    if (!payload || !*payload)
+      return send_response(state, client, "ERR:missing payload");
+    char pname[64], ppass[MAX_PASS];
+    if (sscanf(payload, "%63[^|]|%127s", pname, ppass) < 2)
+      return send_response(state, client, "ERR:syntax name|newpassword");
+    hub_user_record_t *target = NULL;
+    for (int i = 0; i < state->user_record_count; i++) {
+      if (state->user_records[i].is_active &&
+          strcasecmp(state->user_records[i].name, pname) == 0) {
+        target = &state->user_records[i];
+        break;
+      }
+    }
+    if (!target)
+      return send_response(state, client, "ERR:user not found");
+    snprintf(target->password, sizeof(target->password), "%s", ppass);
+    state->config_dirty = true;
+    /* Push updated record to bots — copy fields first to avoid restrict alias */
+    char sync[MAX_BUFFER];
+    char ttype = target->type, tuuid[37], tname[64], tpass[MAX_PASS];
+    snprintf(tuuid,  sizeof(tuuid),  "%s", target->uuid);
+    snprintf(tname,  sizeof(tname),  "%s", target->name);
+    snprintf(tpass,  sizeof(tpass),  "%s", target->password);
+    snprintf(sync, sizeof(sync), "%c|%s|%s|%s|%s|%ld|%ld\n",
+             ttype, tuuid, tname, tpass,
+             target->is_active ? "add" : "del",
+             (long)target->last_seen, (long)target->timestamp);
+    hub_broadcast_config_to_bots(state, sync);
+    hub_broadcast_sync_to_peers(state, sync, -1);
+    char resp[512];
+    snprintf(resp, sizeof(resp), "SUCCESS: password changed for %s", pname);
+    return send_response(state, client, resp);
+  }
+
+  case CMD_ADMIN_MATCH: {
+    if (!payload || !*payload)
+      return send_response(state, client, "ERR:missing name");
+    bool match_all = (strcmp(payload, "*") == 0);
+    char buf[MAX_BUFFER];
+    int off = 0;
+    for (int i = 0; i < state->user_record_count; i++) {
+      hub_user_record_t *u = &state->user_records[i];
+      if (!match_all && strcasecmp(u->name, payload) != 0) continue;
+      off += snprintf(buf + off, sizeof(buf) - off,
+                      "%c|%s|%s|%s|%ld|%ld\n",
+                      u->type, u->uuid, u->name,
+                      u->is_active ? "add" : "del",
+                      (long)u->last_seen, (long)u->timestamp);
+      for (int j = 0; j < state->mask_record_count; j++) {
+        hub_mask_record_t *m = &state->mask_records[j];
+        if (strcmp(m->uuid, u->uuid) != 0) continue;
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "  m|%s|%s|%ld\n",
+                        m->mask, m->is_active ? "add" : "del",
+                        (long)m->last_used);
+        if (off >= (int)sizeof(buf) - 64) break;
+      }
+      if (off >= (int)sizeof(buf) - 64) break;
+    }
+    if (off == 0) snprintf(buf, sizeof(buf), "ERR:no match");
+    return send_response(state, client, buf);
+  }
+
   default:
     return send_response(state, client, "ERROR: Unknown command.");
   }
@@ -5128,6 +5677,23 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               hub_log("[HUB] Peer connected (Curve25519): %s (%s)\n",
                       peer_name[0] ? peer_name : client->ip,
                       peer_uuid[0] ? peer_uuid : "no-uuid");
+
+              /* Send our full state to the newly authenticated peer so it
+               * receives channels, user records, and mask records immediately
+               * rather than waiting for the next change-triggered sync. */
+              {
+                char *init_sync = malloc(MAX_BUFFER);
+                if (init_sync) {
+                  hub_generate_sync_packet(state, init_sync, MAX_BUFFER - 100);
+                  int slen = (int)strlen(init_sync);
+                  if (slen > 0) {
+                    queued_msg_t *sm = queued_msg_new(CMD_PEER_SYNC, LANE_BULK,
+                                                     (const unsigned char *)init_sync, slen);
+                    if (sm) peer_enqueue(client, sm);
+                  }
+                  free(init_sync);
+                }
+              }
             } else {
               hub_log("[HUB] Failed peer auth from %s\n", client->ip);
               record_failed_auth(state, client->ip);
