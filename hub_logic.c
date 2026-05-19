@@ -5783,7 +5783,11 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
           // ADMIN Authentication
           if (strncmp(payload, "ADMIN", 5) == 0) {
             char *pipe = strchr(payload + 6, '|');
+            /* IMPORTANT: zero the full buffer before copying — the constant-
+             * time compare below covers the full sizeof(pass_buf), so any
+             * stack garbage past the password byte would silently mismatch. */
             char pass_buf[128];
+            memset(pass_buf, 0, sizeof(pass_buf));
             int pass_len;
 
             if (pipe) {
@@ -5799,15 +5803,16 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               }
             }
 
-            /* Constant-time comparison. Lengths are bounded by the same
-             * buffer; we compare up to the full pass_buf size so we don't
-             * leak the password length via early exit. */
+            /* Constant-time comparison. Both buffers are pre-zeroed and the
+             * compare covers the full sizeof(pass_buf) so we don't leak the
+             * password length via early exit. */
             size_t cmplen = sizeof(pass_buf);
             char admin_pad[sizeof(pass_buf)];
             memset(admin_pad, 0, sizeof(admin_pad));
             snprintf(admin_pad, sizeof(admin_pad), "%s", state->admin_password);
             bool pass_ok = (CRYPTO_memcmp(pass_buf, admin_pad, cmplen) == 0);
             secure_wipe(admin_pad, sizeof(admin_pad));
+            secure_wipe(pass_buf,  sizeof(pass_buf));
             if (pass_ok) {
               client->type = CLIENT_ADMIN;
               client->authenticated = true;
@@ -5992,6 +5997,11 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             memset(peer_name, 0, sizeof(peer_name));
             memset(peer_bind_ip, 0, sizeof(peer_bind_ip));
 
+            /* Zero pass before sscanf to avoid stack-garbage mismatching the
+             * fixed-length CRYPTO_memcmp below.  sscanf %127s only writes
+             * up to the matched length plus a NUL — bytes past that remain
+             * whatever was on the stack. */
+            memset(pass, 0, sizeof(pass));
             int args = sscanf(payload + 4, "%127s %d %63s %63s %63s",
                               pass, &claimed_port, peer_uuid, peer_name, peer_bind_ip);
 
@@ -6002,6 +6012,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             bool peer_pass_ok = (args >= 1 &&
                 CRYPTO_memcmp(pass, peer_pad, sizeof(peer_pad)) == 0);
             secure_wipe(peer_pad, sizeof(peer_pad));
+            secure_wipe(pass,     sizeof(pass));
             if (peer_pass_ok) {
               hub_log("[HUB] WARN: peer %s used legacy admin_password auth. "
                       "Register peer with its Curve25519 pubkey to upgrade.\n",
