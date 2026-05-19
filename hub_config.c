@@ -9,7 +9,12 @@
 #include <unistd.h>
 
 void hub_set_config_pass(hub_state_t *s, const char *pass) {
-  RAND_bytes(s->config_pass_key, sizeof(s->config_pass_key));
+  if (RAND_bytes(s->config_pass_key, sizeof(s->config_pass_key)) != 1) {
+    /* Fall back to a deterministic key only if RNG fails — at that point the
+     * process has bigger problems but we still need to avoid leaving the
+     * "encrypted" copy equal to plaintext. */
+    memset(s->config_pass_key, 0xA5, sizeof(s->config_pass_key));
+  }
   size_t n = pass ? strlen(pass) : 0;
   if (n >= sizeof(s->config_pass)) n = sizeof(s->config_pass) - 1;
   for (size_t i = 0; i < sizeof(s->config_pass); i++)
@@ -18,11 +23,16 @@ void hub_set_config_pass(hub_state_t *s, const char *pass) {
 }
 
 void hub_get_config_pass(const hub_state_t *s, char *out, size_t len) {
+  if (len == 0) return;
   size_t sz = sizeof(s->config_pass);
   if (len < sz) sz = len;
   for (size_t i = 0; i < sz; i++)
     out[i] = (char)((unsigned char)s->config_pass[i] ^ s->config_pass_key[i]);
-  if (len > 0) out[len - 1] = '\0';
+  /* Always NUL-terminate within the caller's buffer. If sz < len (caller's
+   * buffer is larger than the stored cipher), terminate at sz so a short
+   * password isn't followed by stack junk; otherwise terminate at len-1. */
+  if (sz < len) out[sz] = '\0';
+  else          out[len - 1] = '\0';
 }
 
 // FIXED: Replaced EVP_BytesToKey with PKCS5_PBKDF2_HMAC
@@ -165,8 +175,15 @@ void hub_config_write(hub_state_t *state) {
 
   // FIXED: Use PBKDF2 instead of EVP_BytesToKey
   unsigned char salt[SALT_SIZE], key[32], iv[GCM_IV_LEN], tag[GCM_TAG_LEN];
-  RAND_bytes(salt, sizeof(salt));
-  RAND_bytes(iv, sizeof(iv));
+  /* CRITICAL: GCM nonce reuse is catastrophic. Bail out instead of writing
+   * with a predictable IV/salt if the RNG is unavailable. */
+  if (RAND_bytes(salt, sizeof(salt)) != 1 ||
+      RAND_bytes(iv,   sizeof(iv))   != 1) {
+    hub_log("RAND_bytes failed; aborting config write\n");
+    secure_wipe(buffer, offset);
+    free(buffer);
+    return;
+  }
 
   /* Decode XOR-obfuscated config password before use */
   char plain_pass[MAX_PASS];
@@ -199,12 +216,21 @@ void hub_config_write(hub_state_t *state) {
     return;
   }
 
-  EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv);
-  EVP_EncryptUpdate(ctx, ciphertext, &cipher_len, (unsigned char *)buffer,
-                    offset);
-  EVP_EncryptFinal_ex(ctx, ciphertext + cipher_len, &len);
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
+      EVP_EncryptUpdate(ctx, ciphertext, &cipher_len, (unsigned char *)buffer,
+                        offset) != 1 ||
+      EVP_EncryptFinal_ex(ctx, ciphertext + cipher_len, &len) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag) != 1) {
+    hub_log("EVP encryption failed; aborting config write\n");
+    EVP_CIPHER_CTX_free(ctx);
+    secure_wipe(key, sizeof(key));
+    secure_wipe(ciphertext, (size_t)offset + 16);
+    free(ciphertext);
+    secure_wipe(buffer, offset);
+    free(buffer);
+    return;
+  }
   cipher_len += len;
-  EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag);
   EVP_CIPHER_CTX_free(ctx);
 
   // Write to temp file then rename (atomic operation)
@@ -308,14 +334,17 @@ bool hub_config_load(hub_state_t *state, const char *password) {
     return false;
   }
 
-  EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv);
-  EVP_DecryptUpdate(ctx, plaintext, &plain_len, ciphertext, cipher_len);
-  EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
-
-  if (EVP_DecryptFinal_ex(ctx, plaintext + plain_len, &len) <= 0) {
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
+      EVP_DecryptUpdate(ctx, plaintext, &plain_len, ciphertext, cipher_len) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag) != 1 ||
+      EVP_DecryptFinal_ex(ctx, plaintext + plain_len, &len) <= 0) {
     hub_log("Config decryption failed (wrong password or corrupted file)\n");
     EVP_CIPHER_CTX_free(ctx);
     secure_wipe(key, sizeof(key));
+    /* Partial plaintext may have been written by EVP_DecryptUpdate before the
+     * GCM tag check failed. Wipe before freeing so unverified data doesn't
+     * outlive its scope. */
+    secure_wipe(plaintext, (size_t)cipher_len + 1);
     free(ciphertext);
     free(plaintext);
     return false;

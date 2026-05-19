@@ -1,7 +1,10 @@
 #include "hub.h"
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 void hub_log(const char *format, ...) {
     (void)format;
@@ -31,16 +34,28 @@ int main(int argc, char *argv[]) {
     const char *priv_file = (argc > 1) ? argv[1] : "hub_private.b64";
     const char *pub_file  = (argc > 2) ? argv[2] : "hub_public.b64";
 
-    FILE *fp = fopen(priv_file, "w");
-    if (!fp) {
+    /* Create the private key file 0600 — never world-readable. Using
+     * open() + fdopen() avoids the umask race where fopen("w") followed
+     * by chmod leaves a brief window where the file is world-readable. */
+    int priv_fd = open(priv_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (priv_fd < 0) {
         perror("Failed to create private key file");
+        secure_wipe(priv_b64, strlen(priv_b64));
+        free(priv_b64); free(pub_b64);
+        return 1;
+    }
+    (void)fchmod(priv_fd, 0600);
+    FILE *fp = fdopen(priv_fd, "w");
+    if (!fp) {
+        perror("fdopen private key file");
+        close(priv_fd);
         secure_wipe(priv_b64, strlen(priv_b64));
         free(priv_b64); free(pub_b64);
         return 1;
     }
     fprintf(fp, "%s", priv_b64);
     fclose(fp);
-    printf("Private key written to: %s\n", priv_file);
+    printf("Private key written to: %s (mode 0600)\n", priv_file);
 
     fp = fopen(pub_file, "w");
     if (!fp) {

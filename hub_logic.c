@@ -1,6 +1,7 @@
 #include "hub.h"
 #include <arpa/inet.h>
 #include <errno.h>
+#include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <strings.h>
 #include <sys/select.h>
@@ -5715,7 +5716,16 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               }
             }
 
-            if (strcmp(pass_buf, state->admin_password) == 0) {
+            /* Constant-time comparison. Lengths are bounded by the same
+             * buffer; we compare up to the full pass_buf size so we don't
+             * leak the password length via early exit. */
+            size_t cmplen = sizeof(pass_buf);
+            char admin_pad[sizeof(pass_buf)];
+            memset(admin_pad, 0, sizeof(admin_pad));
+            snprintf(admin_pad, sizeof(admin_pad), "%s", state->admin_password);
+            bool pass_ok = (CRYPTO_memcmp(pass_buf, admin_pad, cmplen) == 0);
+            secure_wipe(admin_pad, sizeof(admin_pad));
+            if (pass_ok) {
               client->type = CLIENT_ADMIN;
               client->authenticated = true;
               snprintf(client->id, sizeof(client->id), "ADMIN");
@@ -5765,7 +5775,14 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             int args = sscanf(payload + 4, "%127s %d %63s %63s %63s",
                               pass, &claimed_port, peer_uuid, peer_name, peer_bind_ip);
 
-            if (args >= 1 && strcmp(pass, state->admin_password) == 0) {
+            /* Constant-time comparison against admin_password. */
+            char peer_pad[sizeof(pass)];
+            memset(peer_pad, 0, sizeof(peer_pad));
+            snprintf(peer_pad, sizeof(peer_pad), "%s", state->admin_password);
+            bool peer_pass_ok = (args >= 1 &&
+                CRYPTO_memcmp(pass, peer_pad, sizeof(peer_pad)) == 0);
+            secure_wipe(peer_pad, sizeof(peer_pad));
+            if (peer_pass_ok) {
               client->type = CLIENT_HUB;
 
               bool is_authorized_peer = false;
