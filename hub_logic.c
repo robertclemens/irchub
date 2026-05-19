@@ -749,15 +749,46 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
                hub_log("[HUB][ERROR] Ephemeral X25519 keygen failed\n"); return false; }
     client->bot_eph_priv_set = true;
 
-    // Send: challenge_32 || eph_pub_32 (raw 64 bytes, length-prefixed)
-    unsigned char out_buf[64];
-    memcpy(out_buf,      client->challenge, 32);
-    memcpy(out_buf + 32, eph_pub,           32);
+    /* v2 challenge: challenge(32) || eph_pub(32) || hub_sig(64)
+     *
+     * Signature commits to the bot UUID, challenge, and ephemeral pubkey so
+     * a MITM cannot substitute its own eph_pub (the bot would derive a
+     * usable session key against the MITM, but the signature wouldn't
+     * verify under the legitimate hub's pubkey). */
+    size_t uuid_len = strlen(uuid);
+    size_t tlen = strlen("irchub-hub-auth-v2|") + uuid_len + 1 + 32 + 32;
+    unsigned char *transcript = malloc(tlen);
+    if (!transcript) {
+      hub_log("[HUB][ERROR] transcript alloc failed\n");
+      return false;
+    }
+    size_t off = 0;
+    memcpy(transcript + off, "irchub-hub-auth-v2|", 19); off += 19;
+    memcpy(transcript + off, uuid, uuid_len);            off += uuid_len;
+    transcript[off++] = '|';
+    memcpy(transcript + off, client->challenge, 32);     off += 32;
+    memcpy(transcript + off, eph_pub, 32);               off += 32;
 
-    uint32_t nl = htonl(64);
+    unsigned char hub_sig[ED25519_SIG_LEN];
+    if (!hub_crypto_ed25519_sign(state->hub_ed25519_priv,
+                                 transcript, off, hub_sig)) {
+      hub_log("[HUB][ERROR] Hub Ed25519 sign failed\n");
+      secure_wipe(transcript, off);
+      free(transcript);
+      return false;
+    }
+    secure_wipe(transcript, off);
+    free(transcript);
+
+    unsigned char out_buf[128];
+    memcpy(out_buf,       client->challenge, 32);
+    memcpy(out_buf + 32,  eph_pub,           32);
+    memcpy(out_buf + 64,  hub_sig,           64);
+
+    uint32_t nl = htonl(128);
     if (write(client->fd, &nl, 4) != 4 ||
-        write(client->fd, out_buf, 64) != 64) {
-      hub_log("[HUB][ERROR] Failed to send challenge to %s\n", uuid);
+        write(client->fd, out_buf, 128) != 128) {
+      hub_log("[HUB][ERROR] Failed to send v2 challenge to %s\n", uuid);
       return false;
     }
 
@@ -765,7 +796,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     client->bot_auth_state = BOT_AUTH_CHALLENGE_SENT;
     client->last_seen = time(NULL);
 
-    hub_log("[HUB] Sent Curve25519 challenge to bot %s\n", uuid);
+    hub_log("[HUB] Sent v2 signed Curve25519 challenge to bot %s\n", uuid);
     return true;
   }
 
@@ -816,12 +847,30 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
       return false;
     }
 
-    // Send 1-byte ACK
-    unsigned char ack = 0x01;
-    uint32_t nl = htonl(1);
+    /* Send GCM-encrypted 1-byte ACK so the bot can confirm the hub knows the
+     * session key — without this, a MITM that proxied the v2 challenge could
+     * still flip the bot into "authenticated" via a plaintext 0x01.
+     *
+     * aes_gcm_encrypt writes (iv || ciphertext) into the output buffer and
+     * the tag into the separate `tag` argument. Wire format we send is:
+     *   iv(GCM_IV_LEN=12) || ciphertext(1) || tag(GCM_TAG_LEN=16) = 29 bytes
+     */
+    unsigned char ack_plain = 0x01;
+    unsigned char ack_wire[GCM_IV_LEN + 1 + GCM_TAG_LEN];
+    unsigned char ack_tag[GCM_TAG_LEN];
+    int enc_len = aes_gcm_encrypt(&ack_plain, 1,
+                                  client->session_key, ack_wire, ack_tag);
+    if (enc_len <= 0) {
+      hub_log("[HUB][ERROR] ACK encrypt failed for %s\n", client->id);
+      return false;
+    }
+    memcpy(ack_wire + enc_len, ack_tag, GCM_TAG_LEN);
+    int ack_total = enc_len + GCM_TAG_LEN;
+
+    uint32_t nl = htonl((uint32_t)ack_total);
     if (write(client->fd, &nl, 4) != 4 ||
-        write(client->fd, &ack, 1) != 1) {
-      hub_log("[HUB][ERROR] Failed to send ACK to %s\n", client->id);
+        write(client->fd, ack_wire, ack_total) != ack_total) {
+      hub_log("[HUB][ERROR] Failed to send v2 ACK to %s\n", client->id);
       return false;
     }
 
