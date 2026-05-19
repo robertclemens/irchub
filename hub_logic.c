@@ -5599,7 +5599,11 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
   } break;
 
   case CMD_BOT_RELAY: {
-    /* Payload: target_uuid|cipher:tag — forward cipher:tag to the target bot */
+    /* Payload: target_uuid|cipher:tag — forward to target bot. The hub
+     * KNOWS the sender's identity from the authenticated session
+     * (client->id == sender bot's UUID). It prepends that UUID to the
+     * forwarded CMD_BOT_MSG payload so the receiver can verify the
+     * sender's GCM AAD binding. */
     char target_uuid[64], relay_payload[MAX_BUFFER];
     char *pipe = strchr(payload, '|');
     if (!pipe) {
@@ -5631,12 +5635,20 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
       break;
     }
 
-    int relay_len = (int)strlen(relay_payload);
+    /* Build the forwarded payload: "<sender_uuid>|<cipher:tag>" */
+    char forwarded_payload[MAX_BUFFER];
+    int forwarded_len = snprintf(forwarded_payload, sizeof(forwarded_payload),
+                                  "%s|%s", client->id, relay_payload);
+    if (forwarded_len <= 0 || forwarded_len >= (int)sizeof(forwarded_payload)) {
+      hub_log("[HUB] CMD_BOT_RELAY: forwarded payload too long\n");
+      break;
+    }
+    int relay_len = forwarded_len;
     unsigned char msg_plain[MAX_BUFFER], msg_buf[MAX_BUFFER], msg_tag[GCM_TAG_LEN];
     msg_plain[0] = (unsigned char)CMD_BOT_MSG;
     uint32_t msg_net_pay = htonl((uint32_t)relay_len);
     memcpy(&msg_plain[1], &msg_net_pay, 4);
-    memcpy(&msg_plain[5], relay_payload, relay_len);
+    memcpy(&msg_plain[5], forwarded_payload, relay_len);
 
     int enc_len = aes_gcm_encrypt(msg_plain, 5 + relay_len,
                                   target->session_key, msg_buf + 4, msg_tag);
