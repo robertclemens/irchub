@@ -3044,17 +3044,22 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
   case CMD_ADMIN_ADD_PEER:
     if (payload && strlen(payload) > 0) {
-      char ip[256], uuid[64], name[64];
+      char ip[256], uuid[64], name[64], pubkey_b64[128];
       int port;
       memset(uuid, 0, sizeof(uuid));
       memset(name, 0, sizeof(name));
+      memset(pubkey_b64, 0, sizeof(pubkey_b64));
 
-      // Parse: IP:PORT:UUID:NAME (UUID and NAME optional for backward compat)
-      int args = sscanf(payload, "%255[^:]:%d:%63[^:]:%63s", ip, &port, uuid, name);
+      /* Parse: IP:PORT:UUID:NAME[:PUBKEY_B64]
+       * UUID, NAME, PUBKEY_B64 all optional. When PUBKEY_B64 is supplied it
+       * must be a valid 88-char Curve25519 combined key (Ed25519+X25519) —
+       * the peer will be authenticated by signature instead of admin_password.
+       */
+      int args = sscanf(payload, "%255[^:]:%d:%63[^:]:%63[^:]:%127s",
+                        ip, &port, uuid, name, pubkey_b64);
 
       if (args >= 2) {
         if (state->peer_count < MAX_PEERS) {
-          // Check for duplicate UUID
           if (uuid[0]) {
             for (int i = 0; i < state->peer_count; i++) {
               if (state->peers[i].uuid[0] &&
@@ -3065,36 +3070,53 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             }
           }
 
-          // Note: Friendly name is now auto-populated from gossip, so no duplicate check needed
+          hub_peer_config_t *np = &state->peers[state->peer_count];
+          memset(np, 0, sizeof(*np));
 
           size_t ip_len = strlen(ip);
-          size_t max_len = sizeof(state->peers[state->peer_count].ip) - 1;
+          size_t max_len = sizeof(np->ip) - 1;
           size_t copy_len = (ip_len < max_len) ? ip_len : max_len;
+          memcpy(np->ip, ip, copy_len);
+          np->ip[copy_len] = '\0';
+          np->port = port;
 
-          memcpy(state->peers[state->peer_count].ip, ip, copy_len);
-          state->peers[state->peer_count].ip[copy_len] = '\0';
-          state->peers[state->peer_count].port = port;
+          if (uuid[0])
+            snprintf(np->uuid, sizeof(np->uuid), "%s", uuid);
+          if (name[0])
+            snprintf(np->friendly_name, sizeof(np->friendly_name), "%s", name);
 
-          if (uuid[0]) {
-            snprintf(state->peers[state->peer_count].uuid,
-                    sizeof(state->peers[state->peer_count].uuid), "%s", uuid);
+          np->has_pubkey = false;
+          if (pubkey_b64[0]) {
+            int dec_len = 0;
+            unsigned char *dec = base64_decode(pubkey_b64, &dec_len);
+            if (dec && dec_len == COMBINED_KEY_LEN) {
+              memcpy(np->ed_pub,     dec,                   ED25519_KEY_LEN);
+              memcpy(np->x25519_pub, dec + ED25519_KEY_LEN, X25519_KEY_LEN);
+              np->has_pubkey = true;
+            } else {
+              if (dec) { secure_wipe(dec, (size_t)(dec_len > 0 ? dec_len : 0)); free(dec); }
+              return send_response(state, client,
+                                   "ERROR: pubkey must be 88-char base64 of "
+                                   "64-byte Curve25519 combined key.");
+            }
+            if (dec) { secure_wipe(dec, (size_t)dec_len); free(dec); }
           }
 
-          if (name[0]) {
-            snprintf(state->peers[state->peer_count].friendly_name,
-                    sizeof(state->peers[state->peer_count].friendly_name), "%s", name);
-          }
-
-          state->peers[state->peer_count].connected = false;
-          state->peers[state->peer_count].fd = -1;
+          np->connected = false;
+          np->fd = -1;
           state->peer_count++;
           state->config_dirty = true;
-          return send_response(state, client, "SUCCESS: Peer Added.");
+          return send_response(state, client,
+                               np->has_pubkey ?
+                               "SUCCESS: Peer added (v2 / Ed25519 auth)." :
+                               "SUCCESS: Peer added (legacy auth — supply "
+                               "pubkey to enable v2).");
         }
         return send_response(state, client, "ERROR: Max peers reached.");
       }
     }
-    return send_response(state, client, "ERROR: Invalid format. Use IP:PORT:UUID:NAME");
+    return send_response(state, client,
+                         "ERROR: Use IP:PORT:UUID:NAME[:PUBKEY_B64]");
 
   case CMD_ADMIN_DEL_PEER:
     if (payload && strlen(payload) > 0) {
@@ -5764,8 +5786,145 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               return false;
             }
           }
-          // HUB Peer Authentication
-          else if (strncmp(payload, "HUB", 3) == 0) {
+          // v2 HUB Peer Authentication (Ed25519 signature, no password)
+          else if (strncmp(payload, "HUBv2|", 6) == 0) {
+            /* Format: "HUBv2|<uuid>|<port>|<name>|<bind_ip>|<ts>|<sig_b64>" */
+            char peer_uuid[64] = "", peer_name[64] = "", peer_bind_ip[64] = "";
+            char ts_str[32] = "", sig_b64[128] = "";
+            int claimed_port = 0;
+
+            /* Parse pipe-separated fields without sscanf-quirks. */
+            char work[MAX_BUFFER];
+            snprintf(work, sizeof(work), "%s", payload + 6);
+            char *sp_v2;
+            char *t_uuid    = strtok_r(work,  "|", &sp_v2);
+            char *t_port    = strtok_r(NULL,  "|", &sp_v2);
+            char *t_name    = strtok_r(NULL,  "|", &sp_v2);
+            char *t_bind    = strtok_r(NULL,  "|", &sp_v2);
+            char *t_ts      = strtok_r(NULL,  "|", &sp_v2);
+            char *t_sig     = strtok_r(NULL,  "|", &sp_v2);
+            if (!t_uuid || !t_port || !t_name || !t_bind || !t_ts || !t_sig) {
+              hub_log("[HUB] v2 peer auth: malformed payload from %s\n",
+                      client->ip);
+              secure_wipe(plain, sizeof(plain));
+              hub_disconnect_client(state, client);
+              return false;
+            }
+            snprintf(peer_uuid,    sizeof(peer_uuid),    "%s", t_uuid);
+            snprintf(peer_name,    sizeof(peer_name),    "%s", t_name);
+            snprintf(peer_bind_ip, sizeof(peer_bind_ip), "%s", t_bind);
+            snprintf(ts_str,       sizeof(ts_str),       "%s", t_ts);
+            snprintf(sig_b64,      sizeof(sig_b64),      "%s", t_sig);
+            claimed_port = atoi(t_port);
+
+            /* Locate peer entry by UUID; require stored pubkey. */
+            int peer_idx = -1;
+            for (int p = 0; p < state->peer_count; p++) {
+              if (state->peers[p].uuid[0] &&
+                  strcmp(state->peers[p].uuid, peer_uuid) == 0) {
+                peer_idx = p;
+                break;
+              }
+            }
+            if (peer_idx < 0 || !state->peers[peer_idx].has_pubkey) {
+              hub_log("[HUB] v2 peer auth: no pubkey on file for uuid %s "
+                      "(from %s) — add the peer with its 88-char pubkey.\n",
+                      peer_uuid, client->ip);
+              record_failed_auth(state, client->ip);
+              secure_wipe(plain, sizeof(plain));
+              hub_disconnect_client(state, client);
+              return false;
+            }
+
+            /* Reconstruct the transcript the sender committed to and verify. */
+            char transcript[512];
+            int tlen = snprintf(transcript, sizeof(transcript),
+                                "irchub-peer-auth-v2|%s|%s|%d|%s|%s",
+                                peer_uuid, ts_str, claimed_port,
+                                peer_name, peer_bind_ip);
+            if (tlen < 0 || tlen >= (int)sizeof(transcript)) {
+              hub_log("[HUB] v2 peer auth: transcript overflow\n");
+              secure_wipe(plain, sizeof(plain));
+              hub_disconnect_client(state, client);
+              return false;
+            }
+
+            int sig_len = 0;
+            unsigned char *sig = base64_decode(sig_b64, &sig_len);
+            if (!sig || sig_len != ED25519_SIG_LEN) {
+              hub_log("[HUB] v2 peer auth: bad signature length %d\n", sig_len);
+              if (sig) { secure_wipe(sig, (size_t)sig_len); free(sig); }
+              record_failed_auth(state, client->ip);
+              secure_wipe(plain, sizeof(plain));
+              hub_disconnect_client(state, client);
+              return false;
+            }
+
+            bool sig_ok = hub_crypto_ed25519_verify(
+                state->peers[peer_idx].ed_pub,
+                (unsigned char *)transcript, (size_t)tlen, sig);
+            secure_wipe(sig, (size_t)sig_len);
+            free(sig);
+
+            if (!sig_ok) {
+              hub_log("[HUB] v2 peer auth: signature verify FAILED for uuid %s "
+                      "(from %s)\n", peer_uuid, client->ip);
+              record_failed_auth(state, client->ip);
+              secure_wipe(plain, sizeof(plain));
+              hub_disconnect_client(state, client);
+              return false;
+            }
+
+            /* Freshness window (±60 s). */
+            time_t client_ts = (time_t)strtoll(ts_str, NULL, 10);
+            time_t now_v2 = time(NULL);
+            if (llabs((long long)(now_v2 - client_ts)) > 60) {
+              hub_log("[HUB] v2 peer auth: timestamp skew %lds (max 60) for %s\n",
+                      (long)(now_v2 - client_ts), peer_uuid);
+              record_failed_auth(state, client->ip);
+              secure_wipe(plain, sizeof(plain));
+              hub_disconnect_client(state, client);
+              return false;
+            }
+
+            /* Accept. */
+            client->type = CLIENT_HUB;
+            client->authenticated = true;
+            state->peers[peer_idx].connected = true;
+            state->peers[peer_idx].fd = client->fd;
+            snprintf(state->peers[peer_idx].remote_ip,
+                     sizeof(state->peers[peer_idx].remote_ip), "%s", client->ip);
+            if (!state->peers[peer_idx].friendly_name[0] && peer_name[0]) {
+              snprintf(state->peers[peer_idx].friendly_name,
+                       sizeof(state->peers[peer_idx].friendly_name),
+                       "%s", peer_name);
+            }
+            snprintf(client->id, sizeof(client->id), "%s",
+                     state->peers[peer_idx].friendly_name[0] ?
+                     state->peers[peer_idx].friendly_name :
+                     (peer_name[0] ? peer_name : "HUB-PEER"));
+            client->id[sizeof(client->id) - 1] = 0;
+
+            hub_log("[HUB] v2 Peer authenticated by Ed25519 signature: %s (%s)\n",
+                    peer_name[0] ? peer_name : client->ip, peer_uuid);
+
+            /* Initial full state sync to the newly authenticated peer. */
+            {
+              char *init_sync = malloc(MAX_BUFFER);
+              if (init_sync) {
+                hub_generate_sync_packet(state, init_sync, MAX_BUFFER - 100);
+                int slen = (int)strlen(init_sync);
+                if (slen > 0) {
+                  queued_msg_t *sm = queued_msg_new(CMD_PEER_SYNC, LANE_BULK,
+                                                   (const unsigned char *)init_sync, slen);
+                  if (sm) peer_enqueue(client, sm);
+                }
+                free(init_sync);
+              }
+            }
+          }
+          // Legacy HUB Peer Authentication (shared admin_password — DEPRECATED)
+          else if (strncmp(payload, "HUB ", 4) == 0) {
             char pass[128], peer_uuid[64], peer_name[64], peer_bind_ip[64];
             int claimed_port = 0;
             memset(peer_uuid, 0, sizeof(peer_uuid));
@@ -5783,6 +5942,9 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 CRYPTO_memcmp(pass, peer_pad, sizeof(peer_pad)) == 0);
             secure_wipe(peer_pad, sizeof(peer_pad));
             if (peer_pass_ok) {
+              hub_log("[HUB] WARN: peer %s used legacy admin_password auth. "
+                      "Register peer with its Curve25519 pubkey to upgrade.\n",
+                      peer_uuid[0] ? peer_uuid : client->ip);
               client->type = CLIENT_HUB;
 
               bool is_authorized_peer = false;

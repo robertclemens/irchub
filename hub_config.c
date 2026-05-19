@@ -72,9 +72,26 @@ void hub_config_write(hub_state_t *state) {
   }
 
   for (int i = 0; i < state->peer_count; i++) {
-    SAFE_WRITE("peer|%s|%d|%s|%s\n", state->peers[i].ip, state->peers[i].port,
+    /* Serialize the per-peer Curve25519 pubkey (88 chars base64 of 64-byte
+     * combined Ed25519+X25519) as the 5th field. Empty string means "no
+     * pubkey known, fall back to legacy peer auth". */
+    char peer_pub_b64[COMBINED_KEY_B64 + 1] = "";
+    if (state->peers[i].has_pubkey) {
+      unsigned char combined[COMBINED_KEY_LEN];
+      memcpy(combined,                    state->peers[i].ed_pub,    ED25519_KEY_LEN);
+      memcpy(combined + ED25519_KEY_LEN,  state->peers[i].x25519_pub, X25519_KEY_LEN);
+      char *b64 = base64_encode(combined, COMBINED_KEY_LEN);
+      if (b64) {
+        snprintf(peer_pub_b64, sizeof(peer_pub_b64), "%s", b64);
+        secure_wipe(b64, strlen(b64));
+        free(b64);
+      }
+      secure_wipe(combined, sizeof(combined));
+    }
+    SAFE_WRITE("peer|%s|%d|%s|%s|%s\n", state->peers[i].ip, state->peers[i].port,
                state->peers[i].uuid[0] ? state->peers[i].uuid : "",
-               state->peers[i].friendly_name[0] ? state->peers[i].friendly_name : "");
+               state->peers[i].friendly_name[0] ? state->peers[i].friendly_name : "",
+               peer_pub_b64);
   }
 
   if (state->hub_keys_loaded) {
@@ -420,7 +437,11 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         }
         if (d) free(d);
       } else if (strcmp(k, "peer") == 0) {
-        // Parse: peer|ip|port|uuid|friendly_name
+        /* Formats accepted:
+         *   peer|ip|port                                 (oldest)
+         *   peer|ip|port|uuid|friendly_name              (v1)
+         *   peer|ip|port|uuid|friendly_name|pubkey_b64   (v2; pubkey may be empty)
+         */
         char *ip = v;
         char *port_str = strchr(ip, '|');
         if (!port_str) port_str = strchr(ip, ':');
@@ -435,35 +456,47 @@ bool hub_config_load(hub_state_t *state, const char *password) {
             uuid_str++;
 
             char *name_str = strchr(uuid_str, '|');
+            char *pubkey_str = NULL;
             if (name_str) {
               *name_str = 0;
               name_str++;
+              pubkey_str = strchr(name_str, '|');
+              if (pubkey_str) { *pubkey_str = 0; pubkey_str++; }
             }
 
-            // Store peer data
-            snprintf(state->peers[state->peer_count].ip,
-                     sizeof(state->peers[state->peer_count].ip), "%s", ip);
+            hub_peer_config_t *p = &state->peers[state->peer_count];
+            snprintf(p->ip, sizeof(p->ip), "%s", ip);
+            p->port = atoi(port_str);
+            snprintf(p->uuid, sizeof(p->uuid), "%s", uuid_str);
 
-            state->peers[state->peer_count].port = atoi(port_str);
+            if (name_str && name_str[0])
+              snprintf(p->friendly_name, sizeof(p->friendly_name), "%s", name_str);
 
-            snprintf(state->peers[state->peer_count].uuid,
-                     sizeof(state->peers[state->peer_count].uuid), "%s", uuid_str);
-
-            // Only copy friendly_name if it's non-empty
-            if (name_str && name_str[0]) {
-              snprintf(state->peers[state->peer_count].friendly_name,
-                       sizeof(state->peers[state->peer_count].friendly_name),
-                       "%s", name_str);
+            p->has_pubkey = false;
+            if (pubkey_str && pubkey_str[0]) {
+              int dec_len = 0;
+              unsigned char *dec = base64_decode(pubkey_str, &dec_len);
+              if (dec && dec_len == COMBINED_KEY_LEN) {
+                memcpy(p->ed_pub,     dec,                   ED25519_KEY_LEN);
+                memcpy(p->x25519_pub, dec + ED25519_KEY_LEN, X25519_KEY_LEN);
+                p->has_pubkey = true;
+              } else {
+                hub_log("[PEER] peer %s pubkey wrong length (%d, need %d) — "
+                        "ignoring; v2 auth disabled for this peer\n",
+                        p->uuid, dec_len, COMBINED_KEY_LEN);
+              }
+              if (dec) { secure_wipe(dec, (size_t)(dec_len > 0 ? dec_len : 0)); free(dec); }
             }
 
-            state->peers[state->peer_count].fd = -1;
+            p->fd = -1;
             state->peer_count++;
           } else {
             // Old format: peer|ip|port (for backward compatibility)
-            snprintf(state->peers[state->peer_count].ip,
-                     sizeof(state->peers[state->peer_count].ip), "%s", ip);
-            state->peers[state->peer_count].port = atoi(port_str);
-            state->peers[state->peer_count].fd = -1;
+            hub_peer_config_t *p = &state->peers[state->peer_count];
+            snprintf(p->ip, sizeof(p->ip), "%s", ip);
+            p->port = atoi(port_str);
+            p->fd = -1;
+            p->has_pubkey = false;
             state->peer_count++;
           }
         }

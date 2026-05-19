@@ -225,26 +225,96 @@ static int hub_seal_send(const unsigned char hub_x25519_pub[32],
     return 32 + enc_len + GCM_TAG_LEN;
 }
 
-void hub_peer_handshake(hub_state_t *state, hub_client_t *c) {
+void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
+                         const hub_peer_config_t *peer) {
     if (!state->hub_keys_loaded) {
         hub_log("[PEER] No Curve25519 keys loaded; cannot handshake\n");
         hub_disconnect_client(state, c);
         return;
     }
 
-    unsigned char pack[256];
-    int msg_len = snprintf((char*)pack, sizeof(pack), "HUB %s %d %s %s %s",
+    /* v2 path: if we have the peer's pubkey on file, build a signed
+     * handshake and seal it to the peer's X25519 pubkey. This drops the
+     * shared admin_password from the wire entirely. */
+    const bool use_v2 = (peer && peer->has_pubkey);
+
+    unsigned char pack[1024];
+    int msg_len;
+
+    if (use_v2) {
+        /* Build the transcript the signature commits to. The receiver
+         * reconstructs the same transcript from the parsed fields and the
+         * stored peer record before verifying. */
+        time_t now = time(NULL);
+        char ts_str[32];
+        snprintf(ts_str, sizeof(ts_str), "%lld", (long long)now);
+
+        char transcript[512];
+        int tlen = snprintf(transcript, sizeof(transcript),
+                            "irchub-peer-auth-v2|%s|%s|%d|%s|%s",
+                            state->hub_uuid, ts_str, state->port,
+                            state->hub_friendly_name, state->bind_ip);
+        if (tlen < 0 || tlen >= (int)sizeof(transcript)) {
+            hub_log("[PEER] v2 transcript too long\n");
+            hub_disconnect_client(state, c);
+            return;
+        }
+
+        unsigned char sig[ED25519_SIG_LEN];
+        if (!hub_crypto_ed25519_sign(state->hub_ed25519_priv,
+                                     (unsigned char *)transcript, (size_t)tlen,
+                                     sig)) {
+            hub_log("[PEER] v2 Ed25519 sign failed\n");
+            hub_disconnect_client(state, c);
+            return;
+        }
+
+        char *sig_b64 = base64_encode(sig, ED25519_SIG_LEN);
+        if (!sig_b64) {
+            hub_log("[PEER] v2 signature base64 encode failed\n");
+            hub_disconnect_client(state, c);
+            return;
+        }
+
+        msg_len = snprintf((char *)pack, sizeof(pack),
+                           "HUBv2|%s|%d|%s|%s|%s|%s",
+                           state->hub_uuid, state->port,
+                           state->hub_friendly_name, state->bind_ip,
+                           ts_str, sig_b64);
+        secure_wipe(sig_b64, strlen(sig_b64));
+        free(sig_b64);
+
+        if (msg_len < 0 || msg_len >= (int)sizeof(pack)) {
+            hub_log("[PEER] v2 packet too long\n");
+            hub_disconnect_client(state, c);
+            return;
+        }
+    } else {
+        /* Legacy v1: shared admin_password inside a sealed-box keyed to OWN
+         * pubkey (only works because all hubs currently share the same
+         * Curve25519 keypair). Will be removed once every peer in the mesh
+         * has been re-added with its pubkey. */
+        hub_log("[PEER] WARN: legacy v1 peer handshake to %s — no pubkey on "
+                "record; add peer with its 88-char Curve25519 pubkey to upgrade.\n",
+                peer ? peer->ip : "(unknown)");
+        msg_len = snprintf((char *)pack, sizeof(pack), "HUB %s %d %s %s %s",
                            state->admin_password, state->port,
                            state->hub_uuid, state->hub_friendly_name, state->bind_ip);
-    if (msg_len < 0 || msg_len >= (int)sizeof(pack)) {
-        hub_log("[PEER] Handshake message too long\n");
-        hub_disconnect_client(state, c);
-        return;
+        if (msg_len < 0 || msg_len >= (int)sizeof(pack)) {
+            hub_log("[PEER] Handshake message too long\n");
+            hub_disconnect_client(state, c);
+            return;
+        }
     }
 
     unsigned char enc[MAX_BUFFER];
     static const unsigned char PEER_INFO[] = "irchub-peer-session-v1";
-    int enc_len = hub_seal_send(state->hub_x25519_pub,
+    /* Outgoing seal: in v2, encrypt to PEER's static X25519 pubkey so only
+     * the legitimate peer can decrypt. In v1 (legacy), encrypt to OWN pubkey
+     * — relies on shared keypair. */
+    const unsigned char *seal_target =
+        use_v2 ? peer->x25519_pub : state->hub_x25519_pub;
+    int enc_len = hub_seal_send(seal_target,
                                 pack, msg_len + 1,
                                 PEER_INFO, sizeof(PEER_INFO) - 1,
                                 enc, sizeof(enc), c->session_key);
@@ -515,7 +585,7 @@ c->last_pong_sent = 0;
                     state->peers[i].connected = true;
                     state->peers[i].fd = sockfd;
                     state->mesh_state_dirty = true;
-                    hub_peer_handshake(state, c);
+                    hub_peer_handshake(state, c, &state->peers[i]);
                 } else {
                     close(sockfd);
                     hub_log("[PEER] Client limit reached.\n");

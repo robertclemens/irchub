@@ -261,6 +261,13 @@ typedef struct {
   int remote_total_peers;
   time_t last_mesh_report;
   char last_gossip[MAX_BUFFER];
+
+  /* v2 peer auth: per-peer Curve25519 public keys. When has_pubkey is true
+   * the handshake uses Ed25519-signature-based auth and drops the shared
+   * admin_password from the wire. */
+  unsigned char ed_pub[ED25519_KEY_LEN];
+  unsigned char x25519_pub[X25519_KEY_LEN];
+  bool has_pubkey;
 } hub_peer_config_t;
 
 typedef enum { CLIENT_BOT, CLIENT_ADMIN, CLIENT_HUB } client_type_t;

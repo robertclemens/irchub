@@ -528,20 +528,41 @@ void peer_list() {
 
 void peer_add() {
     char response[MAX_BUFFER];
-    char ip[64], port[10], uuid[64], name[64];
+    char ip[64], port[10], uuid[64], name[64], pubkey[128];
 
     printf("\n═══════════════════════════════════════════════════\n");
     printf("                   ADD PEER HUB\n");
     printf("═══════════════════════════════════════════════════\n");
-    printf("NOTE: Friendly name will be auto-populated from gossip\n\n");
+    printf("v2 peer auth: paste the peer's 88-char Curve25519 pubkey\n");
+    printf("              (contents of its hub_public.b64) to enable\n");
+    printf("              Ed25519-signature handshakes. Leave blank\n");
+    printf("              to fall back to legacy admin_password auth.\n\n");
 
     get_input("Peer IP: ", ip, sizeof(ip));
     get_input("Peer Port: ", port, sizeof(port));
     get_input("Peer UUID: ", uuid, sizeof(uuid));
     get_input("Friendly Name (optional, auto-syncs): ", name, sizeof(name));
+    get_input("Peer pubkey (88 char base64, blank=legacy): ", pubkey, sizeof(pubkey));
 
-    char payload[256];
-    snprintf(payload, sizeof(payload), "%s:%s:%s:%s", ip, port, uuid, name);
+    /* Strip trailing whitespace some terminals slip in. */
+    size_t pl = strlen(pubkey);
+    while (pl > 0 && (pubkey[pl-1] == ' ' || pubkey[pl-1] == '\r' ||
+                      pubkey[pl-1] == '\n' || pubkey[pl-1] == '\t')) {
+        pubkey[--pl] = '\0';
+    }
+
+    char payload[512];
+    if (pubkey[0]) {
+        if (pl != 88) {
+            printf("\nWarning: pubkey is %zu chars, expected 88. Submitting anyway; "
+                   "hub will reject if invalid.\n", pl);
+        }
+        snprintf(payload, sizeof(payload), "%s:%s:%s:%s:%s",
+                 ip, port, uuid, name, pubkey);
+    } else {
+        snprintf(payload, sizeof(payload), "%s:%s:%s:%s",
+                 ip, port, uuid, name);
+    }
 
     send_packet(g_fd, CMD_ADMIN_ADD_PEER, payload, g_key);
     read_response(g_fd, g_key, response, sizeof(response));
