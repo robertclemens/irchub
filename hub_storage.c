@@ -414,8 +414,23 @@ int hub_storage_get_summary_list(hub_state_t *state, char *buffer,
     if (offset >= max_len - 128)
       break;
 
-    written = snprintf(buffer + offset, max_len - offset, "%s\n",
-                       state->bots[i].uuid);
+    /* Show friendly name alongside UUID for usability */
+    char nick[32] = "";
+    for (int k = 0; k < state->bots[i].entry_count; k++) {
+      if (strcmp(state->bots[i].entries[k].key, "n") == 0) {
+        snprintf(nick, sizeof(nick), "%.*s",
+                 (int)(sizeof(nick) - 1), state->bots[i].entries[k].value);
+        break;
+      }
+    }
+
+    if (nick[0]) {
+      written = snprintf(buffer + offset, max_len - offset,
+                         "%-16s  [%s]\n", nick, state->bots[i].uuid);
+    } else {
+      written = snprintf(buffer + offset, max_len - offset, "%s\n",
+                         state->bots[i].uuid);
+    }
 
     if (written >= max_len - offset)
       break;

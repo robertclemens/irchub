@@ -1260,6 +1260,19 @@ void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
 
 // NEW FUNCTION: Broadcast full config to all connected bots to ensure
 // consistency
+static void hub_request_sync_from_peers(hub_state_t *state) {
+  int sent = 0;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_HUB && c->authenticated) {
+      if (peer_send_urgent(state, c, CMD_SYNC_REQUEST, ""))
+        sent++;
+    }
+  }
+  if (sent > 0)
+    hub_log("[MESH] Sent sync request to %d peer(s)\n", sent);
+}
+
 static void broadcast_full_config_to_all_bots(hub_state_t *state) {
   int sent_count = 0;
   for (int i = 0; i < state->client_count; i++) {
@@ -1884,6 +1897,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                     found_u->timestamp = ts;
                     state->config_dirty = true;
                     updates++;
+                    bot_push_updates++; /* admin/oper name change — bots need this */
                     if (fwd_offset < (int)sizeof(forward_buf) - 200) {
                       int w = snprintf(forward_buf+fwd_offset,
                                        sizeof(forward_buf)-fwd_offset,
@@ -2455,13 +2469,19 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                           // Check for exact match or as part of comma-separated list
                           if (strstr(uuid_list, payload) != NULL) {
                             bot_on_remote_peer = true;
-                            // Find the actual client connection for this peer
-                            for (int c = 0; c < state->client_count; c++) {
-                              if (state->clients[c]->type == CLIENT_HUB &&
-                                  state->clients[c]->authenticated &&
-                                  strcmp(state->clients[c]->ip, state->peers[p].ip) == 0) {
-                                remote_peer_fd = state->clients[c]->fd;
-                                break;
+                            /* Use the peer's tracked fd directly — more reliable
+                             * than IP matching which can fail with NAT/loopback. */
+                            if (state->peers[p].fd > 0) {
+                              remote_peer_fd = state->peers[p].fd;
+                            } else {
+                              /* Fallback: find client by IP */
+                              for (int c = 0; c < state->client_count; c++) {
+                                if (state->clients[c]->type == CLIENT_HUB &&
+                                    state->clients[c]->authenticated &&
+                                    strcmp(state->clients[c]->ip, state->peers[p].ip) == 0) {
+                                  remote_peer_fd = state->clients[c]->fd;
+                                  break;
+                                }
                               }
                             }
                             break;
@@ -2684,7 +2704,17 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       // Check if bot is currently connected
       bool is_connected = false;
       char connected_to[128] = "N/A";
+
+      /* Use "seen" entry timestamp as base — it's sync'd between hubs and
+       * represents the most recent time this bot authenticated anywhere. */
       time_t last_seen = b->last_sync_time;
+      for (int k = 0; k < b->entry_count; k++) {
+        if (strcmp(b->entries[k].key, "seen") == 0) {
+          if (b->entries[k].timestamp > last_seen)
+            last_seen = b->entries[k].timestamp;
+          break;
+        }
+      }
 
       for (int c = 0; c < state->client_count; c++) {
         if (state->clients[c]->type == CLIENT_BOT &&
@@ -2692,7 +2722,9 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
           is_connected = true;
           snprintf(connected_to, sizeof(connected_to), "LOCAL (%s:%d)",
                    state->bind_ip, state->port);
-          last_seen = state->clients[c]->last_seen;
+          /* Live client value is the freshest source */
+          if (state->clients[c]->last_seen > last_seen)
+            last_seen = state->clients[c]->last_seen;
           break;
         }
       }
@@ -4459,29 +4491,52 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
    * Named Admin/Oper/Usermask commands (v2)
    * ================================================================ */
 
-  case CMD_ADMIN_LIST_ADMINS: {
-    char buf[4096];
-    int off = 0;
-    off += snprintf(buf + off, sizeof(buf) - off, "ADMINS:");
-    for (int i = 0; i < state->user_record_count; i++) {
-      hub_user_record_t *u = &state->user_records[i];
-      if (u->type != 'a') continue;
-      off += snprintf(buf + off, sizeof(buf) - off, " %s(%s)%s",
-                      u->name, u->uuid, u->is_active ? "" : "[del]");
-    }
-    return send_response(state, client, buf);
-  }
-
+  case CMD_ADMIN_LIST_ADMINS:
   case CMD_ADMIN_LIST_OPERS_V2: {
-    char buf[4096];
+    char type_ch = (cmd == CMD_ADMIN_LIST_ADMINS) ? 'a' : 'o';
+    const char *label = (cmd == CMD_ADMIN_LIST_ADMINS) ? "admins" : "opers";
+    char buf[8192];
     int off = 0;
-    off += snprintf(buf + off, sizeof(buf) - off, "OPERS:");
+    int name_w = 8;
     for (int i = 0; i < state->user_record_count; i++) {
       hub_user_record_t *u = &state->user_records[i];
-      if (u->type != 'o') continue;
-      off += snprintf(buf + off, sizeof(buf) - off, " %s(%s)%s",
-                      u->name, u->uuid, u->is_active ? "" : "[del]");
+      if (u->type != type_ch || !u->is_active) continue;
+      int nl = (int)strlen(u->name);
+      if (nl > name_w) name_w = nl;
     }
+    off += snprintf(buf + off, sizeof(buf) - off,
+                    "| irchub %s\n+%s\n",
+                    label,
+                    "----------------------------------------------------------------------------");
+    int shown = 0;
+    for (int i = 0; i < state->user_record_count; i++) {
+      hub_user_record_t *u = &state->user_records[i];
+      if (u->type != type_ch || !u->is_active) continue;
+      char ts_buf[48];
+      if (u->last_seen == 0) {
+        snprintf(ts_buf, sizeof(ts_buf), "never");
+      } else {
+        struct tm *t = gmtime(&u->last_seen);
+        strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", t);
+      }
+      off += snprintf(buf + off, sizeof(buf) - off,
+                      "| %-*s  (last seen: %s)\n", name_w, u->name, ts_buf);
+      /* List active masks */
+      for (int j = 0; j < state->mask_record_count; j++) {
+        hub_mask_record_t *m = &state->mask_records[j];
+        if (strcmp(m->uuid, u->uuid) != 0 || !m->is_active) continue;
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "|   %s\n", m->mask);
+        if (off >= (int)sizeof(buf) - 128) break;
+      }
+      shown++;
+      if (off >= (int)sizeof(buf) - 128) break;
+    }
+    if (shown == 0)
+      off += snprintf(buf + off, sizeof(buf) - off, "| (none)\n");
+    off += snprintf(buf + off, sizeof(buf) - off,
+                    "`%s",
+                    "----------------------------------------------------------------------------");
     return send_response(state, client, buf);
   }
 
@@ -4706,26 +4761,55 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     bool match_all = (strcmp(payload, "*") == 0);
     char buf[MAX_BUFFER];
     int off = 0;
+    int name_w = 8;
     for (int i = 0; i < state->user_record_count; i++) {
       hub_user_record_t *u = &state->user_records[i];
+      if (!u->is_active) continue;
       if (!match_all && strcasecmp(u->name, payload) != 0) continue;
+      int nl = (int)strlen(u->name);
+      if (nl > name_w) name_w = nl;
+    }
+    off += snprintf(buf + off, sizeof(buf) - off,
+                    "| irchub match%s\n+%s\n",
+                    match_all ? " *" : "",
+                    "----------------------------------------------------------------------------");
+    int shown = 0;
+    for (int i = 0; i < state->user_record_count; i++) {
+      hub_user_record_t *u = &state->user_records[i];
+      if (!u->is_active) continue;
+      if (!match_all && strcasecmp(u->name, payload) != 0) continue;
+      char ts_buf[48];
+      if (u->last_seen == 0) {
+        snprintf(ts_buf, sizeof(ts_buf), "never");
+      } else {
+        struct tm *t = gmtime(&u->last_seen);
+        strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", t);
+      }
       off += snprintf(buf + off, sizeof(buf) - off,
-                      "%c|%s|%s|%s|%ld|%ld\n",
-                      u->type, u->uuid, u->name,
-                      u->is_active ? "add" : "del",
-                      (long)u->last_seen, (long)u->timestamp);
+                      "| [%c] %-*s  (last seen: %s)\n",
+                      u->type, name_w, u->name, ts_buf);
       for (int j = 0; j < state->mask_record_count; j++) {
         hub_mask_record_t *m = &state->mask_records[j];
-        if (strcmp(m->uuid, u->uuid) != 0) continue;
+        if (strcmp(m->uuid, u->uuid) != 0 || !m->is_active) continue;
+        char used_buf[48];
+        if (m->last_used == 0) {
+          snprintf(used_buf, sizeof(used_buf), "never");
+        } else {
+          struct tm *tu = gmtime(&m->last_used);
+          strftime(used_buf, sizeof(used_buf), "%Y-%m-%d %H:%M:%S UTC", tu);
+        }
         off += snprintf(buf + off, sizeof(buf) - off,
-                        "  m|%s|%s|%ld\n",
-                        m->mask, m->is_active ? "add" : "del",
-                        (long)m->last_used);
-        if (off >= (int)sizeof(buf) - 64) break;
+                        "|   %s  (last used: %s)\n", m->mask, used_buf);
+        if (off >= (int)sizeof(buf) - 128) break;
       }
-      if (off >= (int)sizeof(buf) - 64) break;
+      shown++;
+      if (off >= (int)sizeof(buf) - 128) break;
     }
-    if (off == 0) snprintf(buf, sizeof(buf), "ERR:no match");
+    if (shown == 0)
+      off += snprintf(buf + off, sizeof(buf) - off, "| unknown user\n");
+    off += snprintf(buf + off, sizeof(buf) - off,
+                    "`%s",
+                    "----------------------------------------------------------------------------");
     return send_response(state, client, buf);
   }
 
@@ -5441,6 +5525,60 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     snprintf(peer_inv, sizeof(peer_inv), "invite|%s|%s", inv_nick, inv_chan);
     hub_broadcast_sync_to_peers(state, peer_inv, client->fd);
   } break;
+
+  case CMD_BOT_RELAY: {
+    /* Payload: target_uuid|cipher:tag — forward cipher:tag to the target bot */
+    char target_uuid[64], relay_payload[MAX_BUFFER];
+    char *pipe = strchr(payload, '|');
+    if (!pipe) {
+      hub_log("[HUB] Invalid CMD_BOT_RELAY payload from %s\n", client->id);
+      break;
+    }
+    size_t uuid_len = (size_t)(pipe - payload);
+    if (uuid_len == 0 || uuid_len >= sizeof(target_uuid)) {
+      hub_log("[HUB] CMD_BOT_RELAY bad UUID len from %s\n", client->id);
+      break;
+    }
+    memcpy(target_uuid, payload, uuid_len);
+    target_uuid[uuid_len] = '\0';
+    snprintf(relay_payload, sizeof(relay_payload), "%s", pipe + 1);
+
+    hub_log("[HUB] CMD_BOT_RELAY from %s to %s\n", client->id, target_uuid);
+
+    hub_client_t *target = NULL;
+    for (int i = 0; i < state->client_count; i++) {
+      if (state->clients[i]->type == CLIENT_BOT &&
+          state->clients[i]->authenticated &&
+          strcmp(state->clients[i]->id, target_uuid) == 0) {
+        target = state->clients[i];
+        break;
+      }
+    }
+    if (!target) {
+      hub_log("[HUB] CMD_BOT_RELAY: target %s not connected\n", target_uuid);
+      break;
+    }
+
+    int relay_len = (int)strlen(relay_payload);
+    unsigned char msg_plain[MAX_BUFFER], msg_buf[MAX_BUFFER], msg_tag[GCM_TAG_LEN];
+    msg_plain[0] = (unsigned char)CMD_BOT_MSG;
+    uint32_t msg_net_pay = htonl((uint32_t)relay_len);
+    memcpy(&msg_plain[1], &msg_net_pay, 4);
+    memcpy(&msg_plain[5], relay_payload, relay_len);
+
+    int enc_len = aes_gcm_encrypt(msg_plain, 5 + relay_len,
+                                  target->session_key, msg_buf + 4, msg_tag);
+    if (enc_len > 0) {
+      memcpy(msg_buf + 4 + enc_len, msg_tag, GCM_TAG_LEN);
+      uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
+      memcpy(msg_buf, &net_len, 4);
+      if (write(target->fd, msg_buf, 4 + enc_len + GCM_TAG_LEN) <= 0)
+        hub_log("[HUB] CMD_BOT_RELAY: write to %s failed\n", target_uuid);
+      else
+        hub_log("[HUB] CMD_BOT_RELAY: forwarded to %s (%d bytes)\n",
+                target_uuid, relay_len);
+    }
+  } break;
   }
 }
 
@@ -5601,6 +5739,13 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               }
 
               hub_log("[HUB] Admin Login (Curve25519): %s\n", client->ip);
+
+              /* Kick off an immediate bidirectional mesh sync on admin connect:
+               * push our state to peers and ask them to send back their state,
+               * then refresh all locally-connected bots now. */
+              state->anti_entropy_due = true;
+              hub_request_sync_from_peers(state);
+              broadcast_full_config_to_all_bots(state);
             } else {
               hub_log("[HUB] Failed admin auth from %s\n", client->ip);
               record_failed_auth(state, client->ip);
@@ -5833,6 +5978,20 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                       hub_log("[HUB] Bot %s not connected to this hub (peer forwarding miss)\n", bot_uuid);
                     }
                   }
+                }
+              } else if (cmd == CMD_SYNC_REQUEST) {
+                /* Peer is asking us for our full state immediately.
+                 * Send our full sync packet to just this requesting peer. */
+                hub_log("[MESH] Sync request from peer %s — sending full state\n",
+                        client->ip);
+                char reply_sync[MAX_BUFFER];
+                hub_generate_sync_packet(state, reply_sync, sizeof(reply_sync));
+                if (reply_sync[0] != '\0') {
+                  int reply_len = (int)strlen(reply_sync);
+                  queued_msg_t *sm = queued_msg_new(CMD_PEER_SYNC, LANE_BULK,
+                                                    (const unsigned char *)reply_sync,
+                                                    reply_len);
+                  if (sm) peer_enqueue(client, sm);
                 }
               } else if (cmd == CMD_UPDATE_PUBKEY) {
                 // Peer hub sent new shared keypair: "<priv_b64>|||<pub_b64>"

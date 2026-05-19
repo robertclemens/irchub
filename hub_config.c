@@ -8,6 +8,23 @@
 #include <time.h>
 #include <unistd.h>
 
+void hub_set_config_pass(hub_state_t *s, const char *pass) {
+  RAND_bytes(s->config_pass_key, sizeof(s->config_pass_key));
+  size_t n = pass ? strlen(pass) : 0;
+  if (n >= sizeof(s->config_pass)) n = sizeof(s->config_pass) - 1;
+  for (size_t i = 0; i < sizeof(s->config_pass); i++)
+    s->config_pass[i] = (char)((unsigned char)(i < n ? pass[i] : '\0')
+                                ^ s->config_pass_key[i]);
+}
+
+void hub_get_config_pass(const hub_state_t *s, char *out, size_t len) {
+  size_t sz = sizeof(s->config_pass);
+  if (len < sz) sz = len;
+  for (size_t i = 0; i < sz; i++)
+    out[i] = (char)((unsigned char)s->config_pass[i] ^ s->config_pass_key[i]);
+  if (len > 0) out[len - 1] = '\0';
+}
+
 // FIXED: Replaced EVP_BytesToKey with PKCS5_PBKDF2_HMAC
 void hub_config_write(hub_state_t *state) {
   int estimated_size = 8192 + (state->bot_count * MAX_BOT_ENTRIES * 1100);
@@ -151,10 +168,15 @@ void hub_config_write(hub_state_t *state) {
   RAND_bytes(salt, sizeof(salt));
   RAND_bytes(iv, sizeof(iv));
 
+  /* Decode XOR-obfuscated config password before use */
+  char plain_pass[MAX_PASS];
+  hub_get_config_pass(state, plain_pass, sizeof(plain_pass));
   // FIXED: Proper PBKDF2 with 100,000 iterations
-  if (PKCS5_PBKDF2_HMAC(state->config_pass, strlen(state->config_pass), salt,
-                        SALT_SIZE, PBKDF2_ITERATIONS, EVP_sha256(), 32,
-                        key) != 1) {
+  int pbkdf2_ok = PKCS5_PBKDF2_HMAC(plain_pass, (int)strlen(plain_pass), salt,
+                                      SALT_SIZE, PBKDF2_ITERATIONS, EVP_sha256(),
+                                      32, key);
+  secure_wipe(plain_pass, sizeof(plain_pass));
+  if (!pbkdf2_ok) {
     hub_log("PBKDF2 failed\n");
     secure_wipe(buffer, offset);
     free(buffer);

@@ -85,6 +85,7 @@
 #define CMD_UPDATE_PUBKEY 0x05
 #define CMD_PEER_SYNC 0x06
 #define CMD_MESH_STATE 0x07
+#define CMD_SYNC_REQUEST 0x08  // Hub -> Hub: request peer to immediately send its full sync
 #define CMD_INVITE_REQUEST 0x09 // Bot -> Hub: Request invite for nick into channel
 
 #define CMD_ADMIN_AUTH 0x10
@@ -131,6 +132,8 @@
 #define CMD_OP_FORWARD_GRANT 0x34   // Hub -> Hub: Forward grant response back
 #define CMD_OP_FORWARD_FAILED 0x35  // Hub -> Hub: Forward failure back
 #define CMD_PEER_REKEY_BOT 0x42     // Hub -> Hub: Forward bot rekey to peer
+#define CMD_BOT_RELAY 0x50  // Bot -> Hub: relay encrypted bot command to target bot by UUID
+#define CMD_BOT_MSG   0x51  // Hub -> Bot: relayed encrypted bot command payload
 
 // Tombstone Purge Commands
 #define CMD_ADMIN_PURGE_TOMBSTONES 0x36 // Purge tombstoned entries (payload: days or "immediate")
@@ -353,6 +356,7 @@ typedef struct {
   char hub_friendly_name[64]; // This hub's friendly name
   char admin_password[128];
   char config_pass[128];
+  unsigned char config_pass_key[128];
 
   unsigned char hub_ed25519_priv[32];
   unsigned char hub_ed25519_pub[32];
@@ -409,7 +413,8 @@ typedef struct {
    * This prevents N PBKDF2(100K) calls when N peer syncs arrive in a burst. */
   bool config_dirty;
   time_t last_config_write;
-  bool mesh_state_dirty; /* set on peer connect/disconnect; clears after gossip */
+  bool mesh_state_dirty;    /* set on peer connect/disconnect; clears after gossip */
+  bool anti_entropy_due;    /* set to force anti-entropy on next hub_maintenance tick */
 
   /* Mesh transport: monotonic Lamport sequence stamped onto outgoing deltas
    * (carried as the trailing field of the wire format). On load from disk we
@@ -549,6 +554,8 @@ bool hub_delta_seen_check_and_update(hub_state_t *state,
 // Bot credential generation
 bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
                                    char **out_pub_b64);
+void hub_set_config_pass(hub_state_t *s, const char *pass);
+void hub_get_config_pass(const hub_state_t *s, char *out, size_t len);
 void secure_wipe(void *ptr, size_t len);
 void generate_uuid_v4(char *buffer, size_t len);
 

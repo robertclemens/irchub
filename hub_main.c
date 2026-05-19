@@ -347,10 +347,13 @@ void hub_maintenance(hub_state_t *state) {
         unsigned int jitter = 30 + (unsigned int)(rand() % 61);
         last_anti_entropy = now - (time_t)(MESH_ANTI_ENTROPY_INTERVAL - jitter);
     }
-    if (now - last_anti_entropy > MESH_ANTI_ENTROPY_INTERVAL) {
+    bool forced_ae = state->anti_entropy_due;
+    if (forced_ae || now - last_anti_entropy > MESH_ANTI_ENTROPY_INTERVAL) {
         last_anti_entropy = now;
+        state->anti_entropy_due = false;
         if (state->peer_count > 0) {
-            hub_log("[MESH] Running periodic anti-entropy sync...\n");
+            hub_log("[MESH] Running %santi-entropy sync...\n",
+                    forced_ae ? "forced " : "periodic ");
             char full_sync[MAX_BUFFER];
             hub_generate_sync_packet(state, full_sync, MAX_BUFFER - 100);
             hub_broadcast_sync_to_peers(state, full_sync, -1);
@@ -763,7 +766,7 @@ int main(int argc, char *argv[]) {
                     printf("Passwords do not match. Try again.\n");
                 }
             } while (!cfg_pass1[0] || strcmp(cfg_pass1, cfg_pass2) != 0);
-            snprintf(state.config_pass, sizeof(state.config_pass), "%s", cfg_pass1);
+            hub_set_config_pass(&state, cfg_pass1);
             secure_wipe(cfg_pass1, sizeof(cfg_pass1));
             secure_wipe(cfg_pass2, sizeof(cfg_pass2));
         }
@@ -1003,16 +1006,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Password resolution: .irchub.pass → env var → stdin prompt */
+    /* Password resolution: .irchub.pass → stdin prompt.
+     * Load into a temporary buffer first; XOR-protect into state after load. */
+    char _hub_plain_pass[MAX_PASS];
+    memset(_hub_plain_pass, 0, sizeof(_hub_plain_pass));
     {
         /* 1. Machine-bound password file */
-        if (!state.config_pass[0])
-            passfile_load(HUB_PASS_FILE, state.config_pass, sizeof(state.config_pass));
+        if (!_hub_plain_pass[0])
+            passfile_load(HUB_PASS_FILE, _hub_plain_pass, sizeof(_hub_plain_pass));
 
         /* 2. Interactive prompt — only reached if no passfile */
-        if (!state.config_pass[0]) {
-            read_pass_hidden("Config Password: ", state.config_pass, sizeof(state.config_pass));
-            if (!state.config_pass[0]) {
+        if (!_hub_plain_pass[0]) {
+            read_pass_hidden("Config Password: ", _hub_plain_pass, sizeof(_hub_plain_pass));
+            if (!_hub_plain_pass[0]) {
                 fprintf(stderr, "No password provided.\n");
                 return 1;
             }
@@ -1049,15 +1055,16 @@ int main(int argc, char *argv[]) {
     }
     state.pid_fd = pid_fd;
 
-    if (!hub_config_load(&state, state.config_pass)) {
-        secure_wipe(state.config_pass, sizeof(state.config_pass));
+    if (!hub_config_load(&state, _hub_plain_pass)) {
+        secure_wipe(_hub_plain_pass, sizeof(_hub_plain_pass));
         printf("Config load failed. Run -setup.\n");
         if (log_fp) fprintf(log_fp, "Config load failed.\n");
         remove(HUB_PID_FILE);
         return 1;
     }
-    /* config_pass must remain in state for the lifetime of the daemon —
-     * hub_config_write() re-derives the AES key from it on every save.   */
+    /* XOR-protect config_pass; hub_config_write() decodes it on every save. */
+    hub_set_config_pass(&state, _hub_plain_pass);
+    secure_wipe(_hub_plain_pass, sizeof(_hub_plain_pass));
 
     /* Ensure next_lamport_seq is above the time-based floor even on first
      * boot (when no lamport_seq key exists in config).  The config loader
