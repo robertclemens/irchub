@@ -748,6 +748,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     if (!ok) { secure_wipe(client->bot_eph_x25519_priv, 32);
                hub_log("[HUB][ERROR] Ephemeral X25519 keygen failed\n"); return false; }
     client->bot_eph_priv_set = true;
+    memcpy(client->bot_eph_x25519_pub, eph_pub, 32);
 
     /* v2 challenge: challenge(32) || eph_pub(32) || hub_sig(64)
      *
@@ -817,11 +818,37 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     }
     hub_crypto_split_combined(bot_combined, bot_ed_pub, bot_x_pub);
 
-    if (!hub_crypto_ed25519_verify(bot_ed_pub, client->challenge, 32, data)) {
-      hub_log("[HUB][ERROR] Invalid signature from bot %s\n", client->id);
-      record_failed_auth(state, client->ip);
-      secure_wipe(bot_combined, 64);
-      return false;
+    /* Domain-separated transcript: "irchub-bot-challenge-v1|UUID|" + eph_pub(32)
+     * + challenge(32).  Mirrors ed25519_sign_challenge() in hub_client.c. */
+    {
+      size_t uuid_len = strlen(client->id);
+      /* prefix = "irchub-bot-challenge-v1|" + uuid + "|" */
+      size_t prefix_len = 24 + uuid_len + 1;
+      size_t msg_len = prefix_len + 32 + 32;
+      unsigned char *msg = malloc(msg_len);
+      if (!msg) {
+        hub_log("[HUB][ERROR] OOM building challenge transcript for %s\n",
+                client->id);
+        secure_wipe(bot_combined, 64);
+        return false;
+      }
+      size_t off = 0;
+      memcpy(msg + off, "irchub-bot-challenge-v1|", 24); off += 24;
+      memcpy(msg + off, client->id, uuid_len);           off += uuid_len;
+      msg[off++] = '|';
+      memcpy(msg + off, client->bot_eph_x25519_pub, 32); off += 32;
+      memcpy(msg + off, client->challenge, 32);          off += 32;
+
+      bool sig_ok = hub_crypto_ed25519_verify(bot_ed_pub, msg, msg_len, data);
+      secure_wipe(msg, msg_len);
+      free(msg);
+
+      if (!sig_ok) {
+        hub_log("[HUB][ERROR] Invalid signature from bot %s\n", client->id);
+        record_failed_auth(state, client->ip);
+        secure_wipe(bot_combined, 64);
+        return false;
+      }
     }
 
     unsigned char shared[32];
@@ -3151,15 +3178,17 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             if (dec) { secure_wipe(dec, (size_t)dec_len); free(dec); }
           }
 
+          if (!np->has_pubkey)
+            return send_response(state, client,
+                                 "ERROR: Pubkey is required. "
+                                 "Supply the 88-char base64 Curve25519 combined key.");
+
           np->connected = false;
           np->fd = -1;
           state->peer_count++;
           state->config_dirty = true;
           return send_response(state, client,
-                               np->has_pubkey ?
-                               "SUCCESS: Peer added (v2 / Ed25519 auth)." :
-                               "SUCCESS: Peer added (legacy auth — supply "
-                               "pubkey to enable v2).");
+                               "SUCCESS: Peer added (v2 / Ed25519 auth).");
         }
         return send_response(state, client, "ERROR: Max peers reached.");
       }
@@ -3226,6 +3255,40 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       }
       return send_response(state, client, response);
     }
+
+  case CMD_ADMIN_SET_PEER_PUBKEY:
+    if (payload && strlen(payload) > 0) {
+      char uuid[64], pubkey_b64[128];
+      memset(uuid, 0, sizeof(uuid));
+      memset(pubkey_b64, 0, sizeof(pubkey_b64));
+      if (sscanf(payload, "%63[^:]:%127s", uuid, pubkey_b64) != 2 || !uuid[0] || !pubkey_b64[0])
+        return send_response(state, client, "ERROR: Use UUID:PUBKEY_B64");
+
+      int peer_idx = -1;
+      for (int i = 0; i < state->peer_count; i++) {
+        if (strcmp(state->peers[i].uuid, uuid) == 0) { peer_idx = i; break; }
+      }
+      if (peer_idx < 0)
+        return send_response(state, client, "ERROR: No peer with that UUID.");
+
+      int dec_len = 0;
+      unsigned char *dec = base64_decode(pubkey_b64, &dec_len);
+      if (!dec || dec_len != COMBINED_KEY_LEN) {
+        if (dec) { secure_wipe(dec, (size_t)(dec_len > 0 ? dec_len : 0)); free(dec); }
+        return send_response(state, client,
+                             "ERROR: pubkey must be 88-char base64 of 64-byte combined key.");
+      }
+      memcpy(state->peers[peer_idx].ed_pub,     dec,                   ED25519_KEY_LEN);
+      memcpy(state->peers[peer_idx].x25519_pub, dec + ED25519_KEY_LEN, X25519_KEY_LEN);
+      state->peers[peer_idx].has_pubkey = true;
+      secure_wipe(dec, (size_t)dec_len);
+      free(dec);
+      state->config_dirty = true;
+      hub_log("[HUB] Peer %s pubkey set — next connection will use v2 Ed25519 auth.\n", uuid);
+      return send_response(state, client,
+                           "SUCCESS: Peer pubkey registered. Reconnect the peer to activate v2 auth.");
+    }
+    return send_response(state, client, "ERROR: Use UUID:PUBKEY_B64");
 
   case CMD_ADMIN_LIST_PEERS: {
     char *response_ptr = malloc(65536);
@@ -5803,16 +5866,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               }
             }
 
-            /* Constant-time comparison. Both buffers are pre-zeroed and the
-             * compare covers the full sizeof(pass_buf) so we don't leak the
-             * password length via early exit. */
-            size_t cmplen = sizeof(pass_buf);
-            char admin_pad[sizeof(pass_buf)];
-            memset(admin_pad, 0, sizeof(admin_pad));
-            snprintf(admin_pad, sizeof(admin_pad), "%s", state->admin_password);
-            bool pass_ok = (CRYPTO_memcmp(pass_buf, admin_pad, cmplen) == 0);
-            secure_wipe(admin_pad, sizeof(admin_pad));
-            secure_wipe(pass_buf,  sizeof(pass_buf));
+            bool pass_ok = hub_admin_verify_password(pass_buf, state->admin_password);
+            secure_wipe(pass_buf, sizeof(pass_buf));
             if (pass_ok) {
               client->type = CLIENT_ADMIN;
               client->authenticated = true;
@@ -5989,115 +6044,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               }
             }
           }
-          // Legacy HUB Peer Authentication (shared admin_password — DEPRECATED)
-          else if (strncmp(payload, "HUB ", 4) == 0) {
-            char pass[128], peer_uuid[64], peer_name[64], peer_bind_ip[64];
-            int claimed_port = 0;
-            memset(peer_uuid, 0, sizeof(peer_uuid));
-            memset(peer_name, 0, sizeof(peer_name));
-            memset(peer_bind_ip, 0, sizeof(peer_bind_ip));
-
-            /* Zero pass before sscanf to avoid stack-garbage mismatching the
-             * fixed-length CRYPTO_memcmp below.  sscanf %127s only writes
-             * up to the matched length plus a NUL — bytes past that remain
-             * whatever was on the stack. */
-            memset(pass, 0, sizeof(pass));
-            int args = sscanf(payload + 4, "%127s %d %63s %63s %63s",
-                              pass, &claimed_port, peer_uuid, peer_name, peer_bind_ip);
-
-            /* Constant-time comparison against admin_password. */
-            char peer_pad[sizeof(pass)];
-            memset(peer_pad, 0, sizeof(peer_pad));
-            snprintf(peer_pad, sizeof(peer_pad), "%s", state->admin_password);
-            bool peer_pass_ok = (args >= 1 &&
-                CRYPTO_memcmp(pass, peer_pad, sizeof(peer_pad)) == 0);
-            secure_wipe(peer_pad, sizeof(peer_pad));
-            secure_wipe(pass,     sizeof(pass));
-            if (peer_pass_ok) {
-              hub_log("[HUB] WARN: peer %s used legacy admin_password auth. "
-                      "Register peer with its Curve25519 pubkey to upgrade.\n",
-                      peer_uuid[0] ? peer_uuid : client->ip);
-              client->type = CLIENT_HUB;
-
-              bool is_authorized_peer = false;
-              int peer_idx = -1;
-
-              for (int p = 0; p < state->peer_count; p++) {
-                if (args >= 3 && peer_uuid[0] && state->peers[p].uuid[0]) {
-                  if (strcmp(state->peers[p].uuid, peer_uuid) == 0) {
-                    peer_idx = p; is_authorized_peer = true; break;
-                  }
-                } else {
-                  bool ip_match = (strcmp(state->peers[p].ip, client->ip) == 0 ||
-                                   strcmp(state->bind_ip, client->ip) == 0);
-                  if (ip_match && claimed_port > 0 && state->peers[p].port == claimed_port) {
-                    peer_idx = p; is_authorized_peer = true; break;
-                  }
-                }
-              }
-
-              if (!is_authorized_peer) {
-                hub_log("[HUB] Unauthorized peer from %s (UUID: %s)\n",
-                        client->ip, peer_uuid[0] ? peer_uuid : "none");
-                secure_wipe(plain, sizeof(plain));
-                hub_disconnect_client(state, client);
-                return false;
-              }
-
-              if (args >= 3 && peer_uuid[0] && state->peers[peer_idx].uuid[0]) {
-                if (strcmp(state->peers[peer_idx].uuid, peer_uuid) != 0) {
-                  hub_log("[HUB] UUID mismatch for peer %s\n", client->ip);
-                  secure_wipe(plain, sizeof(plain));
-                  hub_disconnect_client(state, client);
-                  return false;
-                }
-              }
-
-              client->authenticated = true;
-              state->peers[peer_idx].connected = true;
-              state->peers[peer_idx].fd = client->fd;
-              snprintf(state->peers[peer_idx].remote_ip,
-                       sizeof(state->peers[peer_idx].remote_ip), "%s", client->ip);
-
-              if (!state->peers[peer_idx].friendly_name[0] && args >= 4 && peer_name[0]) {
-                snprintf(state->peers[peer_idx].friendly_name,
-                         sizeof(state->peers[peer_idx].friendly_name), "%s", peer_name);
-              }
-
-              snprintf(client->id, sizeof(client->id), "%s",
-                       state->peers[peer_idx].friendly_name[0] ?
-                       state->peers[peer_idx].friendly_name :
-                       (peer_name[0] ? peer_name : "HUB-PEER"));
-              client->id[sizeof(client->id) - 1] = 0;
-
-              hub_log("[HUB] Peer connected (Curve25519): %s (%s)\n",
-                      peer_name[0] ? peer_name : client->ip,
-                      peer_uuid[0] ? peer_uuid : "no-uuid");
-
-              /* Send our full state to the newly authenticated peer so it
-               * receives channels, user records, and mask records immediately
-               * rather than waiting for the next change-triggered sync. */
-              {
-                char *init_sync = malloc(MAX_BUFFER);
-                if (init_sync) {
-                  hub_generate_sync_packet(state, init_sync, MAX_BUFFER - 100);
-                  int slen = (int)strlen(init_sync);
-                  if (slen > 0) {
-                    queued_msg_t *sm = queued_msg_new(CMD_PEER_SYNC, LANE_BULK,
-                                                     (const unsigned char *)init_sync, slen);
-                    if (sm) peer_enqueue(client, sm);
-                  }
-                  free(init_sync);
-                }
-              }
-            } else {
-              hub_log("[HUB] Failed peer auth from %s\n", client->ip);
-              record_failed_auth(state, client->ip);
-              secure_wipe(plain, sizeof(plain));
-              hub_disconnect_client(state, client);
-              return false;
-            }
-          } else {
+          else {
             secure_wipe(plain, sizeof(plain));
             hub_disconnect_client(state, client);
             return false;
@@ -6106,6 +6053,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
           secure_wipe(plain, sizeof(plain));
         } else {
           secure_wipe(session_key, 32);
+          secure_wipe(plain, sizeof(plain));
           // Sealed-box failed — fall through to bot auth
           if (!handle_bot_authentication(state, client, data, packet_len)) {
             hub_disconnect_client(state, client);

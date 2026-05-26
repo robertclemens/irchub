@@ -120,6 +120,7 @@ bool process_incoming_packet() {
             send_packet(g_fd, CMD_PING, NULL, g_key);
         result = true;
     }
+    secure_wipe(plain, (size_t)(len + 1));
     free(plain);
     return result;
 }
@@ -232,15 +233,18 @@ void read_response(int fd, unsigned char *key, char *out_buf, int max_len) {
 
         if (plain_len > 0) {
             if (plain[0] == CMD_PING) {
+                secure_wipe(plain, (size_t)(len + 1));
                 free(plain);
                 send_packet(fd, CMD_PING, NULL, key);
                 continue;
             }
             plain[plain_len] = 0;
             snprintf(out_buf, max_len, "%s", (char *)plain);
+            secure_wipe(plain, (size_t)(len + 1));
             free(plain);
             return;
         }
+        secure_wipe(plain, (size_t)(len + 1));
         free(plain);
         snprintf(out_buf, max_len, "Error: Decryption failed");
         return;
@@ -533,16 +537,15 @@ void peer_add() {
     printf("\n═══════════════════════════════════════════════════\n");
     printf("                   ADD PEER HUB\n");
     printf("═══════════════════════════════════════════════════\n");
-    printf("v2 peer auth: paste the peer's 88-char Curve25519 pubkey\n");
-    printf("              (contents of its hub_public.b64) to enable\n");
-    printf("              Ed25519-signature handshakes. Leave blank\n");
-    printf("              to fall back to legacy admin_password auth.\n\n");
+    printf("Paste the peer's 88-char Curve25519 pubkey (contents of\n");
+    printf("its hub_public.b64). The pubkey is required — connections\n");
+    printf("from peers without a registered pubkey are refused.\n\n");
 
     get_input("Peer IP: ", ip, sizeof(ip));
     get_input("Peer Port: ", port, sizeof(port));
     get_input("Peer UUID: ", uuid, sizeof(uuid));
     get_input("Friendly Name (optional, auto-syncs): ", name, sizeof(name));
-    get_input("Peer pubkey (88 char base64, blank=legacy): ", pubkey, sizeof(pubkey));
+    get_input("Peer pubkey (88 char base64, required): ", pubkey, sizeof(pubkey));
 
     /* Strip trailing whitespace some terminals slip in. */
     size_t pl = strlen(pubkey);
@@ -551,18 +554,22 @@ void peer_add() {
         pubkey[--pl] = '\0';
     }
 
-    char payload[512];
-    if (pubkey[0]) {
-        if (pl != 88) {
-            printf("\nWarning: pubkey is %zu chars, expected 88. Submitting anyway; "
-                   "hub will reject if invalid.\n", pl);
-        }
-        snprintf(payload, sizeof(payload), "%s:%s:%s:%s:%s",
-                 ip, port, uuid, name, pubkey);
-    } else {
-        snprintf(payload, sizeof(payload), "%s:%s:%s:%s",
-                 ip, port, uuid, name);
+    if (!pubkey[0]) {
+        printf("\nError: pubkey is required. Re-add the peer after obtaining "
+               "its hub_public.b64.\n");
+        printf("\nPress Enter to continue...");
+        fflush(stdout);
+        char dummy[10];
+        wait_for_input_or_socket(dummy, sizeof(dummy));
+        return;
     }
+    if (pl != 88) {
+        printf("\nWarning: pubkey is %zu chars, expected 88. Submitting anyway; "
+               "hub will reject if invalid.\n", pl);
+    }
+    char payload[512];
+    snprintf(payload, sizeof(payload), "%s:%s:%s:%s:%s",
+             ip, port, uuid, name, pubkey);
 
     send_packet(g_fd, CMD_ADMIN_ADD_PEER, payload, g_key);
     read_response(g_fd, g_key, response, sizeof(response));
@@ -594,6 +601,45 @@ void peer_remove() {
     }
 
     free(response);
+    printf("\nPress Enter to continue...");
+    fflush(stdout);
+    char dummy[10];
+    wait_for_input_or_socket(dummy, sizeof(dummy));
+}
+
+void peer_set_pubkey() {
+    char response[MAX_BUFFER];
+    char uuid[64], pubkey[128];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("              SET PEER PUBKEY (v2 upgrade)\n");
+    printf("═══════════════════════════════════════════════════\n");
+    printf("Registers the peer's 88-char Curve25519 pubkey on an\n");
+    printf("existing peer entry. The next connection from that peer\n");
+    printf("will use Ed25519-signature auth (no admin_password).\n\n");
+    printf("Get the pubkey from the peer's hub_public.b64 file.\n\n");
+
+    get_input("Peer UUID: ", uuid, sizeof(uuid));
+    get_input("Peer pubkey (88 char base64): ", pubkey, sizeof(pubkey));
+
+    size_t pl = strlen(pubkey);
+    while (pl > 0 && (pubkey[pl-1] == ' ' || pubkey[pl-1] == '\r' ||
+                      pubkey[pl-1] == '\n' || pubkey[pl-1] == '\t'))
+        pubkey[--pl] = '\0';
+
+    if (!uuid[0] || !pubkey[0]) {
+        printf("Cancelled.\n");
+        return;
+    }
+    if (pl != 88)
+        printf("\nWarning: pubkey is %zu chars, expected 88.\n", pl);
+
+    char payload[256];
+    snprintf(payload, sizeof(payload), "%s:%s", uuid, pubkey);
+    send_packet(g_fd, CMD_ADMIN_SET_PEER_PUBKEY, payload, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\nHub: %s\n", response);
+
     printf("\nPress Enter to continue...");
     fflush(stdout);
     char dummy[10];
@@ -1796,9 +1842,10 @@ void menu_manage_peer_connections() {
         printf("  1. List Peers (Mesh Matrix)\n");
         printf("  2. Add Peer\n");
         printf("  3. Remove Peer\n");
-        printf("  4. Force Mesh Sync\n");
-        printf("  5. Rekey Hubs (DANGER)\n");
-        printf("  6. Back to Main Menu\n");
+        printf("  4. Set Peer Pubkey (upgrade to v2 auth)\n");
+        printf("  5. Force Mesh Sync\n");
+        printf("  6. Rekey Hubs (DANGER)\n");
+        printf("  7. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1822,12 +1869,15 @@ void menu_manage_peer_connections() {
                 peer_remove();
                 break;
             case 4:
-                peer_force_sync();
+                peer_set_pubkey();
                 break;
             case 5:
-                peer_rekey_hubs();
+                peer_force_sync();
                 break;
             case 6:
+                peer_rekey_hubs();
+                break;
+            case 7:
                 return;  // Back to main menu
             default:
                 printf("Invalid choice.\n");

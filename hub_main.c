@@ -122,7 +122,7 @@ static void daemonize(void) {
     if (pid > 0) exit(0);   // intermediate parent exits
 
     // Tighten umask; stay in the working directory so relative paths (.pid, .log) resolve
-    umask(0027);
+    umask(0077);
 
     // Redirect stdin/stdout/stderr to /dev/null
     int devnull = open("/dev/null", O_RDWR);
@@ -233,15 +233,17 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
         return;
     }
 
-    /* v2 path: if we have the peer's pubkey on file, build a signed
-     * handshake and seal it to the peer's X25519 pubkey. This drops the
-     * shared admin_password from the wire entirely. */
-    const bool use_v2 = (peer && peer->has_pubkey);
+    if (!peer || !peer->has_pubkey) {
+        hub_log("[PEER] Peer has no registered pubkey — refusing to connect. "
+                "Re-add this peer with its Curve25519 pubkey to enable v2 auth.\n");
+        hub_disconnect_client(state, c);
+        return;
+    }
 
     unsigned char pack[1024];
     int msg_len;
 
-    if (use_v2) {
+    {
         /* Build the transcript the signature commits to. The receiver
          * reconstructs the same transcript from the parsed fields and the
          * stored peer record before verifying. */
@@ -289,31 +291,11 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
             hub_disconnect_client(state, c);
             return;
         }
-    } else {
-        /* Legacy v1: shared admin_password inside a sealed-box keyed to OWN
-         * pubkey (only works because all hubs currently share the same
-         * Curve25519 keypair). Will be removed once every peer in the mesh
-         * has been re-added with its pubkey. */
-        hub_log("[PEER] WARN: legacy v1 peer handshake to %s — no pubkey on "
-                "record; add peer with its 88-char Curve25519 pubkey to upgrade.\n",
-                peer ? peer->ip : "(unknown)");
-        msg_len = snprintf((char *)pack, sizeof(pack), "HUB %s %d %s %s %s",
-                           state->admin_password, state->port,
-                           state->hub_uuid, state->hub_friendly_name, state->bind_ip);
-        if (msg_len < 0 || msg_len >= (int)sizeof(pack)) {
-            hub_log("[PEER] Handshake message too long\n");
-            hub_disconnect_client(state, c);
-            return;
-        }
     }
 
     unsigned char enc[MAX_BUFFER];
     static const unsigned char PEER_INFO[] = "irchub-peer-session-v1";
-    /* Outgoing seal: in v2, encrypt to PEER's static X25519 pubkey so only
-     * the legitimate peer can decrypt. In v1 (legacy), encrypt to OWN pubkey
-     * — relies on shared keypair. */
-    const unsigned char *seal_target =
-        use_v2 ? peer->x25519_pub : state->hub_x25519_pub;
+    const unsigned char *seal_target = peer->x25519_pub;
     int enc_len = hub_seal_send(seal_target,
                                 pack, msg_len + 1,
                                 PEER_INFO, sizeof(PEER_INFO) - 1,
@@ -618,33 +600,76 @@ static void read_pass_hidden(const char *prompt, char *buf, size_t len) {
     buf[strcspn(buf, "\n")] = 0;
 }
 
-/* Build a key-derivation string from stable machine/user constants.
- * None of these are secret, but together they are specific to this user
- * on this filesystem — a copied .irchub.pass won't decrypt elsewhere. */
 static void passfile_build_context(char *buf, size_t len) {
     struct stat home_st;
     struct utsname uts;
     struct passwd *pw = getpwuid(getuid());
-
     memset(&home_st, 0, sizeof(home_st));
     memset(&uts, 0, sizeof(uts));
-    if (pw && pw->pw_dir)
-        stat(pw->pw_dir, &home_st);
+    if (pw && pw->pw_dir) stat(pw->pw_dir, &home_st);
     uname(&uts);
-
     snprintf(buf, len, "%lu:%lu:%u:%u:%s",
-             (unsigned long)home_st.st_ino,
-             (unsigned long)home_st.st_dev,
-             (unsigned int)getuid(),
-             (unsigned int)getgid(),
-             uts.machine);
+             (unsigned long)home_st.st_ino, (unsigned long)home_st.st_dev,
+             (unsigned int)getuid(), (unsigned int)getgid(), uts.machine);
 }
 
-/* Derive a 32-byte AES key from context string + salt via PBKDF2-SHA256. */
 static bool passfile_derive_key(const char *ctx, const unsigned char *salt,
                                 unsigned char *key) {
     return PKCS5_PBKDF2_HMAC(ctx, (int)strlen(ctx), salt, SALT_SIZE,
                              PBKDF2_ITERATIONS, EVP_sha256(), 32, key) == 1;
+}
+
+static bool passfile_load(const char *path, char *out_pass, size_t out_len) {
+    struct stat st;
+    bool ok = false;
+    if (stat(path, &st) != 0) return false;
+    if (st.st_uid != getuid()) {
+        fprintf(stderr, "[WARN] .irchub.pass: wrong owner, ignoring.\n");
+        return false;
+    }
+    if ((st.st_mode & 0777) != 0600) {
+        fprintf(stderr, "[WARN] .irchub.pass: must be 0600, ignoring.\n");
+        return false;
+    }
+    int min_size = SALT_SIZE + GCM_IV_LEN + 1 + GCM_TAG_LEN;
+    if (st.st_size < min_size) return false;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    size_t total = (size_t)st.st_size;
+    unsigned char *buf = malloc(total);
+    if (!buf) { close(fd); return false; }
+    if (read(fd, buf, total) != (ssize_t)total) { close(fd); free(buf); return false; }
+    close(fd);
+    unsigned char *salt    = buf;
+    unsigned char *enc_blk = buf + SALT_SIZE;
+    int enc_len            = (int)(total - SALT_SIZE - GCM_TAG_LEN);
+    unsigned char *tag     = buf + SALT_SIZE + enc_len;
+    unsigned char key[32];
+    char ctx[256];
+    passfile_build_context(ctx, sizeof(ctx));
+    if (!passfile_derive_key(ctx, salt, key)) goto done;
+    mlock(out_pass, out_len);
+    unsigned char *plain = malloc((size_t)enc_len);
+    if (!plain) goto done;
+    mlock(plain, (size_t)enc_len);
+    int dec_len = aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
+    if (dec_len > 0 && (size_t)dec_len < out_len) {
+        plain[dec_len] = 0;
+        memcpy(out_pass, plain, (size_t)dec_len + 1);
+        ok = true;
+    } else {
+        fprintf(stderr, "[WARN] .irchub.pass: decryption failed "
+                        "(wrong machine or tampered file), falling through.\n");
+    }
+    secure_wipe(plain, (size_t)enc_len);
+    munlock(plain, (size_t)enc_len);
+    free(plain);
+done:
+    secure_wipe(key, sizeof(key));
+    secure_wipe(ctx, sizeof(ctx));
+    munlock(out_pass, out_len);
+    free(buf);
+    return ok;
 }
 
 /* File layout: [SALT_SIZE][IV+ciphertext from aes_gcm_encrypt][GCM_TAG_LEN]
@@ -699,78 +724,6 @@ static bool passfile_create(const char *path, const char *password) {
 done:
     secure_wipe(key, sizeof(key));
     secure_wipe(ctx, sizeof(ctx));
-    return ok;
-}
-
-/* Returns true and populates out_pass on success.
- * Rejects the file if permissions or ownership are wrong.              */
-static bool passfile_load(const char *path, char *out_pass, size_t out_len) {
-    struct stat st;
-    bool ok = false;
-
-    if (stat(path, &st) != 0) return false;
-
-    if (st.st_uid != getuid()) {
-        fprintf(stderr, "[WARN] .irchub.pass: wrong owner, ignoring.\n");
-        return false;
-    }
-    if ((st.st_mode & 0777) != 0600) {
-        fprintf(stderr, "[WARN] .irchub.pass: must be 0600, ignoring.\n");
-        return false;
-    }
-
-    /* Minimum valid size: salt + IV + 1 byte plaintext + tag */
-    int min_size = SALT_SIZE + GCM_IV_LEN + 1 + GCM_TAG_LEN;
-    if (st.st_size < min_size) return false;
-
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return false;
-
-    size_t total = (size_t)st.st_size;
-    unsigned char *buf = malloc(total);
-    if (!buf) { close(fd); return false; }
-
-    if (read(fd, buf, total) != (ssize_t)total) {
-        close(fd); free(buf); return false;
-    }
-    close(fd);
-
-    /* Split: salt | IV+ciphertext | tag */
-    unsigned char *salt    = buf;
-    unsigned char *enc_blk = buf + SALT_SIZE;
-    int enc_len            = (int)(total - SALT_SIZE - GCM_TAG_LEN);
-    unsigned char *tag     = buf + SALT_SIZE + enc_len;
-
-    unsigned char key[32];
-    char ctx[256];
-    passfile_build_context(ctx, sizeof(ctx));
-    if (!passfile_derive_key(ctx, salt, key)) goto done;
-
-    /* mlock both buffers to prevent swapping during the decrypt window */
-    mlock(out_pass, out_len);
-    unsigned char *plain = malloc((size_t)enc_len);
-    if (!plain) goto done;
-    mlock(plain, (size_t)enc_len);
-
-    int dec_len = aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
-    if (dec_len > 0 && (size_t)dec_len < out_len) {
-        plain[dec_len] = 0;
-        memcpy(out_pass, plain, (size_t)dec_len + 1);
-        ok = true;
-    } else {
-        fprintf(stderr, "[WARN] .irchub.pass: decryption failed "
-                        "(wrong machine or tampered file), falling through.\n");
-    }
-
-    secure_wipe(plain, (size_t)enc_len);
-    munlock(plain, (size_t)enc_len);
-    free(plain);
-
-done:
-    secure_wipe(key, sizeof(key));
-    secure_wipe(ctx, sizeof(ctx));
-    munlock(out_pass, out_len);
-    free(buf);
     return ok;
 }
 
@@ -870,11 +823,18 @@ int main(int argc, char *argv[]) {
                 char *priv_b64 = base64_encode(priv64, 64);
                 char *pub_b64  = base64_encode(pub64, 64);
                 if (priv_b64 && pub_b64) {
-                    FILE *fp = fopen("hub_private.b64", "w");
-                    if (fp) {
-                        fprintf(fp, "%s", priv_b64);
-                        fclose(fp);
-                        chmod("hub_private.b64", 0600);
+                    int kfd = open("hub_private.b64",
+                                   O_WRONLY | O_CREAT | O_TRUNC, 0600);
+                    if (kfd >= 0) {
+                        if (fchmod(kfd, 0600) != 0)
+                            perror("[WARN] fchmod hub_private.b64");
+                        FILE *fp = fdopen(kfd, "w");
+                        if (fp) {
+                            fprintf(fp, "%s", priv_b64);
+                            fclose(fp);
+                        } else {
+                            close(kfd);
+                        }
                         printf("[+] Private key saved to: hub_private.b64\n");
                     }
                     FILE *fpu = fopen("hub_public.b64", "w");
@@ -900,6 +860,12 @@ int main(int argc, char *argv[]) {
                 }
                 kp_path[strcspn(kp_path, "\n")] = 0;
 
+                {
+                    struct stat kst;
+                    if (stat(kp_path, &kst) == 0 && (kst.st_mode & 0177) != 0)
+                        printf("[WARN] %s has insecure permissions %04o — should be 0600\n",
+                               kp_path, (unsigned)(kst.st_mode & 0777));
+                }
                 FILE *f = fopen(kp_path, "r");
                 if (!f) {
                     printf("Key file not found: %s\n", kp_path);
@@ -1155,6 +1121,27 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* While all hubs share one Curve25519 keypair, auto-populate has_pubkey
+     * for any peer that lacks it so they use v2 Ed25519 auth immediately.
+     * This becomes a no-op once per-hub independent keys are introduced,
+     * because by then each peer will already have its own distinct key set. */
+    {
+        int migrated = 0;
+        for (int i = 0; i < state.peer_count; i++) {
+            if (!state.peers[i].has_pubkey) {
+                memcpy(state.peers[i].ed_pub,     state.hub_ed25519_pub, ED25519_KEY_LEN);
+                memcpy(state.peers[i].x25519_pub, state.hub_x25519_pub,  X25519_KEY_LEN);
+                state.peers[i].has_pubkey = true;
+                migrated++;
+            }
+        }
+        if (migrated > 0) {
+            hub_log("[HUB] Auto-populated shared pubkey on %d peer(s) — "
+                    "they will use v2 Ed25519 auth on next connect.\n", migrated);
+            state.config_dirty = true;
+        }
+    }
+
     hub_log("[HUB] Started on port %d (PID: %d)\n", state.port, getpid());
 
     state.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1305,6 +1292,8 @@ int main(int argc, char *argv[]) {
 
     secure_wipe(state.hub_ed25519_priv, 32);
     secure_wipe(state.hub_x25519_priv,  32);
+    OPENSSL_cleanse(state.config_pass,   sizeof(state.config_pass));
+    munlock(state.config_pass, sizeof(state.config_pass));
 
     return 0;
 }

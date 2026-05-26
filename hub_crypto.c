@@ -68,7 +68,8 @@ unsigned char *base64_decode(const char *input, int *out_len) {
 void generate_uuid_v4(char *buffer, size_t len) {
     unsigned char b[16];
     if (RAND_bytes(b, 16) != 1) {
-        for (int i = 0; i < 16; i++) b[i] = (unsigned char)(rand() % 256);
+        hub_log("RAND_bytes failed in generate_uuid_v4; aborting\n");
+        abort();
     }
 
     b[6] = (b[6] & 0x0F) | 0x40;
@@ -265,6 +266,10 @@ int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
 
 err:
     if (ctx) EVP_CIPHER_CTX_free(ctx);
+    /* GCM is online: EVP_DecryptUpdate may have written partial plaintext before
+     * the tag check failed.  Zero it now so unauthenticated bytes never escape. */
+    if (ciphertext_len > 0)
+        secure_wipe(plaintext, (size_t)ciphertext_len);
     return -1;
 }
 
@@ -300,3 +305,4 @@ err:
     if (ctx) EVP_CIPHER_CTX_free(ctx);
     return -1;
 }
+

@@ -1,38 +1,90 @@
 #include "hub.h"
+#include <fcntl.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 void hub_set_config_pass(hub_state_t *s, const char *pass) {
-  if (RAND_bytes(s->config_pass_key, sizeof(s->config_pass_key)) != 1) {
-    /* Fall back to a deterministic key only if RNG fails — at that point the
-     * process has bigger problems but we still need to avoid leaving the
-     * "encrypted" copy equal to plaintext. */
-    memset(s->config_pass_key, 0xA5, sizeof(s->config_pass_key));
-  }
+  /* Store plaintext and lock the page into RAM so it cannot be swapped.
+   * See the threat-model comment on hub_state_t.config_pass in hub.h. */
   size_t n = pass ? strlen(pass) : 0;
   if (n >= sizeof(s->config_pass)) n = sizeof(s->config_pass) - 1;
-  for (size_t i = 0; i < sizeof(s->config_pass); i++)
-    s->config_pass[i] = (char)((unsigned char)(i < n ? pass[i] : '\0')
-                                ^ s->config_pass_key[i]);
+  memcpy(s->config_pass, pass ? pass : "", n);
+  memset(s->config_pass + n, 0, sizeof(s->config_pass) - n);
+  mlock(s->config_pass, sizeof(s->config_pass));
 }
 
 void hub_get_config_pass(const hub_state_t *s, char *out, size_t len) {
   if (len == 0) return;
   size_t sz = sizeof(s->config_pass);
   if (len < sz) sz = len;
-  for (size_t i = 0; i < sz; i++)
-    out[i] = (char)((unsigned char)s->config_pass[i] ^ s->config_pass_key[i]);
-  /* Always NUL-terminate within the caller's buffer. If sz < len (caller's
-   * buffer is larger than the stored cipher), terminate at sz so a short
-   * password isn't followed by stack junk; otherwise terminate at len-1. */
+  memcpy(out, s->config_pass, sz);
   if (sz < len) out[sz] = '\0';
   else          out[len - 1] = '\0';
+}
+
+bool hub_admin_hash_password(const char *plaintext, char *out, size_t out_len) {
+  if (!plaintext || !out || out_len == 0) return false;
+  unsigned char salt[SALT_SIZE];
+  if (RAND_bytes(salt, sizeof(salt)) != 1) return false;
+  unsigned char hash[32];
+  if (PKCS5_PBKDF2_HMAC(plaintext, (int)strlen(plaintext),
+                        salt, SALT_SIZE, ADMIN_PBKDF2_ITERATIONS,
+                        EVP_sha256(), 32, hash) != 1) return false;
+  char *salt_b64 = base64_encode(salt, SALT_SIZE);
+  char *hash_b64 = base64_encode(hash, 32);
+  bool ok = false;
+  if (salt_b64 && hash_b64) {
+    int n = snprintf(out, out_len, "%s%s$%s",
+                     ADMIN_PASS_HASH_PREFIX, salt_b64, hash_b64);
+    ok = (n > 0 && (size_t)n < out_len);
+  }
+  free(salt_b64);
+  free(hash_b64);
+  OPENSSL_cleanse(hash, sizeof(hash));
+  return ok;
+}
+
+bool hub_admin_verify_password(const char *plaintext, const char *stored) {
+  if (!plaintext || !stored) return false;
+  if (strncmp(stored, ADMIN_PASS_HASH_PREFIX, strlen(ADMIN_PASS_HASH_PREFIX)) != 0)
+    return false;
+  /* Parse "$pbkdf2$<salt_b64>$<hash_b64>" */
+  const char *after_prefix = stored + strlen(ADMIN_PASS_HASH_PREFIX);
+  const char *dollar = strchr(after_prefix, '$');
+  if (!dollar) return false;
+  int salt_b64_len = (int)(dollar - after_prefix);
+  const char *hash_b64_str = dollar + 1;
+
+  char salt_b64_buf[64];
+  if (salt_b64_len <= 0 || salt_b64_len >= (int)sizeof(salt_b64_buf)) return false;
+  memcpy(salt_b64_buf, after_prefix, (size_t)salt_b64_len);
+  salt_b64_buf[salt_b64_len] = '\0';
+
+  int salt_len = 0, stored_hash_len = 0;
+  unsigned char *salt = base64_decode(salt_b64_buf, &salt_len);
+  unsigned char *stored_hash = base64_decode(hash_b64_str, &stored_hash_len);
+  bool ok = false;
+  if (salt && stored_hash && salt_len == SALT_SIZE && stored_hash_len == 32) {
+    unsigned char derived[32];
+    if (PKCS5_PBKDF2_HMAC(plaintext, (int)strlen(plaintext),
+                          salt, salt_len, ADMIN_PBKDF2_ITERATIONS,
+                          EVP_sha256(), 32, derived) == 1) {
+      ok = (CRYPTO_memcmp(derived, stored_hash, 32) == 0);
+      OPENSSL_cleanse(derived, sizeof(derived));
+    }
+  }
+  free(salt);
+  free(stored_hash);
+  return ok;
 }
 
 // FIXED: Replaced EVP_BytesToKey with PKCS5_PBKDF2_HMAC
@@ -62,6 +114,16 @@ void hub_config_write(hub_state_t *state) {
   SAFE_WRITE("bind_ip|%s\n", state->bind_ip[0] ? state->bind_ip : "127.0.0.1");
   SAFE_WRITE("uuid|%s\n", state->hub_uuid[0] ? state->hub_uuid : "");
   SAFE_WRITE("hub_name|%s\n", state->hub_friendly_name[0] ? state->hub_friendly_name : "");
+  /* Hash the admin password before writing if it isn't already. */
+  if (strncmp(state->admin_password, ADMIN_PASS_HASH_PREFIX,
+              strlen(ADMIN_PASS_HASH_PREFIX)) != 0 &&
+      state->admin_password[0] != '\0') {
+    char hashed[128];
+    if (hub_admin_hash_password(state->admin_password, hashed, sizeof(hashed))) {
+      snprintf(state->admin_password, sizeof(state->admin_password), "%s", hashed);
+      secure_wipe(hashed, sizeof(hashed));
+    }
+  }
   SAFE_WRITE("admin|%s\n", state->admin_password);
   /* Persist Lamport seq so it survives restart and stays monotonic. */
   SAFE_WRITE("lamport_seq|%llu\n", (unsigned long long)state->next_lamport_seq);
@@ -74,7 +136,7 @@ void hub_config_write(hub_state_t *state) {
   for (int i = 0; i < state->peer_count; i++) {
     /* Serialize the per-peer Curve25519 pubkey (88 chars base64 of 64-byte
      * combined Ed25519+X25519) as the 5th field. Empty string means "no
-     * pubkey known, fall back to legacy peer auth". */
+     * pubkey known, peer will be refused at connection time". */
     char peer_pub_b64[COMBINED_KEY_B64 + 1] = "";
     if (state->peers[i].has_pubkey) {
       unsigned char combined[COMBINED_KEY_LEN];
@@ -253,7 +315,9 @@ void hub_config_write(hub_state_t *state) {
   // Write to temp file then rename (atomic operation)
   char tmp[64];
   snprintf(tmp, sizeof(tmp), "%s.tmp", HUB_CONFIG_FILE);
-  FILE *fp = fopen(tmp, "wb");
+  int tmp_fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  FILE *fp = (tmp_fd >= 0) ? fdopen(tmp_fd, "wb") : NULL;
+  if (!fp && tmp_fd >= 0) close(tmp_fd);
   if (fp) {
     fwrite(salt, 1, SALT_SIZE, fp);
     fwrite(iv, 1, GCM_IV_LEN, fp);
@@ -277,6 +341,12 @@ void hub_config_write(hub_state_t *state) {
 
 // FIXED: Use PBKDF2 and improved error handling
 bool hub_config_load(hub_state_t *state, const char *password) {
+  struct stat cfg_st;
+  if (stat(HUB_CONFIG_FILE, &cfg_st) == 0) {
+    if ((cfg_st.st_mode & 0177) != 0)
+      hub_log("[WARN] %s has insecure permissions %04o — should be 0600\n",
+              HUB_CONFIG_FILE, (unsigned)(cfg_st.st_mode & 0777));
+  }
   FILE *fp = fopen(HUB_CONFIG_FILE, "rb");
   if (!fp) {
     hub_log("Config file not found\n");
@@ -405,6 +475,18 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         }
       } else if (strcmp(k, "admin") == 0) {
         snprintf(state->admin_password, sizeof(state->admin_password), "%s", v);
+        /* Migrate plaintext password to PBKDF2 hash on load so the running
+         * hub can authenticate immediately without waiting for a config write. */
+        if (state->admin_password[0] &&
+            strncmp(state->admin_password, ADMIN_PASS_HASH_PREFIX,
+                    strlen(ADMIN_PASS_HASH_PREFIX)) != 0) {
+          char hashed[128];
+          if (hub_admin_hash_password(state->admin_password, hashed, sizeof(hashed))) {
+            snprintf(state->admin_password, sizeof(state->admin_password), "%s", hashed);
+            secure_wipe(hashed, sizeof(hashed));
+            state->config_dirty = true;
+          }
+        }
       } else if (strcmp(k, "purge_days") == 0) {
         state->purge_days_setting = atoi(v);
         if (state->purge_days_setting < 0) state->purge_days_setting = 0;

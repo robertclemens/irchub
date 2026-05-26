@@ -35,7 +35,12 @@
 #define HEADER_SIZE 4
 #define MAX_PENDING_BOTS 10
 #define MAX_PENDING_OP_REQUESTS 500
-#define PBKDF2_ITERATIONS 100000 // NEW: For password-based key derivation
+#define PBKDF2_ITERATIONS 100000 // For config-file key derivation
+/* Admin-password hashing: ~250 ms on commodity hardware; much slower than
+ * config-key derivation since this is an interactive auth path not a startup
+ * hot path. Format on disk: "$pbkdf2$<salt_b64>$<hash_b64>" */
+#define ADMIN_PBKDF2_ITERATIONS 500000
+#define ADMIN_PASS_HASH_PREFIX "$pbkdf2$"
 #define HUB_PID_FILE ".irchub.pid"
 #define HUB_PASS_FILE ".irchub.pass"
 #define HUB_CONFIG_PURGE_DAYS_KEY "purge_days"
@@ -164,6 +169,7 @@
 #define CMD_ADMIN_MATCH          0x4D   // Query all records for user or * (payload: name or *)
 #define CMD_ADMIN_LIST_ADMINS    0x4E   // List all admin records
 #define CMD_ADMIN_LIST_OPERS_V2  0x4F   // List all oper records
+#define CMD_ADMIN_SET_PEER_PUBKEY 0x52  // Set/replace pubkey on existing peer (payload: UUID:PUBKEY_B64)
 
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
@@ -314,6 +320,7 @@ typedef struct {
   bot_auth_state_t bot_auth_state;
   unsigned char challenge[32];
   unsigned char bot_eph_x25519_priv[32];
+  unsigned char bot_eph_x25519_pub[32];
   bool bot_eph_priv_set;
   int recv_len;
   char admin_connect_ip[64];   // IP that hub_admin used to connect
@@ -362,8 +369,16 @@ typedef struct {
   char hub_uuid[64];         // This hub's UUID
   char hub_friendly_name[64]; // This hub's friendly name
   char admin_password[128];
+  /* config_pass holds the plaintext AES-GCM config-file password for the
+   * lifetime of the process (needed on every config write).  It is mlock'd
+   * so the OS cannot page it to swap, and OPENSSL_cleanse'd at shutdown.
+   *
+   * Threat model: mlock prevents swap-file / hibernate leaks.  A root process
+   * with ptrace or /proc/<pid>/mem access CAN still read this field while the
+   * hub is running — that is unavoidable without hardware-backed key storage.
+   * The real defences are OS-level: ptrace_scope, process isolation, and
+   * filesystem permissions on the config file itself. */
   char config_pass[128];
-  unsigned char config_pass_key[128];
 
   unsigned char hub_ed25519_priv[32];
   unsigned char hub_ed25519_pub[32];
@@ -452,6 +467,8 @@ void hub_log(const char *format, ...);
 
 bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);
+bool hub_admin_hash_password(const char *plaintext, char *out, size_t out_len);
+bool hub_admin_verify_password(const char *plaintext, const char *stored);
 
 // Curve25519 crypto functions
 bool hub_crypto_generate_combined_keypair(unsigned char priv_out[64],
