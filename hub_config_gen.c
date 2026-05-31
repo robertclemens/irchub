@@ -186,13 +186,19 @@ int main(int argc, char *argv[]) {
         if (strncmp(argv[i], "peer:", 5) == 0) {
             const char *p = argv[i] + 5;
             /* format: IP:PORT:UUID:NAME — write as-is into peer| line */
-            char peerip[64], peeruuid[64], peername[64];
+            char peerip[64], peeruuid[64], peername[64], peerpub[128];
             int peerport;
             memset(peerip, 0, sizeof(peerip));
             memset(peeruuid, 0, sizeof(peeruuid));
             memset(peername, 0, sizeof(peername));
-            sscanf(p, "%63[^:]:%d:%63[^:]:%63s", peerip, &peerport, peeruuid, peername);
-            APP("peer|%s|%d|%s|%s\n", peerip, peerport, peeruuid, peername);
+            memset(peerpub, 0, sizeof(peerpub));
+            /* IP:PORT:UUID:NAME[:PUBKEY_B64] — pubkey enables v3 peer auth */
+            sscanf(p, "%63[^:]:%d:%63[^:]:%63[^:]:%127s",
+                   peerip, &peerport, peeruuid, peername, peerpub);
+            if (peerpub[0])
+                APP("peer|%s|%d|%s|%s|%s\n", peerip, peerport, peeruuid, peername, peerpub);
+            else
+                APP("peer|%s|%d|%s|%s\n", peerip, peerport, peeruuid, peername);
         }
     }
 

@@ -114,23 +114,24 @@ void hub_config_write(hub_state_t *state) {
   SAFE_WRITE("bind_ip|%s\n", state->bind_ip[0] ? state->bind_ip : "127.0.0.1");
   SAFE_WRITE("uuid|%s\n", state->hub_uuid[0] ? state->hub_uuid : "");
   SAFE_WRITE("hub_name|%s\n", state->hub_friendly_name[0] ? state->hub_friendly_name : "");
-  /* Hash the admin password before writing if it isn't already. */
-  if (strncmp(state->admin_password, ADMIN_PASS_HASH_PREFIX,
-              strlen(ADMIN_PASS_HASH_PREFIX)) != 0 &&
-      state->admin_password[0] != '\0') {
-    char hashed[128];
-    if (hub_admin_hash_password(state->admin_password, hashed, sizeof(hashed))) {
-      snprintf(state->admin_password, sizeof(state->admin_password), "%s", hashed);
-      secure_wipe(hashed, sizeof(hashed));
-    }
-  }
-  SAFE_WRITE("admin|%s\n", state->admin_password);
+  /* No 'admin|' line is written: per-admin auth uses the a| user records'
+   * password hashes (see hub_admin_verify_password). Existing files that
+   * carry an admin| line are silently ignored at load time. */
   /* Persist Lamport seq so it survives restart and stays monotonic. */
   SAFE_WRITE("lamport_seq|%llu\n", (unsigned long long)state->next_lamport_seq);
 
   // Write purge_days setting (only if enabled)
   if (state->purge_days_setting > 0) {
     SAFE_WRITE("purge_days|%d\n", state->purge_days_setting);
+  }
+
+  /* D3: persist the loopback-trust flag. Always written so the security
+   * posture is explicit in the config file rather than implied by absence. */
+  SAFE_WRITE("trust_loopback|%d\n", state->trust_loopback ? 1 : 0);
+
+  // Network opt flags: opt|<letters>|<timestamp>
+  if (state->opt_flags[0] != '\0') {
+    SAFE_WRITE("opt|%s|%ld\n", state->opt_flags, (long)state->opt_flags_ts);
   }
 
   for (int i = 0; i < state->peer_count; i++) {
@@ -191,6 +192,8 @@ void hub_config_write(hub_state_t *state) {
   }
 
   // Write named admin/oper records (a| and o| lines) — skip duplicates by type+name
+  // Format: <a|o>|uuid|name|password|add/del|last_seen|timestamp|<pubkey_b64>
+  // pubkey_b64 is empty when has_pubkey == false.
   char wr_seen_names[MAX_HUB_USER_RECORDS][64];
   char wr_seen_types[MAX_HUB_USER_RECORDS];
   int  wr_seen_count = 0;
@@ -207,10 +210,11 @@ void hub_config_write(hub_state_t *state) {
     snprintf(wr_seen_names[wr_seen_count], sizeof(wr_seen_names[0]), "%s", u->name);
     wr_seen_types[wr_seen_count] = u->type;
     wr_seen_count++;
-    SAFE_WRITE("%c|%s|%s|%s|%s|%ld|%ld\n",
+    SAFE_WRITE("%c|%s|%s|%s|%s|%ld|%ld|%s\n",
                u->type, u->uuid, u->name, u->password,
                u->is_active ? "add" : "del",
-               (long)u->last_seen, (long)u->timestamp);
+               (long)u->last_seen, (long)u->timestamp,
+               u->has_pubkey ? u->pubkey_b64 : "");
   }
 
   // Write usermask records (m| lines) — skip masks with no surviving owner
@@ -474,22 +478,34 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           snprintf(state->hub_friendly_name, sizeof(state->hub_friendly_name), "%s", v);
         }
       } else if (strcmp(k, "admin") == 0) {
-        snprintf(state->admin_password, sizeof(state->admin_password), "%s", v);
-        /* Migrate plaintext password to PBKDF2 hash on load so the running
-         * hub can authenticate immediately without waiting for a config write. */
-        if (state->admin_password[0] &&
-            strncmp(state->admin_password, ADMIN_PASS_HASH_PREFIX,
-                    strlen(ADMIN_PASS_HASH_PREFIX)) != 0) {
-          char hashed[128];
-          if (hub_admin_hash_password(state->admin_password, hashed, sizeof(hashed))) {
-            snprintf(state->admin_password, sizeof(state->admin_password), "%s", hashed);
-            secure_wipe(hashed, sizeof(hashed));
-            state->config_dirty = true;
-          }
-        }
+        /* Legacy 'admin|' line ignored (global admin password dropped in
+         * favour of per-admin records). Old configs simply lose this field
+         * on the next save; admins must already exist as a| records. */
+        (void)v;
       } else if (strcmp(k, "purge_days") == 0) {
         state->purge_days_setting = atoi(v);
         if (state->purge_days_setting < 0) state->purge_days_setting = 0;
+      } else if (strcmp(k, "trust_loopback") == 0) {
+        /* D3: exempt 127.0.0.1/::1 from rate limiting only when explicitly set.
+         * Absent key -> false (secure default; state is zeroed before load). */
+        state->trust_loopback = (v && (v[0] == '1' ||
+                                       strcasecmp(v, "true") == 0 ||
+                                       strcasecmp(v, "yes")  == 0));
+      } else if (strcmp(k, "opt") == 0) {
+        /* opt|<letters>|<timestamp> — keep only [a-zA-Z0-9] */
+        char flags[MAX_OPT_FLAGS + 1] = {0};
+        long ts = 0;
+        if (sscanf(v, "%32[^|]|%ld", flags, &ts) >= 1) {
+          int w = 0;
+          for (int i = 0; flags[i] && w < MAX_OPT_FLAGS; i++) {
+            char c = flags[i];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9'))
+              state->opt_flags[w++] = c;
+          }
+          state->opt_flags[w] = '\0';
+          state->opt_flags_ts = (ts > 0) ? (time_t)ts : 0;
+        }
       } else if (strcmp(k, "lamport_seq") == 0) {
         unsigned long long loaded_seq = 0;
         sscanf(v, "%llu", &loaded_seq);
@@ -700,7 +716,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
                        first[13] == '-' && first[18] == '-' && first[23] == '-');
 
         if (is_new && state->user_record_count < MAX_HUB_USER_RECORDS) {
-          /* New format: uuid|name|password|action|last_seen|timestamp */
+          /* New format: uuid|name|password|action|last_seen|timestamp[|pubkey_b64] */
           hub_user_record_t *u = &state->user_records[state->user_record_count];
           memset(u, 0, sizeof(*u));
           char *p1 = strchr(v, '|');           /* after uuid */
@@ -708,6 +724,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           char *p3 = p2 ? strchr(p2+1, '|') : NULL; /* after pass */
           char *p4 = p3 ? strchr(p3+1, '|') : NULL; /* after action */
           char *p5 = p4 ? strchr(p4+1, '|') : NULL; /* after last_seen */
+          char *p6 = p5 ? strchr(p5+1, '|') : NULL; /* after timestamp (optional pubkey) */
           if (p1 && p2 && p3 && p4 && p5) {
             snprintf(u->uuid,     sizeof(u->uuid),     "%.*s", (int)(p1-v),    v);
             snprintf(u->name,     sizeof(u->name),     "%.*s", (int)(p2-p1-1), p1+1);
@@ -715,7 +732,19 @@ bool hub_config_load(hub_state_t *state, const char *password) {
             u->type      = k[0];
             u->is_active = (strncmp(p3+1, "add", 3) == 0);
             u->last_seen = (time_t)atol(p4+1);
-            u->timestamp = (time_t)atol(p5+1);
+            if (p6) {
+              /* timestamp ends at p6 boundary, pubkey is everything after p6 */
+              char ts_buf[32];
+              snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
+              u->timestamp = (time_t)atol(ts_buf);
+              snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", p6+1);
+              u->has_pubkey = (u->pubkey_b64[0] != '\0' &&
+                               strlen(u->pubkey_b64) == COMBINED_KEY_B64);
+            } else {
+              u->timestamp = (time_t)atol(p5+1);
+              u->has_pubkey = false;
+              u->pubkey_b64[0] = '\0';
+            }
             state->user_record_count++;
           }
         }

@@ -5,8 +5,13 @@
 # Configuration
 # ============================================================================
 
-# Compiler
-CC = gcc
+# Compiler: prefer gcc, fall back to clang, then cc, if gcc is not installed.
+# An explicit `make CC=<compiler>` (command line / env) always wins.
+ifeq ($(origin CC),default)
+  CC := $(shell command -v gcc >/dev/null 2>&1 && echo gcc || \
+                { command -v clang >/dev/null 2>&1 && echo clang; } || echo cc)
+endif
+$(info [build] using CC=$(CC))
 
 # Project name
 PROJECT = irchub

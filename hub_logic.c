@@ -194,6 +194,14 @@ static int peer_encrypt_into_writing(hub_client_t *peer, queued_msg_t *m) {
     memcpy(&plain[5], m->payload, (size_t)m->payload_len);
   int total_plain = 5 + m->payload_len;
 
+  /* D2: writing_buf may be the small pre-auth buffer. Refuse to encrypt a
+   * frame that would not fit (4-byte length prefix + ciphertext + tag).
+   * AES-GCM ciphertext length equals the plaintext length. */
+  if (4 + total_plain + GCM_TAG_LEN > peer->writing_cap) {
+    secure_wipe(plain, sizeof(plain));
+    return 0;
+  }
+
   unsigned char tag[GCM_TAG_LEN];
   int cipher_len = aes_gcm_encrypt(plain, total_plain, peer->session_key,
                                    peer->writing_buf + 4, tag);
@@ -262,6 +270,7 @@ void peer_drain_writable(hub_state_t *state, hub_client_t *peer) {
       }
 
       queued_msg_t *m = lane->head;
+      if (!m) { lane->count = 0; break; }  /* count/head desync guard: never deref a NULL head */
       lane->head = m->next;
       if (!lane->head) lane->tail = NULL;
       lane->count--;
@@ -378,7 +387,6 @@ static bool send_pong(hub_state_t *state, hub_client_t *c);
 static void add_pending_bot(hub_state_t *state, const char *uuid,
                             const char *ip);
 static void remove_pending_bot(hub_state_t *state, const char *uuid);
-static void broadcast_new_key(hub_state_t *state, const char *new_priv_key, const char *new_pub_key);
 static void process_mesh_state(hub_state_t *state, hub_client_t *c,
                                char *payload);
 static void process_peer_sync(hub_state_t *state, char *payload, int origin_fd);
@@ -488,15 +496,56 @@ static ip_rate_limit_t* find_or_create_ip_limit(hub_state_t *state, const char *
         entry->last_failed_auth = 0;
         entry->blocked_until = 0;
         entry->first_seen = time(NULL);
+        entry->churn_window_start = entry->first_seen;
+        entry->churn_count = 0;
         return entry;
     }
 
     return NULL;  // No space (shouldn't happen with large limit)
 }
 
+/* D2: allocate a client's recv/writing buffers. recv_buf is `size`; writing_buf
+ * is `size + 64` to hold the 4-byte length prefix + GCM tag overhead. */
+bool hub_client_alloc_buffers(hub_client_t *c, int size) {
+    if (!c || size <= 0) return false;
+    c->recv_buf    = malloc((size_t)size);
+    c->writing_buf = malloc((size_t)size + 64);
+    if (!c->recv_buf || !c->writing_buf) {
+        free(c->recv_buf);    c->recv_buf = NULL;
+        free(c->writing_buf); c->writing_buf = NULL;
+        return false;
+    }
+    c->recv_cap    = size;
+    c->writing_cap = size + 64;
+    return true;
+}
+
+/* D2: grow a client's buffers to full MAX_BUFFER on successful auth. Idempotent.
+ * realloc preserves any already-buffered bytes (e.g. data pipelined behind the
+ * final handshake frame). On OOM the existing buffers are left intact and the
+ * caller should disconnect. */
+bool hub_client_promote_buffers(hub_client_t *c) {
+    if (!c) return false;
+    if (c->recv_cap >= MAX_BUFFER) return true;  /* already promoted */
+
+    unsigned char *nr = realloc(c->recv_buf, MAX_BUFFER);
+    if (!nr) return false;
+    c->recv_buf = nr;
+    c->recv_cap = MAX_BUFFER;
+
+    unsigned char *nw = realloc(c->writing_buf, MAX_BUFFER + 64);
+    if (!nw) return false;  /* recv already grown; writing stays small — caller drops */
+    c->writing_buf = nw;
+    c->writing_cap = MAX_BUFFER + 64;
+    return true;
+}
+
 bool is_ip_allowed(hub_state_t *state, const char *ip) {
-    /* Loopback is trusted — skip all rate limiting */
-    if (strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0) return true;
+    /* D3: loopback is exempt only when explicitly trusted. Default is to treat
+     * 127.0.0.1/::1 like any other IP, so a local/SSRF/co-tenant source cannot
+     * bypass per-IP limits. */
+    if (state->trust_loopback &&
+        (strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0)) return true;
 
     ip_rate_limit_t *entry = find_or_create_ip_limit(state, ip);
     if (!entry) return true;  // If can't track, allow (fail open)
@@ -505,7 +554,7 @@ bool is_ip_allowed(hub_state_t *state, const char *ip) {
 
     // Check if temporarily blocked
     if (entry->blocked_until > 0 && now < entry->blocked_until) {
-        hub_log("[RATE_LIMIT] IP %s is blocked until %ld (failed auth)\n",
+        hub_log("[RATE_LIMIT] IP %s is blocked until %ld\n",
                 ip, (long)entry->blocked_until);
         return false;
     }
@@ -514,6 +563,23 @@ bool is_ip_allowed(hub_state_t *state, const char *ip) {
     if (entry->blocked_until > 0 && now >= entry->blocked_until) {
         entry->blocked_until = 0;
         entry->failed_auth_count = 0;
+    }
+
+    /* D1: churn-based throttle. is_ip_allowed() is the single per-accept gate,
+     * so each call is exactly one new connection attempt. Count attempts in a
+     * sliding window; a connect/close flood trips a temporary block here even
+     * though it never exceeds the concurrency limit or fails auth. */
+    if (now - entry->churn_window_start >= CHURN_WINDOW_SEC) {
+        entry->churn_window_start = now;
+        entry->churn_count = 0;
+    }
+    entry->churn_count++;
+    if (entry->churn_count > CHURN_MAX_CONNS) {
+        entry->blocked_until = now + CHURN_BLOCK_SEC;
+        hub_log("[RATE_LIMIT] IP %s connection churn flood (%d conns/%ds) — "
+                "blocked %ds\n", ip, entry->churn_count, CHURN_WINDOW_SEC,
+                CHURN_BLOCK_SEC);
+        return false;
     }
 
     // Check connection limit
@@ -545,7 +611,9 @@ void decrement_active_connections(hub_state_t *state, const char *ip) {
 }
 
 static void record_failed_auth(hub_state_t *state, const char *ip) {
-    if (strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0) return;
+    /* D3: only skip failed-auth tracking for loopback when it is trusted. */
+    if (state->trust_loopback &&
+        (strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0)) return;
     ip_rate_limit_t *entry = find_or_create_ip_limit(state, ip);
     if (!entry) return;
 
@@ -906,6 +974,13 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     client->bot_auth_state = BOT_AUTH_COMPLETE;
     client->last_seen = time(NULL);
 
+    /* D2: grow buffers to full size now that the bot is authenticated. */
+    if (!hub_client_promote_buffers(client)) {
+      hub_log("[HUB][ERROR] Buffer promotion OOM for %s — disconnecting\n",
+              client->id);
+      return false;
+    }
+
     hub_storage_update_entry(state, client->id, "seen", "", "", "", client->last_seen);
 
     hub_log("[HUB] Bot %s authenticated (Curve25519)\n", client->id);
@@ -1007,52 +1082,9 @@ static void remove_pending_bot(hub_state_t *state, const char *uuid) {
   }
 }
 
-static void broadcast_new_key(hub_state_t *state, const char *new_priv_key, const char *new_pub_key) {
-  unsigned char buffer[MAX_BUFFER];
-  unsigned char tag[GCM_TAG_LEN];
-  unsigned char plain[MAX_BUFFER];
-
-  // Combine private and public keys in payload: "PRIVKEY|||PUBKEY"
-  // Using ||| as delimiter since PEM keys contain single | in base64
-  char combined_payload[MAX_BUFFER];
-  int written = snprintf(combined_payload, sizeof(combined_payload), "%s|||%s", new_priv_key, new_pub_key);
-  if (written < 0 || written >= (int)sizeof(combined_payload)) {
-    hub_log("[HUB] ERROR: Combined key payload too large for buffer\n");
-    return;
-  }
-
-  plain[0] = CMD_UPDATE_PUBKEY;
-  int payload_len = strlen(combined_payload);
-  if (payload_len > (MAX_BUFFER - 10))
-    return;
-
-  memcpy(&plain[1], &payload_len, 4);
-  memcpy(&plain[5], combined_payload, payload_len);
-  int total_plain = 1 + 4 + payload_len;
-
-  int hub_count = 0;
-
-  // Send both private and public keys to peer hubs (they share the same keys for hub-to-hub auth)
-  // Do NOT send to bots - they have their own individual keypairs
-  for (int i = 0; i < state->client_count; i++) {
-    hub_client_t *c = state->clients[i];
-    if (c->authenticated && c->type == CLIENT_HUB) {
-      int enc_len =
-          aes_gcm_encrypt(plain, total_plain, c->session_key, buffer + 4, tag);
-      if (enc_len > 0) {
-        memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-        int packet_len = enc_len + GCM_TAG_LEN;
-        uint32_t net_len = htonl(packet_len);
-        memcpy(buffer, &net_len, 4);
-
-        if (write(c->fd, buffer, 4 + packet_len) == (ssize_t)(4 + packet_len)) {
-          hub_count++;
-        }
-      }
-    }
-  }
-  hub_log("[HUB] Broadcasted new private and public keys to %d peer hubs for rekey.\n", hub_count);
-}
+/* broadcast_new_key removed: independent per-hub keypairs mean private keys
+ * must never travel between hubs.  Rekey is local-only — each hub regenerates
+ * its own keypair and exports the new pubkey for peers to re-register. */
 
 static void hub_state_add_bot_memory(hub_state_t *state, const char *uuid,
                                      const char *nick, const char *pub_key) {
@@ -1371,6 +1403,25 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
 
   hub_log("[HUB] Processing config push from %s\n", client->id);
 
+  /* opt 'h' (OPT_HUB_ONLY_MUTATIONS) enforcement point.  When the network is in
+   * hub-only-mutation mode the hub is the SOLE authority for privileged record
+   * types, and this is what makes the flag *binding* against a rogue or
+   * malicious bot.  The matching bot-side guard (ircbot/commands.c:516) only
+   * stops a well-behaved bot from issuing the command locally; a modified or
+   * compromised bot can ignore it and push the record straight up this path.
+   * Rejecting those pushes here ensures a bot cannot mutate admin/oper/usermask/
+   * channel/password state under opt 'h'.  These map 1:1 to the bot-side
+   * HUB_ONLY_CMDS list: a=+/-admin, o=+/-oper, m=+/-usermask, c=join/part+chpass,
+   * p=botpass.  The bot's own runtime identity (nick 'n', hostmask 'h') is
+   * intrinsic state only the bot can report, so it stays accepted.
+   * Note: bots cannot clear this flag — 'opt|' updates arrive only via
+   * CMD_PEER_SYNC (CLIENT_HUB) or CMD_ADMIN_SET_OPT_FLAGS (CLIENT_ADMIN);
+   * the CLIENT_BOT dispatch never reaches process_peer_sync.  Combined with the
+   * rejection below, once opt 'h' is set a bot can neither mutate privileged
+   * records nor escalate to an admin record that would let it clear the flag. */
+  const bool hub_only_mutations =
+      (strchr(state->opt_flags, OPT_HUB_ONLY_MUTATIONS) != NULL);
+
   char work_buf[MAX_BUFFER];
   snprintf(work_buf, sizeof(work_buf), "%s", payload);
 
@@ -1394,6 +1445,17 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
     }
 
     char *data = line + 2;
+
+    /* Reject hub-authoritative record types from bots while opt 'h' is active. */
+    if (hub_only_mutations &&
+        (type == 'a' || type == 'o' || type == 'm' ||
+         type == 'c' || type == 'p')) {
+      hub_log("[HUB] opt 'h' active: REJECTED bot-pushed '%c' record from %s "
+              "(hub-authoritative — mutation must originate from hub_admin)\n",
+              type, client->id);
+      line = strtok_r(NULL, "\n", &saveptr);
+      continue;
+    }
 
     // Special handling for different types
     if (type == 'c') {
@@ -1493,7 +1555,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         }
       }
     } else if (type == 'o' || type == 'a') {
-      /* New format: uuid|name|password|add/del|last_seen|timestamp
+      /* New format: uuid|name|password|add/del|last_seen|timestamp[|pubkey_b64]
        * Old single-password format is ignored (hub is authoritative) */
       char first_ao[40] = {0};
       char *pfao = strchr(data, '|');
@@ -1503,14 +1565,24 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
         char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
         char *p5=p4?strchr(p4+1,'|'):NULL;
+        char *p6=p5?strchr(p5+1,'|'):NULL; /* optional pubkey trailer */
         if (p1&&p2&&p3&&p4&&p5) {
           char uuid[37], uname[64], upass[MAX_PASS], act[8];
+          char incoming_pub[COMBINED_KEY_B64 + 1] = {0};
           long last_seen, ts;
           snprintf(uuid,  sizeof(uuid),  "%.*s",(int)(p1-data),data);
           snprintf(uname, sizeof(uname), "%.*s",(int)(p2-p1-1),p1+1);
           snprintf(upass, sizeof(upass), "%.*s",(int)(p3-p2-1),p2+1);
           snprintf(act,   sizeof(act),   "%.*s",(int)(p4-p3-1),p3+1);
-          last_seen = atol(p4+1); ts = atol(p5+1);
+          last_seen = atol(p4+1);
+          if (p6) {
+            char ts_buf[32];
+            snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
+            ts = atol(ts_buf);
+            snprintf(incoming_pub, sizeof(incoming_pub), "%s", p6+1);
+          } else {
+            ts = atol(p5+1);
+          }
           bool is_active = (strncmp(act,"add",3)==0);
           hub_user_record_t *found_u = NULL;
           for (int ui=0; ui<state->user_record_count; ui++) {
@@ -1523,16 +1595,14 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
             memset(found_u,0,sizeof(*found_u));
             snprintf(found_u->uuid,sizeof(found_u->uuid),"%s",uuid);
           }
-          /* If no UUID match, check for name collision before creating new record */
           if (!found_u) {
             for (int ui2=0; ui2<state->user_record_count; ui2++) {
               if (state->user_records[ui2].type == type &&
                   strcasecmp(state->user_records[ui2].name, uname) == 0) {
-                found_u = &state->user_records[ui2]; /* merge into existing */
+                found_u = &state->user_records[ui2];
                 break;
               }
             }
-            /* If still not found, allocate new slot */
             if (!found_u && state->user_record_count < MAX_HUB_USER_RECORDS) {
               found_u = &state->user_records[state->user_record_count++];
               memset(found_u,0,sizeof(*found_u));
@@ -1546,11 +1616,16 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
             found_u->is_active = is_active;
             if (last_seen > found_u->last_seen) found_u->last_seen = last_seen;
             found_u->timestamp = ts;
+            if (incoming_pub[0] && strlen(incoming_pub) == COMBINED_KEY_B64) {
+              snprintf(found_u->pubkey_b64, sizeof(found_u->pubkey_b64), "%s", incoming_pub);
+              found_u->has_pubkey = true;
+            }
             state->config_dirty = true;
             updates++;
             int w = snprintf(sync_buffer+sync_offset, sizeof(sync_buffer)-sync_offset,
-                             "%c|%s|%s|%s|%s|%ld|%ld\n",
-                             type, uuid, uname, upass, act, last_seen, ts);
+                             "%c|%s|%s|%s|%s|%ld|%ld|%s\n",
+                             type, uuid, uname, upass, act, last_seen, ts,
+                             found_u->has_pubkey ? found_u->pubkey_b64 : "");
             if (w>0) sync_offset += w;
           }
         }
@@ -1600,7 +1675,10 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       // Nick: n|nickname|timestamp
       char nick[MAX_NICK];
       long ts;
-      if (sscanf(data, "%32[^|]|%ld", nick, &ts) == 2) {
+      /* %31 not %32: a 32-char field + NUL would write 33 bytes into nick[32]
+       * (1-byte stack overflow).  Reachable by any authenticated bot via an
+       * 'n|' config-push record. */
+      if (sscanf(data, "%31[^|]|%ld", nick, &ts) == 2) {
         bool accepted = hub_storage_update_entry(state, client->id, "n", nick, "", "", ts);
         hub_log("[HUB-DEBUG] Nick %s: ts=%ld -> %s\n", nick, ts, accepted ? "ACCEPTED" : "REJECTED");
         if (accepted) {
@@ -1669,15 +1747,17 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
     offset += written;
   }
 
-  /* Include new-format user records so peer hubs share admin/oper records */
+  /* Include new-format user records so peer hubs share admin/oper records
+   * (8-field format: trailing pubkey_b64). */
   for (int i = 0; i < state->user_record_count; i++) {
     hub_user_record_t *u = &state->user_records[i];
     if (max_len - offset <= 1) break;
     written = snprintf(buffer + offset, max_len - offset,
-                       "%c|%s|%s|%s|%s|%ld|%ld\n",
+                       "%c|%s|%s|%s|%s|%ld|%ld|%s\n",
                        u->type, u->uuid, u->name, u->password,
                        u->is_active ? "add" : "del",
-                       (long)u->last_seen, (long)u->timestamp);
+                       (long)u->last_seen, (long)u->timestamp,
+                       u->has_pubkey ? u->pubkey_b64 : "");
     if (written < 0 || written >= (max_len - offset)) break;
     offset += written;
   }
@@ -1692,6 +1772,14 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
                        (long)m->last_used, (long)m->timestamp);
     if (written < 0 || written >= (max_len - offset)) break;
     offset += written;
+  }
+
+  /* Include network opt flag string (peers must converge on this). */
+  if (max_len - offset > 1 && state->opt_flags_ts > 0) {
+    written = snprintf(buffer + offset, max_len - offset, "opt|%s|%ld\n",
+                       state->opt_flags[0] ? state->opt_flags : "",
+                       (long)state->opt_flags_ts);
+    if (written > 0 && written < (max_len - offset)) offset += written;
   }
 
   // 2. Include bot entries
@@ -1879,6 +1967,38 @@ static void process_peer_sync(hub_state_t *state, char *payload,
       continue;
     }
 
+    /* Handle 'opt|<letters>|<ts>' from peer hubs (mesh-replicated opt flags).
+     * Adopt incoming value if its timestamp is newer than ours. */
+    if (strncmp(line, "opt|", 4) == 0) {
+      char incoming_flags[MAX_OPT_FLAGS + 1] = {0};
+      long incoming_ts = 0;
+      const char *v = line + 4;
+      if (sscanf(v, "%32[^|]|%ld", incoming_flags, &incoming_ts) >= 1) {
+        if (incoming_ts > 0 && incoming_ts > state->opt_flags_ts) {
+          int w = 0;
+          for (int i = 0; incoming_flags[i] && w < MAX_OPT_FLAGS; i++) {
+            char c = incoming_flags[i];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9'))
+              state->opt_flags[w++] = c;
+          }
+          state->opt_flags[w] = '\0';
+          state->opt_flags_ts = (time_t)incoming_ts;
+          state->config_dirty = true;
+          updates++;
+          bot_push_updates++;
+          if (fwd_offset < (int)sizeof(forward_buf) - 64) {
+            int wfwd = snprintf(forward_buf + fwd_offset,
+                                sizeof(forward_buf) - fwd_offset,
+                                "%s\n", line);
+            if (wfwd > 0) fwd_offset += wfwd;
+          }
+        }
+      }
+      line = strtok_r(NULL, "\n", &saveptr);
+      continue;
+    }
+
     // Check if this is a global entry (format: key|value|timestamp)
     // Global keys: c, m, o, a, p (NOT starting with b|)
     if (strncmp(line, "b|", 2) != 0) {
@@ -1913,18 +2033,28 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                                  first_f[13]=='-' && first_f[18]=='-' && first_f[23]=='-');
 
               if (is_new_fmt && is_user_key) {
-                /* Parse: uuid|name|pass|add/del|last_seen|ts */
+                /* Parse: uuid|name|pass|add/del|last_seen|ts[|pubkey_b64] */
                 char *pp1=vp1, *pp2=pp1?strchr(pp1+1,'|'):NULL;
                 char *pp3=pp2?strchr(pp2+1,'|'):NULL, *pp4=pp3?strchr(pp3+1,'|'):NULL;
                 char *pp5=pp4?strchr(pp4+1,'|'):NULL;
+                char *pp6=pp5?strchr(pp5+1,'|'):NULL;
                 if (pp1&&pp2&&pp3&&pp4&&pp5) {
                   char uuid[37], uname[64], upass[MAX_PASS], act[8];
+                  char incoming_pub[COMBINED_KEY_B64 + 1] = {0};
                   long last_seen, ts;
                   snprintf(uuid,  sizeof(uuid),  "%.*s",(int)(pp1-vstart),vstart);
                   snprintf(uname, sizeof(uname), "%.*s",(int)(pp2-pp1-1),pp1+1);
                   snprintf(upass, sizeof(upass), "%.*s",(int)(pp3-pp2-1),pp2+1);
                   snprintf(act,   sizeof(act),   "%.*s",(int)(pp4-pp3-1),pp3+1);
-                  last_seen = atol(pp4+1); ts = atol(pp5+1);
+                  last_seen = atol(pp4+1);
+                  if (pp6) {
+                    char ts_buf[32];
+                    snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(pp6-pp5-1), pp5+1);
+                    ts = atol(ts_buf);
+                    snprintf(incoming_pub, sizeof(incoming_pub), "%s", pp6+1);
+                  } else {
+                    ts = atol(pp5+1);
+                  }
                   bool is_active = (strncmp(act,"add",3)==0);
                   hub_user_record_t *found_u = NULL;
                   for (int ui=0; ui<state->user_record_count; ui++)
@@ -1972,6 +2102,11 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                     found_u->is_active = is_active;
                     if (last_seen > found_u->last_seen) found_u->last_seen = last_seen;
                     found_u->timestamp = ts;
+                    if (incoming_pub[0] && strlen(incoming_pub) == COMBINED_KEY_B64) {
+                      snprintf(found_u->pubkey_b64, sizeof(found_u->pubkey_b64),
+                               "%s", incoming_pub);
+                      found_u->has_pubkey = true;
+                    }
                     state->config_dirty = true;
                     updates++;
                     bot_push_updates++; /* admin/oper name change — bots need this */
@@ -2466,6 +2601,43 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   }
   case CMD_ADMIN_REKEY_BOT:
     if (payload && strlen(payload) > 0) {
+      /* v3: per-bot independent keys.  Only the bot can rekey — it owns its
+       * private key.  The bot's 'rekey' admin command regenerates the keypair
+       * locally and pushes the new PUBLIC key to us over its authenticated
+       * session (we store it as the bot's 'pub' entry and fan it out to peers
+       * via auto-sync).  We deliberately do NOT disconnect the bot here: it
+       * needs that active session to push the new pub, and it reconnects
+       * itself with the new key as the final step of 'rekey'. */
+      bool bot_online = false;
+      for (int i = 0; i < state->client_count; i++) {
+        if (state->clients[i]->type == CLIENT_BOT &&
+            strcmp(state->clients[i]->id, payload) == 0) {
+          bot_online = true;
+          break;
+        }
+      }
+      char msg[384];
+      snprintf(msg, sizeof(msg),
+               "INSTRUCT|%s|rekey is bot-local (only the bot holds its private "
+               "key). On the bot host, as an admin, message the bot:\n"
+               "  /msg <bot> ~A1c... rekey\n"
+               "The bot generates a new keypair, pushes its new pubkey here, "
+               "and reconnects; peers auto-sync. Bot is currently %s.",
+               payload,
+               bot_online ? "ONLINE — you can rekey now"
+                          : "OFFLINE — wait for it to reconnect first");
+      return send_response(state, client, msg);
+    }
+    return send_response(state, client, "ERROR|Missing UUID");
+
+  /* Legacy code dropped: the block below used to (1) generate a new keypair
+   * on the hub, (2) overwrite the stored pub, (3) ship the new priv to the
+   * bot, and (4) forward the rekey via CMD_PEER_REKEY_BOT.  Per the v3 trust
+   * model, only the bot generates its own keys.  Kept until the rekey IRC
+   * command on the bot is shipped — at which point this whole block can be
+   * removed and the conditional below is unreachable. */
+#if 0
+    if (payload && strlen(payload) > 0) {
       // Find bot by UUID
       bot_config_t *bot = NULL;
       for (int i = 0; i < state->bot_count; i++) {
@@ -2696,6 +2868,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       }
     }
     return send_response(state, client, "ERROR|Missing UUID");
+#endif  /* end legacy CMD_ADMIN_REKEY_BOT block */
 
   case CMD_ADMIN_DISCONNECT_BOT:
     if (payload && strlen(payload) > 0) {
@@ -2855,7 +3028,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         snprintf(time_buf, sizeof(time_buf), "Never");
       } else {
         struct tm *t = localtime(&last_seen);
-        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", t);
+        if (t) strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", t);
+        else   snprintf(time_buf, sizeof(time_buf), "invalid");
       }
 
       // Build output line
@@ -2942,78 +3116,75 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   }
 
   case CMD_ADMIN_CREATE_BOT: {
-    char nick[64];
-    if (payload && strlen(payload) > 0) {
-      snprintf(nick, sizeof(nick), "%s", payload);
-    } else {
-      snprintf(nick, sizeof(nick), "UnnamedBot");
+    /* v3: bot-provided identity.  Payload: "NICK|UUID|PUBKEY_B64".
+     * The hub no longer generates the bot keypair — the bot did, locally
+     * during 'ircbot -setup'.  Only the public key reaches the hub. */
+    if (!payload || !*payload) {
+      send_response(state, client, "ERROR|Empty payload");
+      return true;
     }
-
-    char *uuid = NULL, *priv_key = NULL, *pub_key = NULL;
-
-    if (hub_crypto_generate_bot_creds(&uuid, &priv_key, &pub_key)) {
-      hub_state_add_bot_memory(state, uuid, nick, pub_key);
-      state->config_dirty = true;
-
-      int w =
-          snprintf(response, sizeof(response), "SUCCESS|%s|%s", uuid, priv_key);
-
-      if (w >= (int)sizeof(response)) {
-        send_response(state, client, "ERROR|Key too large.");
-      } else {
-        send_response(state, client, response);
-      }
-
-      // ADDED: Secure cleanup
-      if (priv_key) {
-        secure_wipe(priv_key, strlen(priv_key));
-        free(priv_key);
-      }
-      if (pub_key)
-        free(pub_key);
-      if (uuid)
-        free(uuid);
-    } else {
-      send_response(state, client, "ERROR|Crypto generation failed.");
+    char nick[64] = {0}, uuid_in[64] = {0}, pubkey_in[256] = {0};
+    if (sscanf(payload, "%63[^|]|%63[^|]|%255s", nick, uuid_in, pubkey_in) < 3) {
+      send_response(state, client, "ERROR|Format: NICK|UUID|PUBKEY_B64");
+      return true;
     }
+    if (strlen(uuid_in) != 36 || uuid_in[8] != '-' || uuid_in[13] != '-' ||
+        uuid_in[18] != '-' || uuid_in[23] != '-') {
+      send_response(state, client, "ERROR|Invalid UUID format");
+      return true;
+    }
+    if (strlen(pubkey_in) != COMBINED_KEY_B64) {
+      send_response(state, client, "ERROR|pubkey must be 88-char base64");
+      return true;
+    }
+    {
+      int dec_len = 0;
+      unsigned char *dec = base64_decode(pubkey_in, &dec_len);
+      if (!dec || dec_len != COMBINED_KEY_LEN) {
+        if (dec) free(dec);
+        send_response(state, client, "ERROR|pubkey not valid 64-byte Curve25519");
+        return true;
+      }
+      free(dec);
+    }
+    /* Reject if UUID already exists */
+    for (int i = 0; i < state->bot_count; i++) {
+      if (strcmp(state->bots[i].uuid, uuid_in) == 0) {
+        send_response(state, client, "ERROR|Bot UUID already registered");
+        return true;
+      }
+    }
+    hub_state_add_bot_memory(state, uuid_in, nick, pubkey_in);
+    state->config_dirty = true;
+
+    char ok[128];
+    snprintf(ok, sizeof(ok), "SUCCESS|%s|registered", uuid_in);
+    send_response(state, client, ok);
   }
     return true;
 
   case CMD_ADMIN_REGEN_KEYS: {
+    /* Local-only hub rekey: generate a new Curve25519 keypair, save it
+     * encrypted in .irchub.cnf, dump the new public key for re-distribution.
+     * Independent per-hub keys: the new pubkey is NOT pushed to peers; each
+     * peer hub must re-register it via 'Set Peer Pubkey' in hub_admin.
+     * Bots that connect here must also re-run 'sethubpub'. */
     unsigned char priv64[64], pub64[64];
     if (hub_crypto_generate_combined_keypair(priv64, pub64)) {
-      char *priv_b64 = base64_encode(priv64, 64);
-      char *pub_b64  = base64_encode(pub64,  64);
+      hub_crypto_split_combined(priv64, state->hub_ed25519_priv, state->hub_x25519_priv);
+      hub_crypto_split_combined(pub64,  state->hub_ed25519_pub,  state->hub_x25519_pub);
+      char *pub_b64 = base64_encode(pub64, 64);
       secure_wipe(priv64, 64);
+      if (!pub_b64) return send_response(state, client, "ERROR: Base64 encoding failed.");
 
-      if (!priv_b64 || !pub_b64) {
-        if (priv_b64) { secure_wipe(priv_b64, strlen(priv_b64)); free(priv_b64); }
-        if (pub_b64)  free(pub_b64);
-        return send_response(state, client, "ERROR: Base64 encoding failed.");
-      }
-
-      // Update in-memory state directly from the generated keys (priv64/pub64
-      // are still available here; only the encoded base64 copies were made)
-      hub_crypto_split_combined(pub64, state->hub_ed25519_pub, state->hub_x25519_pub);
-      {
-        unsigned char priv_raw[64];
-        int dec_len = 0;
-        unsigned char *dec = base64_decode(priv_b64, &dec_len);
-        if (dec && dec_len == 64) {
-          hub_crypto_split_combined(dec, state->hub_ed25519_priv, state->hub_x25519_priv);
-          secure_wipe(dec, 64);
-        }
-        if (dec) free(dec);
-        secure_wipe(priv_raw, 64);
-      }
       state->hub_keys_loaded = true;
-
-      broadcast_new_key(state, priv_b64, pub_b64);
       state->config_dirty = true;
 
-      // Disconnect peer hubs so they reconnect with new key
+      /* Disconnect peers + bots so they must reauthenticate (and rediscover
+       * that this hub's pubkey changed). */
       for (int i = 0; i < state->client_count; i++) {
-        if (state->clients[i]->type == CLIENT_HUB) {
+        if (state->clients[i]->type == CLIENT_HUB ||
+            state->clients[i]->type == CLIENT_BOT) {
           hub_disconnect_client(state, state->clients[i]);
           i--;
         }
@@ -3027,8 +3198,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       if (fp) { fprintf(fp, "%s", pub_b64); fclose(fp); }
 
       bool ok = send_response(state, client, pub_b64);
-      secure_wipe(priv_b64, strlen(priv_b64));
-      free(priv_b64); free(pub_b64);
+      free(pub_b64);
       return ok;
     }
     return send_response(state, client, "ERROR: Key generation failed.");
@@ -3556,6 +3726,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       written = snprintf(response_ptr + offset, 65536 - offset,
                          " %d. %-*s | %-21s |", row + 1, peer_col_width - 3, peer_str, ip_port_str);
       if (written < 0 || written >= (int)(65536 - offset)) {
+        free(reported_mismatches);
         free(response_ptr);
         return send_response(state, client,
                              "ERROR: Matrix too large for buffer");
@@ -3784,6 +3955,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
       // CRITICAL FIX: Check the write result
       if (written < 0 || written >= (int)(65536 - offset)) {
+        free(reported_mismatches);
         free(response_ptr);
         return send_response(state, client,
                              "ERROR: Matrix too large for buffer");
@@ -4622,6 +4794,55 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
             break;
         }
 
+  case CMD_ADMIN_GET_OPT_FLAGS: {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "opt|%s",
+             state->opt_flags[0] ? state->opt_flags : "(none)");
+    return send_response(state, client, msg);
+  }
+
+  case CMD_ADMIN_SET_OPT_FLAGS: {
+    /* Payload: bare flag string ([a-zA-Z0-9]+) or empty to clear. */
+    char clean[MAX_OPT_FLAGS + 1] = {0};
+    int w = 0;
+    if (payload) {
+      for (int i = 0; payload[i] && w < MAX_OPT_FLAGS; i++) {
+        char c = payload[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9'))
+          clean[w++] = c;
+      }
+    }
+    clean[w] = '\0';
+    /* Dedupe (preserve insertion order). */
+    char dedup[MAX_OPT_FLAGS + 1] = {0};
+    int dw = 0;
+    for (int i = 0; clean[i] && dw < MAX_OPT_FLAGS; i++) {
+      bool seen = false;
+      for (int j = 0; j < dw; j++)
+        if (dedup[j] == clean[i]) { seen = true; break; }
+      if (!seen) dedup[dw++] = clean[i];
+    }
+    dedup[dw] = '\0';
+    snprintf(state->opt_flags, sizeof(state->opt_flags), "%s", dedup);
+    state->opt_flags_ts = time(NULL);
+    state->config_dirty = true;
+
+    /* Broadcast to peer hubs */
+    char sync_pkt[64];
+    snprintf(sync_pkt, sizeof(sync_pkt), "opt|%s|%ld\n",
+             state->opt_flags, (long)state->opt_flags_ts);
+    hub_broadcast_sync_to_peers(state, sync_pkt, -1);
+
+    /* Push to bots */
+    broadcast_full_config_to_all_bots(state);
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "SUCCESS: opt flags now '%s'",
+             state->opt_flags[0] ? state->opt_flags : "(none)");
+    return send_response(state, client, msg);
+  }
+
   /* ================================================================
    * Named Admin/Oper/Usermask commands (v2)
    * ================================================================ */
@@ -4652,7 +4873,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         snprintf(ts_buf, sizeof(ts_buf), "never");
       } else {
         struct tm *t = gmtime(&u->last_seen);
-        strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", t);
+        if (t) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", t);
+        else   snprintf(ts_buf, sizeof(ts_buf), "invalid");
       }
       off += snprintf(buf + off, sizeof(buf) - off,
                       "| %-*s  (last seen: %s)\n", name_w, u->name, ts_buf);
@@ -4701,6 +4923,24 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     time_t now = time(NULL);
     char new_uuid[37];
     generate_uuid_v4(new_uuid, sizeof(new_uuid));
+
+    /* Generate per-user Curve25519 keypair.  Store pubkey in record; return
+     * priv to the requesting admin so they can install it on a machine that
+     * will run hub_admin under this name.  The hub never keeps the priv. */
+    char new_priv_b64[COMBINED_KEY_B64 + 1] = {0};
+    char new_pub_b64[COMBINED_KEY_B64 + 1]  = {0};
+    {
+      unsigned char ad_priv[COMBINED_KEY_LEN], ad_pub[COMBINED_KEY_LEN];
+      if (hub_crypto_generate_combined_keypair(ad_priv, ad_pub)) {
+        char *pb = base64_encode(ad_priv, COMBINED_KEY_LEN);
+        char *Pb = base64_encode(ad_pub,  COMBINED_KEY_LEN);
+        secure_wipe(ad_priv, COMBINED_KEY_LEN);
+        if (pb) { snprintf(new_priv_b64, sizeof(new_priv_b64), "%s", pb);
+                  secure_wipe(pb, strlen(pb)); free(pb); }
+        if (Pb) { snprintf(new_pub_b64,  sizeof(new_pub_b64),  "%s", Pb); free(Pb); }
+      }
+    }
+
     hub_user_record_t *u = &state->user_records[state->user_record_count++];
     memset(u, 0, sizeof(*u));
     snprintf(u->uuid,     sizeof(u->uuid),     "%s", new_uuid);
@@ -4710,6 +4950,10 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     u->is_active = true;
     u->last_seen = 0;
     u->timestamp = now;
+    if (new_pub_b64[0]) {
+      snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", new_pub_b64);
+      u->has_pubkey = true;
+    }
     hub_mask_record_t *m = &state->mask_records[state->mask_record_count++];
     memset(m, 0, sizeof(*m));
     snprintf(m->uuid, sizeof(m->uuid), "%s", new_uuid);
@@ -4718,19 +4962,25 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     m->last_used = 0;
     m->timestamp = now;
     state->config_dirty = true;
-    /* Broadcast new records to bots */
+    /* Broadcast new records to bots (8-field format with pubkey) */
     char sync[MAX_BUFFER];
-    snprintf(sync, sizeof(sync), "%c|%s|%s|%s|add|0|%ld\n",
-             u->type, u->uuid, u->name, u->password, (long)now);
+    snprintf(sync, sizeof(sync), "%c|%s|%s|%s|add|0|%ld|%s\n",
+             u->type, u->uuid, u->name, u->password, (long)now,
+             u->has_pubkey ? u->pubkey_b64 : "");
     hub_broadcast_config_to_bots(state, sync);
     hub_broadcast_sync_to_peers(state, sync, -1);
     snprintf(sync, sizeof(sync), "m|%s|%s|add|0|%ld\n",
              m->uuid, m->mask, (long)now);
     hub_broadcast_config_to_bots(state, sync);
     hub_broadcast_sync_to_peers(state, sync, -1);
-    char resp[512];
-    snprintf(resp, sizeof(resp), "SUCCESS: %s %s added with mask %s",
-             (u->type == 'a') ? "Admin" : "Oper", pname, pmask);
+
+    /* Response includes the generated priv key (one-time delivery).  Format:
+     *   SUCCESS|<a|o>|<name>|<mask>|<priv_b64>|<pub_b64>
+     * If keypair generation failed, fields 5 and 6 are empty. */
+    char resp[2048];
+    snprintf(resp, sizeof(resp), "SUCCESS|%c|%s|%s|%s|%s",
+             u->type, pname, pmask, new_priv_b64, new_pub_b64);
+    secure_wipe(new_priv_b64, sizeof(new_priv_b64));
     return send_response(state, client, resp);
   }
 
@@ -4756,11 +5006,13 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         state->mask_records[i].is_active = false;
     }
     state->config_dirty = true;
-    /* Broadcast tombstone */
+    target->timestamp = now;
+    /* Broadcast tombstone (8-field with pubkey trailer for consistency). */
     char sync[MAX_BUFFER];
-    snprintf(sync, sizeof(sync), "%c|%s|%s|%s|del|%ld|%ld\n",
+    snprintf(sync, sizeof(sync), "%c|%s|%s|%s|del|%ld|%ld|%s\n",
              target->type, target->uuid, target->name, target->password,
-             (long)target->last_seen, (long)now);
+             (long)target->last_seen, (long)now,
+             target->has_pubkey ? target->pubkey_b64 : "");
     hub_broadcast_config_to_bots(state, sync);
     hub_broadcast_sync_to_peers(state, sync, -1);
     char resp[512];
@@ -4872,17 +5124,23 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     if (!target)
       return send_response(state, client, "ERR:user not found");
     snprintf(target->password, sizeof(target->password), "%s", ppass);
+    /* Bump timestamp so peers and bots see this update as newer than the
+     * old record (otherwise replication compares ts and drops the change). */
+    target->timestamp = time(NULL);
     state->config_dirty = true;
-    /* Push updated record to bots — copy fields first to avoid restrict alias */
+    /* Push updated record to bots — copy fields first to avoid restrict alias.
+     * Emit 8-field format (including pubkey trailer) so the pubkey field
+     * stays in sync across the mesh. */
     char sync[MAX_BUFFER];
-    char ttype = target->type, tuuid[37], tname[64], tpass[MAX_PASS];
-    snprintf(tuuid,  sizeof(tuuid),  "%s", target->uuid);
-    snprintf(tname,  sizeof(tname),  "%s", target->name);
-    snprintf(tpass,  sizeof(tpass),  "%s", target->password);
-    snprintf(sync, sizeof(sync), "%c|%s|%s|%s|%s|%ld|%ld\n",
+    char ttype = target->type, tuuid[37], tname[64], tpass[MAX_PASS], tpub[COMBINED_KEY_B64 + 1];
+    snprintf(tuuid, sizeof(tuuid), "%s", target->uuid);
+    snprintf(tname, sizeof(tname), "%s", target->name);
+    snprintf(tpass, sizeof(tpass), "%s", target->password);
+    snprintf(tpub,  sizeof(tpub),  "%s", target->has_pubkey ? target->pubkey_b64 : "");
+    snprintf(sync, sizeof(sync), "%c|%s|%s|%s|%s|%ld|%ld|%s\n",
              ttype, tuuid, tname, tpass,
              target->is_active ? "add" : "del",
-             (long)target->last_seen, (long)target->timestamp);
+             (long)target->last_seen, (long)target->timestamp, tpub);
     hub_broadcast_config_to_bots(state, sync);
     hub_broadcast_sync_to_peers(state, sync, -1);
     char resp[512];
@@ -4918,7 +5176,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         snprintf(ts_buf, sizeof(ts_buf), "never");
       } else {
         struct tm *t = gmtime(&u->last_seen);
-        strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", t);
+        if (t) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", t);
+        else   snprintf(ts_buf, sizeof(ts_buf), "invalid");
       }
       off += snprintf(buf + off, sizeof(buf) - off,
                       "| [%c] %-*s  (last seen: %s)\n",
@@ -4931,7 +5190,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
           snprintf(used_buf, sizeof(used_buf), "never");
         } else {
           struct tm *tu = gmtime(&m->last_used);
-          strftime(used_buf, sizeof(used_buf), "%Y-%m-%d %H:%M:%S UTC", tu);
+          if (tu) strftime(used_buf, sizeof(used_buf), "%Y-%m-%d %H:%M:%S UTC", tu);
+          else    snprintf(used_buf, sizeof(used_buf), "invalid");
         }
         off += snprintf(buf + off, sizeof(buf) - off,
                         "|   %s  (last used: %s)\n", m->mask, used_buf);
@@ -5772,10 +6032,14 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
     memcpy(&net_len, client->recv_buf, 4);
     int packet_len = ntohl(net_len);
 
-    // ADDED: Enhanced bounds checking
-    if (packet_len < 0 || packet_len > (MAX_BUFFER - 4)) {
-      hub_log("[ERROR] Invalid packet length %d from %s\n", packet_len,
-              client->ip);
+    // ADDED: Enhanced bounds checking. D2: bound against the client's actual
+    // buffer capacity (recv_cap), which is the small PREAUTH_BUF_SIZE until the
+    // handshake completes. This turns the pre-auth buffer into a clean hard
+    // limit — an oversized pre-auth frame is rejected here rather than hanging
+    // until the recv loop fills and trips the overflow path.
+    if (packet_len < 0 || packet_len > (client->recv_cap - 4)) {
+      hub_log("[ERROR] Invalid packet length %d from %s (cap %d)\n", packet_len,
+              client->ip, client->recv_cap);
       hub_disconnect_client(state, client);
       return false;
     }
@@ -5790,6 +6054,28 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
     // AUTHENTICATION PHASE
     // ========================================================================
     if (!client->authenticated) {
+      /* ADMIN-HELLO probe: plaintext frame "ADMIN-HELLO" from hub_admin so it
+       * can learn this hub's X25519 pubkey without needing a hub_public.b64
+       * file at runtime.  Reply with "HUB-PUBKEY|<hub_x_pub_b64>|<hub_uuid>"
+       * (plaintext, length-prefixed) and stay in the unauth state — the next
+       * frame from hub_admin will be the normal sealed-box ADMIN auth. */
+      if (packet_len == 11 && memcmp(data, "ADMIN-HELLO", 11) == 0 &&
+          client->bot_auth_state == BOT_AUTH_IDLE) {
+        if (state->hub_keys_loaded) {
+          char *pub_b64 = base64_encode(state->hub_x25519_pub, 32);
+          if (pub_b64) {
+            char reply[256];
+            int rl = snprintf(reply, sizeof(reply), "HUB-PUBKEY|%s|%s",
+                              pub_b64, state->hub_uuid[0] ? state->hub_uuid : "");
+            uint32_t nl = htonl((uint32_t)rl);
+            if (write(client->fd, &nl, 4) == 4)
+              (void)!write(client->fd, reply, rl);
+            free(pub_b64);
+          }
+        }
+        goto packet_consumed;
+      }
+
       // Detect packet type: Bot UUID (plaintext, 36 chars, hex+hyphens)
       // or mid-handshake bot packet (64-byte sig or eph_pub response)
       bool looks_like_uuid = false;
@@ -5843,64 +6129,157 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
           plain[pl] = 0;
           char *payload = (char *)plain;
 
-          // ADMIN Authentication
-          if (strncmp(payload, "ADMIN", 5) == 0) {
-            char *pipe = strchr(payload + 6, '|');
-            /* IMPORTANT: zero the full buffer before copying — the constant-
-             * time compare below covers the full sizeof(pass_buf), so any
-             * stack garbage past the password byte would silently mismatch. */
-            char pass_buf[128];
-            memset(pass_buf, 0, sizeof(pass_buf));
-            int pass_len;
+          /* ADMIN Authentication (v3): "ADMIN|<name>|<password>|<ip>:<port>"
+           * Look up the admin by name in user_records, verify the per-admin
+           * password.  The legacy global admin_password is no longer accepted. */
+          if (strncmp(payload, "ADMIN|", 6) == 0) {
+            char auth_name[64] = {0};
+            char auth_pass[128] = {0};
+            char client_addr[96] = {0};
 
-            if (pipe) {
-              pass_len = pipe - (payload + 6);
-              if (pass_len >= (int)sizeof(pass_buf)) pass_len = sizeof(pass_buf) - 1;
-              memcpy(pass_buf, payload + 6, pass_len);
-              pass_buf[pass_len] = '\0';
+            /* Parse 4 pipe-separated fields after the "ADMIN|" prefix. */
+            char *p = payload + 6;
+            char *p_pass  = strchr(p, '|');
+            if (!p_pass) {
+              hub_log("[HUB] Malformed ADMIN payload (missing pass) from %s\n",
+                      client->ip);
+              record_failed_auth(state, client->ip);
+              secure_wipe(plain, sizeof(plain));
+              hub_disconnect_client(state, client);
+              return false;
+            }
+            int nlen = (int)(p_pass - p);
+            if (nlen >= (int)sizeof(auth_name)) nlen = sizeof(auth_name) - 1;
+            memcpy(auth_name, p, nlen);
+            auth_name[nlen] = '\0';
+
+            char *p_addr = strchr(p_pass + 1, '|');
+            int plen;
+            if (p_addr) {
+              plen = (int)(p_addr - (p_pass + 1));
+              if (plen >= (int)sizeof(auth_pass)) plen = sizeof(auth_pass) - 1;
+              memcpy(auth_pass, p_pass + 1, plen);
+              auth_pass[plen] = '\0';
+              snprintf(client_addr, sizeof(client_addr), "%s", p_addr + 1);
             } else {
-              if (strlen(payload + 6) >= sizeof(pass_buf)) {
-                pass_len = 0; pass_buf[0] = '\0';
-              } else {
-                snprintf(pass_buf, sizeof(pass_buf), "%s", payload + 6);
+              snprintf(auth_pass, sizeof(auth_pass), "%s", p_pass + 1);
+            }
+
+            /* Find an active admin record with this name */
+            hub_user_record_t *admin_u = NULL;
+            for (int ui = 0; ui < state->user_record_count; ui++) {
+              hub_user_record_t *u = &state->user_records[ui];
+              if (u->type == 'a' && u->is_active &&
+                  strcasecmp(u->name, auth_name) == 0) {
+                admin_u = u;
+                break;
               }
             }
 
-            bool pass_ok = hub_admin_verify_password(pass_buf, state->admin_password);
-            secure_wipe(pass_buf, sizeof(pass_buf));
+            bool pass_ok = false;
+            if (admin_u && admin_u->password[0]) {
+              /* IMPORTANT: per-admin passwords are stored in plaintext form
+               * in the a| record.  Bots compute HMAC-PBKDF2 over this exact
+               * password value for the v1c admin-command auth path, so the
+               * hub MUST NOT hash it on the way through — that would change
+               * the value on the wire and bots would compute the wrong HMAC.
+               *
+               * The on-wire copy is still confidential: the sealed-box +
+               * GCM session key protects it in transit, the .irchub.cnf
+               * is AES-256-GCM encrypted at rest with PBKDF2(config_pass). */
+              if (strncmp(admin_u->password, ADMIN_PASS_HASH_PREFIX,
+                          strlen(ADMIN_PASS_HASH_PREFIX)) == 0) {
+                /* Legacy: only the OLD global admin password was ever stored
+                 * in PBKDF2-hashed form (v3 transition).  Keep the path so
+                 * older deployments can still authenticate. */
+                pass_ok = hub_admin_verify_password(auth_pass, admin_u->password);
+              } else {
+                size_t got = strlen(auth_pass);
+                size_t want = strlen(admin_u->password);
+                if (got == want && got > 0)
+                  pass_ok = (CRYPTO_memcmp(auth_pass, admin_u->password, got) == 0);
+              }
+            }
+            secure_wipe(auth_pass, sizeof(auth_pass));
+
+            /* Verify that the eph_pub field of the sealed-box (= admin's static
+             * X25519 pub) matches the X25519 pub stored in this admin's record.
+             *
+             * This means admin A cannot authenticate as admin B even if A knows
+             * B's password: hub_logic already decrypts correctly (DH is symmetric),
+             * but the pubkey check catches the mismatch before accepting.
+             *
+             * MITM resistance: only the holder of admin_x_priv can produce a
+             * GCM-valid sealed-box under HKDF(X25519(hub_priv, admin_pub), ...)
+             * so stealing the credentials from a MITM-intercepted session does not
+             * allow the attacker to authenticate — they don't have admin_x_priv. */
+            if (pass_ok) {
+              if (!admin_u->has_pubkey) {
+                hub_log("[HUB] Admin auth from %s: no pubkey for '%s' — "
+                        "re-create the admin account to provision a key pair\n",
+                        client->ip, auth_name);
+                pass_ok = false;
+              } else {
+                int clen = 0;
+                unsigned char *combined = base64_decode(admin_u->pubkey_b64, &clen);
+                if (!combined || clen != COMBINED_KEY_LEN) {
+                  hub_log("[HUB] Admin auth from %s: bad stored pubkey for '%s'\n",
+                          client->ip, auth_name);
+                  if (combined) { secure_wipe(combined, clen); free(combined); }
+                  pass_ok = false;
+                } else {
+                  /* Combined pubkey layout: ed_pub(32) || x25519_pub(32).
+                   * eph_pub in the sealed-box is data[0..31] (admin's X25519 pub). */
+                  if (CRYPTO_memcmp(data, combined + 32, 32) != 0) {
+                    hub_log("[HUB] Admin auth from %s: pubkey mismatch for '%s' — "
+                            "wrong admin key file used\n", client->ip, auth_name);
+                    pass_ok = false;
+                  }
+                  secure_wipe(combined, clen);
+                  free(combined);
+                }
+              }
+            }
+
             if (pass_ok) {
               client->type = CLIENT_ADMIN;
               client->authenticated = true;
-              snprintf(client->id, sizeof(client->id), "ADMIN");
+              /* D2: grow buffers now that the admin is authenticated. */
+              if (!hub_client_promote_buffers(client)) {
+                hub_log("[HUB][ERROR] Buffer promotion OOM for admin %s — "
+                        "disconnecting\n", client->ip);
+                hub_disconnect_client(state, client);
+                return false;
+              }
+              snprintf(client->id, sizeof(client->id), "ADMIN:%s", auth_name);
 
-              if (pipe) {
-                char *colon = strchr(pipe + 1, ':');
+              /* Capture admin's reported ip:port (informational) */
+              if (client_addr[0]) {
+                char *colon = strchr(client_addr, ':');
                 if (colon) {
-                  int ip_len = colon - (pipe + 1);
+                  int ip_len = (int)(colon - client_addr);
                   if (ip_len >= (int)sizeof(client->admin_connect_ip))
                     ip_len = sizeof(client->admin_connect_ip) - 1;
-                  memcpy(client->admin_connect_ip, pipe + 1, ip_len);
+                  memcpy(client->admin_connect_ip, client_addr, ip_len);
                   client->admin_connect_ip[ip_len] = '\0';
                   client->admin_connect_port = atoi(colon + 1);
-                } else {
-                  client->admin_connect_ip[0] = '\0';
-                  client->admin_connect_port = 0;
                 }
               } else {
                 client->admin_connect_ip[0] = '\0';
                 client->admin_connect_port = 0;
               }
 
-              hub_log("[HUB] Admin Login (Curve25519): %s\n", client->ip);
+              admin_u->last_seen = time(NULL);
+              state->config_dirty = true;
+              hub_log("[HUB] Admin Login (per-user, Curve25519): %s as '%s'\n",
+                      client->ip, auth_name);
 
-              /* Kick off an immediate bidirectional mesh sync on admin connect:
-               * push our state to peers and ask them to send back their state,
-               * then refresh all locally-connected bots now. */
               state->anti_entropy_due = true;
               hub_request_sync_from_peers(state);
               broadcast_full_config_to_all_bots(state);
             } else {
-              hub_log("[HUB] Failed admin auth from %s\n", client->ip);
+              hub_log("[HUB] Failed admin auth from %s (name=%s)\n",
+                      client->ip, auth_name);
               record_failed_auth(state, client->ip);
               secure_wipe(plain, sizeof(plain));
               hub_disconnect_client(state, client);
@@ -6011,6 +6390,13 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             /* Accept. */
             client->type = CLIENT_HUB;
             client->authenticated = true;
+            /* D2: grow buffers — peers exchange bulk anti-entropy sync. */
+            if (!hub_client_promote_buffers(client)) {
+              hub_log("[HUB][ERROR] Buffer promotion OOM for peer %s — "
+                      "disconnecting\n", client->ip);
+              hub_disconnect_client(state, client);
+              return false;
+            }
             state->peers[peer_idx].connected = true;
             state->peers[peer_idx].fd = client->fd;
             snprintf(state->peers[peer_idx].remote_ip,
@@ -6118,8 +6504,12 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               } else if (cmd == CMD_OP_FORWARD_FAILED) {
                 process_forward_op_failed(state, client, payload_ptr);
               } else if (cmd == CMD_PEER_REKEY_BOT) {
-                // Peer hub is forwarding a bot rekey request to us
-                // Payload format: bot_uuid|new_priv_b64
+                /* v3: per-bot independent keys.  Peer-forwarded bot rekey
+                 * is rejected because it would carry a private key. */
+                hub_log("[HUB] Rejected CMD_PEER_REKEY_BOT from peer %s: "
+                        "per-bot independent keys; rekey is bot-local.\n",
+                        client->ip);
+              } else if (cmd == 0xFF /* dead */) {
                 if (payload_ptr && strlen(payload_ptr) > 0) {
                   char bot_uuid[64];
                   char *pipe = strchr(payload_ptr, '|');
@@ -6193,48 +6583,11 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                   if (sm) peer_enqueue(client, sm);
                 }
               } else if (cmd == CMD_UPDATE_PUBKEY) {
-                // Peer hub sent new shared keypair: "<priv_b64>|||<pub_b64>"
-                if (payload_ptr && strlen(payload_ptr) > 0) {
-                  hub_log("[HUB] Received Curve25519 key update from peer %s\n", client->ip);
-                  char *sep = strstr(payload_ptr, "|||");
-                  if (sep) {
-                    size_t priv_b64_len = sep - payload_ptr;
-                    char priv_b64[128] = {0};
-                    char pub_b64[128]  = {0};
-                    if (priv_b64_len < sizeof(priv_b64) && strlen(sep + 3) < sizeof(pub_b64)) {
-                      memcpy(priv_b64, payload_ptr, priv_b64_len);
-                      snprintf(pub_b64, sizeof(pub_b64), "%s", sep + 3);
-
-                      int pl = 0, publ = 0;
-                      unsigned char *pd = base64_decode(priv_b64, &pl);
-                      unsigned char *pubp = base64_decode(pub_b64, &publ);
-                      if (pd && pl == 64 && pubp && publ == 64) {
-                        hub_crypto_split_combined(pd, state->hub_ed25519_priv, state->hub_x25519_priv);
-                        hub_crypto_split_combined(pubp, state->hub_ed25519_pub, state->hub_x25519_pub);
-                        state->hub_keys_loaded = true;
-                        secure_wipe(pd, 64);
-                        state->config_dirty = true;
-                        hub_log("[HUB] Applied new Curve25519 mesh keypair from peer\n");
-                        if (pd) free(pd);
-                        if (pubp) free(pubp);
-                        // Disconnect peers so they reconnect with new key
-                        for (int i = 0; i < state->client_count; i++) {
-                          if (state->clients[i]->type == CLIENT_HUB) {
-                            hub_disconnect_client(state, state->clients[i]);
-                            i--;
-                          }
-                        }
-                        return false;
-                      } else {
-                        hub_log("[HUB] Invalid Curve25519 key update from peer %s\n", client->ip);
-                      }
-                      if (pd) { secure_wipe(pd, pl); free(pd); }
-                      if (pubp) free(pubp);
-                    }
-                  } else {
-                    hub_log("[HUB] Invalid key update format from peer %s\n", client->ip);
-                  }
-                }
+                /* v3: independent per-hub keypairs.  A peer must NEVER
+                 * push its private key to us.  Refuse and log. */
+                hub_log("[HUB] Rejected CMD_UPDATE_PUBKEY from peer %s: "
+                        "per-hub independent keys; private keys do not "
+                        "cross hub boundaries.\n", client->ip);
               }
             }
           }

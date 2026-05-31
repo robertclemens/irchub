@@ -9,6 +9,7 @@
 #include <openssl/evp.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,8 @@
 
 int g_fd = -1;
 unsigned char g_key[32];
+
+void pause_and_continue(void);
 
 // Stub hub_log for hub_crypto.c (hub_admin doesn't use file logging)
 void hub_log(const char *format, ...) {
@@ -92,7 +95,7 @@ void send_packet_binary(int fd, int cmd_id, const unsigned char *payload, int pa
 /* Upper bound for any valid hub packet: 65536-byte plaintext + IV + tag */
 #define MAX_HUB_PACKET (65536 + GCM_IV_LEN + GCM_TAG_LEN + 64)
 
-bool process_incoming_packet() {
+bool process_incoming_packet(void) {
     uint32_t net_len;
     if (recv(g_fd, &net_len, 4, MSG_PEEK | MSG_DONTWAIT) != 4) return false;
 
@@ -255,7 +258,7 @@ void read_response(int fd, unsigned char *key, char *out_buf, int max_len) {
 // BOT MANAGEMENT FUNCTIONS
 // ============================================================================
 
-void bot_list() {
+void bot_list(void) {
     char response[MAX_BUFFER];
     send_packet(g_fd, CMD_ADMIN_LIST_FULL, NULL, g_key);
     read_response(g_fd, g_key, response, sizeof(response));
@@ -267,110 +270,59 @@ void bot_list() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void bot_add() {
+void bot_add(void) {
     char nick[64];
+    char uuid[64];
+    char pubkey[256];
     char response[8192];
-    
+
     printf("\n═══════════════════════════════════════════════════\n");
-    printf("           ADD BOT - REMOTE PROVISIONING\n");
-    printf("═══════════════════════════════════════════════════\n\n");
-    
-    get_input("Enter Bot Nickname: ", nick, sizeof(nick));
-    
-    printf("[*] Requesting hub to generate credentials...\n");
-    send_packet(g_fd, CMD_ADMIN_CREATE_BOT, nick, g_key);
+    printf("           ADD BOT (bot-provided identity)\n");
+    printf("═══════════════════════════════════════════════════\n");
+    printf("The bot has generated its own UUID and Curve25519\n");
+    printf("keypair during 'ircbot -setup'.  Paste the UUID and\n");
+    printf("the 88-char base64 public key it printed.\n\n");
 
-    read_response(g_fd, g_key, response, sizeof(response));
-    
-    if (strncmp(response, "SUCCESS|", 8) == 0) {
-        char *uuid_start = response + 8;
-        char *priv_key = strchr(uuid_start, '|');
-        
-        if (priv_key) {
-            *priv_key = 0;
-            priv_key++;  // Now points to BASE64(full PEM)
-
-            char uuid[64];
-            if (strlen(uuid_start) >= sizeof(uuid)) {
-                printf("Error: invalid UUID in server response\n");
-                return;
-            }
-            snprintf(uuid, sizeof(uuid), "%s", uuid_start);
-            
-            printf("\n╔══════════════════════════════════════════════════╗\n");
-            printf("║             BOT CREATED SUCCESSFULLY             ║\n");
-            printf("╚══════════════════════════════════════════════════╝\n\n");
-            
-            printf("Bot Name: %s\n", nick);
-            printf("UUID:     %s\n\n", uuid);
-            
-            printf("\nKey Distribution:\n");
-            printf("  1. Export to file\n");
-            printf("  2. Show private key (base64)\n");
-            printf("  3. Show IRC sethubkey commands\n\n");
-
-            char kd_buf[10];
-            get_input("Choice: ", kd_buf, sizeof(kd_buf));
-            int kd_choice = atoi(kd_buf);
-
-            switch (kd_choice) {
-                case 1: {
-                    char fname[128];
-                    snprintf(fname, sizeof(fname), "bot_%s_priv_key.b64", nick);
-                    FILE *kf = fopen(fname, "w");
-                    if (kf) {
-                        fprintf(kf, "%s", priv_key);
-                        fclose(kf);
-                        printf("[Saved: %s]\n", fname);
-                    } else {
-                        printf("Error: could not create file.\n");
-                    }
-                    break;
-                }
-                case 2:
-                    printf("\nPrivate Key (base64):\n%s\n", priv_key);
-                    break;
-                case 3: {
-                    size_t key_len = strlen(priv_key);
-                    int total_parts = (int)((key_len + 249) / 250);
-                    printf("Private key: %zu chars, %d parts\n\n", key_len, total_parts);
-                    printf("COPY AND PASTE THESE COMMANDS:\n");
-                    printf("===================================================\n\n");
-                    for (int i = 0; i < total_parts; i++) {
-                        size_t start = (size_t)i * 250;
-                        size_t clen = (start + 250 > key_len) ? (key_len - start) : 250;
-                        char chunk[260];
-                        memset(chunk, 0, sizeof(chunk));
-                        memcpy(chunk, priv_key + start, clen);
-                        chunk[clen] = '\0';
-                        printf("/msg %s <hash> sethubkey %d/%d:%s\n",
-                               nick, i + 1, total_parts, chunk);
-                    }
-                    printf("\n/msg %s <hash> setuuid %s\n", nick, uuid);
-                    printf("/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
-                    printf("===================================================\n");
-                    break;
-                }
-                default:
-                    printf("Invalid choice.\n");
-                    break;
-            }
-            
-            secure_wipe(response, sizeof(response));
-        } else {
-            printf("ERROR: Malformed response from hub.\n");
-        }
-    } else {
-        printf("Hub Response: %s\n", response);
+    get_input("Bot Nickname: ", nick, sizeof(nick));
+    get_input("Bot UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx): ",
+              uuid, sizeof(uuid));
+    /* Validate UUID */
+    if (strlen(uuid) != 36 || uuid[8] != '-' || uuid[13] != '-' ||
+        uuid[18] != '-' || uuid[23] != '-') {
+        printf("Error: UUID format invalid.\n");
+        pause_and_continue();
+        return;
     }
-    
-    printf("\nPress Enter to continue...");
-    fflush(stdout);
-    char dummy[10];
-    wait_for_input_or_socket(dummy, sizeof(dummy));
+    get_input("Bot public key (88 chars base64): ", pubkey, sizeof(pubkey));
+    size_t pl = strlen(pubkey);
+    while (pl > 0 && (pubkey[pl-1]==' '||pubkey[pl-1]=='\r'||
+                      pubkey[pl-1]=='\n'||pubkey[pl-1]=='\t'))
+        pubkey[--pl] = '\0';
+    if (pl != 88) {
+        printf("Error: public key must be exactly 88 chars (got %zu).\n", pl);
+        pause_and_continue();
+        return;
+    }
+
+    /* Payload: NICK|UUID|PUBKEY_B64 */
+    char payload[512];
+    snprintf(payload, sizeof(payload), "%s|%s|%s", nick, uuid, pubkey);
+    send_packet(g_fd, CMD_ADMIN_CREATE_BOT, payload, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+
+    if (strncmp(response, "SUCCESS", 7) == 0) {
+        printf("\n[+] Bot '%s' (UUID %s) registered.\n", nick, uuid);
+        printf("    Hub UUID + pubkey were printed during 'irchub -setup'\n");
+        printf("    (see hub_public.b64). Use those when configuring the\n");
+        printf("    bot's hub connection from 'ircbot -setup'.\n");
+    } else {
+        printf("\nHub Response: %s\n", response);
+    }
+
+    pause_and_continue();
 }
 
-void bot_remove() {
+void bot_remove(void) {
     char response[MAX_BUFFER];
     
     send_packet(g_fd, CMD_ADMIN_LIST_SUMMARY, NULL, g_key);
@@ -392,7 +344,7 @@ void bot_remove() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void bot_rekey() {
+void bot_rekey(void) {
     char response[MAX_BUFFER];
     
     send_packet(g_fd, CMD_ADMIN_LIST_SUMMARY, NULL, g_key);
@@ -407,103 +359,33 @@ void bot_rekey() {
         return;
     }
     
-    if (!get_confirmation("Generate new keypair? Bot will be disconnected")) {
+    /* Rekey is bot-local: only the bot can rotate its own keypair, because it
+     * owns its private key (v3 trust model — the hub never holds bot privkeys).
+     * This menu just relays the request; the hub replies with instructions to
+     * run the bot's own 'rekey' admin command, which regenerates the keypair
+     * locally, pushes the new pubkey to the hub, and reconnects. */
+    if (!get_confirmation("Ask the bot to rekey itself (it will reconnect)?")) {
         return;
     }
-    
-    printf("\n[*] Requesting hub to rekey bot...\n");
+
+    printf("\n[*] Requesting rekey instructions from hub...\n");
     send_packet(g_fd, CMD_ADMIN_REKEY_BOT, uuid, g_key);
     read_response(g_fd, g_key, response, sizeof(response));
-    
-    if (strncmp(response, "SUCCESS|", 8) == 0) {
-        char *nick_start = response + 8;
-        char *priv_key = strchr(nick_start, '|');
 
-        if (priv_key) {
-            *priv_key = 0;
-            priv_key++;
-
-            char nick[64];
-            if (strlen(nick_start) >= sizeof(nick)) {
-                printf("Error: invalid nick in server response\n");
-                return;
-            }
-            snprintf(nick, sizeof(nick), "%s", nick_start);
-
-            printf("\n╔══════════════════════════════════════════════════╗\n");
-            printf("║              BOT REKEYED SUCCESSFULLY            ║\n");
-            printf("╚══════════════════════════════════════════════════╝\n\n");
-
-            printf("UUID: %s\n", uuid);
-            printf("Nick: %s\n\n", nick);
-
-            // Check if bot was auto-updated (connected)
-            if (strncmp(priv_key, "AUTO-UPDATED", 12) == 0) {
-                printf("✓ Bot was connected - keys automatically updated!\n");
-                printf("✓ Bot has been disconnected and will reconnect with new keys.\n");
-                printf("✓ No manual intervention required.\n\n");
-            } else {
-                // Manual update required (bot was not connected)
-                printf("Bot was NOT connected - manual update required.\n\n");
-
-                printf("\nKey Distribution:\n");
-                printf("  1. Export to file\n");
-                printf("  2. Show private key (base64)\n");
-                printf("  3. Show IRC sethubkey commands\n\n");
-
-                char kd_buf[10];
-                get_input("Choice: ", kd_buf, sizeof(kd_buf));
-                int kd_choice = atoi(kd_buf);
-
-                switch (kd_choice) {
-                    case 1: {
-                        char fname[128];
-                        snprintf(fname, sizeof(fname), "bot_%s_priv_key_REKEY.b64", nick);
-                        FILE *kf = fopen(fname, "w");
-                        if (kf) {
-                            fprintf(kf, "%s", priv_key);
-                            fclose(kf);
-                            printf("[Saved: %s]\n", fname);
-                        } else {
-                            printf("Error: could not create file.\n");
-                        }
-                        break;
-                    }
-                    case 2:
-                        printf("\nPrivate Key (base64):\n%s\n", priv_key);
-                        break;
-                    case 3: {
-                        size_t key_len = strlen(priv_key);
-                        int total_parts = (int)((key_len + 249) / 250);
-                        printf("Private key: %zu chars, %d parts\n\n", key_len, total_parts);
-                        printf("COPY AND PASTE THESE COMMANDS:\n");
-                        printf("===================================================\n\n");
-                        for (int i = 0; i < total_parts; i++) {
-                            size_t start = (size_t)i * 250;
-                            size_t clen = (start + 250 > key_len) ? (key_len - start) : 250;
-                            char chunk[260];
-                            memset(chunk, 0, sizeof(chunk));
-                            memcpy(chunk, priv_key + start, clen);
-                            chunk[clen] = '\0';
-                            printf("/msg %s <hash> sethubkey %d/%d:%s\n",
-                                   nick, i + 1, total_parts, chunk);
-                        }
-                        printf("\n/msg %s <hash> +hub <hub_ip>:<hub_port>\n\n", nick);
-                        printf("===================================================\n");
-                        break;
-                    }
-                    default:
-                        printf("Invalid choice.\n");
-                        break;
-                }
-            }
-
-            secure_wipe(response, sizeof(response));
-        }
+    /* Hub replies INSTRUCT|<uuid>|<human-readable instructions> on success,
+     * or ERROR|<reason>. Show the instructions (stripped of the prefix). */
+    if (strncmp(response, "INSTRUCT|", 9) == 0) {
+        char *p = strchr(response + 9, '|');
+        const char *text = p ? p + 1 : response;
+        printf("\n╔══════════════════════════════════════════════════╗\n");
+        printf("║                  REKEY: NEXT STEP                ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n\n");
+        printf("UUID: %s\n\n%s\n", uuid, text);
     } else {
         printf("Hub Response: %s\n", response);
     }
-    
+    secure_wipe(response, sizeof(response));
+
     printf("\nPress Enter to continue...");
     fflush(stdout);
     char dummy[10];
@@ -514,7 +396,7 @@ void bot_rekey() {
 // PEER (HUB) MANAGEMENT FUNCTIONS
 // ============================================================================
 
-void peer_list() {
+void peer_list(void) {
     char *response = malloc(MAX_HUB_PACKET);
     if (!response) { printf("Error: Out of memory\n"); return; }
 
@@ -530,7 +412,7 @@ void peer_list() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void peer_add() {
+void peer_add(void) {
     char response[MAX_BUFFER];
     char ip[64], port[10], uuid[64], name[64], pubkey[128];
 
@@ -581,7 +463,7 @@ void peer_add() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void peer_remove() {
+void peer_remove(void) {
     char *response = malloc(MAX_HUB_PACKET);
     if (!response) { printf("Error: Out of memory\n"); return; }
 
@@ -607,7 +489,7 @@ void peer_remove() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void peer_set_pubkey() {
+void peer_set_pubkey(void) {
     char response[MAX_BUFFER];
     char uuid[64], pubkey[128];
 
@@ -646,7 +528,7 @@ void peer_set_pubkey() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void peer_force_sync() {
+void peer_force_sync(void) {
     char response[1024];
     
     printf("\n[*] Forcing mesh synchronization...\n");
@@ -660,7 +542,7 @@ void peer_force_sync() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void peer_rekey_hubs() {
+void peer_rekey_hubs(void) {
     char response[MAX_BUFFER];
     
     printf("\n╔══════════════════════════════════════════════════╗\n");
@@ -727,7 +609,7 @@ void peer_rekey_hubs() {
 // ADMIN COMMANDS FUNCTIONS
 // ============================================================================
 
-void admin_op_user() {
+void admin_op_user(void) {
     char response[MAX_BUFFER];
     char nick[64], channel[64];
 
@@ -754,7 +636,7 @@ void admin_op_user() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-static void pause_and_continue(void) {
+void pause_and_continue(void) {
     printf("\nPress Enter to continue...");
     fflush(stdout);
     char dummy[10];
@@ -790,9 +672,39 @@ void admin_add_admin_record(void) {
         snprintf(payload, sizeof(payload), "%s|%s|%s", name, pass, mask);
         send_packet(g_fd, CMD_ADMIN_ADD_ADMIN, payload, g_key);
         read_response(g_fd, g_key, response, sizeof(response));
-        printf("\nHub: %s\n", response);
         secure_wipe(pass, sizeof(pass));
         secure_wipe(payload, sizeof(payload));
+        /* Response format: SUCCESS|<a|o>|<name>|<mask>|<priv_b64>|<pub_b64>
+         * Pull out the priv_b64 and offer to save it. */
+        if (strncmp(response, "SUCCESS|", 8) == 0) {
+            char *toks[6] = {0}; int n = 0;
+            char *save_ptr2 = NULL;
+            char *t = strtok_r(response, "|", &save_ptr2);
+            while (t && n < 6) { toks[n++] = t; t = strtok_r(NULL, "|", &save_ptr2); }
+            const char *priv_b64 = (n > 4) ? toks[4] : "";
+            const char *pub_b64  = (n > 5) ? toks[5] : "";
+            printf("\n[+] Admin '%s' created.\n", name);
+            if (priv_b64 && priv_b64[0]) {
+                printf("\n    ┌──────────────────────────────────────────────────────────┐\n");
+                printf("    │ ⚠ Admin '%s' PRIVATE key (save NOW; NOT stored on hub):\n",
+                       name);
+                printf("    │                                                          \n");
+                printf("    │  %s\n", priv_b64);
+                printf("    │                                                          \n");
+                printf("    │ Save to admin_%s.b64 (mode 0600) on the host that will  \n",
+                       name);
+                printf("    │ run hub_admin under this name.  Then:                    \n");
+                printf("    │   ./hub_admin <ip> <port> admin_%s.b64                   \n",
+                       name);
+                printf("    │                                                          \n");
+                printf("    │ Not recoverable if lost — admin must be re-created.      \n");
+                printf("    └──────────────────────────────────────────────────────────┘\n");
+                if (pub_b64 && pub_b64[0])
+                    printf("\n    Public key (mesh-replicated): %s\n", pub_b64);
+            }
+        } else {
+            printf("\nHub: %s\n", response);
+        }
     }
     pause_and_continue();
 }
@@ -840,9 +752,32 @@ void admin_add_oper_record(void) {
         snprintf(payload, sizeof(payload), "%s|%s|%s", name, pass, mask);
         send_packet(g_fd, CMD_ADMIN_ADD_OPER_RECORD, payload, g_key);
         read_response(g_fd, g_key, response, sizeof(response));
-        printf("\nHub: %s\n", response);
         secure_wipe(pass, sizeof(pass));
         secure_wipe(payload, sizeof(payload));
+        if (strncmp(response, "SUCCESS|", 8) == 0) {
+            char *toks[6] = {0}; int n = 0;
+            char *save_ptr2 = NULL;
+            char *t = strtok_r(response, "|", &save_ptr2);
+            while (t && n < 6) { toks[n++] = t; t = strtok_r(NULL, "|", &save_ptr2); }
+            const char *priv_b64 = (n > 4) ? toks[4] : "";
+            const char *pub_b64  = (n > 5) ? toks[5] : "";
+            printf("\n[+] Oper '%s' created.\n", name);
+            if (priv_b64 && priv_b64[0]) {
+                printf("\n    ┌──────────────────────────────────────────────────────────┐\n");
+                printf("    │ ⚠ Oper '%s' PRIVATE key (save NOW; NOT stored on hub): \n",
+                       name);
+                printf("    │                                                          \n");
+                printf("    │  %s\n", priv_b64);
+                printf("    │                                                          \n");
+                printf("    │ Opers currently do not need this key for hub_admin login \n");
+                printf("    │ (only admins do), but save it for future use.            \n");
+                printf("    └──────────────────────────────────────────────────────────┘\n");
+                if (pub_b64 && pub_b64[0])
+                    printf("\n    Public key (mesh-replicated): %s\n", pub_b64);
+            }
+        } else {
+            printf("\nHub: %s\n", response);
+        }
     }
     pause_and_continue();
 }
@@ -949,7 +884,7 @@ void admin_change_userpass(void) {
     pause_and_continue();
 }
 
-void admin_list_channels() {
+void admin_list_channels(void) {
     char response[MAX_BUFFER];
 
     printf("\n");
@@ -963,7 +898,7 @@ void admin_list_channels() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_add_channel() {
+void admin_add_channel(void) {
     char response[MAX_BUFFER];
     char chan[64], key[64];
 
@@ -993,7 +928,7 @@ void admin_add_channel() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_del_channel() {
+void admin_del_channel(void) {
     char response[MAX_BUFFER];
 
     send_packet(g_fd, CMD_ADMIN_LIST_CHANNELS, NULL, g_key);
@@ -1015,7 +950,7 @@ void admin_del_channel() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_change_admin_password() {
+void admin_change_admin_password(void) {
     char response[MAX_BUFFER];
     char pass[128];
 
@@ -1039,7 +974,7 @@ void admin_change_admin_password() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_change_bot_password() {
+void admin_change_bot_password(void) {
     char response[MAX_BUFFER];
     char pass[128];
 
@@ -1065,7 +1000,7 @@ void admin_change_bot_password() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_purge_tombstones() {
+void admin_purge_tombstones(void) {
     char response[MAX_BUFFER];
     char choice[10];
 
@@ -1130,7 +1065,7 @@ void admin_purge_tombstones() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_configure_auto_purge() {
+void admin_configure_auto_purge(void) {
     char response[MAX_BUFFER];
     char days_input[10];
 
@@ -1168,7 +1103,7 @@ void admin_configure_auto_purge() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_list_allowlist() {
+void admin_list_allowlist(void) {
     char response[MAX_BUFFER];
 
     printf("\n");
@@ -1182,7 +1117,7 @@ void admin_list_allowlist() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_add_allowlist() {
+void admin_add_allowlist(void) {
     char response[MAX_BUFFER];
     char ip_pattern[256];
 
@@ -1208,7 +1143,7 @@ void admin_add_allowlist() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_del_allowlist() {
+void admin_del_allowlist(void) {
     char response[MAX_BUFFER];
 
     send_packet(g_fd, CMD_ADMIN_LIST_ALLOWLIST, NULL, g_key);
@@ -1230,7 +1165,7 @@ void admin_del_allowlist() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_list_denylist() {
+void admin_list_denylist(void) {
     char response[MAX_BUFFER];
 
     printf("\n");
@@ -1244,7 +1179,7 @@ void admin_list_denylist() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_add_denylist() {
+void admin_add_denylist(void) {
     char response[MAX_BUFFER];
     char ip_pattern[256];
 
@@ -1270,7 +1205,7 @@ void admin_add_denylist() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_del_denylist() {
+void admin_del_denylist(void) {
     char response[MAX_BUFFER];
 
     send_packet(g_fd, CMD_ADMIN_LIST_DENYLIST, NULL, g_key);
@@ -1292,7 +1227,7 @@ void admin_del_denylist() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void menu_manage_allowlist() {
+void menu_manage_allowlist(void) {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
@@ -1325,7 +1260,7 @@ void menu_manage_allowlist() {
     }
 }
 
-void menu_manage_denylist() {
+void menu_manage_denylist(void) {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
@@ -1335,7 +1270,7 @@ void menu_manage_denylist() {
         printf("  1. List Denylist\n");
         printf("  2. Add IP to Denylist\n");
         printf("  3. Remove IP from Denylist\n");
-        printf("  4. Back to Admin Commands\n");
+        printf("  4. Back\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1358,7 +1293,7 @@ void menu_manage_denylist() {
     }
 }
 
-void admin_set_bind_ip() {
+void admin_set_bind_ip(void) {
     char response[MAX_BUFFER];
     char ip[64];
 
@@ -1385,7 +1320,7 @@ void admin_set_bind_ip() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_set_hub_name() {
+void admin_set_hub_name(void) {
     char response[MAX_BUFFER];
     char name[64];
 
@@ -1409,7 +1344,7 @@ void admin_set_hub_name() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_set_bind_port() {
+void admin_set_bind_port(void) {
     char response[MAX_BUFFER];
     char port[10];
 
@@ -1433,7 +1368,7 @@ void admin_set_bind_port() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_export_private_key() {
+void admin_export_private_key(void) {
     char response[MAX_BUFFER];
 
     printf("\n╔══════════════════════════════════════════════════╗\n");
@@ -1478,14 +1413,20 @@ void admin_export_private_key() {
             struct tm *t = localtime(&now);
             char fname[64];
             strftime(fname, sizeof(fname), "hub_private_%Y%m%d_%H%M%S.b64", t);
-            FILE *f = fopen(fname, "w");
+            /* Create the private-key file with mode 0600 atomically.  fopen("w")
+             * honors the umask first and would leave the key world-readable in
+             * the window before chmod — a local-disclosure race for key
+             * material.  open(O_CREAT,0600)+fchmod closes that window. */
+            int kfd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            FILE *f = (kfd >= 0) ? fdopen(kfd, "w") : NULL;
             if (f) {
+                (void)fchmod(fileno(f), 0600);
                 fputs(response, f);
                 fclose(f);
-                chmod(fname, 0600);
                 printf("\n[PRIVATE KEY SAVED: %s] (permissions: 0600)\n", fname);
                 printf("Move this file to secure storage and delete it from here.\n");
             } else {
+                if (kfd >= 0) close(kfd);
                 printf("\nFailed to save private key to file.\n");
             }
         }
@@ -1498,7 +1439,7 @@ void admin_export_private_key() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_export_public_key() {
+void admin_export_public_key(void) {
     char response[MAX_BUFFER];
 
     printf("\n═══════════════════════════════════════════════════\n");
@@ -1548,7 +1489,7 @@ void admin_export_public_key() {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_set_log_level() {
+void admin_set_log_level(void) {
     printf("\n");
     printf("Log Levels:\n");
     printf("  0: NONE (no logging)\n");
@@ -1582,7 +1523,7 @@ void admin_set_log_level() {
     printf("[+] %s\n", response);
 }
 
-void admin_set_log_size_limit() {
+void admin_set_log_size_limit(void) {
     printf("\nCurrent default: 10 MB\n");
     printf("Enter log size limit in MB (1-1024): ");
     fflush(stdout);
@@ -1690,7 +1631,7 @@ void menu_manage_opers(void) {
     }
 }
 
-void menu_manage_channels() {
+void menu_manage_channels(void) {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
@@ -1700,7 +1641,7 @@ void menu_manage_channels() {
         printf("  1. List Channels\n");
         printf("  2. Add Channel\n");
         printf("  3. Del Channel\n");
-        printf("  4. Back to Admin Commands\n");
+        printf("  4. Back\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1732,11 +1673,70 @@ void menu_manage_channels() {
     }
 }
 
-void menu_admin_commands() {
+static void admin_show_opt_flags(void) {
+    char response[256];
+    send_packet(g_fd, CMD_ADMIN_GET_OPT_FLAGS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\nCurrent network opt flags:\n  %s\n", response);
+    pause_and_continue();
+}
+
+static void admin_set_opt_flags_cli(void) {
+    char response[256];
+    char flags[64];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("              SET NETWORK OPT FLAGS\n");
+    printf("═══════════════════════════════════════════════════\n");
+    printf("Each character is a single option letter [a-zA-Z0-9].\n");
+    printf("Known options:\n");
+    printf("  h  hub-only mutations (bots refuse local +admin/-admin,\n");
+    printf("     +oper/-oper, +usermask/-usermask, +bot/-bot, join/part,\n");
+    printf("     botpass, chpass, +hub/-hub)\n\n");
+    printf("Enter the full flag string (empty to clear): ");
+    fflush(stdout);
+    if (!wait_for_input_or_socket(flags, sizeof(flags))) return;
+
+    send_packet(g_fd, CMD_ADMIN_SET_OPT_FLAGS, flags, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\nHub: %s\n", response);
+    pause_and_continue();
+}
+
+void menu_manage_global_peer_config(void) {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
-        printf("║               ADMIN COMMANDS                     ║\n");
+        printf("║         MANAGE GLOBAL PEER CONFIG                ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. Show Opt Flags\n");
+        printf("  2. Set Opt Flags\n");
+        printf("  3. Back to Main Menu\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        switch(atoi(buf)) {
+            case 1: admin_show_opt_flags();    break;
+            case 2: admin_set_opt_flags_cli(); break;
+            case 3: return;
+            default: printf("Invalid choice.\n"); break;
+        }
+    }
+}
+
+void menu_admin_commands(void) {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║             IRC ADMIN COMMANDS                   ║\n");
         printf("╚══════════════════════════════════════════════════╝\n");
         printf("\n");
         printf("  1. Op User\n");
@@ -1786,7 +1786,7 @@ void menu_admin_commands() {
 // MENU FUNCTIONS
 // ============================================================================
 
-void menu_manage_bots() {
+void menu_manage_bots(void) {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
@@ -1832,7 +1832,7 @@ void menu_manage_bots() {
     }
 }
 
-void menu_manage_peer_connections() {
+void menu_manage_peer_connections(void) {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
@@ -1886,11 +1886,11 @@ void menu_manage_peer_connections() {
     }
 }
 
-void menu_manage_peer_config() {
+void menu_manage_peer_config(void) {
     while (1) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════╗\n");
-        printf("║            MANAGE PEER CONFIG                    ║\n");
+        printf("║         MANAGE LOCAL PEER CONFIG                 ║\n");
         printf("╚══════════════════════════════════════════════════╝\n");
         printf("\n");
         printf("  1. Set Hub Name\n");
@@ -1970,36 +1970,64 @@ void menu_manage_peer_config() {
 
 int main(int argc, char *argv[]) {
     if (argc != 4) {
-        printf("Usage: ./hub_admin <ip> <port> <pub.b64>\n");
+        printf("Usage: ./hub_admin <ip> <port> <admin_<name>_priv.b64>\n");
+        printf("\n");
+        printf("The admin's Curve25519 private key file (88-char base64 of\n");
+        printf("the 64-byte combined Ed25519+X25519 key) is the only credential\n");
+        printf("required.  The hub's public key is fetched at connect time over\n");
+        printf("the same TCP connection (no hub_public.b64 file needed).\n");
         return 1;
     }
 
-    // Load hub's X25519 public key from base64 file (hub_public.b64)
+    /* Load admin's combined Curve25519 PRIVATE key (88 chars base64). */
     FILE *f = fopen(argv[3], "r");
     if (!f) {
-        perror("Failed to open key file");
+        perror("Failed to open admin priv key file");
         return 1;
     }
-    char b64line[128] = {0};
-    if (!fgets(b64line, sizeof(b64line), f)) {
-        fprintf(stderr, "Failed to read key file\n");
+    char ab64[128] = {0};
+    if (!fgets(ab64, sizeof(ab64), f)) {
+        fprintf(stderr, "Failed to read admin priv key file\n");
         fclose(f);
         return 1;
     }
     fclose(f);
-    b64line[strcspn(b64line, "\r\n")] = 0;
+    ab64[strcspn(ab64, "\r\n")] = 0;
 
-    int dec_len = 0;
-    unsigned char *pub_combined = base64_decode(b64line, &dec_len);
-    if (!pub_combined || dec_len != 64) {
-        fprintf(stderr, "Invalid key file: expected 64-byte Curve25519 pub key (88 chars base64)\n");
-        if (pub_combined) free(pub_combined);
+    int adec_len = 0;
+    unsigned char *admin_priv_combined = base64_decode(ab64, &adec_len);
+    secure_wipe(ab64, sizeof(ab64));
+    if (!admin_priv_combined || adec_len != 64) {
+        fprintf(stderr, "Invalid admin priv key file: expected 64-byte "
+                        "Curve25519 combined key (88 chars base64).\n");
+        if (admin_priv_combined) free(admin_priv_combined);
         return 1;
     }
-    // We only need the X25519 public key (bytes 32-63)
-    unsigned char hub_x25519_pub[32];
-    memcpy(hub_x25519_pub, pub_combined + 32, 32);
-    free(pub_combined);
+    /* Layout: ed_priv(32) || x_priv(32).  We only use x_priv for the
+     * ECDH that derives the session key.  Could later sign a challenge
+     * with ed_priv for stronger anti-replay (not yet implemented). */
+    unsigned char admin_x_priv[32], admin_ed_priv[32];
+    memcpy(admin_ed_priv, admin_priv_combined,      32);
+    memcpy(admin_x_priv,  admin_priv_combined + 32, 32);
+    secure_wipe(admin_priv_combined, 64);
+    free(admin_priv_combined);
+    (void)admin_ed_priv; /* reserved for future signed handshake */
+
+    /* Derive admin X25519 public key from the loaded priv. */
+    unsigned char admin_x_pub[32];
+    {
+        EVP_PKEY *pk = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL,
+                                                    admin_x_priv, 32);
+        size_t l = 32;
+        bool ok = pk && EVP_PKEY_get_raw_public_key(pk, admin_x_pub, &l) == 1 && l == 32;
+        if (pk) EVP_PKEY_free(pk);
+        if (!ok) {
+            fprintf(stderr, "Failed to derive admin pubkey from priv key.\n");
+            secure_wipe(admin_x_priv, 32);
+            return 1;
+        }
+    }
+    (void)admin_x_pub;
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr = {
@@ -2010,52 +2038,115 @@ int main(int argc, char *argv[]) {
 
     if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         perror("Connect failed");
+        secure_wipe(admin_x_priv, 32);
         return 1;
     }
 
     signal(SIGPIPE, SIG_IGN);
     g_fd = fd;
 
-    char auth_pass[128];
-    get_password_secure("Admin Password: ", auth_pass, sizeof(auth_pass));
-
-    // Build auth plaintext (no session key prefix — sealed-box derives it)
-    unsigned char plain[256];
-    int msg_len = snprintf((char*)plain, sizeof(plain), "ADMIN %s|%s:%s",
-                           auth_pass, argv[1], argv[2]);
-    secure_wipe(auth_pass, sizeof(auth_pass));
-
-    // Generate ephemeral X25519, derive session key, seal the plaintext
-    unsigned char eph_priv[32], eph_pub[32];
+    /* Step 1: ADMIN-HELLO probe.  Hub responds with its X25519 pubkey + UUID
+     * over the same TCP socket — no hub_public.b64 file needed. */
     {
-        EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
-        EVP_PKEY *pk = NULL;
-        size_t len = 32;
-        bool ok = ctx && EVP_PKEY_keygen_init(ctx) > 0
-                      && EVP_PKEY_keygen(ctx, &pk) > 0
-                      && EVP_PKEY_get_raw_private_key(pk, eph_priv, &len) > 0 && len == 32
-                      && EVP_PKEY_get_raw_public_key(pk, eph_pub, &len) > 0 && len == 32;
-        if (pk)  EVP_PKEY_free(pk);
-        if (ctx) EVP_PKEY_CTX_free(ctx);
-        if (!ok) {
-            fprintf(stderr, "Ephemeral X25519 keygen failed\n");
-            secure_wipe(eph_priv, 32);
+        const char *hello = "ADMIN-HELLO";
+        uint32_t nl = htonl(11);
+        if (write(fd, &nl, 4) != 4 || write(fd, hello, 11) != 11) {
+            perror("HELLO write failed");
+            secure_wipe(admin_x_priv, 32);
             close(fd);
             return 1;
         }
     }
 
-    unsigned char shared[32], session_key[32];
-    if (!hub_crypto_x25519_derive(eph_priv, hub_x25519_pub, shared)) {
-        fprintf(stderr, "X25519 derive failed\n");
-        secure_wipe(eph_priv, 32);
+    unsigned char hub_x25519_pub[32] = {0};
+    {
+        uint32_t rnl;
+        if (recv_all(fd, &rnl, 4) != 4) {
+            fprintf(stderr, "No HELLO reply from hub.\n");
+            secure_wipe(admin_x_priv, 32);
+            close(fd);
+            return 1;
+        }
+        int rl = (int)ntohl(rnl);
+        if (rl < 14 || rl > 200) {
+            fprintf(stderr, "HELLO reply length out of range: %d\n", rl);
+            secure_wipe(admin_x_priv, 32);
+            close(fd);
+            return 1;
+        }
+        char reply[256] = {0};
+        if (recv_all(fd, reply, rl) != rl) {
+            fprintf(stderr, "Short HELLO reply.\n");
+            secure_wipe(admin_x_priv, 32);
+            close(fd);
+            return 1;
+        }
+        reply[rl] = 0;
+        if (strncmp(reply, "HUB-PUBKEY|", 11) != 0) {
+            fprintf(stderr, "Unexpected HELLO reply: %s\n", reply);
+            secure_wipe(admin_x_priv, 32);
+            close(fd);
+            return 1;
+        }
+        char *pub_b64 = reply + 11;
+        char *bar = strchr(pub_b64, '|');
+        if (bar) *bar = 0;
+        int xpd = 0;
+        unsigned char *xpd_buf = base64_decode(pub_b64, &xpd);
+        if (!xpd_buf || xpd != 32) {
+            fprintf(stderr, "HELLO reply pubkey not 32 bytes.\n");
+            if (xpd_buf) free(xpd_buf);
+            secure_wipe(admin_x_priv, 32);
+            close(fd);
+            return 1;
+        }
+        memcpy(hub_x25519_pub, xpd_buf, 32);
+        free(xpd_buf);
+        printf("[*] Discovered hub X25519 pubkey via HELLO.\n");
+    }
+
+    /* Step 2: prompt for admin name + password, then sealed-box AUTH using
+     * the admin's STATIC X25519 priv (instead of an ephemeral) so the hub
+     * can identify the admin by the pubkey on the wire. */
+    char auth_name[64];
+    char auth_pass[128];
+    printf("Admin name: ");
+    fflush(stdout);
+    if (!fgets(auth_name, sizeof(auth_name), stdin)) {
+        fprintf(stderr, "No name provided.\n");
+        secure_wipe(admin_x_priv, 32);
         close(fd);
         return 1;
     }
-    secure_wipe(eph_priv, 32);
+    auth_name[strcspn(auth_name, "\r\n")] = '\0';
+    if (!auth_name[0]) {
+        fprintf(stderr, "Empty admin name.\n");
+        secure_wipe(admin_x_priv, 32);
+        close(fd);
+        return 1;
+    }
+    get_password_secure("Admin Password: ", auth_pass, sizeof(auth_pass));
+
+    unsigned char plain[256];
+    int msg_len = snprintf((char*)plain, sizeof(plain), "ADMIN|%s|%s|%s:%s",
+                           auth_name, auth_pass, argv[1], argv[2]);
+    secure_wipe(auth_pass, sizeof(auth_pass));
+    secure_wipe(auth_name, sizeof(auth_name));
+
+    /* Derive session key from STATIC admin X25519 priv + hub X25519 pub.
+     * This binds the wire to possession of the admin priv key — only the
+     * admin (and the hub) can reconstruct the same key. */
+    unsigned char shared[32], session_key[32];
+    if (!hub_crypto_x25519_derive(admin_x_priv, hub_x25519_pub, shared)) {
+        fprintf(stderr, "X25519 derive failed\n");
+        secure_wipe(admin_x_priv, 32);
+        close(fd);
+        return 1;
+    }
+    secure_wipe(admin_x_priv, 32);
 
     static const unsigned char ADMIN_INFO[] = "irchub-admin-session-v1";
-    if (!hub_crypto_hkdf_sha256(shared, 32, eph_pub, 32,
+    if (!hub_crypto_hkdf_sha256(shared, 32, admin_x_pub, 32,
                                 ADMIN_INFO, sizeof(ADMIN_INFO) - 1,
                                 session_key, 32)) {
         fprintf(stderr, "HKDF failed\n");
@@ -2067,11 +2158,15 @@ int main(int argc, char *argv[]) {
     memcpy(g_key, session_key, 32);
     secure_wipe(session_key, 32);
 
-    // Encrypt plaintext using AES-256-GCM with g_key
+    /* Wire layout for hub_handle_client_data's sealed-box decode is:
+     *   eph_pub(32) || iv(GCM_IV_LEN) || ct || tag
+     * where the hub uses its own X25519 priv with eph_pub to recover the
+     * shared secret.  We slot the admin's STATIC X25519 pub into that
+     * field — semantics on the hub side are identical (X25519(hub_priv,
+     * admin_pub) == X25519(admin_priv, hub_pub)). */
     unsigned char enc[512];
     unsigned char tag[GCM_TAG_LEN];
-    // Layout: eph_pub(32) || iv(GCM_IV_LEN) || ct || tag
-    memcpy(enc, eph_pub, 32);
+    memcpy(enc, admin_x_pub, 32);
     int ct_len = aes_gcm_encrypt(plain, msg_len + 1, g_key, enc + 32, tag);
     secure_wipe(plain, sizeof(plain));
     if (ct_len <= 0) {
@@ -2089,7 +2184,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("[+] Authenticated to hub (Curve25519).\n");
+    printf("[+] Authenticated to hub (per-admin Curve25519).\n");
 
     // MAIN MENU LOOP
     while (1) {
@@ -2100,9 +2195,10 @@ int main(int argc, char *argv[]) {
         printf("\n");
         printf("  1. Manage Bots\n");
         printf("  2. Manage Peer Connections\n");
-        printf("  3. Manage Peer Config\n");
-        printf("  4. Admin Commands\n");
-        printf("  5. Exit\n");
+        printf("  3. Manage Local Peer Config\n");
+        printf("  4. Manage Global Peer Config\n");
+        printf("  5. IRC Admin Commands\n");
+        printf("  6. Exit\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -2129,10 +2225,14 @@ int main(int argc, char *argv[]) {
                 break;
 
             case 4:
-                menu_admin_commands();
+                menu_manage_global_peer_config();
                 break;
 
             case 5:
+                menu_admin_commands();
+                break;
+
+            case 6:
                 printf("\nExiting...\n");
                 secure_wipe(g_key, sizeof(g_key));
                 close(fd);

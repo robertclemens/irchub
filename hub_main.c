@@ -1,4 +1,5 @@
 #include "hub.h"
+#include <malloc.h>
 #include <stdarg.h>
 #include <signal.h>
 #include <time.h>
@@ -176,10 +177,13 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
     secure_wipe(c->session_key, sizeof(c->session_key));
     secure_wipe(c->bot_eph_x25519_priv, sizeof(c->bot_eph_x25519_priv));
     c->bot_eph_priv_set = false;
-    secure_wipe(c->recv_buf, c->recv_len);
+    if (c->recv_buf) secure_wipe(c->recv_buf, c->recv_len);
     /* Free per-peer outbound queues + in-flight ciphertext.  Done after the
      * fd is closed so no drain attempts can race. */
     peer_queue_destroy(c);
+    /* D2: release the heap-allocated client buffers. */
+    free(c->recv_buf);
+    free(c->writing_buf);
     free(c);
 }
 
@@ -317,6 +321,9 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
     }
 
     c->authenticated = true;
+    /* D2: no-op for outbound peers (already full-size) but keeps every
+     * auth-completion path uniform. */
+    hub_client_promote_buffers(c);
     hub_log("[PEER] Handshake complete with %s\n", c->ip);
     /* Send a full config sync immediately via the BULK queue.  The queue
      * enforces a per-peer byte budget (BULK_SOFT_BUDGET_BPS = 32 KB/s) so
@@ -460,6 +467,19 @@ void hub_maintenance(hub_state_t *state) {
                 i--;
                 continue;
             }
+            /* D4: reap connections that never authenticated within the pre-auth
+             * window. Uses connected_at (not last_seen) so a slowloris that
+             * dribbles bytes to keep last_seen fresh is still dropped. Outbound
+             * CLIENT_HUB peers are trusted, operator-configured endpoints and
+             * are exempt. */
+            if (!c->authenticated && c->type != CLIENT_HUB &&
+                (now - c->connected_at) > PREAUTH_TIMEOUT_SEC) {
+                hub_log("[HUB] Pre-auth timeout for %s (%lds, no handshake) — "
+                        "dropping\n", c->ip, (long)(now - c->connected_at));
+                hub_disconnect_client(state, c);
+                i--;
+                continue;
+            }
             if (c->authenticated && (now - c->last_seen) > PING_INTERVAL) {
                 if (!send_ping(c)) {
                     hub_log("[WARN] Ping failed to %s. Disconnecting.\n", c->ip);
@@ -552,16 +572,20 @@ void hub_check_peers(hub_state_t *state) {
             if (connect(sockfd, (struct sockaddr*)&peer_addr, sizeof(peer_addr)) == 0) {
                 if (state->client_count < MAX_CLIENTS) {
                     hub_client_t *c = calloc(1, sizeof(hub_client_t));
-                    if (!c) {
+                    /* D2: outbound peers immediately exchange bulk anti-entropy
+                     * sync, so allocate full-size buffers up front. */
+                    if (!c || !hub_client_alloc_buffers(c, MAX_BUFFER)) {
+                        free(c);
                         close(sockfd);
                         continue;
                     }
-                    
+
                     c->fd = sockfd;
                     snprintf(c->ip, sizeof(c->ip), "%s", state->peers[i].ip);
                     c->type = CLIENT_HUB;
                     c->last_seen = time(NULL);
-c->last_pong_sent = 0;
+                    c->connected_at = c->last_seen;  /* D4 (exempt: CLIENT_HUB) */
+                    c->last_pong_sent = 0;
                     state->clients[state->client_count++] = c;
                     
                     state->peers[i].connected = true;
@@ -728,6 +752,15 @@ done:
 }
 
 int main(int argc, char *argv[]) {
+    /* DoS hardening: each accepted connection allocates a ~33 KB hub_client_t.
+     * glibc keeps freed chunks of that size in the arena (they exceed the
+     * default trim threshold but sit below the dynamic mmap threshold), so a
+     * rapid connect/close flood grows RSS unboundedly even though the structs
+     * are freed.  Force allocations >= 32 KB through mmap so free() returns
+     * them to the OS, and lower the trim threshold, bounding RSS under churn. */
+    mallopt(M_MMAP_THRESHOLD, 32 * 1024);
+    mallopt(M_TRIM_THRESHOLD, 64 * 1024);
+
     bool setup_mode = false;
     bool passfile_mode = false;
     for (int i = 1; i < argc; i++) {
@@ -794,139 +827,62 @@ int main(int argc, char *argv[]) {
             secure_wipe(cfg_pass2, sizeof(cfg_pass2));
         }
 
-        printf("\nHub Keypair (Curve25519):\n");
-        printf("  1. Generate new keypair\n");
-        printf("     Fresh Curve25519 keypair (Ed25519 + X25519) for first deployment.\n");
-        printf("\n");
-        printf("  2. Use existing key file (hub_private.b64)\n");
-        printf("     For secondary hubs joining an existing mesh — all hubs share\n");
-        printf("     the same Curve25519 keypair.  Provide path to hub_private.b64.\n");
-        printf("Choice: ");
-        fflush(stdout);
+        /* Per-hub independent keypair (no shared-keypair mesh).
+         * Generate fresh; export only the public key.  The private key stays
+         * inside the encrypted .irchub.cnf — no plaintext hub_private.b64
+         * file is dumped any more. */
         {
-            int kp_choice = 0;
-            if (scanf("%d", &kp_choice) != 1) kp_choice = 2;
-            while ((ch = getchar()) != '\n' && ch != EOF);
-
-            if (kp_choice == 1) {
-                unsigned char priv64[64], pub64[64];
-                printf("[*] Generating Curve25519 keypair (Ed25519 + X25519)...\n");
-                if (!hub_crypto_generate_combined_keypair(priv64, pub64)) {
-                    printf("Key generation failed.\n");
-                    return 1;
-                }
-                hub_crypto_split_combined(priv64, state.hub_ed25519_priv, state.hub_x25519_priv);
-                hub_crypto_split_combined(pub64,  state.hub_ed25519_pub,  state.hub_x25519_pub);
-                state.hub_keys_loaded = true;
-
-                // Export to files so user has them
-                char *priv_b64 = base64_encode(priv64, 64);
-                char *pub_b64  = base64_encode(pub64, 64);
-                if (priv_b64 && pub_b64) {
-                    int kfd = open("hub_private.b64",
-                                   O_WRONLY | O_CREAT | O_TRUNC, 0600);
-                    if (kfd >= 0) {
-                        if (fchmod(kfd, 0600) != 0)
-                            perror("[WARN] fchmod hub_private.b64");
-                        FILE *fp = fdopen(kfd, "w");
-                        if (fp) {
-                            fprintf(fp, "%s", priv_b64);
-                            fclose(fp);
-                        } else {
-                            close(kfd);
-                        }
-                        printf("[+] Private key saved to: hub_private.b64\n");
-                    }
-                    FILE *fpu = fopen("hub_public.b64", "w");
-                    if (fpu) {
-                        fprintf(fpu, "%s", pub_b64);
-                        fclose(fpu);
-                        printf("[+] Public key saved to:  hub_public.b64\n");
-                    }
-                }
-                if (priv_b64) free(priv_b64);
-                if (pub_b64)  free(pub_b64);
-
-                secure_wipe(priv64, 64);
-                printf("[+] Curve25519 keypair generated.\n");
-            } else {
-                char kp_path[256];
-                memset(kp_path, 0, sizeof(kp_path));
-                printf("Private Key File Path (hub_private.b64): ");
-                fflush(stdout);
-                if (!fgets(kp_path, sizeof(kp_path), stdin)) {
-                    printf("Read error.\n");
-                    return 1;
-                }
-                kp_path[strcspn(kp_path, "\n")] = 0;
-
-                {
-                    struct stat kst;
-                    if (stat(kp_path, &kst) == 0 && (kst.st_mode & 0177) != 0)
-                        printf("[WARN] %s has insecure permissions %04o — should be 0600\n",
-                               kp_path, (unsigned)(kst.st_mode & 0777));
-                }
-                FILE *f = fopen(kp_path, "r");
-                if (!f) {
-                    printf("Key file not found: %s\n", kp_path);
-                    return 1;
-                }
-                char b64line[128] = {0};
-                if (!fgets(b64line, sizeof(b64line), f)) {
-                    printf("Error reading key file.\n");
-                    fclose(f);
-                    return 1;
-                }
-                fclose(f);
-                b64line[strcspn(b64line, "\r\n")] = 0;
-
-                int dec_len = 0;
-                unsigned char *dec = base64_decode(b64line, &dec_len);
-                if (!dec || dec_len != 64) {
-                    printf("Invalid key file: need 64-byte Curve25519 key (88 chars base64).\n");
-                    printf("This does not look like a hub_private.b64 file.\n");
-                    if (dec) free(dec);
-                    return 1;
-                }
-                hub_crypto_split_combined(dec, state.hub_ed25519_priv, state.hub_x25519_priv);
-
-                // Derive public keys
-                EVP_PKEY *ep = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, dec, 32);
-                EVP_PKEY *xp = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, dec + 32, 32);
-                secure_wipe(dec, 64); free(dec);
-                if (!ep || !xp) {
-                    if (ep) EVP_PKEY_free(ep);
-                    if (xp) EVP_PKEY_free(xp);
-                    printf("Failed to load Curve25519 key material.\n");
-                    return 1;
-                }
-                size_t len = 32;
-                EVP_PKEY_get_raw_public_key(ep, state.hub_ed25519_pub, &len);
-                len = 32;
-                EVP_PKEY_get_raw_public_key(xp, state.hub_x25519_pub, &len);
-                EVP_PKEY_free(ep); EVP_PKEY_free(xp);
-                state.hub_keys_loaded = true;
-                printf("[+] Curve25519 keypair loaded from %s.\n", kp_path);
+            unsigned char priv64[64], pub64[64];
+            printf("\n[*] Generating per-hub Curve25519 keypair (Ed25519 + X25519)...\n");
+            if (!hub_crypto_generate_combined_keypair(priv64, pub64)) {
+                printf("Key generation failed.\n");
+                return 1;
             }
-        }
+            hub_crypto_split_combined(priv64, state.hub_ed25519_priv, state.hub_x25519_priv);
+            hub_crypto_split_combined(pub64,  state.hub_ed25519_pub,  state.hub_x25519_pub);
+            state.hub_keys_loaded = true;
 
-        {
-            char admin_pass1[MAX_PASS], admin_pass2[MAX_PASS];
-            do {
-                read_pass_hidden("Hub Admin Password (for CLI tool & peer auth): ", admin_pass1, sizeof(admin_pass1));
-                read_pass_hidden("Confirm Hub Admin Password: ", admin_pass2, sizeof(admin_pass2));
-                if (strcmp(admin_pass1, admin_pass2) != 0) {
-                    printf("Passwords do not match. Try again.\n");
+            char *pub_b64 = base64_encode(pub64, 64);
+            secure_wipe(priv64, 64);
+            if (pub_b64) {
+                /* Dump the public key only.  The private key is persisted
+                 * inside the AES-256-GCM encrypted .irchub.cnf. */
+                int pfd = open("hub_public.b64",
+                               O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (pfd >= 0) {
+                    FILE *fpu = fdopen(pfd, "w");
+                    if (fpu) { fprintf(fpu, "%s", pub_b64); fclose(fpu); }
+                    else close(pfd);
                 }
-            } while (strcmp(admin_pass1, admin_pass2) != 0);
-            snprintf(state.admin_password, sizeof(state.admin_password), "%s", admin_pass1);
-            secure_wipe(admin_pass1, sizeof(admin_pass1));
-            secure_wipe(admin_pass2, sizeof(admin_pass2));
+                printf("[+] Public key saved to: hub_public.b64\n");
+                printf("[+] Public key: %s\n\n", pub_b64);
+                printf("    ┌─────────────────────────────────────────────────┐\n");
+                printf("    │ Save this public key + this hub's UUID.         │\n");
+                printf("    │   - Bots adding this hub will need both         │\n");
+                printf("    │     (ircbot -setup prompts for UUID + pubkey).  │\n");
+                printf("    │   - Peer hubs adding this hub will need the     │\n");
+                printf("    │     UUID + ip:port + pubkey via hub_admin.      │\n");
+                printf("    │ The hub's PRIVATE key never leaves this machine │\n");
+                printf("    │ (stored encrypted inside .irchub.cnf).          │\n");
+                printf("    └─────────────────────────────────────────────────┘\n");
+                free(pub_b64);
+            }
+            printf("[+] Curve25519 keypair generated.\n");
         }
+        (void)ch;
 
-        /* Bot admin user setup — creates first a| and m| records */
-        printf("\n--- Bot Admin User Setup ---\n");
-        printf("This creates the first named admin for IRC bot command authentication.\n\n");
+        /* The legacy single 'Hub Admin Password' is gone — auth is per-admin
+         * via the a| user records. state->admin_password remains in the struct
+         * but is not used or persisted by the v3 admin auth path. */
+        state.admin_password[0] = '\0';
+
+        /* Admin user setup — creates first a| and m| records.
+         * Each admin gets a Curve25519 keypair: pubkey lives in the a| record
+         * (replicated through the mesh); the matching priv is dumped to a file
+         * the operator must carry to the machine that runs hub_admin. */
+        printf("\n--- First Admin Setup ---\n");
+        printf("This creates the first named admin for IRC bot command\n");
+        printf("authentication AND hub_admin login (per-admin password).\n\n");
         {
             char bot_admin_name[64] = {0};
             char bot_admin_pass1[MAX_PASS] = {0}, bot_admin_pass2[MAX_PASS] = {0};
@@ -951,7 +907,50 @@ int main(int argc, char *argv[]) {
                     printf("Passwords do not match. Try again.\n");
             } while (strcmp(bot_admin_pass1, bot_admin_pass2) != 0);
 
-            /* Generate UUID and create the user record first */
+            /* Generate per-admin Curve25519 keypair.  The PRIVATE key is
+             * displayed exactly once — never written to disk by this wizard.
+             * The operator must copy it (out of band) to a file on the host
+             * that will run hub_admin (e.g. ~/admin_<name>.b64, 0600).
+             * The PUBLIC key is stored in the a| record and replicates
+             * through the mesh. */
+            char admin_pub_b64[COMBINED_KEY_B64 + 1] = {0};
+            {
+                unsigned char ad_priv[COMBINED_KEY_LEN], ad_pub[COMBINED_KEY_LEN];
+                if (!hub_crypto_generate_combined_keypair(ad_priv, ad_pub)) {
+                    fprintf(stderr, "Admin keypair generation failed.\n");
+                    return 1;
+                }
+                char *priv_b64 = base64_encode(ad_priv, COMBINED_KEY_LEN);
+                char *pub_b64  = base64_encode(ad_pub,  COMBINED_KEY_LEN);
+                secure_wipe(ad_priv, COMBINED_KEY_LEN);
+                if (priv_b64 && pub_b64) {
+                    snprintf(admin_pub_b64, sizeof(admin_pub_b64), "%s", pub_b64);
+                    printf("\n");
+                    printf("    ┌──────────────────────────────────────────────────────────┐\n");
+                    printf("    │  ⚠ Admin '%s' PRIVATE key (save this NOW; not stored):  \n",
+                           bot_admin_name);
+                    printf("    │                                                          \n");
+                    printf("    │  %s  \n", priv_b64);
+                    printf("    │                                                          \n");
+                    printf("    │  Save to (e.g.) admin_%s.b64 with mode 0600 on the      \n",
+                           bot_admin_name);
+                    printf("    │  host that will run hub_admin, then:                     \n");
+                    printf("    │    ./hub_admin <ip> <port> admin_%s.b64                  \n",
+                           bot_admin_name);
+                    printf("    │                                                          \n");
+                    printf("    │  This key is NOT recoverable from .irchub.cnf if lost.   \n");
+                    printf("    └──────────────────────────────────────────────────────────┘\n");
+                    printf("\n    Admin public key (replicated through mesh in a| record):\n");
+                    printf("      %s\n\n", pub_b64);
+                    printf("    Press Enter when you have copied the private key...");
+                    fflush(stdout);
+                    { int c; while ((c = getchar()) != '\n' && c != EOF); }
+                }
+                if (priv_b64) { secure_wipe(priv_b64, strlen(priv_b64)); free(priv_b64); }
+                if (pub_b64)  free(pub_b64);
+            }
+
+            /* Generate UUID and create the user record */
             char new_uuid[37];
             generate_uuid_v4(new_uuid, sizeof(new_uuid));
             time_t now = time(NULL);
@@ -963,6 +962,10 @@ int main(int argc, char *argv[]) {
                 snprintf(u->name,     sizeof(u->name),     "%s", bot_admin_name);
                 snprintf(u->password, sizeof(u->password), "%s", bot_admin_pass1);
                 u->type = 'a'; u->is_active = true; u->timestamp = now;
+                if (admin_pub_b64[0]) {
+                    snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", admin_pub_b64);
+                    u->has_pubkey = true;
+                }
             }
             secure_wipe(bot_admin_pass1, sizeof(bot_admin_pass1));
             secure_wipe(bot_admin_pass2, sizeof(bot_admin_pass2));
@@ -1121,24 +1124,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* While all hubs share one Curve25519 keypair, auto-populate has_pubkey
-     * for any peer that lacks it so they use v2 Ed25519 auth immediately.
-     * This becomes a no-op once per-hub independent keys are introduced,
-     * because by then each peer will already have its own distinct key set. */
+    /* Per-hub independent keypairs (no shared-keypair mesh).
+     * Peers without a registered pubkey are refused at handshake time —
+     * the operator must add each peer with its own pubkey via hub_admin. */
     {
-        int migrated = 0;
-        for (int i = 0; i < state.peer_count; i++) {
-            if (!state.peers[i].has_pubkey) {
-                memcpy(state.peers[i].ed_pub,     state.hub_ed25519_pub, ED25519_KEY_LEN);
-                memcpy(state.peers[i].x25519_pub, state.hub_x25519_pub,  X25519_KEY_LEN);
-                state.peers[i].has_pubkey = true;
-                migrated++;
-            }
-        }
-        if (migrated > 0) {
-            hub_log("[HUB] Auto-populated shared pubkey on %d peer(s) — "
-                    "they will use v2 Ed25519 auth on next connect.\n", migrated);
-            state.config_dirty = true;
+        int peerless = 0;
+        for (int i = 0; i < state.peer_count; i++)
+            if (!state.peers[i].has_pubkey) peerless++;
+        if (peerless > 0) {
+            hub_log("[HUB] WARNING: %d peer(s) lack a Curve25519 pubkey and "
+                    "will be refused on connect. Re-add them with their "
+                    "hub_public.b64 via hub_admin (Add Peer / Set Peer Pubkey).\n",
+                    peerless);
         }
     }
 
@@ -1236,10 +1233,13 @@ int main(int argc, char *argv[]) {
                     close(new_fd);
                 } else if (state.client_count < MAX_CLIENTS) {
                     hub_client_t *c = calloc(1, sizeof(hub_client_t));
-                    if (c) {
+                    /* D2: unauthenticated clients get a small buffer; it is
+                     * grown to MAX_BUFFER once the handshake completes. */
+                    if (c && hub_client_alloc_buffers(c, PREAUTH_BUF_SIZE)) {
                         c->fd = new_fd;
                         snprintf(c->ip, sizeof(c->ip), "%s", incoming_ip);
                         c->last_seen = time(NULL);
+                        c->connected_at = c->last_seen;  /* D4: pre-auth clock */
                         c->last_pong_sent = 0;
                         state.clients[state.client_count++] = c;
 
@@ -1247,6 +1247,7 @@ int main(int argc, char *argv[]) {
 
                         hub_log("[HUB] Incoming connect: %s\n", c->ip);
                     } else {
+                        free(c);
                         close(new_fd);
                     }
                 } else {
@@ -1259,7 +1260,7 @@ int main(int argc, char *argv[]) {
             hub_client_t *c = state.clients[i];
             
             if (c->fd > 0 && FD_ISSET(c->fd, &read_fds)) {
-                int space = MAX_BUFFER - c->recv_len;
+                int space = c->recv_cap - c->recv_len;  /* D2: per-client cap */
                 
                 if (space > 0) {
                     int n = read(c->fd, c->recv_buf + c->recv_len, space);

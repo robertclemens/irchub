@@ -23,6 +23,12 @@
 #define MAX_CLIENTS 100
 #define MAX_BOTS 100
 #define MAX_PEERS 10
+#define MAX_OPT_FLAGS 32
+
+/* Network option flag letters (synced via the 'opt|' record).
+ * Each option is a single [a-zA-Z0-9] character; the active set lives in
+ * hub_state_t.opt_flags and replicates to bots in CMD_CONFIG_DATA / sync. */
+#define OPT_HUB_ONLY_MUTATIONS 'h'
 #define MAX_CHAN 65
 #define MAX_NICK 32
 #define MAX_KEY 31
@@ -69,6 +75,14 @@
 #define MAX_FAILED_AUTH_ATTEMPTS 3
 #define FAILED_AUTH_BLOCK_DURATION 300  // 5 minutes
 #define FAILED_AUTH_RESET_TIME 3600     // 1 hour
+
+/* D1 — churn-based (connect/close flood) throttle. Concurrency + failed-auth
+ * limits don't catch a rapid connect/close flood; this sliding window does.
+ * More than CHURN_MAX_CONNS new connections from one IP within
+ * CHURN_WINDOW_SEC seconds triggers a CHURN_BLOCK_SEC temporary block. */
+#define CHURN_WINDOW_SEC 10
+#define CHURN_MAX_CONNS  30
+#define CHURN_BLOCK_SEC  30
 #define MAX_RECENT_PURGES 5             // Track recent PURGE cutoffs to prevent loops
 #define PURGE_DEDUP_WINDOW 60            // Seconds to remember PURGE (prevents loops)
 
@@ -80,6 +94,17 @@
 #define PING_INTERVAL 60
 #define CLIENT_TIMEOUT 180
 #define CONNECT_TIMEOUT 5
+
+/* D4 — pre-authentication handshake timeout. An accepted connection that has
+ * not authenticated within this window is dropped, freeing its MAX_CLIENTS
+ * slot far sooner than CLIENT_TIMEOUT (180s). Outbound CLIENT_HUB peers are
+ * exempt (they are trusted, operator-configured endpoints). */
+#define PREAUTH_TIMEOUT_SEC 10
+
+/* D2 — two-tier client buffers. Unauthenticated clients get a small buffer
+ * (enough for the handshake); it is grown to MAX_BUFFER on successful auth.
+ * This keeps the unauthenticated footprint ~8KB instead of ~33KB. */
+#define PREAUTH_BUF_SIZE 4096
 #define PEER_RECONNECT_INTERVAL 120
 
 // Protocol Commands
@@ -170,6 +195,8 @@
 #define CMD_ADMIN_LIST_ADMINS    0x4E   // List all admin records
 #define CMD_ADMIN_LIST_OPERS_V2  0x4F   // List all oper records
 #define CMD_ADMIN_SET_PEER_PUBKEY 0x52  // Set/replace pubkey on existing peer (payload: UUID:PUBKEY_B64)
+#define CMD_ADMIN_SET_OPT_FLAGS   0x53  // Set network opt flag string (payload: <letters>)
+#define CMD_ADMIN_GET_OPT_FLAGS   0x54  // Get current network opt flag string
 
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
@@ -206,6 +233,11 @@ typedef struct {
 typedef struct {
   char   uuid[37];
   char   name[64];
+  /* Per-user Curve25519 combined pubkey (Ed25519 + X25519), base64-encoded
+   * (88 chars + NUL).  Empty when no key on file.  Used by hub_admin to
+   * authenticate; the matching priv key lives only on the admin's machine. */
+  char   pubkey_b64[COMBINED_KEY_B64 + 1];
+  bool   has_pubkey;
   char   password[MAX_PASS];
   char   type;         /* 'a' = admin, 'o' = oper */
   bool   is_active;    /* false when action == "del" */
@@ -253,6 +285,8 @@ typedef struct {
   time_t last_failed_auth;   // Timestamp of last failed auth
   time_t blocked_until;      // Temporary block expiration (0 if not blocked)
   time_t first_seen;         // For cleanup of old entries
+  time_t churn_window_start; // D1: start of current connect-rate window
+  int    churn_count;        // D1: new connections counted in current window
 } ip_rate_limit_t;
 
 typedef struct {
@@ -316,7 +350,9 @@ typedef struct {
   client_type_t type;
   time_t last_seen;
   time_t last_pong_sent;
-  unsigned char recv_buf[MAX_BUFFER];
+  time_t connected_at;             // D4: when the socket was accepted/created
+  unsigned char *recv_buf;         // D2: heap; PREAUTH_BUF_SIZE then MAX_BUFFER
+  int           recv_cap;          // D2: allocated capacity of recv_buf
   bot_auth_state_t bot_auth_state;
   unsigned char challenge[32];
   unsigned char bot_eph_x25519_priv[32];
@@ -333,7 +369,8 @@ typedef struct {
   /* In-flight cipher buffer for partial writes.  When non-empty the FD must
    * be watched for writability until offset == len, before any new message
    * is encrypted. */
-  unsigned char writing_buf[MAX_BUFFER + 64];
+  unsigned char *writing_buf;      // D2: heap; PREAUTH_BUF_SIZE then MAX_BUFFER+64
+  int           writing_cap;       // D2: allocated capacity of writing_buf
   int           writing_len;
   int           writing_offset;
 
@@ -415,6 +452,8 @@ typedef struct {
   int ip_limits_count;
 
   int purge_days_setting;  // Days threshold for tombstone purge (0 = disabled)
+  bool trust_loopback;     // D3: if true, 127.0.0.1/::1 bypass rate limiting
+                           //     (default false — secure by default)
   int pid_fd;  // File descriptor for PID file lock
   volatile bool running;
 
@@ -429,6 +468,11 @@ typedef struct {
 
   int log_level;       // Current log level (LOG_NONE, LOG_ERROR, etc.)
   int log_max_size;    // Max log file size in bytes (default 10MB)
+
+  /* Network options pushed to bots/peers via the 'opt|' record. Each letter
+   * in opt_flags is an enabled flag (see OPT_* in this header). */
+  char opt_flags[MAX_OPT_FLAGS + 1];
+  time_t opt_flags_ts;
 
   /* Debounced config write: set dirty flag instead of writing immediately.
    * hub_maintenance flushes at most once every CONFIG_WRITE_DEBOUNCE_S seconds.
@@ -500,6 +544,12 @@ int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
 
 // Rate limiting and IP access control functions
 bool is_ip_allowed(hub_state_t *state, const char *ip);
+/* D2: allocate a client's recv/writing buffers at `size` (and writing at
+ * size+64). Returns false on OOM. Used at accept/connect time. */
+bool hub_client_alloc_buffers(hub_client_t *c, int size);
+/* D2: grow a client's buffers to MAX_BUFFER on successful authentication.
+ * Idempotent (no-op if already full size). Returns false on OOM. */
+bool hub_client_promote_buffers(hub_client_t *c);
 void increment_active_connections(hub_state_t *state, const char *ip);
 void decrement_active_connections(hub_state_t *state, const char *ip);
 void cleanup_old_ip_limits(hub_state_t *state);

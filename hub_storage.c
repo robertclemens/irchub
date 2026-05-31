@@ -464,14 +464,15 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
     offset += written;
   }
 
-  // 1a. Add named admin/oper records (new format: a|/o| lines)
+  // 1a. Add named admin/oper records (new format: a|/o| lines, 8-field with pubkey_b64)
   for (int i = 0; i < state->user_record_count; i++) {
     hub_user_record_t *u = &state->user_records[i];
     written = snprintf(buffer + offset, max_len - offset,
-                       "%c|%s|%s|%s|%s|%ld|%ld\n",
+                       "%c|%s|%s|%s|%s|%ld|%ld|%s\n",
                        u->type, u->uuid, u->name, u->password,
                        u->is_active ? "add" : "del",
-                       (long)u->last_seen, (long)u->timestamp);
+                       (long)u->last_seen, (long)u->timestamp,
+                       u->has_pubkey ? u->pubkey_b64 : "");
     if (written < 0 || written >= (max_len - offset)) break;
     offset += written;
   }
@@ -493,6 +494,15 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   time_t now = time(NULL);
   written = snprintf(buffer + offset, max_len - offset, "pd|%d|%ld\n",
                      state->purge_days_setting, (long)now);
+  if (written > 0 && written < (max_len - offset)) {
+    offset += written;
+  }
+
+  // 1c. Push network opt flag string (always, even when empty, so bots can
+  // observe a clear -> blank transition).  Capital 'O' for bot wire format.
+  written = snprintf(buffer + offset, max_len - offset, "O|%s|%ld\n",
+                     state->opt_flags[0] ? state->opt_flags : "",
+                     (long)(state->opt_flags_ts > 0 ? state->opt_flags_ts : now));
   if (written > 0 && written < (max_len - offset)) {
     offset += written;
   }
