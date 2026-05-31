@@ -1461,27 +1461,27 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
     if (type == 'c') {
       // Channel: c|#chan|key|modes|add|timestamp (new) or c|#chan|key|add|timestamp (old)
       char chan[MAX_CHAN], key[MAX_KEY], op[8];
-      long ts;
+      long long ts;
       int modes_val = 0;
       int parsed;
 
       /* Try new 5-field: chan|key|modes|op|ts */
-      parsed = sscanf(data, "%64[^|]|%30[^|]|%d|%7[^|]|%ld",
+      parsed = sscanf(data, "%64[^|]|%30[^|]|%d|%7[^|]|%lld",
                       chan, key, &modes_val, op, &ts);
       if (parsed < 5) {
         /* Try new 5-field without key: chan||modes|op|ts */
         modes_val = 0;
-        parsed = sscanf(data, "%64[^|]||%d|%7[^|]|%ld",
+        parsed = sscanf(data, "%64[^|]||%d|%7[^|]|%lld",
                         chan, &modes_val, op, &ts);
         if (parsed >= 4) {
           key[0] = '\0';
         } else {
           /* Old 4-field: chan|key|op|ts */
           modes_val = 0;
-          parsed = sscanf(data, "%64[^|]|%30[^|]|%7[^|]|%ld",
+          parsed = sscanf(data, "%64[^|]|%30[^|]|%7[^|]|%lld",
                           chan, key, op, &ts);
           if (parsed < 3) {
-            parsed = sscanf(data, "%64[^|]||%7[^|]|%ld", chan, op, &ts);
+            parsed = sscanf(data, "%64[^|]||%7[^|]|%lld", chan, op, &ts);
             key[0] = '\0';
           }
         }
@@ -1496,14 +1496,14 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
           snprintf(extra, sizeof(extra), "|%d", modes_val);
 
         bool accepted = hub_storage_update_global_entry(state, "c", chan, extra, op, ts);
-        hub_log("[HUB-DEBUG] Channel %s: ts=%ld op=%s modes=%d -> %s\n",
+        hub_log("[HUB-DEBUG] Channel %s: ts=%lld op=%s modes=%d -> %s\n",
                 chan, ts, op, modes_val, accepted ? "ACCEPTED" : "REJECTED");
         if (accepted) {
           updates++;
           /* Sync buffer: include modes for peer hubs */
           int w = snprintf(
               sync_buffer + sync_offset, sizeof(sync_buffer) - sync_offset,
-              "b|%s|c|%s|%s|%d|%s|%ld\n",
+              "b|%s|c|%s|%s|%d|%s|%lld\n",
               client->id, chan, key, modes_val, op, ts);
           if (w > 0)
             sync_offset += w;
@@ -1521,12 +1521,12 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
         if (p1&&p2&&p3&&p4) {
           char uuid[37], mask_s[MAX_MASK_LEN], act[8];
-          long last_used, ts;
+          long long last_used, ts;
           snprintf(uuid,   sizeof(uuid),   "%.*s",(int)(p1-data),data);
           snprintf(mask_s, sizeof(mask_s), "%.*s",(int)(p2-p1-1),p1+1);
           snprintf(act,    sizeof(act),    "%.*s",(int)(p3-p2-1),p2+1);
-          last_used = atol(p3+1);
-          ts        = atol(p4+1);
+          last_used = atoll(p3+1);
+          ts        = atoll(p4+1);
           bool is_active = (strncmp(act,"add",3)==0);
           /* Find or create mask record */
           hub_mask_record_t *found_m = NULL;
@@ -1549,7 +1549,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
             state->config_dirty = true;
             updates++;
             int w = snprintf(sync_buffer+sync_offset, sizeof(sync_buffer)-sync_offset,
-                             "m|%s|%s|%s|%ld|%ld\n", uuid, mask_s, act, last_used, ts);
+                             "m|%s|%s|%s|%lld|%lld\n", uuid, mask_s, act, last_used, ts);
             if (w>0) sync_offset += w;
           }
         }
@@ -1569,19 +1569,19 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         if (p1&&p2&&p3&&p4&&p5) {
           char uuid[37], uname[64], upass[MAX_PASS], act[8];
           char incoming_pub[COMBINED_KEY_B64 + 1] = {0};
-          long last_seen, ts;
+          long long last_seen, ts;
           snprintf(uuid,  sizeof(uuid),  "%.*s",(int)(p1-data),data);
           snprintf(uname, sizeof(uname), "%.*s",(int)(p2-p1-1),p1+1);
           snprintf(upass, sizeof(upass), "%.*s",(int)(p3-p2-1),p2+1);
           snprintf(act,   sizeof(act),   "%.*s",(int)(p4-p3-1),p3+1);
-          last_seen = atol(p4+1);
+          last_seen = atoll(p4+1);
           if (p6) {
             char ts_buf[32];
             snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
-            ts = atol(ts_buf);
+            ts = atoll(ts_buf);
             snprintf(incoming_pub, sizeof(incoming_pub), "%s", p6+1);
           } else {
-            ts = atol(p5+1);
+            ts = atoll(p5+1);
           }
           bool is_active = (strncmp(act,"add",3)==0);
           hub_user_record_t *found_u = NULL;
@@ -1623,7 +1623,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
             state->config_dirty = true;
             updates++;
             int w = snprintf(sync_buffer+sync_offset, sizeof(sync_buffer)-sync_offset,
-                             "%c|%s|%s|%s|%s|%ld|%ld|%s\n",
+                             "%c|%s|%s|%s|%s|%lld|%lld|%s\n",
                              type, uuid, uname, upass, act, last_seen, ts,
                              found_u->has_pubkey ? found_u->pubkey_b64 : "");
             if (w>0) sync_offset += w;
@@ -1633,8 +1633,8 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
     } else if (type == 'p') {
       // Bot password: p|password|timestamp
       char pass[MAX_PASS];
-      long ts = 0;
-      int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
+      long long ts = 0;
+      int parsed = sscanf(data, "%127[^|]|%lld", pass, &ts);
       if (parsed < 1) {
         // Fallback: no delimiter found, treat entire data as password
         snprintf(pass, MAX_PASS, "%s", data);
@@ -1644,28 +1644,28 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         ts = time(NULL);
       }
       bool accepted = hub_storage_update_entry(state, client->id, "p", pass, "", "", ts);
-      hub_log("[HUB-DEBUG] BotPass: ts=%ld -> %s\n", ts, accepted ? "ACCEPTED" : "REJECTED");
+      hub_log("[HUB-DEBUG] BotPass: ts=%lld -> %s\n", ts, accepted ? "ACCEPTED" : "REJECTED");
       if (accepted) {
         updates++;
         // Broadcast as global bot password update (WITHOUT b| prefix)
         int w =
             snprintf(sync_buffer + sync_offset,
-                     sizeof(sync_buffer) - sync_offset, "p|%s|%ld\n", pass, ts);
+                     sizeof(sync_buffer) - sync_offset, "p|%s|%lld\n", pass, ts);
         if (w > 0)
           sync_offset += w;
       }
     } else if (type == 'h') {
       // Hostmask: h|nick!user@host|timestamp
       char hostmask[256];
-      long ts;
-      if (sscanf(data, "%255[^|]|%ld", hostmask, &ts) == 2) {
+      long long ts;
+      if (sscanf(data, "%255[^|]|%lld", hostmask, &ts) == 2) {
         bool accepted = hub_storage_update_entry(state, client->id, "h", hostmask, "", "", ts);
-        hub_log("[HUB-DEBUG] Hostmask %s: ts=%ld -> %s\n", hostmask, ts, accepted ? "ACCEPTED" : "REJECTED");
+        hub_log("[HUB-DEBUG] Hostmask %s: ts=%lld -> %s\n", hostmask, ts, accepted ? "ACCEPTED" : "REJECTED");
         if (accepted) {
           updates++;
           // Broadcast in bot entry format: b|uuid|h|hostmask|timestamp
           int w = snprintf(sync_buffer + sync_offset,
-                           sizeof(sync_buffer) - sync_offset, "b|%s|h|%s|%ld\n",
+                           sizeof(sync_buffer) - sync_offset, "b|%s|h|%s|%lld\n",
                            client->id, hostmask, ts);
           if (w > 0)
             sync_offset += w;
@@ -1674,18 +1674,18 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
     } else if (type == 'n') {
       // Nick: n|nickname|timestamp
       char nick[MAX_NICK];
-      long ts;
+      long long ts;
       /* %31 not %32: a 32-char field + NUL would write 33 bytes into nick[32]
        * (1-byte stack overflow).  Reachable by any authenticated bot via an
        * 'n|' config-push record. */
-      if (sscanf(data, "%31[^|]|%ld", nick, &ts) == 2) {
+      if (sscanf(data, "%31[^|]|%lld", nick, &ts) == 2) {
         bool accepted = hub_storage_update_entry(state, client->id, "n", nick, "", "", ts);
-        hub_log("[HUB-DEBUG] Nick %s: ts=%ld -> %s\n", nick, ts, accepted ? "ACCEPTED" : "REJECTED");
+        hub_log("[HUB-DEBUG] Nick %s: ts=%lld -> %s\n", nick, ts, accepted ? "ACCEPTED" : "REJECTED");
         if (accepted) {
           updates++;
           // Broadcast in bot entry format: b|uuid|n|nickname|timestamp
           int w = snprintf(sync_buffer + sync_offset,
-                           sizeof(sync_buffer) - sync_offset, "b|%s|n|%s|%ld\n",
+                           sizeof(sync_buffer) - sync_offset, "b|%s|n|%s|%lld\n",
                            client->id, nick, ts);
           if (w > 0)
             sync_offset += w;
@@ -1898,8 +1898,8 @@ static void process_peer_sync(hub_state_t *state, char *payload,
   while (line) {
     // Check for PURGE command
     if (strncmp(line, "PURGE|", 6) == 0) {
-      long cutoff_val;
-      if (sscanf(line + 6, "%ld", &cutoff_val) == 1) {
+      long long cutoff_val;
+      if (sscanf(line + 6, "%lld", &cutoff_val) == 1) {
         time_t cutoff = (time_t)cutoff_val;
         hub_log("[MESH] Received PURGE from peer: cutoff=%ld\n", (long)cutoff);
 
@@ -1971,9 +1971,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
      * Adopt incoming value if its timestamp is newer than ours. */
     if (strncmp(line, "opt|", 4) == 0) {
       char incoming_flags[MAX_OPT_FLAGS + 1] = {0};
-      long incoming_ts = 0;
+      long long incoming_ts = 0;
       const char *v = line + 4;
-      if (sscanf(v, "%32[^|]|%ld", incoming_flags, &incoming_ts) >= 1) {
+      if (sscanf(v, "%32[^|]|%lld", incoming_flags, &incoming_ts) >= 1) {
         if (incoming_ts > 0 && incoming_ts > state->opt_flags_ts) {
           int w = 0;
           for (int i = 0; incoming_flags[i] && w < MAX_OPT_FLAGS; i++) {
@@ -2041,19 +2041,19 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                 if (pp1&&pp2&&pp3&&pp4&&pp5) {
                   char uuid[37], uname[64], upass[MAX_PASS], act[8];
                   char incoming_pub[COMBINED_KEY_B64 + 1] = {0};
-                  long last_seen, ts;
+                  long long last_seen, ts;
                   snprintf(uuid,  sizeof(uuid),  "%.*s",(int)(pp1-vstart),vstart);
                   snprintf(uname, sizeof(uname), "%.*s",(int)(pp2-pp1-1),pp1+1);
                   snprintf(upass, sizeof(upass), "%.*s",(int)(pp3-pp2-1),pp2+1);
                   snprintf(act,   sizeof(act),   "%.*s",(int)(pp4-pp3-1),pp3+1);
-                  last_seen = atol(pp4+1);
+                  last_seen = atoll(pp4+1);
                   if (pp6) {
                     char ts_buf[32];
                     snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(pp6-pp5-1), pp5+1);
-                    ts = atol(ts_buf);
+                    ts = atoll(ts_buf);
                     snprintf(incoming_pub, sizeof(incoming_pub), "%s", pp6+1);
                   } else {
-                    ts = atol(pp5+1);
+                    ts = atoll(pp5+1);
                   }
                   bool is_active = (strncmp(act,"add",3)==0);
                   hub_user_record_t *found_u = NULL;
@@ -2128,11 +2128,11 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                 char *pp3=pp2?strchr(pp2+1,'|'):NULL, *pp4=pp3?strchr(pp3+1,'|'):NULL;
                 if (pp1&&pp2&&pp3&&pp4) {
                   char uuid[37], mask_s[MAX_MASK_LEN], act[8];
-                  long last_used, ts;
+                  long long last_used, ts;
                   snprintf(uuid,   sizeof(uuid),   "%.*s",(int)(pp1-vstart),vstart);
                   snprintf(mask_s, sizeof(mask_s), "%.*s",(int)(pp2-pp1-1),pp1+1);
                   snprintf(act,    sizeof(act),    "%.*s",(int)(pp3-pp2-1),pp2+1);
-                  last_used = atol(pp3+1); ts = atol(pp4+1);
+                  last_used = atoll(pp3+1); ts = atoll(pp4+1);
                   bool is_active = (strncmp(act,"add",3)==0);
                   /* Reject masks for unknown user UUIDs */
                   bool uuid_known = false;
@@ -2182,7 +2182,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
               if (val_len < sizeof(val)) {
                 memcpy(val, p1 + 1, val_len);
                 val[val_len] = 0;
-                long ts = atol(p_last + 1);
+                long long ts = atoll(p_last + 1);
 
                 if (store_global_entry_raw(state, key, val, ts)) {
                   updates++;
@@ -2191,7 +2191,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                   if (sizeof(forward_buf) - fwd_offset > 1200) {
                     int w = snprintf(forward_buf + fwd_offset,
                                      sizeof(forward_buf) - fwd_offset,
-                                     "%s|%s|%ld\n", key, val, ts);
+                                     "%s|%s|%lld\n", key, val, ts);
                     if (w > 0 && w < (int)(sizeof(forward_buf) - fwd_offset)) {
                       fwd_offset += w;
                     }
@@ -2213,7 +2213,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
     }
 
     char uuid[64], key[32], val[1024];
-    long ts;
+    long long ts;
 
     char *p1 = strchr(ptr, '|');
     if (p1) {
@@ -2228,13 +2228,13 @@ static void process_peer_sync(hub_state_t *state, char *payload,
           snprintf(uuid, sizeof(uuid), "%s", ptr);
           snprintf(key,  sizeof(key),  "%s", p1 + 1);
           val[0] = '\0';
-          ts = atol(p2 + 1);
+          ts = atoll(p2 + 1);
           if (hub_storage_update_entry(state, uuid, key, "", "", "", ts)) {
             updates++;
             if (sizeof(forward_buf) - fwd_offset > 200) {
               int w = snprintf(forward_buf + fwd_offset,
                                sizeof(forward_buf) - fwd_offset,
-                               "b|%s|%s|%ld\n", uuid, key, ts);
+                               "b|%s|%s|%lld\n", uuid, key, ts);
               if (w > 0 && w < (int)(sizeof(forward_buf) - fwd_offset))
                 fwd_offset += w;
             }
@@ -2247,7 +2247,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
           snprintf(uuid, sizeof(uuid), "%s", ptr);
           snprintf(key, sizeof(key), "%s", p1 + 1);
           snprintf(val, sizeof(val), "%s", p2 + 1);
-          ts = atol(p3 + 1);
+          ts = atoll(p3 + 1);
 
           // For c/m/o keys, parse the combined value format
           char parsed_val[512] = "", parsed_extra[256] = "", parsed_op[16] = "";
@@ -2306,7 +2306,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
             if (sizeof(forward_buf) - fwd_offset > 1200) {
               int w = snprintf(forward_buf + fwd_offset,
                                sizeof(forward_buf) - fwd_offset,
-                               "b|%s|%s|%s|%ld\n", uuid, key, val, ts);
+                               "b|%s|%s|%s|%lld\n", uuid, key, val, ts);
               if (w > 0 && w < (int)(sizeof(forward_buf) - fwd_offset)) {
                 fwd_offset += w;
               }
@@ -5347,10 +5347,10 @@ static void process_forward_op_request(hub_state_t *state,
    *   request_id|requester_uuid|target_uuid|channel|requester_hostmask|origin_ts */
   char request_id[64], requester_uuid[64], target_uuid[64], channel[MAX_CHAN];
   char carried_hostmask[MAX_MASK_LEN] = "";
-  long origin_ts = 0;
+  long long origin_ts = 0;
 
   int parsed = sscanf(payload,
-                      "%63[^|]|%63[^|]|%63[^|]|%64[^|]|%255[^|]|%ld",
+                      "%63[^|]|%63[^|]|%63[^|]|%64[^|]|%255[^|]|%lld",
                       request_id, requester_uuid, target_uuid, channel,
                       carried_hostmask, &origin_ts);
   if (parsed < 4) {
@@ -5645,14 +5645,14 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
      * with two trailing fields |<origin_hub_uuid>|<lamport_seq> for the
      * seen-set. We compose that into the payload for CMD_PEER_SYNC DELTA. */
     char key[32], val[1024];
-    long ts;
-    if (sscanf(payload, "%31[^|]|%1023[^|]|%ld", key, val, &ts) < 2) {
+    long long ts;
+    if (sscanf(payload, "%31[^|]|%1023[^|]|%lld", key, val, &ts) < 2) {
       hub_log("[HUB] Invalid CMD_BOT_DELTA from %s — ignoring\n", client->id);
       break;
     }
-    if (ts == 0) ts = (long)time(NULL);
+    if (ts == 0) ts = (long long)time(NULL);
 
-    hub_log("[HUB] BOT_DELTA from %s: key=%s val=%.40s ts=%ld\n",
+    hub_log("[HUB] BOT_DELTA from %s: key=%s val=%.40s ts=%lld\n",
             client->id, key, val, ts);
 
     bool accepted = hub_storage_update_entry(state, client->id, key,
@@ -5671,7 +5671,7 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     uint64_t seq = hub_next_lamport_seq(state);
     char delta_line[MAX_BUFFER];
     int dlen = snprintf(delta_line, sizeof(delta_line),
-                        "b|%s|%s|%s|%ld\n",
+                        "b|%s|%s|%s|%lld\n",
                         client->id, key, val, ts);
     if (dlen <= 0 || dlen >= (int)sizeof(delta_line)) break;
 

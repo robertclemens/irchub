@@ -1,5 +1,7 @@
 #include "hub.h"
-#include <malloc.h>
+#if defined(__GLIBC__)
+#include <malloc.h>   /* for mallopt(); glibc-only, guarded like its use in main() */
+#endif
 #include <stdarg.h>
 #include <signal.h>
 #include <time.h>

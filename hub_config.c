@@ -494,8 +494,8 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       } else if (strcmp(k, "opt") == 0) {
         /* opt|<letters>|<timestamp> — keep only [a-zA-Z0-9] */
         char flags[MAX_OPT_FLAGS + 1] = {0};
-        long ts = 0;
-        if (sscanf(v, "%32[^|]|%ld", flags, &ts) >= 1) {
+        long long ts = 0;
+        if (sscanf(v, "%32[^|]|%lld", flags, &ts) >= 1) {
           int w = 0;
           for (int i = 0; flags[i] && w < MAX_OPT_FLAGS; i++) {
             char c = flags[i];
@@ -612,13 +612,13 @@ bool hub_config_load(hub_state_t *state, const char *password) {
 
             if (strcmp(bk, "t") == 0 || strcmp(bk, "seen") == 0) {
               // Metadata fields without value: b|uuid|t|timestamp or b|uuid|seen|timestamp
-              hub_storage_update_entry(state, uuid, bk, "", "", "", atol(bv));
+              hub_storage_update_entry(state, uuid, bk, "", "", "", atoll(bv));
             } else {
               // Config entry: b|uuid|key|value|timestamp
               char *s4 = strrchr(bv, '|');
               if (s4) {
                 *s4 = 0;
-                long ts = atol(s4 + 1);
+                long long ts = atoll(s4 + 1);
 
                 char *pipe1 = strchr(bv, '|');
                 if (pipe1) {
@@ -661,7 +661,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           char *s_ts = strrchr(gv, '|');
           if (s_ts) {
             *s_ts = 0;
-            long ts = atol(s_ts + 1);
+            long long ts = atoll(s_ts + 1);
 
             // Parse complex values based on key
             // c -> value|extra|op
@@ -731,17 +731,17 @@ bool hub_config_load(hub_state_t *state, const char *password) {
             snprintf(u->password, sizeof(u->password), "%.*s", (int)(p3-p2-1), p2+1);
             u->type      = k[0];
             u->is_active = (strncmp(p3+1, "add", 3) == 0);
-            u->last_seen = (time_t)atol(p4+1);
+            u->last_seen = (time_t)atoll(p4+1);
             if (p6) {
               /* timestamp ends at p6 boundary, pubkey is everything after p6 */
               char ts_buf[32];
               snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
-              u->timestamp = (time_t)atol(ts_buf);
+              u->timestamp = (time_t)atoll(ts_buf);
               snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", p6+1);
               u->has_pubkey = (u->pubkey_b64[0] != '\0' &&
                                strlen(u->pubkey_b64) == COMBINED_KEY_B64);
             } else {
-              u->timestamp = (time_t)atol(p5+1);
+              u->timestamp = (time_t)atoll(p5+1);
               u->has_pubkey = false;
               u->pubkey_b64[0] = '\0';
             }
@@ -772,8 +772,8 @@ bool hub_config_load(hub_state_t *state, const char *password) {
             snprintf(m->uuid,     sizeof(m->uuid),     "%.*s", (int)(p1-v),    v);
             snprintf(m->mask,     sizeof(m->mask),     "%.*s", (int)(p2-p1-1), p1+1);
             m->is_active = (strncmp(p2+1, "add", 3) == 0);
-            m->last_used = (time_t)atol(p3+1);
-            m->timestamp = (time_t)atol(p4+1);
+            m->last_used = (time_t)atoll(p3+1);
+            m->timestamp = (time_t)atoll(p4+1);
             state->mask_record_count++;
           }
         }
@@ -782,7 +782,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         char *s_ts = strrchr(v, '|');
         if (s_ts) {
           *s_ts = 0;
-          long ts = atol(s_ts + 1);
+          long long ts = atoll(s_ts + 1);
           char *pipe1 = strchr(v, '|');
           if (pipe1) {
             *pipe1 = 0;
@@ -799,7 +799,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         char *s_ts = strrchr(v, '|');
         if (s_ts) {
           *s_ts = 0;
-          hub_storage_update_global_entry(state, k, v, "", "", atol(s_ts + 1));
+          hub_storage_update_global_entry(state, k, v, "", "", atoll(s_ts + 1));
         }
       }
     }
