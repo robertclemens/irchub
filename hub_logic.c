@@ -2907,7 +2907,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
       time_t now = time(NULL);
       char sync[256];
-      snprintf(sync, sizeof(sync), "%s|d|1|%ld\n", payload, now);
+      snprintf(sync, sizeof(sync), "%s|d|1|%ld\n", payload, (long)now);
       hub_broadcast_sync_to_peers(state, sync, -1);
       return send_response(state, client, "SUCCESS: Deleted & Synced.");
     }
@@ -3074,7 +3074,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         remove_pending_bot(state, target_uuid);
 
         char sync[256];
-        snprintf(sync, sizeof(sync), "%s|t||%ld\n", target_uuid, now);
+        snprintf(sync, sizeof(sync), "%s|t||%ld\n", target_uuid, (long)now);
         hub_broadcast_sync_to_peers(state, sync, -1);
 
         return send_response(state, client,
@@ -3090,7 +3090,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       state->config_dirty = true;
 
       char sync[256];
-      snprintf(sync, sizeof(sync), "%s|t||%ld\n", payload, now);
+      snprintf(sync, sizeof(sync), "%s|t||%ld\n", payload, (long)now);
       hub_broadcast_sync_to_peers(state, sync, -1);
 
       return send_response(state, client, "SUCCESS: UUID Authorized & Synced.");
