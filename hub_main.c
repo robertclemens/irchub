@@ -11,6 +11,7 @@
 #include <openssl/evp.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <inttypes.h>
 #include <sys/utsname.h>
 #include <fcntl.h>
 #include <termios.h>
@@ -632,8 +633,8 @@ static void passfile_build_context(char *buf, size_t len) {
     memset(&uts, 0, sizeof(uts));
     if (pw && pw->pw_dir) stat(pw->pw_dir, &home_st);
     uname(&uts);
-    snprintf(buf, len, "%lu:%lu:%u:%u:%s",
-             (unsigned long)home_st.st_ino, (unsigned long)home_st.st_dev,
+    snprintf(buf, len, "%ju:%ju:%u:%u:%.64s",
+             (uintmax_t)home_st.st_ino, (uintmax_t)home_st.st_dev,
              (unsigned int)getuid(), (unsigned int)getgid(), uts.machine);
 }
 
