@@ -8,4 +8,4 @@ irchub
 .claude
 *.b64
 docs/
-hub_config_gen
+hub_config_gen*
