@@ -757,9 +757,14 @@ int main(int argc, char *argv[]) {
      * default trim threshold but sit below the dynamic mmap threshold), so a
      * rapid connect/close flood grows RSS unboundedly even though the structs
      * are freed.  Force allocations >= 32 KB through mmap so free() returns
-     * them to the OS, and lower the trim threshold, bounding RSS under churn. */
+     * them to the OS, and lower the trim threshold, bounding RSS under churn.
+     * This tuning is glibc-arena-specific; other allocators (notably FreeBSD's
+     * jemalloc) already return such allocations to the OS, so it is skipped
+     * there. */
+#if defined(__GLIBC__)
     mallopt(M_MMAP_THRESHOLD, 32 * 1024);
     mallopt(M_TRIM_THRESHOLD, 64 * 1024);
+#endif
 
     bool setup_mode = false;
     bool passfile_mode = false;

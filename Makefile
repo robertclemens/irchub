@@ -48,8 +48,19 @@ ENCRYPT_TARGET = $(BIN_DIR)/hub_encrypt
 # Compiler Flags
 # ============================================================================
 
+# Detect OS so feature-test macros and library paths stay correct per-platform.
+UNAME_S := $(shell uname -s)
+
 # Base flags
-CFLAGS = -Wall -Wextra -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L
+CFLAGS = -Wall -Wextra -Wpedantic -std=c11
+
+ifeq ($(UNAME_S),Linux)
+# glibc + -std=c11 defines __STRICT_ANSI__ and hides POSIX symbols unless we
+# explicitly request a POSIX environment.
+CFLAGS += -D_POSIX_C_SOURCE=200809L
+endif
+# FreeBSD/other BSD: leaving _POSIX_C_SOURCE unset keeps __BSD_VISIBLE on, which
+# is required for MSG_DONTWAIT and flock/LOCK_* used by the hub.
 
 # OpenSSL includes (adjust if needed)
 INCLUDES = -I/usr/include -I/usr/local/include
@@ -59,6 +70,11 @@ LIBS = -lssl -lcrypto -lpthread
 
 # Linker flags
 LDFLAGS =
+
+# Ports install third-party libs under /usr/local on the BSDs.
+ifneq ($(UNAME_S),Linux)
+LDFLAGS += -L/usr/local/lib
+endif
 
 # ============================================================================
 # Build Modes
@@ -109,9 +125,11 @@ directories:
 # Check OpenSSL version
 check-openssl:
 	@echo "Checking OpenSSL version..."
-	@pkg-config --exists openssl && \
-		echo "OpenSSL version: $$(pkg-config --modversion openssl)" || \
-		echo "Warning: pkg-config cannot find OpenSSL, build may fail"
+	@if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists openssl; then \
+		echo "OpenSSL version: $$(pkg-config --modversion openssl)"; \
+	else \
+		echo "Note: pkg-config/openssl.pc not found; relying on compiler default include paths (e.g. FreeBSD base OpenSSL or /usr/local)"; \
+	fi
 	@echo ""
 
 # ============================================================================
