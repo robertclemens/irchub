@@ -6151,6 +6151,17 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             }
 
             if (pass_ok) {
+              /* client->id is the admin's identity key for storage lookups
+               * and logging.  "ADMIN:" + a 63-char name does not fit in
+               * id[64], and two long names sharing a prefix would collapse
+               * to the same id.  Fail closed rather than authenticate under
+               * a truncated identity. */
+              if (strlen(auth_name) + sizeof("ADMIN:") > sizeof(client->id)) {
+                hub_log("[HUB] Admin auth from %s: name '%s' too long for "
+                        "client id — refusing\n", client->ip, auth_name);
+                hub_disconnect_client(state, client);
+                return false;
+              }
               client->type = CLIENT_ADMIN;
               client->authenticated = true;
               /* D2: grow buffers now that the admin is authenticated. */
@@ -6160,7 +6171,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 hub_disconnect_client(state, client);
                 return false;
               }
-              snprintf(client->id, sizeof(client->id), "ADMIN:%s", auth_name);
+              snprintf(client->id, sizeof(client->id), "ADMIN:%.*s",
+                       (int)(sizeof(client->id) - sizeof("ADMIN:")), auth_name);
 
               /* Capture admin's reported ip:port (informational) */
               if (client_addr[0]) {
