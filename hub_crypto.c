@@ -200,34 +200,6 @@ bool hub_crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
     return ok;
 }
 
-// --- Bot Credential Generation ---
-bool hub_crypto_generate_bot_creds(char **out_uuid,
-                                   char **out_priv_b64,
-                                   char **out_pub_b64) {
-    *out_uuid = NULL; *out_priv_b64 = NULL; *out_pub_b64 = NULL;
-    unsigned char priv[64], pub[64];
-
-    *out_uuid = malloc(37);
-    if (!*out_uuid) return false;
-    generate_uuid_v4(*out_uuid, 37);
-
-    if (!hub_crypto_generate_combined_keypair(priv, pub)) goto fail;
-
-    *out_priv_b64 = base64_encode(priv, 64);
-    *out_pub_b64  = base64_encode(pub,  64);
-    secure_wipe(priv, 64);
-    if (!*out_priv_b64 || !*out_pub_b64) goto fail;
-    return true;
-
-fail:
-    secure_wipe(priv, 64);
-    if (*out_uuid)     { free(*out_uuid);     *out_uuid     = NULL; }
-    if (*out_priv_b64) { secure_wipe(*out_priv_b64, strlen(*out_priv_b64));
-                         free(*out_priv_b64); *out_priv_b64 = NULL; }
-    if (*out_pub_b64)  { free(*out_pub_b64);  *out_pub_b64  = NULL; }
-    return false;
-}
-
 // --- AES-256-GCM ---
 int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
                     const unsigned char *key, unsigned char *plaintext,

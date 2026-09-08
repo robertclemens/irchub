@@ -9,3 +9,4 @@ irchub
 *.b64
 docs/
 hub_config_gen*
+CLAUDE.md

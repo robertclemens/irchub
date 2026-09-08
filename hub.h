@@ -205,11 +205,67 @@
 #define MAX_HUB_USER_MASKS   200  // max total usermask records across all users
 
 /* ==========================================================================
+ * Bulk-payload ceilings (Change 5) — hard upper bounds on generated config /
+ * sync payloads, derived entirely from the record-count macros above so they
+ * auto-track whatever an operator sets.  These bound the *allocation cap*, not
+ * the bytes actually sent (payloads carry only real records at real sizes).
+ *
+ * These are true hard bounds because ingest is bounded: per-bot state is
+ * restricted to the whitelist {t,n,h,pub,seen,d} with per-key value caps in
+ * hub_storage_update_entry, so a bot has at most BOT_SYNC_FIELDS entries whose
+ * lines never approach value[1024].  Keep this shared contract identical with
+ * ircbot/bot.h (MAX_CONFIG_PAYLOAD).
+ * ========================================================================== */
+#define BOT_SYNC_FIELDS   8      /* {t,n,h,pub,seen,d} = 6, +slack */
+#define GLOBAL_LINE_MAX   1088   /* config_entry_t: key[32]+value[1024]+ts+seps */
+#define BOT_FIELD_LINE    320    /* per-bot line: capped value (<=MAX_MASK_LEN) */
+#define USER_LINE_MAX     384    /* a|/o|: uuid+name+MAX_PASS+COMBINED_KEY_B64 */
+#define MASK_LINE_MAX     352    /* m|: uuid+MAX_MASK_LEN */
+#define BLINE_MAX         352    /* b|<mask>|<uuid>|<ts> trusted-bot line */
+#define PEER_LINE_MAX     256    /* peer|/opt| sync lines */
+#define PAYLOAD_SLACK     8192
+
+/* Bot config payload (hub_generate_bot_payload): globals + users + masks +
+ * this bot's own fields + one b| line per other bot. */
+#define MAX_CONFIG_PAYLOAD \
+  ( MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
+    MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
+    MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
+    BOT_SYNC_FIELDS      * BOT_FIELD_LINE  + \
+    MAX_BOTS             * BLINE_MAX       + \
+    PAYLOAD_SLACK )
+
+/* Hub<->hub full-state sync (hub_generate_sync_packet): globals + users +
+ * masks + every bot's fields + peer/opt lines. */
+#define MAX_SYNC_PAYLOAD \
+  ( MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
+    MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
+    MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
+    MAX_BOTS * BOT_SYNC_FIELDS * BOT_FIELD_LINE + \
+    MAX_PEERS            * PEER_LINE_MAX   + \
+    PAYLOAD_SLACK )
+
+/* Largest bulk lane payload — buffers on the config/sync paths size to this. */
+#define MAX_BULK_PAYLOAD \
+  ((MAX_CONFIG_PAYLOAD) > (MAX_SYNC_PAYLOAD) ? (MAX_CONFIG_PAYLOAD) \
+                                             : (MAX_SYNC_PAYLOAD))
+
+/* ==========================================================================
  * Mesh transport tuning (see docs/mesh.md)
  * ========================================================================== */
 #define LANE_COUNT                3
 #define MAX_QUEUE_PER_LANE        256          /* per peer/client, per lane */
-#define MAX_QUEUED_BYTES_PER_PEER (256 * 1024) /* hard cap across all lanes */
+/* Must hold one full bulk payload plus concurrent small-lane traffic (deltas,
+ * op grants) on a connection — a multiple of the bulk ceiling.  Enforced cap,
+ * not a reservation, so a large value costs nothing until actually queued. */
+#define MAX_QUEUED_BYTES_PER_PEER (3 * (MAX_BULK_PAYLOAD))
+
+/* Change 5 guard: a single bulk payload must fit within a connection's queue
+ * byte budget, else a full config/sync could never be enqueued.  Compile-time
+ * so a future macro change that breaks the relationship fails the build rather
+ * than silently dropping payloads at runtime. */
+_Static_assert(MAX_QUEUED_BYTES_PER_PEER >= MAX_BULK_PAYLOAD,
+               "per-peer queue budget must hold at least one bulk payload");
 #define MAX_DELTA_SEEN            8192
 #define BULK_SOFT_BUDGET_BPS      (32 * 1024)
 #define DELTA_HARD_BUDGET_BPS     (64 * 1024)
@@ -625,9 +681,6 @@ bool hub_delta_seen_check_and_update(hub_state_t *state,
                                      const char *bot_uuid,
                                      uint64_t seq);
 
-// Bot credential generation
-bool hub_crypto_generate_bot_creds(char **out_uuid, char **out_priv_b64,
-                                   char **out_pub_b64);
 void hub_set_config_pass(hub_state_t *s, const char *pass);
 void hub_get_config_pass(const hub_state_t *s, char *out, size_t len);
 void secure_wipe(void *ptr, size_t len);

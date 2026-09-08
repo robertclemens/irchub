@@ -21,7 +21,9 @@ static void hub_broadcast_config_to_bots(hub_state_t *state, const char *config_
 
 queued_msg_t *queued_msg_new(uint8_t cmd, lane_t lane,
                              const unsigned char *payload, int payload_len) {
-  if (payload_len < 0 || payload_len > MAX_BUFFER - 64)
+  /* Change 5: bulk lanes (CONFIG_DATA / PEER_SYNC full-state) may be far larger
+   * than MAX_BUFFER; bound by the bulk-payload ceiling instead. */
+  if (payload_len < 0 || payload_len > MAX_BULK_PAYLOAD)
     return NULL;
   queued_msg_t *m = calloc(1, sizeof(*m));
   if (!m) return NULL;
@@ -168,7 +170,12 @@ void peer_queue_destroy(hub_client_t *peer) {
  * total wire length (4-byte length prefix + ciphertext + tag) or 0 on
  * failure. */
 static int peer_encrypt_into_writing(hub_client_t *peer, queued_msg_t *m) {
-  unsigned char plain[MAX_BUFFER];
+  /* Change 5: heap the plaintext scratch — a bulk CONFIG_DATA/PEER_SYNC frame
+   * (up to MAX_BULK_PAYLOAD) is far too large for the stack. */
+  if (m->payload_len < 0 || m->payload_len > MAX_BULK_PAYLOAD) return 0;
+  unsigned char *plain = malloc((size_t)m->payload_len + 5);
+  if (!plain) return 0;
+  size_t plain_alloc = (size_t)m->payload_len + 5;
   /* Wire envelope per existing protocol:
    *   plain[0]    = cmd
    *   plain[1..4] = (uint32_t) inner_len in HOST byte order (matches hub_logic
@@ -181,7 +188,6 @@ static int peer_encrypt_into_writing(hub_client_t *peer, queued_msg_t *m) {
    * inner length here in HOST order for peer/admin packets and in NETWORK
    * order for CMD_CONFIG_DATA bot frames (the only opcode that requires it).
    */
-  if (m->payload_len > MAX_BUFFER - 16) return 0;
   plain[0] = m->cmd;
   uint32_t inner_len_field;
   if (m->cmd == CMD_CONFIG_DATA) {
@@ -198,7 +204,8 @@ static int peer_encrypt_into_writing(hub_client_t *peer, queued_msg_t *m) {
    * frame that would not fit (4-byte length prefix + ciphertext + tag).
    * AES-GCM ciphertext length equals the plaintext length. */
   if (4 + total_plain + GCM_TAG_LEN > peer->writing_cap) {
-    secure_wipe(plain, sizeof(plain));
+    secure_wipe(plain, plain_alloc);
+    free(plain);
     return 0;
   }
 
@@ -206,7 +213,8 @@ static int peer_encrypt_into_writing(hub_client_t *peer, queued_msg_t *m) {
   int cipher_len = aes_gcm_encrypt(plain, total_plain, peer->session_key,
                                    peer->writing_buf + 4, tag);
   /* Wipe plaintext copy ASAP. */
-  secure_wipe(plain, sizeof(plain));
+  secure_wipe(plain, plain_alloc);
+  free(plain);
   if (cipher_len <= 0) return 0;
   memcpy(peer->writing_buf + 4 + cipher_len, tag, GCM_TAG_LEN);
   int packet_len = cipher_len + GCM_TAG_LEN;
@@ -520,23 +528,43 @@ bool hub_client_alloc_buffers(hub_client_t *c, int size) {
     return true;
 }
 
-/* D2: grow a client's buffers to full MAX_BUFFER on successful auth. Idempotent.
- * realloc preserves any already-buffered bytes (e.g. data pipelined behind the
- * final handshake frame). On OOM the existing buffers are left intact and the
- * caller should disconnect. */
+/* D2: grow a client's buffers on successful auth. Idempotent. realloc preserves
+ * any already-buffered bytes (e.g. data pipelined behind the final handshake
+ * frame). On OOM the existing buffers are left intact and the caller should
+ * disconnect.
+ *
+ * Change 5: size by client type so bulk lanes never truncate.  Peers exchange
+ * full-state anti-entropy sync both directions (MAX_SYNC_PAYLOAD); a bot
+ * receives its full config on the hub->bot (writing) side (MAX_CONFIG_PAYLOAD)
+ * but only ever pushes small config/deltas up (recv stays MAX_BUFFER).  Must be
+ * called after c->type is set. */
 bool hub_client_promote_buffers(hub_client_t *c) {
     if (!c) return false;
-    if (c->recv_cap >= MAX_BUFFER) return true;  /* already promoted */
 
-    unsigned char *nr = realloc(c->recv_buf, MAX_BUFFER);
-    if (!nr) return false;
-    c->recv_buf = nr;
-    c->recv_cap = MAX_BUFFER;
+    int recv_target, write_target;
+    if (c->type == CLIENT_HUB) {
+        recv_target  = MAX_SYNC_PAYLOAD;
+        write_target = MAX_SYNC_PAYLOAD;
+    } else if (c->type == CLIENT_BOT) {
+        recv_target  = MAX_BUFFER;          /* bot->hub pushes are small */
+        write_target = MAX_CONFIG_PAYLOAD;  /* hub->bot full config */
+    } else {
+        recv_target  = MAX_BUFFER;          /* admin */
+        write_target = MAX_BUFFER;
+    }
 
-    unsigned char *nw = realloc(c->writing_buf, MAX_BUFFER + 64);
-    if (!nw) return false;  /* recv already grown; writing stays small — caller drops */
-    c->writing_buf = nw;
-    c->writing_cap = MAX_BUFFER + 64;
+    if (c->recv_cap < recv_target) {
+        unsigned char *nr = realloc(c->recv_buf, (size_t)recv_target);
+        if (!nr) return false;
+        c->recv_buf = nr;
+        c->recv_cap = recv_target;
+    }
+    if (c->writing_cap < write_target + 64) {
+        unsigned char *nw = realloc(c->writing_buf, (size_t)write_target + 64);
+        if (!nw) return false;  /* recv already grown; caller drops on failure */
+        c->writing_buf = nw;
+        c->writing_cap = write_target + 64;
+    }
     return true;
 }
 
@@ -1346,7 +1374,9 @@ void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
    * heuristic is a conservative default that matches existing call patterns
    * (most callers in hub_logic.c send a single line). */
   int payload_len = (int)strlen(payload);
-  if (payload_len > (MAX_BUFFER - 10))
+  /* Change 5: a full-state anti-entropy sync can exceed MAX_BUFFER; bound by
+   * the sync-payload ceiling so it is never silently dropped here. */
+  if (payload_len > (MAX_SYNC_PAYLOAD - 10))
     return;
 
   lane_t lane = (payload_len > 1024) ? LANE_BULK : LANE_DELTA;
@@ -1880,6 +1910,91 @@ static bool store_global_entry_raw(hub_state_t *state, const char *key,
     return true;
   }
   return false;
+}
+
+/* Split a stored global 'c' entry value into its parts.
+ *
+ * Two shapes exist because two writers produce them:
+ *   3-field  chan|key|op        — CMD_ADMIN_ADD/DEL_CHANNEL and legacy records
+ *   4-field  chan|key|modes|op  — process_bot_config_push (bots report modes)
+ * Both share the same anchors — channel is the first field, op is the last — so
+ * split on those instead of counting fields.  Whatever sits between is the key,
+ * optionally followed by the modes.  Reading op as the *last* field is what makes
+ * the "del" tombstone check reliable across both shapes: a positional parse reads
+ * "0|del" as the op on the 4-field form and treats a deleted channel as live.
+ *
+ * Any out-param may be NULL.  Returns false only when value has no '|' at all. */
+static bool parse_global_channel_value(const char *value,
+                                       char *chan_out, size_t chan_len,
+                                       char *key_out, size_t key_len,
+                                       int *modes_out,
+                                       char *op_out, size_t op_len) {
+  if (chan_out && chan_len) chan_out[0] = '\0';
+  if (key_out && key_len)   key_out[0]  = '\0';
+  if (op_out && op_len)     op_out[0]   = '\0';
+  if (modes_out)            *modes_out  = 0;
+  if (!value) return false;
+
+  const char *first = strchr(value, '|');
+  const char *last  = strrchr(value, '|');
+  if (!first || !last) return false;
+
+  if (chan_out && chan_len) {
+    size_t n = (size_t)(first - value);
+    if (n >= chan_len) n = chan_len - 1;
+    memcpy(chan_out, value, n);
+    chan_out[n] = '\0';
+  }
+  if (op_out && op_len) {
+    size_t n = strlen(last + 1);
+    if (n >= op_len) n = op_len - 1;
+    memcpy(op_out, last + 1, n);
+    op_out[n] = '\0';
+  }
+
+  /* Middle field(s): "key" (3-field) or "key|modes" (4-field). */
+  if (last > first) {
+    char middle[128];
+    size_t n = (size_t)(last - first - 1);
+    if (n >= sizeof(middle)) n = sizeof(middle) - 1;
+    memcpy(middle, first + 1, n);
+    middle[n] = '\0';
+
+    char *sep = strrchr(middle, '|');
+    if (sep) {
+      *sep = '\0';
+      if (modes_out) *modes_out = atoi(sep + 1);
+    }
+    if (key_out && key_len) {
+      size_t klen = strlen(middle);
+      if (klen >= key_len) klen = key_len - 1;
+      memcpy(key_out, middle, klen);
+      key_out[klen] = '\0';
+    }
+  }
+  return true;
+}
+
+/* Modes currently recorded for a channel, or 0 when unknown.  The admin add path
+ * has no modes of its own — they only ever arrive from a bot reporting a live
+ * MODE change — so a re-add must carry forward what is already stored.  Global
+ * entries are overwritten wholesale once the timestamp wins
+ * (hub_storage_update_global_entry), so not carrying them forward erases them.
+ * Matched case-sensitively on the channel name, same as the storage layer. */
+static int global_channel_modes(hub_state_t *state, const char *chan) {
+  for (int i = 0; i < state->global_entry_count; i++) {
+    if (strcmp(state->global_entries[i].key, "c") != 0)
+      continue;
+    char stored_chan[128];  /* matches the admin handlers' channel buffers */
+    int modes = 0;
+    if (!parse_global_channel_value(state->global_entries[i].value,
+                                    stored_chan, sizeof(stored_chan),
+                                    NULL, 0, &modes, NULL, 0))
+      continue;
+    if (strcmp(stored_chan, chan) == 0)
+      return modes;
+  }
+  return 0;
 }
 
 static void process_peer_sync(hub_state_t *state, char *payload,
@@ -2630,246 +2745,6 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     }
     return send_response(state, client, "ERROR|Missing UUID");
 
-  /* Legacy code dropped: the block below used to (1) generate a new keypair
-   * on the hub, (2) overwrite the stored pub, (3) ship the new priv to the
-   * bot, and (4) forward the rekey via CMD_PEER_REKEY_BOT.  Per the v3 trust
-   * model, only the bot generates its own keys.  Kept until the rekey IRC
-   * command on the bot is shipped — at which point this whole block can be
-   * removed and the conditional below is unreachable. */
-#if 0
-    if (payload && strlen(payload) > 0) {
-      // Find bot by UUID
-      bot_config_t *bot = NULL;
-      for (int i = 0; i < state->bot_count; i++) {
-        if (strcmp(state->bots[i].uuid, payload) == 0) {
-          bot = &state->bots[i];
-          break;
-        }
-      }
-
-      if (!bot) {
-        return send_response(state, client, "ERROR|Bot not found");
-      }
-
-      // Get bot nickname
-      char nick[64] = "Unknown";
-      for (int i = 0; i < bot->entry_count; i++) {
-        if (strcmp(bot->entries[i].key, "n") == 0) {
-          snprintf(nick, sizeof(nick), "%.*s",
-                   (int)(sizeof(nick) - 1), bot->entries[i].value);
-          break;
-        }
-      }
-
-      // Generate new keypair (same logic as CREATE_BOT)
-      char *new_priv_b64 = NULL, *new_pub_b64 = NULL;
-
-      // Use existing crypto function
-      char *uuid_temp = NULL, *priv_temp = NULL, *pub_temp = NULL;
-      if (hub_crypto_generate_bot_creds(&uuid_temp, &priv_temp, &pub_temp)) {
-        // We only need the keys, not the UUID
-        new_priv_b64 = priv_temp;
-        new_pub_b64 = pub_temp;
-
-        if (uuid_temp)
-          free(uuid_temp);
-
-        // Update bot's public key in storage
-        time_t now = time(NULL);
-        hub_storage_update_entry(state, payload, "pub", new_pub_b64, "", "",
-                                 now);
-        state->config_dirty = true;
-
-        // Check if bot is currently connected to THIS hub
-        hub_client_t *bot_client = NULL;
-        for (int i = 0; i < state->client_count; i++) {
-          if (state->clients[i]->type == CLIENT_BOT &&
-              strcmp(state->clients[i]->id, payload) == 0) {
-            bot_client = state->clients[i];
-            break;
-          }
-        }
-
-        // Check if bot is connected to a REMOTE peer by checking gossip
-        bool bot_on_remote_peer = false;
-        int remote_peer_fd = -1;
-        if (!bot_client) {
-          for (int p = 0; p < state->peer_count; p++) {
-            if (state->peers[p].connected &&
-                strlen(state->peers[p].last_gossip) > 0) {
-              // Parse gossip format: connected:total:count:uuid_list|...
-              char *colon3 = strchr(state->peers[p].last_gossip, ':');
-              if (colon3) {
-                colon3 = strchr(colon3 + 1, ':');
-                if (colon3) {
-                  colon3 = strchr(colon3 + 1, ':');
-                  if (colon3) {
-                    // Found third colon, now extract UUID list
-                    char *pipe = strchr(colon3 + 1, '|');
-                    if (pipe) {
-                      char uuid_list[MAX_BUFFER];
-                      int list_len = pipe - (colon3 + 1);
-                      if (list_len > 0 && list_len < (int)sizeof(uuid_list)) {
-                        memcpy(uuid_list, colon3 + 1, list_len);
-                        uuid_list[list_len] = '\0';
-
-                        // Check if this bot's UUID is in the list
-                        if (strcmp(uuid_list, "-") != 0) {
-                          // Check for exact match or as part of comma-separated list
-                          if (strstr(uuid_list, payload) != NULL) {
-                            bot_on_remote_peer = true;
-                            /* Use the peer's tracked fd directly — more reliable
-                             * than IP matching which can fail with NAT/loopback. */
-                            if (state->peers[p].fd > 0) {
-                              remote_peer_fd = state->peers[p].fd;
-                            } else {
-                              /* Fallback: find client by IP */
-                              for (int c = 0; c < state->client_count; c++) {
-                                if (state->clients[c]->type == CLIENT_HUB &&
-                                    state->clients[c]->authenticated &&
-                                    strcmp(state->clients[c]->ip, state->peers[p].ip) == 0) {
-                                  remote_peer_fd = state->clients[c]->fd;
-                                  break;
-                                }
-                              }
-                            }
-                            break;
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-        // Massive buffer needed for CMD_ADMIN_LIST_PEERS and LIST_BOTS matrices
-        char *response = malloc(65536);
-        if (!response) return send_response(state, client, "ERROR: Memory allocation failed");
-        if (bot_client && bot_client->authenticated) {
-          // Bot is connected - send new key via secure channel
-          hub_log("[ADMIN] Bot %s is connected, sending key update in real-time\n", payload);
-
-          // Send CMD_BOT_KEY_UPDATE with new private key
-          unsigned char buffer[MAX_BUFFER];
-          unsigned char plain[MAX_BUFFER];
-          unsigned char tag[GCM_TAG_LEN];
-
-          plain[0] = CMD_BOT_KEY_UPDATE;
-          int key_len = strlen(new_priv_b64);
-          uint32_t payload_len = htonl(key_len);
-          memcpy(&plain[1], &payload_len, 4);
-          memcpy(&plain[5], new_priv_b64, key_len);
-
-          int enc_len = aes_gcm_encrypt(plain, 5 + key_len, bot_client->session_key,
-                                        buffer + 4, tag);
-          if (enc_len > 0) {
-            memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-            uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
-            memcpy(buffer, &net_len, 4);
-
-            if (write(bot_client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
-              hub_log("[ADMIN] Sent new key to bot %s, disconnecting for reconnect\n", payload);
-
-              // Give bot a moment to process and save the new key
-              struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000}; // 100ms
-              nanosleep(&delay, NULL);
-
-              // Now disconnect so bot reconnects with new key
-              hub_disconnect_client(state, bot_client);
-
-              // Build response indicating automatic update
-              snprintf(response, 65536,
-                       "SUCCESS|%s|AUTO-UPDATED (bot was connected)", nick);
-            } else {
-              hub_log("[ADMIN] Failed to send key to bot %s, falling back to manual\n", payload);
-              hub_disconnect_client(state, bot_client);
-              snprintf(response, 65536, "SUCCESS|%s|%s", nick, new_priv_b64);
-            }
-          } else {
-            hub_log("[ADMIN] Encryption failed, falling back to manual key update\n");
-            hub_disconnect_client(state, bot_client);
-            snprintf(response, 65536, "SUCCESS|%s|%s", nick, new_priv_b64);
-          }
-        } else if (bot_on_remote_peer && remote_peer_fd != -1) {
-          // Bot is connected to a remote peer - forward rekey to that peer
-          hub_log("[ADMIN] Bot %s is connected to remote peer, forwarding rekey\n", payload);
-
-          // Send CMD_PEER_REKEY_BOT to the peer hub
-          // Payload format: bot_uuid|new_priv_b64
-          char forward_payload[MAX_BUFFER];
-          int forward_len = snprintf(forward_payload, sizeof(forward_payload), "%s|%s", payload, new_priv_b64);
-          if (forward_len < 0 || forward_len >= (int)sizeof(forward_payload)) {
-            hub_log("[ADMIN] Rekey forward payload too large\n");
-            snprintf(response, 65536, "SUCCESS|%s|%s", nick, new_priv_b64);
-          } else {
-            unsigned char forward_buffer[MAX_BUFFER];
-            unsigned char forward_plain[MAX_BUFFER];
-            unsigned char forward_tag[GCM_TAG_LEN];
-
-            forward_plain[0] = CMD_PEER_REKEY_BOT;
-            uint32_t fwd_payload_len = htonl(forward_len);
-            memcpy(&forward_plain[1], &fwd_payload_len, 4);
-            memcpy(&forward_plain[5], forward_payload, forward_len);
-
-            // Find the peer hub client to get its session key
-            hub_client_t *peer_hub = NULL;
-            for (int c = 0; c < state->client_count; c++) {
-              if (state->clients[c]->fd == remote_peer_fd) {
-                peer_hub = state->clients[c];
-                break;
-              }
-            }
-
-            if (peer_hub) {
-              /* Route rekey forward through URGENT (admin-initiated, time-sensitive). */
-              (void)forward_plain; (void)forward_buffer; (void)forward_tag;
-              if (peer_send_urgent(state, peer_hub, CMD_PEER_REKEY_BOT, forward_payload)) {
-                hub_log("[ADMIN] Queued PEER_REKEY_BOT URGENT to peer hub for bot %s\n", payload);
-                snprintf(response, 65536,
-                         "SUCCESS|%s|AUTO-UPDATED (bot connected to peer hub)", nick);
-              } else {
-                hub_log("[ADMIN] Failed to queue rekey to peer, falling back to manual\n");
-                snprintf(response, 65536, "SUCCESS|%s|%s", nick, new_priv_b64);
-              }
-            } else {
-              hub_log("[ADMIN] Could not find peer hub client\n");
-              snprintf(response, 65536, "SUCCESS|%s|%s", nick, new_priv_b64);
-            }
-          }
-        } else {
-          // Bot is not connected - return key for manual update
-          hub_log("[ADMIN] Bot %s not connected, manual key update required\n", payload);
-          snprintf(response, 65536, "SUCCESS|%s|%s", nick, new_priv_b64);
-        }
-
-        // Broadcast sync to peers
-        char sync_packet[MAX_BUFFER];
-        snprintf(sync_packet, sizeof(sync_packet), "b|%s|pub|%s|%ld\n", payload,
-                 new_pub_b64, (long)now);
-        hub_broadcast_sync_to_peers(state, sync_packet, -1);
-
-        // Cleanup
-        if (new_pub_b64)
-          free(new_pub_b64);
-        bool result = send_response(state, client, response);
-        free(response);
-
-        // Wipe private key from memory
-        if (new_priv_b64) {
-          secure_wipe(new_priv_b64, strlen(new_priv_b64));
-          free(new_priv_b64);
-        }
-
-        return result;
-      } else {
-        return send_response(state, client, "ERROR|Keypair generation failed");
-      }
-    }
-    return send_response(state, client, "ERROR|Missing UUID");
-#endif  /* end legacy CMD_ADMIN_REKEY_BOT block */
-
   case CMD_ADMIN_DISCONNECT_BOT:
     if (payload && strlen(payload) > 0) {
       // Find and disconnect bot by UUID
@@ -3109,9 +2984,13 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     //           return send_response(state, client, "ERROR: Not found.");
 
   case CMD_ADMIN_SYNC_MESH: {
-    char full_sync[MAX_BUFFER];
-    hub_generate_sync_packet(state, full_sync, MAX_BUFFER - 100);
+    /* Change 5: heap the full-state buffer (MAX_SYNC_PAYLOAD > stack budget). */
+    char *full_sync = malloc(MAX_SYNC_PAYLOAD);
+    if (!full_sync)
+      return send_response(state, client, "ERROR: OOM building sync.");
+    hub_generate_sync_packet(state, full_sync, MAX_SYNC_PAYLOAD);
     hub_broadcast_sync_to_peers(state, full_sync, -1);
+    free(full_sync);
     return send_response(state, client, "SUCCESS: Full Sync broadcasted.");
   }
 
@@ -4154,20 +4033,18 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     for (int i = 0; i < state->global_entry_count; i++) {
       if (strcmp(state->global_entries[i].key, "c") == 0) {
         char chan_name[128] = "", chan_key[64] = "", op[16] = "";
-        // Parse: channel|key|op or channel||op (empty key)
-        int parsed = sscanf(state->global_entries[i].value, "%127[^|]|%63[^|]|%15s",
-                           chan_name, chan_key, op);
-        if (parsed < 2) {
-          // Try empty key format: channel||op
-          parsed = sscanf(state->global_entries[i].value, "%127[^|]||%15s",
-                         chan_name, op);
-          chan_key[0] = '\0';
-        }
+        /* Handles both the 3-field admin shape and the 4-field bot shape that
+         * carries modes; op is read as the last field so the tombstone check
+         * below is correct for either. */
+        bool parsed = parse_global_channel_value(state->global_entries[i].value,
+                                                 chan_name, sizeof(chan_name),
+                                                 chan_key, sizeof(chan_key),
+                                                 NULL, op, sizeof(op));
         // Skip deleted channels
         if (strcmp(op, "del") == 0)
           continue;
 
-        if (parsed >= 2 || (parsed == 1 && chan_name[0])) {
+        if (parsed && chan_name[0]) {
           chan_count++;
           written = snprintf(response + offset, sizeof(response) - offset,
                              "%-30s %-20s\n", chan_name,
@@ -4192,17 +4069,21 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       key[0] = '\0';
       if (sscanf(payload, "%127[^|]|%63s", chan, key) >= 1) {
         time_t now = time(NULL);
-        hub_storage_update_global_entry(state, "c", chan, key, "add", now);
+
+        /* Carry forward any modes a bot previously reported for this channel.
+         * The admin console only prompts for name + key, and the storage layer
+         * replaces the whole value once the timestamp wins, so without this an
+         * admin re-add to change the key silently wipes the recorded +i/+k
+         * state.  Store and sync the 4-field shape so both writers agree. */
+        int modes = global_channel_modes(state, chan);
+        char extra[80];
+        snprintf(extra, sizeof(extra), "%s|%d", key, modes);
+        hub_storage_update_global_entry(state, "c", chan, extra, "add", now);
         state->config_dirty = true;
 
         char sync_msg[256];
-        if (strlen(key) > 0) {
-          snprintf(sync_msg, sizeof(sync_msg), "c|%s|%s|add|%ld\n", chan, key,
-                   (long)now);
-        } else {
-          snprintf(sync_msg, sizeof(sync_msg), "c|%s||add|%ld\n", chan,
-                   (long)now);
-        }
+        snprintf(sync_msg, sizeof(sync_msg), "c|%s|%s|%d|add|%ld\n", chan, key,
+                 modes, (long)now);
         hub_broadcast_config_to_bots(state, sync_msg);
         hub_broadcast_sync_to_peers(state, sync_msg, -1);
         return send_response(state, client, "SUCCESS: Channel added and synced.");
@@ -5652,6 +5533,25 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     }
     if (ts == 0) ts = (long long)time(NULL);
 
+    /* Change 3 — opt 'h' (OPT_HUB_ONLY_MUTATIONS): the delta path bypasses the
+     * reject-list that process_bot_config_push enforces, letting a compromised
+     * bot mutate hub-authoritative records (a/o/m/c/p) that hub_storage routes
+     * to global storage.  Apply the same guard here so the flag is binding on
+     * every bot-write path. */
+    if ((strchr(state->opt_flags, OPT_HUB_ONLY_MUTATIONS) != NULL) &&
+        (strcmp(key, "a") == 0 || strcmp(key, "o") == 0 ||
+         strcmp(key, "m") == 0 || strcmp(key, "c") == 0 ||
+         strcmp(key, "p") == 0)) {
+      hub_log("[HUB] opt 'h' active: REJECTED bot delta '%s' from %s "
+              "(hub-authoritative)\n", key, client->id);
+      break;
+    }
+
+    /* Change 3b's per-bot key whitelist + value caps are enforced centrally in
+     * hub_storage_update_entry (the single choke point shared by this delta
+     * path, process_bot_config_push, process_peer_sync, and config load), so a
+     * rejected key/value simply returns "not accepted" below. */
+
     hub_log("[HUB] BOT_DELTA from %s: key=%s val=%.40s ts=%lld\n",
             client->id, key, val, ts);
 
@@ -5991,15 +5891,23 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
 
 // NEW FUNCTION: Send hub's stored config back to bot
 static void send_config_to_bot(hub_state_t *state, hub_client_t *client) {
-  char payload[MAX_BUFFER];
+  /* Change 5: heap the generation buffer — a full config can exceed MAX_BUFFER
+   * at scale and is too large for the stack.  MAX_CONFIG_PAYLOAD is a hard
+   * upper bound (see hub.h), so hub_generate_bot_payload never truncates. */
+  char *payload = malloc(MAX_CONFIG_PAYLOAD);
+  if (!payload) {
+    hub_log("[HUB] send_config_to_bot: OOM for %s\n", client->id);
+    return;
+  }
 
   // Use the new payload generator that combines Global + Bot-specific
   // and omits "b|uuid|" prefix for correct bot parsing
-  hub_generate_bot_payload(state, client->id, payload, sizeof(payload));
+  hub_generate_bot_payload(state, client->id, payload, MAX_CONFIG_PAYLOAD);
 
   int len = strlen(payload);
   if (len == 0) {
     hub_log("[HUB] No config to send to %s\n", client->id);
+    free(payload);
     return;
   }
 
@@ -6016,6 +5924,7 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client) {
 
   queued_msg_t *m = queued_msg_new(CMD_CONFIG_DATA, LANE_BULK,
                                    (const unsigned char *)payload, len);
+  free(payload);
   if (!m) return;
   queued_msg_set_coalesce(m, state->hub_uuid,
                           hub_next_lamport_seq(state), coalesce);
@@ -6417,9 +6326,9 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
 
             /* Initial full state sync to the newly authenticated peer. */
             {
-              char *init_sync = malloc(MAX_BUFFER);
+              char *init_sync = malloc(MAX_SYNC_PAYLOAD);
               if (init_sync) {
-                hub_generate_sync_packet(state, init_sync, MAX_BUFFER - 100);
+                hub_generate_sync_packet(state, init_sync, MAX_SYNC_PAYLOAD);
                 int slen = (int)strlen(init_sync);
                 if (slen > 0) {
                   queued_msg_t *sm = queued_msg_new(CMD_PEER_SYNC, LANE_BULK,
@@ -6509,78 +6418,22 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 hub_log("[HUB] Rejected CMD_PEER_REKEY_BOT from peer %s: "
                         "per-bot independent keys; rekey is bot-local.\n",
                         client->ip);
-              } else if (cmd == 0xFF /* dead */) {
-                if (payload_ptr && strlen(payload_ptr) > 0) {
-                  char bot_uuid[64];
-                  char *pipe = strchr(payload_ptr, '|');
-                  if (pipe && (pipe - payload_ptr) < 64) {
-                    memcpy(bot_uuid, payload_ptr, pipe - payload_ptr);
-                    bot_uuid[pipe - payload_ptr] = '\0';
-                    char *new_priv_b64 = pipe + 1;
-
-                    hub_log("[HUB] Received rekey forward for bot %s from peer %s\n", bot_uuid, client->ip);
-
-                    // Find the bot client connected to THIS hub
-                    hub_client_t *bot_client = NULL;
-                    for (int i = 0; i < state->client_count; i++) {
-                      if (state->clients[i]->type == CLIENT_BOT &&
-                          strcmp(state->clients[i]->id, bot_uuid) == 0 &&
-                          state->clients[i]->authenticated) {
-                        bot_client = state->clients[i];
-                        break;
-                      }
-                    }
-
-                    if (bot_client) {
-                      // Send CMD_BOT_KEY_UPDATE to the bot
-                      unsigned char buffer[MAX_BUFFER];
-                      unsigned char plain[MAX_BUFFER];
-                      unsigned char tag[GCM_TAG_LEN];
-
-                      plain[0] = CMD_BOT_KEY_UPDATE;
-                      int key_len = strlen(new_priv_b64);
-                      uint32_t payload_len = htonl(key_len);
-                      memcpy(&plain[1], &payload_len, 4);
-                      memcpy(&plain[5], new_priv_b64, key_len);
-
-                      int enc_len = aes_gcm_encrypt(plain, 5 + key_len, bot_client->session_key,
-                                                    buffer + 4, tag);
-                      if (enc_len > 0) {
-                        memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-                        uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
-                        memcpy(buffer, &net_len, 4);
-
-                        if (write(bot_client->fd, buffer, 4 + enc_len + GCM_TAG_LEN) > 0) {
-                          hub_log("[HUB] Sent forwarded rekey to bot %s, disconnecting\n", bot_uuid);
-
-                          // Give bot a moment to process and save the new key
-                          struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000}; // 100ms
-                          nanosleep(&delay, NULL);
-
-                          // Disconnect so bot reconnects with new key
-                          hub_disconnect_client(state, bot_client);
-                        } else {
-                          hub_log("[HUB] Failed to send forwarded rekey to bot %s\n", bot_uuid);
-                        }
-                      }
-                    } else {
-                      hub_log("[HUB] Bot %s not connected to this hub (peer forwarding miss)\n", bot_uuid);
-                    }
-                  }
-                }
               } else if (cmd == CMD_SYNC_REQUEST) {
                 /* Peer is asking us for our full state immediately.
                  * Send our full sync packet to just this requesting peer. */
                 hub_log("[MESH] Sync request from peer %s — sending full state\n",
                         client->ip);
-                char reply_sync[MAX_BUFFER];
-                hub_generate_sync_packet(state, reply_sync, sizeof(reply_sync));
-                if (reply_sync[0] != '\0') {
-                  int reply_len = (int)strlen(reply_sync);
-                  queued_msg_t *sm = queued_msg_new(CMD_PEER_SYNC, LANE_BULK,
-                                                    (const unsigned char *)reply_sync,
-                                                    reply_len);
-                  if (sm) peer_enqueue(client, sm);
+                char *reply_sync = malloc(MAX_SYNC_PAYLOAD);
+                if (reply_sync) {
+                  hub_generate_sync_packet(state, reply_sync, MAX_SYNC_PAYLOAD);
+                  if (reply_sync[0] != '\0') {
+                    int reply_len = (int)strlen(reply_sync);
+                    queued_msg_t *sm = queued_msg_new(CMD_PEER_SYNC, LANE_BULK,
+                                                      (const unsigned char *)reply_sync,
+                                                      reply_len);
+                    if (sm) peer_enqueue(client, sm);
+                  }
+                  free(reply_sync);
                 }
               } else if (cmd == CMD_UPDATE_PUBKEY) {
                 /* v3: independent per-hub keypairs.  A peer must NEVER

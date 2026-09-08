@@ -153,6 +153,34 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
   if (!b)
     return false;
 
+  /* Change 3b — zero-trust per-bot ingest bound (single enforcement point for
+   * the delta path, config-push, peer-sync, and config load).  Global keys
+   * (c/m/o/a/p) were already intercepted above.  A bot's per-bot state is
+   * exactly {t, n, h, pub, seen, d}; reject any other key so a hostile bot or
+   * peer cannot create arbitrarily-named entries and unbound the sync payload.
+   * This is what makes BOT_SYNC_FIELDS a hard bound (see hub.h). Value length
+   * is capped per key so a per-bot line can never approach value[1024]. */
+  if (strcmp(key, "t") != 0 && strcmp(key, "n") != 0 &&
+      strcmp(key, "h") != 0 && strcmp(key, "pub") != 0 &&
+      strcmp(key, "seen") != 0 && strcmp(key, "d") != 0) {
+    hub_log("[STORAGE] REJECTED per-bot key '%s' for %s (not in whitelist)\n",
+            key, uuid);
+    return false;
+  }
+  {
+    size_t vlen = value ? strlen(value) : 0;
+    size_t cap = 0;
+    if      (strcmp(key, "h") == 0)   cap = MAX_MASK_LEN - 1;
+    else if (strcmp(key, "n") == 0)   cap = MAX_NICK - 1;
+    else if (strcmp(key, "pub") == 0) cap = COMBINED_KEY_B64;
+    else                              cap = 31; /* seen/d/t: short numerics */
+    if (vlen > cap) {
+      hub_log("[STORAGE] REJECTED per-bot '%s' for %s: value too long "
+              "(%zu > %zu)\n", key, uuid, vlen, cap);
+      return false;
+    }
+  }
+
   // Special Metadata: Sync Timestamp
   if (strcmp(key, "t") == 0) {
     if (ts > b->last_sync_time) {

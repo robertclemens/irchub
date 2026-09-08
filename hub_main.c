@@ -324,9 +324,14 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
     }
 
     c->authenticated = true;
-    /* D2: no-op for outbound peers (already full-size) but keeps every
-     * auth-completion path uniform. */
-    hub_client_promote_buffers(c);
+    /* D2/Change 5: grow buffers to the per-type bulk size now that the peer is
+     * authenticated (c->type == CLIENT_HUB → MAX_SYNC_PAYLOAD) — the full sync
+     * below rides these.  Runs before any bulk frame is queued. */
+    if (!hub_client_promote_buffers(c)) {
+        hub_log("[PEER] Buffer promotion OOM for %s — disconnecting\n", c->ip);
+        hub_disconnect_client(state, c);
+        return;
+    }
     hub_log("[PEER] Handshake complete with %s\n", c->ip);
     /* Send a full config sync immediately via the BULK queue.  The queue
      * enforces a per-peer byte budget (BULK_SOFT_BUDGET_BPS = 32 KB/s) so
