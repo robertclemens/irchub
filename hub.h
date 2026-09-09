@@ -555,15 +555,22 @@ typedef struct {
 // --- Prototypes ---
 void hub_log(const char *format, ...);
 
-// Log level filtering macros - these check the log level before calling hub_log
-#define hub_log_error(format, ...) \
-    do { if (g_state && g_state->log_level >= LOG_ERROR) hub_log("[ERROR] " format, ##__VA_ARGS__); } while(0)
-#define hub_log_warning(format, ...) \
-    do { if (g_state && g_state->log_level >= LOG_WARNING) hub_log("[WARNING] " format, ##__VA_ARGS__); } while(0)
-#define hub_log_info(format, ...) \
-    do { if (g_state && g_state->log_level >= LOG_INFO) hub_log("[INFO] " format, ##__VA_ARGS__); } while(0)
-#define hub_log_debug(format, ...) \
-    do { if (g_state && g_state->log_level >= LOG_DEBUG) hub_log("[DEBUG] " format, ##__VA_ARGS__); } while(0)
+// Log level filtering macros - these check the log level before calling hub_log.
+// The tag is glued to the caller's format by string-literal concatenation, so a
+// message with no varargs stays warning-free under -Wpedantic (an empty
+// __VA_ARGS__ after a named parameter is not valid C11).
+#define hub_log_error(...) \
+    do { if (g_state && g_state->log_level >= LOG_ERROR) hub_log("[ERROR] " __VA_ARGS__); } while(0)
+#define hub_log_warning(...) \
+    do { if (g_state && g_state->log_level >= LOG_WARNING) hub_log("[WARNING] " __VA_ARGS__); } while(0)
+#define hub_log_info(...) \
+    do { if (g_state && g_state->log_level >= LOG_INFO) hub_log("[INFO] " __VA_ARGS__); } while(0)
+#define hub_log_debug(...) \
+    do { if (g_state && g_state->log_level >= LOG_DEBUG) hub_log("[DEBUG] " __VA_ARGS__); } while(0)
+/* Periodic runtime counters. Carries its own [STATUS] tag but is gated at the
+ * LOG_INFO level, so it disappears together with the rest of the INFO traffic. */
+#define hub_log_status(...) \
+    do { if (g_state && g_state->log_level >= LOG_INFO) hub_log("[STATUS] " __VA_ARGS__); } while(0)
 
 bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);

@@ -24,6 +24,23 @@
 FILE *log_fp = NULL;
 hub_state_t *g_state = NULL;  // Global state pointer for use in hub_log() and other global functions
 
+/* Open HUB_LOG_FILE at 0600. open(O_CREAT,0600)+fdopen is used rather than
+ * fopen("a") so the mode never depends on the caller's umask, and the fchmod
+ * tightens a log that already exists with looser permissions — mode= only
+ * applies on creation, so an inherited 0644 file would otherwise stay 0644.
+ * Same guard the codebase documents in keygen.c and hub_admin.c. */
+static FILE *hub_log_open(bool truncate) {
+    int flags = O_CREAT | O_WRONLY | (truncate ? O_TRUNC : O_APPEND);
+    int fd = open(HUB_LOG_FILE, flags, 0600);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && (st.st_mode & 0777) != 0600)
+        (void)fchmod(fd, 0600);
+    FILE *fp = fdopen(fd, "a");   /* "a" even after O_TRUNC: fd carries the flags */
+    if (!fp) close(fd);
+    return fp;
+}
+
 void hub_log(const char *format, ...) {
     va_list args;
     time_t now = time(NULL);
@@ -38,12 +55,7 @@ void hub_log(const char *format, ...) {
 
     if (!log_fp) {
         // Try to open log file first
-        int fd = open(HUB_LOG_FILE, O_CREAT | O_APPEND | O_WRONLY, 0600);
-        if (fd >= 0) {
-            log_fp = fdopen(fd, "a");
-        } else {
-            log_fp = NULL;
-        }
+        log_fp = hub_log_open(false);
         if (!log_fp) {
             return;  // Silent fail if can't open
         }
@@ -68,12 +80,7 @@ void hub_log(const char *format, ...) {
 
     // Reopen if not open
     if (!log_fp) {
-        int fd = open(HUB_LOG_FILE, O_CREAT | O_APPEND | O_WRONLY, 0600);
-        if (fd >= 0) {
-            log_fp = fdopen(fd, "a");
-        } else {
-            log_fp = NULL;
-        }
+        log_fp = hub_log_open(false);
         if (!log_fp) {
             return;  // Silent fail if can't open
         }
@@ -87,12 +94,7 @@ void hub_log(const char *format, ...) {
     if (stat(HUB_LOG_FILE, &file_stat) == 0 && file_stat.st_size >= log_max_size) {
         // File exceeded size limit, truncate it
         fclose(log_fp);
-        int fd = open(HUB_LOG_FILE, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-        if (fd >= 0) {
-            log_fp = fdopen(fd, "a");  // Use "a" mode for fdopen after truncate
-        } else {
-            log_fp = NULL;
-        }
+        log_fp = hub_log_open(true);
         if (!log_fp) {
             return;  // Silent fail if can't reopen
         }
@@ -527,7 +529,7 @@ void hub_maintenance(hub_state_t *state) {
         if (ipcln_in   < 0) ipcln_in   = 0;
 
         if (purge_in >= 0) {
-            hub_log("[STATUS] clients=%d(bots=%d peers=%d authing=%d) "
+            hub_log_status("clients=%d(bots=%d peers=%d authing=%d) "
                     "dirty=%d "
                     "gossip_in=%lds entropy_in=%lds scan_in=%lds "
                     "ipcln_in=%lds peer_chk_in=%lds purge_in=%lds\n",
@@ -536,7 +538,7 @@ void hub_maintenance(hub_state_t *state) {
                     (long)gossip_in, (long)entropy_in, (long)scan_in,
                     (long)ipcln_in, (long)peer_chk_in, (long)purge_in);
         } else {
-            hub_log("[STATUS] clients=%d(bots=%d peers=%d authing=%d) "
+            hub_log_status("clients=%d(bots=%d peers=%d authing=%d) "
                     "dirty=%d "
                     "gossip_in=%lds entropy_in=%lds scan_in=%lds "
                     "ipcln_in=%lds peer_chk_in=%lds purge=off\n",
@@ -1083,7 +1085,7 @@ int main(int argc, char *argv[]) {
      * sequence — used to stagger anti-entropy timing across the mesh. */
     srand((unsigned int)(time(NULL) ^ getpid()));
 
-    log_fp = fopen(HUB_LOG_FILE, "a");
+    log_fp = hub_log_open(false);
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_signal);
@@ -1092,18 +1094,18 @@ int main(int argc, char *argv[]) {
     // Create PID file with exclusive lock
     int pid_fd = open(HUB_PID_FILE, O_CREAT | O_RDWR, 0600);
     if (pid_fd == -1) {
-        hub_log("[ERROR] Cannot create PID file\n");
+        hub_log_error("Cannot create PID file\n");
         return 1;
     }
     if (flock(pid_fd, LOCK_EX | LOCK_NB) == -1) {
-        hub_log("[ERROR] Hub already running (PID file locked)\n");
+        hub_log_error("Hub already running (PID file locked)\n");
         close(pid_fd);
         return 1;
     }
     char pid_str[16];
     snprintf(pid_str, sizeof(pid_str), "%d\n", getpid());
     if (write(pid_fd, pid_str, strlen(pid_str)) < 0) {
-        hub_log("[WARN] Failed to write PID\n");
+        hub_log_warning("Failed to write PID\n");
     }
     state.pid_fd = pid_fd;
 
