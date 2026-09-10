@@ -484,10 +484,16 @@ void hub_maintenance(hub_state_t *state) {
              * dribbles bytes to keep last_seen fresh is still dropped. Outbound
              * CLIENT_HUB peers are trusted, operator-configured endpoints and
              * are exempt. */
+            /* D4b: a connection that spoke ADMIN-HELLO is an interactive admin
+             * login gated on manual name/password entry — give it a longer
+             * grace window. Everything else keeps the strict pre-auth window. */
+            time_t preauth_window = c->admin_hello_seen ? PREAUTH_ADMIN_TIMEOUT_SEC
+                                                        : PREAUTH_TIMEOUT_SEC;
             if (!c->authenticated && c->type != CLIENT_HUB &&
-                (now - c->connected_at) > PREAUTH_TIMEOUT_SEC) {
-                hub_log("[HUB] Pre-auth timeout for %s (%lds, no handshake) — "
-                        "dropping\n", c->ip, (long)(now - c->connected_at));
+                (now - c->connected_at) > preauth_window) {
+                hub_log("[HUB] Pre-auth timeout for %s (%lds, no handshake%s) — "
+                        "dropping\n", c->ip, (long)(now - c->connected_at),
+                        c->admin_hello_seen ? ", admin" : "");
                 hub_disconnect_client(state, c);
                 i--;
                 continue;

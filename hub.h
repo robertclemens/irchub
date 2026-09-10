@@ -101,6 +101,16 @@
  * exempt (they are trusted, operator-configured endpoints). */
 #define PREAUTH_TIMEOUT_SEC 10
 
+/* D4b — extended pre-auth grace for interactive admin logins. A connection
+ * that has spoken the ADMIN-HELLO discovery probe has positively identified
+ * itself as hub_admin, but the sealed-box ADMIN auth that follows is gated on
+ * a human typing an admin name + password at the prompt. 10s is too tight for
+ * manual entry, so a HELLO-marked connection gets this longer window instead.
+ * Bots, peers, and unidentified slowloris connections keep PREAUTH_TIMEOUT_SEC.
+ * Still bounded (and < CLIENT_TIMEOUT) so an idle admin slot is not held open
+ * indefinitely; the connection also remains subject to churn/concurrency caps. */
+#define PREAUTH_ADMIN_TIMEOUT_SEC 120
+
 /* D2 — two-tier client buffers. Unauthenticated clients get a small buffer
  * (enough for the handshake); it is grown to MAX_BUFFER on successful auth.
  * This keeps the unauthenticated footprint ~8KB instead of ~33KB. */
@@ -407,6 +417,7 @@ typedef struct {
   time_t last_seen;
   time_t last_pong_sent;
   time_t connected_at;             // D4: when the socket was accepted/created
+  bool admin_hello_seen;           // D4b: sent ADMIN-HELLO → longer pre-auth grace
   unsigned char *recv_buf;         // D2: heap; PREAUTH_BUF_SIZE then MAX_BUFFER
   int           recv_cap;          // D2: allocated capacity of recv_buf
   bot_auth_state_t bot_auth_state;

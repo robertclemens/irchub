@@ -5970,6 +5970,11 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
        * frame from hub_admin will be the normal sealed-box ADMIN auth. */
       if (packet_len == 11 && memcmp(data, "ADMIN-HELLO", 11) == 0 &&
           client->bot_auth_state == BOT_AUTH_IDLE) {
+        /* D4b: this connection is an interactive admin client whose sealed-box
+         * ADMIN auth waits on a human typing a name + password. Grant it the
+         * longer pre-auth window (PREAUTH_ADMIN_TIMEOUT_SEC) so the reaper does
+         * not close the socket mid-login. Bots/peers/slowloris are unaffected. */
+        client->admin_hello_seen = true;
         if (state->hub_keys_loaded) {
           char *pub_b64 = base64_encode(state->hub_x25519_pub, 32);
           if (pub_b64) {
