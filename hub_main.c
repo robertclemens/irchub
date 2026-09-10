@@ -19,6 +19,8 @@
 #include <termios.h>
 #include <pwd.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 
 
 FILE *log_fp = NULL;
@@ -761,7 +763,29 @@ done:
     return ok;
 }
 
+/* Process hardening: keep secrets out of anything that lands on disk.
+ *
+ * PR_SET_DUMPABLE(0) suppresses the core dump on a crash.  Without it a crash
+ * hands every admin/oper plaintext password in user_records[], plus
+ * config_pass and both hub private keys, to core_pattern -- on a default
+ * Ubuntu host that pipes to systemd-coredump, i.e. straight to disk.  It also
+ * blocks same-uid ptrace attach, complementing kernel.yama.ptrace_scope.
+ *
+ * RLIMIT_CORE 0 covers the same ground and is inherited across exec.
+ *
+ * Neither defends against root.  Called before any config or key material is
+ * loaded.  Mirrors harden_process() in ircbot/main.c. */
+static void harden_process(void) {
+    struct rlimit rl = { 0, 0 };
+    setrlimit(RLIMIT_CORE, &rl);
+#ifdef PR_SET_DUMPABLE
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
+}
+
 int main(int argc, char *argv[]) {
+    harden_process();
+
     /* DoS hardening: each accepted connection allocates a ~33 KB hub_client_t.
      * glibc keeps freed chunks of that size in the arena (they exceed the
      * default trim threshold but sit below the dynamic mmap threshold), so a
@@ -785,6 +809,27 @@ int main(int argc, char *argv[]) {
 
     static hub_state_t state;
     memset(&state, 0, sizeof(state));
+
+    /* Lock the secret-bearing fields into RAM so they cannot reach swap or a
+     * hibernation image.  hub_state_t is ~8.1 MB -- bots[] alone is 6.8 MB of
+     * public config entries -- so it exceeds RLIMIT_MEMLOCK (4 MB here) and
+     * cannot be locked wholesale the way ircbot's bot_state_t is.  Lock only
+     * what is actually secret: ~14 KB total.  peers[] is deliberately absent,
+     * it holds only public keys (hub_peer_config_t: ed_pub / x25519_pub).
+     * Best-effort; a failure here is not fatal. */
+    {
+        struct { void *p; size_t n; const char *what; } locks[] = {
+            { state.admin_password,   sizeof(state.admin_password),   "admin_password"   },
+            { state.config_pass,      sizeof(state.config_pass),      "config_pass"      },
+            { state.hub_ed25519_priv, sizeof(state.hub_ed25519_priv), "hub_ed25519_priv" },
+            { state.hub_x25519_priv,  sizeof(state.hub_x25519_priv),  "hub_x25519_priv"  },
+            { state.user_records,     sizeof(state.user_records),     "user_records"     },
+        };
+        for (size_t i = 0; i < sizeof(locks)/sizeof(locks[0]); i++)
+            if (mlock(locks[i].p, locks[i].n) != 0)
+                fprintf(stderr, "Warning: mlock(%s) failed - "
+                                "secrets may reach swap.\n", locks[i].what);
+    }
     state.running = true;
     g_state = &state;
     state.log_level = HUB_DEFAULT_LOG_LEVEL;
