@@ -1,232 +1,177 @@
-#include "hub.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <termios.h>
-#include <openssl/rand.h>
-#include <openssl/evp.h>
+/* hub_encrypt.c -- encrypt a plaintext irchub config.
+ *
+ * Usage: hub_encrypt [plaintext_file] [output_file]
+ *        (defaults: config.txt, .irchub.cnf)
+ *
+ * The password is prompted for after start-up, twice, with echo off -- or read
+ * once as the first line of stdin when stdin is not a terminal.  It is never
+ * taken from argv.  The output is written 0600 to a temp file and renamed into
+ * place, as hub_config_write() does, so a failure never leaves a truncated
+ * config behind. */
+#include "hub_tool.h" /* first: sets the feature-test macro */
 
-// Stub hub_log for hub_crypto.c (encrypt tool doesn't use file logging)
-void hub_log(const char *format, ...) {
-    (void)format;
+#include <openssl/rand.h>
+
+static void usage(const char *argv0) {
+  fprintf(stderr,
+          "Usage: %s [plaintext_file] [output_file]   (defaults: config.txt, "
+          "%s)\n"
+          "Prompts for the config password (twice), then writes the "
+          "encrypted config.\n"
+          "With stdin not a terminal, the first line of stdin is the "
+          "password.\n",
+          argv0, HUB_CONFIG_FILE);
 }
 
-void get_password_secure(const char *prompt, char *buf, size_t len) {
-    struct termios oldt, newt;
-    printf("%s", prompt);
-    fflush(stdout);
+/* hub_config_load() reads "key|value" (or "key:value") lines and skips the
+ * rest; every usable config has some.  Ciphertext almost always contains a
+ * NUL (large files) or has no such line (small ones), so together these catch
+ * an already-encrypted input without rejecting any config the hub accepts. */
+static bool looks_like_plain_config(const unsigned char *p, size_t len) {
+  if (memchr(p, '\0', len)) return false;
+  size_t i = 0;
+  while (i < len) {
+    size_t k = i;
+    while (k < len && ((p[k] >= 'a' && p[k] <= 'z') ||
+                       (p[k] >= 'A' && p[k] <= 'Z') || p[k] == '_'))
+      k++;
+    if (k > i && k < len && (p[k] == '|' || p[k] == ':')) return true;
+    const unsigned char *nl = memchr(p + i, '\n', len - i);
+    if (!nl) break;
+    i = (size_t)(nl - p) + 1;
+  }
+  return false;
+}
 
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~ECHO;
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-
-    if (!fgets(buf, len, stdin)) buf[0] = 0;
-
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-    printf("\n");
-    buf[strcspn(buf, "\n")] = 0;
+/* Write buf to path atomically: mkstemp (0600) in the same directory, fsync,
+ * rename.  The temp file is removed on any failure. */
+static bool write_atomic(const char *path, const unsigned char *buf,
+                         size_t len) {
+  char tmp[PATH_MAX];
+  if (snprintf(tmp, sizeof(tmp), "%s.XXXXXX", path) >= (int)sizeof(tmp)) {
+    fprintf(stderr, "Error: output path too long.\n");
+    return false;
+  }
+  int fd = mkstemp(tmp);
+  if (fd < 0) {
+    fprintf(stderr, "Error: cannot create temp file for '%s': %s\n", path,
+            strerror(errno));
+    return false;
+  }
+  bool ok = fchmod(fd, 0600) == 0 && tool_write_all(fd, buf, len) &&
+            fsync(fd) == 0;
+  int saved = errno;
+  if (close(fd) != 0) ok = false;
+  if (ok && rename(tmp, path) != 0) {
+    saved = errno;
+    ok = false;
+  }
+  if (!ok) {
+    fprintf(stderr, "Error: writing '%s': %s\n", path, strerror(saved));
+    unlink(tmp);
+  }
+  return ok;
 }
 
 int main(int argc, char *argv[]) {
-    const char *input_file = "config.txt";
-    const char *output_file = HUB_CONFIG_FILE;
-    char password[128], password_confirm[128];
+  tool_harden();
 
-    printf("IRCHub Config Encryption Utility\n");
-    printf("=================================\n\n");
+  if (argc > 3 || (argc > 1 && argv[1][0] == '-') ||
+      (argc > 2 && argv[2][0] == '-')) {
+    usage(argv[0]);
+    return 1;
+  }
+  const char *in_path = (argc > 1) ? argv[1] : "config.txt";
+  const char *out_path = (argc > 2) ? argv[2] : HUB_CONFIG_FILE;
 
-    if (argc > 1) input_file = argv[1];
-    if (argc > 2) output_file = argv[2];
+  unsigned char *plain = NULL;
+  size_t plain_len = 0;
+  if (!tool_read_file(in_path, 1, HUB_TOOL_MAX_CONFIG, &plain, &plain_len))
+    return 1;
+  if (!looks_like_plain_config(plain, plain_len)) {
+    fprintf(stderr, "Error: '%s' does not look like a plaintext config (no "
+                    "\"key|value\" lines; already encrypted?).\n", in_path);
+    tool_wipe_unlock(plain, plain_len);
+    free(plain);
+    return 1;
+  }
 
-    printf("Input file:  %s\n", input_file);
-    printf("Output file: %s\n\n", output_file);
+  int rc = 1, len = 0, ct_len = 0;
+  bool derived;
+  char password[MAX_PASS], confirm[MAX_PASS];
+  unsigned char key[HUB_TOOL_KEY_LEN];
+  unsigned char *out = NULL;
+  EVP_CIPHER_CTX *ctx = NULL;
+  tool_lock(password, sizeof(password));
+  tool_lock(confirm, sizeof(confirm));
+  tool_lock(key, sizeof(key));
 
-    // Read plaintext input file
-    FILE *fp = fopen(input_file, "rb");
-    if (!fp) {
-        fprintf(stderr, "Error: Cannot open input file '%s'\n", input_file);
-        return 1;
+  if (tool_read_password("New config password: ", password,
+                         sizeof(password)) < 0)
+    goto done;
+  if (isatty(STDIN_FILENO)) {
+    if (tool_read_password("Confirm password: ", confirm, sizeof(confirm)) < 0)
+      goto done;
+    if (strcmp(password, confirm) != 0) {
+      fprintf(stderr, "Error: passwords do not match.\n");
+      goto done;
     }
+  }
 
-    fseek(fp, 0, SEEK_END);
-    long plaintext_len = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+  /* salt | iv | tag | ciphertext, assembled in one buffer. */
+  out = malloc(HUB_TOOL_HDR_LEN + plain_len);
+  ctx = EVP_CIPHER_CTX_new();
+  if (!out || !ctx) {
+    fprintf(stderr, "Error: out of memory.\n");
+    goto done;
+  }
+  unsigned char *salt = out;
+  unsigned char *iv = salt + SALT_SIZE;
+  unsigned char *tag = iv + GCM_IV_LEN;
+  unsigned char *ct = tag + GCM_TAG_LEN;
 
-    if (plaintext_len <= 0) {
-        fprintf(stderr, "Error: Input file is empty\n");
-        fclose(fp);
-        return 1;
-    }
+  /* A fresh random salt and IV every run.  GCM IV reuse under one key is
+   * catastrophic, so an RNG failure aborts rather than falling back. */
+  if (RAND_bytes(salt, SALT_SIZE) != 1 || RAND_bytes(iv, GCM_IV_LEN) != 1) {
+    fprintf(stderr, "Error: RNG failure; nothing written.\n");
+    goto done;
+  }
+  derived = tool_derive_key(password, salt, key);
+  OPENSSL_cleanse(password, sizeof(password));
+  OPENSSL_cleanse(confirm, sizeof(confirm));
+  if (!derived) {
+    fprintf(stderr, "Error: key derivation failed.\n");
+    goto done;
+  }
 
-    unsigned char *plaintext = malloc(plaintext_len);
-    if (!plaintext) {
-        fprintf(stderr, "Error: Memory allocation failed\n");
-        fclose(fp);
-        return 1;
-    }
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL) != 1 ||
+      EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) != 1 ||
+      EVP_EncryptUpdate(ctx, ct, &len, plain, (int)plain_len) != 1) {
+    fprintf(stderr, "Error: encryption failed.\n");
+    goto done;
+  }
+  ct_len = len;
+  if (EVP_EncryptFinal_ex(ctx, ct + ct_len, &len) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag) != 1) {
+    fprintf(stderr, "Error: encryption failed.\n");
+    goto done;
+  }
+  ct_len += len;
 
-    if (fread(plaintext, 1, plaintext_len, fp) != (size_t)plaintext_len) {
-        fprintf(stderr, "Error: Failed to read input file\n");
-        free(plaintext);
-        fclose(fp);
-        return 1;
-    }
-    fclose(fp);
+  if (!write_atomic(out_path, out, HUB_TOOL_HDR_LEN + (size_t)ct_len))
+    goto done;
+  fprintf(stderr, "Encrypted %zu bytes to '%s' (0600).\n", plain_len,
+          out_path);
+  rc = 0;
 
-    printf("Read %ld bytes from input file\n\n", plaintext_len);
-
-    // Get password
-    get_password_secure("Enter encryption password: ", password, sizeof(password));
-    get_password_secure("Confirm password: ", password_confirm, sizeof(password_confirm));
-
-    if (strcmp(password, password_confirm) != 0) {
-        fprintf(stderr, "\nError: Passwords do not match\n");
-        secure_wipe(password, sizeof(password));
-        secure_wipe(password_confirm, sizeof(password_confirm));
-        secure_wipe(plaintext, plaintext_len);
-        free(plaintext);
-        return 1;
-    }
-    secure_wipe(password_confirm, sizeof(password_confirm));
-
-    if (strlen(password) == 0) {
-        fprintf(stderr, "\nError: Password cannot be empty\n");
-        secure_wipe(password, sizeof(password));
-        secure_wipe(plaintext, plaintext_len);
-        free(plaintext);
-        return 1;
-    }
-
-    // Generate random salt and IV
-    unsigned char salt[SALT_SIZE];
-    unsigned char iv[GCM_IV_LEN];
-
-    if (RAND_bytes(salt, SALT_SIZE) != 1 || RAND_bytes(iv, GCM_IV_LEN) != 1) {
-        fprintf(stderr, "\nError: Failed to generate random bytes\n");
-        secure_wipe(password, sizeof(password));
-        secure_wipe(plaintext, plaintext_len);
-        free(plaintext);
-        return 1;
-    }
-
-    // Derive key from password
-    unsigned char key[32];
-    printf("\nDeriving encryption key (this may take a moment)...\n");
-
-    if (PKCS5_PBKDF2_HMAC(password, strlen(password),
-                          salt, SALT_SIZE, PBKDF2_ITERATIONS,
-                          EVP_sha256(), 32, key) != 1) {
-        fprintf(stderr, "Error: PBKDF2 key derivation failed\n");
-        secure_wipe(password, sizeof(password));
-        secure_wipe(plaintext, plaintext_len);
-        free(plaintext);
-        return 1;
-    }
-
-    secure_wipe(password, sizeof(password));
-
-    // Encrypt the plaintext
-    unsigned char *ciphertext = malloc(plaintext_len + EVP_CIPHER_block_size(EVP_aes_256_gcm()));
-    unsigned char tag[GCM_TAG_LEN];
-    if (!ciphertext) {
-        fprintf(stderr, "Error: Memory allocation failed\n");
-        secure_wipe(key, sizeof(key));
-        secure_wipe(plaintext, plaintext_len);
-        free(plaintext);
-        return 1;
-    }
-
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        fprintf(stderr, "Error: Failed to create cipher context\n");
-        secure_wipe(key, sizeof(key));
-        secure_wipe(plaintext, plaintext_len);
-        free(plaintext);
-        free(ciphertext);
-        return 1;
-    }
-
-    int len, ciphertext_len;
-
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1) {
-        fprintf(stderr, "Error: Encryption initialization failed\n");
-        EVP_CIPHER_CTX_free(ctx);
-        secure_wipe(key, sizeof(key));
-        secure_wipe(plaintext, plaintext_len);
-        free(plaintext);
-        free(ciphertext);
-        return 1;
-    }
-
-    if (EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, plaintext_len) != 1) {
-        fprintf(stderr, "Error: Encryption failed\n");
-        EVP_CIPHER_CTX_free(ctx);
-        secure_wipe(key, sizeof(key));
-        secure_wipe(plaintext, plaintext_len);
-        free(plaintext);
-        free(ciphertext);
-        return 1;
-    }
-    ciphertext_len = len;
-
-    if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) != 1) {
-        fprintf(stderr, "Error: Encryption finalization failed\n");
-        EVP_CIPHER_CTX_free(ctx);
-        secure_wipe(key, sizeof(key));
-        secure_wipe(plaintext, plaintext_len);
-        free(plaintext);
-        free(ciphertext);
-        return 1;
-    }
-    ciphertext_len += len;
-
-    // Get the authentication tag
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag) != 1) {
-        fprintf(stderr, "Error: Failed to get authentication tag\n");
-        EVP_CIPHER_CTX_free(ctx);
-        secure_wipe(key, sizeof(key));
-        secure_wipe(plaintext, plaintext_len);
-        free(plaintext);
-        free(ciphertext);
-        return 1;
-    }
-
-    EVP_CIPHER_CTX_free(ctx);
-    secure_wipe(key, sizeof(key));
-    secure_wipe(plaintext, plaintext_len);
-    free(plaintext);
-
-    // Write encrypted file
-    printf("Encrypting...\n");
-
-    FILE *out = fopen(output_file, "wb");
-    if (!out) {
-        fprintf(stderr, "Error: Cannot create output file '%s'\n", output_file);
-        secure_wipe(ciphertext, ciphertext_len);
-        free(ciphertext);
-        return 1;
-    }
-
-    // Write: salt + iv + tag + ciphertext
-    if (fwrite(salt, 1, SALT_SIZE, out) != SALT_SIZE ||
-        fwrite(iv, 1, GCM_IV_LEN, out) != GCM_IV_LEN ||
-        fwrite(tag, 1, GCM_TAG_LEN, out) != GCM_TAG_LEN ||
-        fwrite(ciphertext, 1, ciphertext_len, out) != (size_t)ciphertext_len) {
-        fprintf(stderr, "Error: Failed to write output file\n");
-        fclose(out);
-        secure_wipe(ciphertext, ciphertext_len);
-        free(ciphertext);
-        return 1;
-    }
-
-    fclose(out);
-    secure_wipe(ciphertext, ciphertext_len);
-    free(ciphertext);
-
-    printf("\nSuccess! Encrypted config written to: %s\n", output_file);
-    printf("Total size: %ld bytes (salt + iv + tag + ciphertext)\n",
-           (long)(SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN + ciphertext_len));
-
-    return 0;
+done:
+  EVP_CIPHER_CTX_free(ctx);
+  tool_wipe_unlock(key, sizeof(key));
+  tool_wipe_unlock(password, sizeof(password));
+  tool_wipe_unlock(confirm, sizeof(confirm));
+  free(out);
+  tool_wipe_unlock(plain, plain_len);
+  free(plain);
+  return rc;
 }

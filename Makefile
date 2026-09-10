@@ -28,8 +28,8 @@ OBJ_DIR = $(BUILD_DIR)/obj
 # Source files
 HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c
 ADMIN_SOURCES = hub_admin.c hub_crypto.c
-DECRYPT_SOURCES = hub_decrypt.c hub_crypto.c
-ENCRYPT_SOURCES = hub_encrypt.c hub_crypto.c
+DECRYPT_SOURCES = hub_decrypt.c
+ENCRYPT_SOURCES = hub_encrypt.c
 
 # Object files
 HUB_OBJECTS = $(HUB_SOURCES:%.c=$(OBJ_DIR)/%.o)
@@ -193,6 +193,8 @@ $(ENCRYPT_TARGET): $(ENCRYPT_OBJECTS)
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c hub.h
 	@echo "Compiling $<..."
 	@$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJ_DIR)/hub_decrypt.o $(OBJ_DIR)/hub_encrypt.o: hub_tool.h
 
 # ============================================================================
 # Build Modes (shortcuts)

@@ -245,18 +245,19 @@ The config file (`.irchub.cnf`) is AES-256-GCM encrypted with a key derived from
 ### Decrypt config (inspection / debugging)
 
 ```bash
-./hub_decrypt [config-file]
+./hub_decrypt [config-file]                # defaults to .irchub.cnf
+./hub_decrypt .irchub.cnf > config.txt     # raw plaintext, nothing else
 ```
 
-Prompts for the config password and prints the plaintext config. Defaults to `.irchub.cnf` if no file is specified.
+Prompts for the config password (no echo) and writes the raw plaintext config to stdout — no banner or framing, so it can be redirected or piped. The prompt goes to the terminal and errors to stderr. When stdin is not a terminal, the first line of stdin is taken as the password (`echo "$PW" | ./hub_decrypt`); the password is never passed as an argument.
 
 ### Encrypt config
 
 ```bash
-./hub_encrypt <plaintext-file> <output-file>
+./hub_encrypt [plaintext-file] [output-file]   # defaults: config.txt, .irchub.cnf
 ```
 
-Re-encrypts a plaintext config file. Useful for migrating or restoring configs.
+Re-encrypts a plaintext config file. Useful for migrating or restoring configs. Prompts for the password twice (or reads one line from a non-terminal stdin), then writes the output mode 0600 via a temp file and rename, so a failed run never leaves a truncated config. Input that does not look like a plaintext config (e.g. an already-encrypted file) is refused.
 
 ### Generate keypair
 

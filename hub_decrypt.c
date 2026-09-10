@@ -1,140 +1,105 @@
-#include "hub.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <termios.h>
+/* hub_decrypt.c -- dump a decrypted irchub config.
+ *
+ * Usage: hub_decrypt [config_file]        (default: .irchub.cnf)
+ *
+ * The password is prompted for after start-up (echo off), or read as the first
+ * line of stdin when stdin is not a terminal -- never taken from argv.
+ * stdout carries the raw plaintext and nothing else, byte for byte (no
+ * banner, no framing), so it can be redirected or piped; the prompt goes to
+ * the terminal, errors to stderr. */
+#include "hub_tool.h"
 
-// Stub hub_log for hub_crypto.c (decrypt tool doesn't use file logging)
-void hub_log(const char *format, ...) {
-    (void)format;
-}
-
-void get_password_secure(const char *prompt, char *buf, size_t len) {
-    struct termios oldt, newt;
-    printf("%s", prompt);
-    fflush(stdout);
-    
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~ECHO;
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    
-    if (!fgets(buf, len, stdin)) buf[0] = 0;
-    
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-    printf("\n");
-    buf[strcspn(buf, "\n")] = 0;
+static void usage(const char *argv0) {
+  fprintf(stderr,
+          "Usage: %s [config_file]   (default: %s)\n"
+          "Prompts for the config password, then writes the raw plaintext "
+          "to stdout.\n"
+          "With stdin not a terminal, the first line of stdin is the "
+          "password.\n",
+          argv0, HUB_CONFIG_FILE);
 }
 
 int main(int argc, char *argv[]) {
-    const char *config_file = HUB_CONFIG_FILE;
-    char password[128];
-    
-    printf("IRCHub Config Decryption Utility\n");
-    printf("=================================\n\n");
-    
-    if (argc > 1) config_file = argv[1];
-    
-    printf("Config file: %s\n\n", config_file);
-    
-    FILE *fp = fopen(config_file, "rb");
-    if (!fp) {
-        fprintf(stderr, "Error: Cannot open '%s'\n", config_file);
-        return 1;
-    }
+  tool_harden();
 
-    unsigned char salt[SALT_SIZE], iv[GCM_IV_LEN], tag[GCM_TAG_LEN];
-    
-    if (fread(salt, 1, SALT_SIZE, fp) != SALT_SIZE ||
-        fread(iv, 1, GCM_IV_LEN, fp) != GCM_IV_LEN ||
-        fread(tag, 1, GCM_TAG_LEN, fp) != GCM_TAG_LEN) {
-        fprintf(stderr, "Error: Failed to read headers\n");
-        fclose(fp);
-        return 1;
-    }
+  if (argc > 2 || (argc == 2 && argv[1][0] == '-')) {
+    usage(argv[0]);
+    return 1;
+  }
+  const char *path = (argc == 2) ? argv[1] : HUB_CONFIG_FILE;
 
-    fseek(fp, 0, SEEK_END);
-    long fsize = ftell(fp);
-    long cipher_len = fsize - SALT_SIZE - GCM_IV_LEN - GCM_TAG_LEN;
-    
-    if (cipher_len <= 0) {
-        fprintf(stderr, "Error: Invalid file size\n");
-        fclose(fp);
-        return 1;
-    }
+  /* Read the file first so a bad path fails before the user types anything. */
+  unsigned char *file = NULL;
+  size_t file_len = 0;
+  if (!tool_read_file(path, HUB_TOOL_HDR_LEN + 1,
+                      HUB_TOOL_HDR_LEN + HUB_TOOL_MAX_CONFIG, &file, &file_len))
+    return 1;
 
-    fseek(fp, SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN, SEEK_SET);
-    unsigned char *ciphertext = malloc(cipher_len);
-    if (!ciphertext) {
-        fprintf(stderr, "Error: Memory allocation failed\n");
-        fclose(fp);
-        return 1;
-    }
+  const unsigned char *salt = file;
+  const unsigned char *iv = salt + SALT_SIZE;
+  unsigned char tag[GCM_TAG_LEN];
+  memcpy(tag, iv + GCM_IV_LEN, GCM_TAG_LEN);
+  const unsigned char *ct = file + HUB_TOOL_HDR_LEN;
+  const int ct_len = (int)(file_len - HUB_TOOL_HDR_LEN);
 
-    if (fread(ciphertext, 1, cipher_len, fp) != (size_t)cipher_len) {
-        fprintf(stderr, "Error: Read failed\n");
-        free(ciphertext);
-        fclose(fp);
-        return 1;
-    }
-    fclose(fp);
+  int rc = 1, len = 0, plain_len = 0;
+  bool derived;
+  char password[MAX_PASS];
+  unsigned char key[HUB_TOOL_KEY_LEN];
+  unsigned char *plain = NULL;
+  EVP_CIPHER_CTX *ctx = NULL;
+  tool_lock(password, sizeof(password));
+  tool_lock(key, sizeof(key));
 
-    get_password_secure("Enter password: ", password, sizeof(password));
-    
-    unsigned char key[32];
-    printf("Deriving key...\n");
-    
-    if (PKCS5_PBKDF2_HMAC(password, strlen(password),
-                          salt, SALT_SIZE, PBKDF2_ITERATIONS,
-                          EVP_sha256(), 32, key) != 1) {
-        fprintf(stderr, "Error: PBKDF2 failed\n");
-        secure_wipe(password, sizeof(password));
-        free(ciphertext);
-        return 1;
-    }
-    
-    secure_wipe(password, sizeof(password));
+  if (tool_read_password("Config password: ", password, sizeof(password)) < 0)
+    goto out;
+  derived = tool_derive_key(password, salt, key);
+  OPENSSL_cleanse(password, sizeof(password));
+  if (!derived) {
+    fprintf(stderr, "Error: key derivation failed.\n");
+    goto out;
+  }
 
-    unsigned char *plaintext = malloc(cipher_len + 1);
-    if (!plaintext) {
-        fprintf(stderr, "Error: Memory allocation failed\n");
-        secure_wipe(key, sizeof(key));
-        free(ciphertext);
-        return 1;
-    }
-    int len, plain_len;
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        fprintf(stderr, "Error: Failed to create cipher context\n");
-        secure_wipe(key, sizeof(key));
-        free(ciphertext);
-        free(plaintext);
-        return 1;
-    }
+  plain = malloc((size_t)ct_len);
+  ctx = EVP_CIPHER_CTX_new();
+  if (!plain || !ctx) {
+    fprintf(stderr, "Error: out of memory.\n");
+    goto out;
+  }
+  tool_lock(plain, (size_t)ct_len);
 
-    EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv);
-    EVP_DecryptUpdate(ctx, plaintext, &plain_len, ciphertext, cipher_len);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL) != 1 ||
+      EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1 ||
+      EVP_DecryptUpdate(ctx, plain, &len, ct, ct_len) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag) != 1) {
+    fprintf(stderr, "Error: decryption setup failed.\n");
+    goto out;
+  }
+  plain_len = len;
+  /* GCM authenticates here: nothing is released unless the tag verifies. */
+  if (EVP_DecryptFinal_ex(ctx, plain + plain_len, &len) != 1) {
+    fprintf(stderr, "Error: decryption failed (wrong password, or the file "
+                    "is corrupt or not an irchub config).\n");
+    goto out;
+  }
+  plain_len += len;
 
-    if (EVP_DecryptFinal_ex(ctx, plaintext + plain_len, &len) <= 0) {
-        fprintf(stderr, "\nDecryption failed (wrong password?)\n");
-        EVP_CIPHER_CTX_free(ctx);
-        secure_wipe(key, sizeof(key));
-        free(ciphertext);
-        secure_wipe(plaintext, plain_len);
-        free(plaintext);
-        return 1;
-    }
+  if (!tool_write_all(STDOUT_FILENO, plain, (size_t)plain_len)) {
+    fprintf(stderr, "Error: writing to stdout: %s\n", strerror(errno));
+    goto out;
+  }
+  rc = 0;
 
-    plain_len += len;
-    plaintext[plain_len] = 0;
-    EVP_CIPHER_CTX_free(ctx);
-    secure_wipe(key, sizeof(key));
-    free(ciphertext);
-
-    printf("\n=== DECRYPTED CONFIG ===\n\n%s\n", plaintext);
-    
-    secure_wipe(plaintext, plain_len);
-    free(plaintext);
-    return 0;
+out:
+  EVP_CIPHER_CTX_free(ctx);
+  tool_wipe_unlock(key, sizeof(key));
+  tool_wipe_unlock(password, sizeof(password));
+  if (plain) {
+    tool_wipe_unlock(plain, (size_t)ct_len);
+    free(plain);
+  }
+  tool_wipe_unlock(file, file_len);
+  free(file);
+  return rc;
 }
