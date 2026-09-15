@@ -22,7 +22,7 @@ hub_admin ──► irchub ──► ircbot A
 - **Encrypted config sync** — AES-256-GCM encrypted configuration pushed to all bots on connect and periodically
 - **Peer mesh** — multiple hub instances synchronize state; leader election prevents duplicate operations
 - **Admin console** — interactive TUI (`hub_admin`) for managing bots, channels, masks, and opers
-- **IP access control** — allowlist/denylist with CIDR support
+- **IP access control** — IPv4 allowlist/denylist with CIDR support, local to each hub; changes apply to existing connections too, and a change that would lock out your own admin session is refused
 - **Rate limiting** — per-IP connection limits and failed-auth blocking
 - **Tombstone purging** — automatic cleanup of deleted config entries with configurable retention
 

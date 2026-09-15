@@ -688,93 +688,110 @@ void cleanup_old_ip_limits(hub_state_t *state) {
 
 // ============ IP ACCESS CONTROL FUNCTIONS ============
 
-// Simple CIDR matching (supports /24, /16, /8 and exact match)
-static bool ip_matches_pattern(const char *ip, const char *pattern) {
-    // Check for CIDR notation
-    char pattern_copy[MAX_MASK_LEN];
-    snprintf(pattern_copy, sizeof(pattern_copy), "%s", pattern);
+bool hub_ip_acl_parse(const char *in, hub_ip_acl_t *out) {
+    if (!in || !out) return false;
+    size_t n = strnlen(in, IP_ACL_PATTERN_MAX);
+    if (n == 0 || n >= IP_ACL_PATTERN_MAX) return false;
 
-    char *slash = strchr(pattern_copy, '/');
+    char addr[IP_ACL_PATTERN_MAX];
+    memcpy(addr, in, n + 1);
+    int prefix = 32;
+    char *slash = strchr(addr, '/');
     if (slash) {
-        *slash = '\0';
-        int prefix_len = atoi(slash + 1);
-
-        // Convert IPs to binary
-        struct in_addr ip_addr, pattern_addr;
-        if (inet_pton(AF_INET, ip, &ip_addr) != 1 ||
-            inet_pton(AF_INET, pattern_copy, &pattern_addr) != 1) {
+        /* 1-2 decimal digits, no sign/space/leading zero: atoi() used to turn
+         * "10.0.0.0/" or "/x" into prefix 0, which matches every address. */
+        const char *p = slash + 1;
+        size_t plen = strlen(p);
+        bool d0 = plen >= 1 && p[0] >= '0' && p[0] <= '9';
+        bool d1 = plen == 2 && p[1] >= '0' && p[1] <= '9';
+        if (!d0 || plen > 2 || (plen == 2 && (!d1 || p[0] == '0')))
             return false;
-        }
-
-        // Create netmask
-        uint32_t mask = 0;
-        if (prefix_len > 0 && prefix_len <= 32) {
-            mask = htonl(~((1u << (32 - prefix_len)) - 1));
-        }
-
-        // Compare network portions
-        return (ip_addr.s_addr & mask) == (pattern_addr.s_addr & mask);
+        prefix = plen == 2 ? (p[0] - '0') * 10 + (p[1] - '0') : p[0] - '0';
+        if (prefix > 32) return false;
+        *slash = '\0';
     }
 
-    // Exact match
-    return strcmp(ip, pattern) == 0;
+    struct in_addr a;  /* strict dotted quad: no short forms, octal or spaces */
+    if (inet_pton(AF_INET, addr, &a) != 1) return false;
+
+    uint32_t mask = prefix ? 0xFFFFFFFFu << (32 - prefix) : 0;
+    out->net = ntohl(a.s_addr) & mask;
+    out->mask = mask;
+    out->added = 0;
+
+    char buf[INET_ADDRSTRLEN];
+    struct in_addr na = { .s_addr = htonl(out->net) };
+    if (!inet_ntop(AF_INET, &na, buf, sizeof(buf))) return false;
+    int w = prefix == 32
+          ? snprintf(out->pattern, sizeof(out->pattern), "%s", buf)
+          : snprintf(out->pattern, sizeof(out->pattern), "%s/%d", buf, prefix);
+    return w > 0 && w < (int)sizeof(out->pattern);
 }
 
-static bool is_ip_in_list(hub_state_t *state, const char *ip, const char *list_key) {
-    for (int i = 0; i < state->global_entry_count; i++) {
-        if (strcmp(state->global_entries[i].key, list_key) == 0) {
-            // Check if this is a tombstone (deleted)
-            if (strstr(state->global_entries[i].value, "|del") != NULL) {
-                continue;
-            }
-
-            // Extract IP pattern (before first |)
-            char pattern[256];
-            const char *pipe = strchr(state->global_entries[i].value, '|');
-            if (pipe) {
-                size_t len = pipe - state->global_entries[i].value;
-                if (len >= sizeof(pattern)) len = sizeof(pattern) - 1;
-                memcpy(pattern, state->global_entries[i].value, len);
-                pattern[len] = '\0';
-            } else {
-                snprintf(pattern, sizeof(pattern), "%.*s",
-                         (int)(sizeof(pattern) - 1), state->global_entries[i].value);
-            }
-
-            if (ip_matches_pattern(ip, pattern)) {
-                return true;
-            }
-        }
-    }
+static bool ip_acl_match(const hub_ip_acl_t *list, int count, uint32_t addr) {
+    for (int i = 0; i < count; i++)
+        if ((addr & list[i].mask) == list[i].net) return true;
     return false;
 }
 
+/* 0 = permitted, 1 = on the denylist, 2 = not on a non-empty allowlist. */
+static int ip_acl_verdict(const hub_state_t *state, const char *ip) {
+    struct in_addr a;
+    bool parsed = ip && inet_pton(AF_INET, ip, &a) == 1;
+    uint32_t addr = parsed ? ntohl(a.s_addr) : 0;
+
+    if (state->ip_deny_count > 0 &&
+        (!parsed || ip_acl_match(state->ip_deny, state->ip_deny_count, addr)))
+        return 1;
+    if (state->ip_allow_count > 0 &&
+        (!parsed || !ip_acl_match(state->ip_allow, state->ip_allow_count, addr)))
+        return 2;
+    return 0;
+}
+
+bool hub_ip_acl_permits(const hub_state_t *state, const char *ip) {
+    return ip_acl_verdict(state, ip) == 0;
+}
+
 bool check_ip_access_lists(hub_state_t *state, const char *ip) {
-    // Check denylist first
-    if (is_ip_in_list(state, ip, "x")) {
-        hub_log("[ACCESS_CONTROL] IP %s denied (denylist)\n", ip);
-        return false;
-    }
+    int verdict = ip_acl_verdict(state, ip);
+    if (verdict == 0) return true;
+    hub_log("[ACCESS_CONTROL] IP %s denied (%s)\n", ip,
+            verdict == 1 ? "denylist" : "not in allowlist");
+    return false;
+}
 
-    // Check if allowlist exists (count entries with key "w")
-    bool allowlist_exists = false;
-    for (int i = 0; i < state->global_entry_count; i++) {
-        if (strcmp(state->global_entries[i].key, "w") == 0) {
-            if (strstr(state->global_entries[i].value, "|del") == NULL) {
-                allowlist_exists = true;
-                break;
-            }
-        }
-    }
+static hub_ip_acl_t *ip_acl_list(hub_state_t *state, char list, int **count) {
+    if (list == 'w') { *count = &state->ip_allow_count; return state->ip_allow; }
+    if (list == 'x') { *count = &state->ip_deny_count;  return state->ip_deny; }
+    return NULL;
+}
 
-    // If allowlist exists, IP must be in it
-    if (allowlist_exists) {
-        if (!is_ip_in_list(state, ip, "w")) {
-            hub_log("[ACCESS_CONTROL] IP %s denied (not in allowlist)\n", ip);
-            return false;
-        }
-    }
+static int ip_acl_find(const hub_ip_acl_t *list, int count, const hub_ip_acl_t *e) {
+    for (int i = 0; i < count; i++)
+        if (list[i].net == e->net && list[i].mask == e->mask) return i;
+    return -1;
+}
 
+ip_acl_add_t hub_ip_acl_add(hub_state_t *state, char list, const hub_ip_acl_t *e) {
+    int *count;
+    hub_ip_acl_t *l = ip_acl_list(state, list, &count);
+    if (!l) return IP_ACL_BAD_LIST;
+    if (ip_acl_find(l, *count, e) >= 0) return IP_ACL_DUPLICATE;
+    if (*count >= MAX_IP_ACL_ENTRIES) return IP_ACL_FULL;
+    l[(*count)++] = *e;
+    return IP_ACL_ADDED;
+}
+
+bool hub_ip_acl_remove(hub_state_t *state, char list, const hub_ip_acl_t *e) {
+    int *count;
+    hub_ip_acl_t *l = ip_acl_list(state, list, &count);
+    if (!l) return false;
+    int i = ip_acl_find(l, *count, e);
+    if (i < 0) return false;
+    memmove(&l[i], &l[i + 1], sizeof(*l) * (size_t)(*count - i - 1));
+    (*count)--;
+    memset(&l[*count], 0, sizeof(*l));
     return true;
 }
 
@@ -1738,9 +1755,9 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
   buffer[0] = 0;
 
   // 1. Include global entries (c, m, o, a, p)
-  // Note: h/n/w/x in global_entries are hub-only local metadata
+  // Note: h/n/w/x are hub-only local metadata and never belong here
   // - h/n: hub name/bind settings (shouldn't exist in global_entries)
-  // - w/x: allowlist/denylist (local-only IP access control)
+  // - w/x: allowlist/denylist, kept in ip_allow/ip_deny (local-only)
   // Bot-specific h/n (like b|uuid|h|..., b|uuid|n|...) are synced in the bot loop below
   for (int i = 0; i < state->global_entry_count; i++) {
     config_entry_t *e = &state->global_entries[i];
@@ -2639,6 +2656,80 @@ write_and_notify:
   hub_broadcast_config_to_bots(state, purge_msg);
 
   return purged_count;
+}
+
+/* CMD_ADMIN_ADD/DEL_ALLOWLIST/DENYLIST (list 'w' or 'x').  The lists are
+ * local to this hub: nothing is sent to peers or bots.  A change after which
+ * the admin's own address could not connect is refused and rolled back; the
+ * inbound connections a change refuses are closed by hub_maintenance. */
+static bool admin_ip_acl_change(hub_state_t *state, hub_client_t *client,
+                                char list, bool add, const char *payload) {
+  const char *name = list == 'w' ? "allowlist" : "denylist";
+  char msg[320];
+  hub_ip_acl_t e;
+
+  if (!payload || !payload[0])
+    return send_response(state, client, "ERROR: Missing IP pattern.");
+  if (!hub_ip_acl_parse(payload, &e)) {
+    snprintf(msg, sizeof(msg), "ERROR: '%.40s' is not an IPv4 address or CIDR "
+             "(e.g. 192.168.1.5 or 10.0.0.0/8).", payload);
+    return send_response(state, client, msg);
+  }
+
+  hub_ip_acl_t *l = list == 'w' ? state->ip_allow : state->ip_deny;
+  int *count = list == 'w' ? &state->ip_allow_count : &state->ip_deny_count;
+  hub_ip_acl_t saved[MAX_IP_ACL_ENTRIES];
+  int saved_count = *count;
+  memcpy(saved, l, sizeof(saved));
+
+  if (add) {
+    e.added = time(NULL);
+    ip_acl_add_t r = hub_ip_acl_add(state, list, &e);
+    if (r != IP_ACL_ADDED) {
+      if (r == IP_ACL_DUPLICATE)
+        snprintf(msg, sizeof(msg), "ERROR: %s is already on the %s.", e.pattern, name);
+      else
+        snprintf(msg, sizeof(msg), "ERROR: The %s is full (%d entries).", name,
+                 MAX_IP_ACL_ENTRIES);
+      return send_response(state, client, msg);
+    }
+  } else if (!hub_ip_acl_remove(state, list, &e)) {
+    snprintf(msg, sizeof(msg), "ERROR: %s is not on the %s.", e.pattern, name);
+    return send_response(state, client, msg);
+  }
+
+  if (!hub_ip_acl_permits(state, client->ip)) {
+    memcpy(l, saved, sizeof(saved));
+    *count = saved_count;
+    snprintf(msg, sizeof(msg), "ERROR: Refused: your own address %s could not "
+             "connect after this change.%s", client->ip,
+             list == 'w' ? " Allow it first." : "");
+    return send_response(state, client, msg);
+  }
+
+  int closing = 0;
+  for (int i = 0; i < state->client_count; i++) {
+    const hub_client_t *c = state->clients[i];
+    if (c != client && c->inbound && !hub_ip_acl_permits(state, c->ip))
+      closing++;
+  }
+  state->ip_acl_changed = true;
+  state->config_dirty = true;
+  hub_log("[ACCESS_CONTROL] %s %s %s by %s\n", e.pattern,
+          add ? "added to" : "removed from", name, client->id);
+
+  int off = snprintf(msg, sizeof(msg), "SUCCESS: %s %s %s.", e.pattern,
+                     add ? "added to" : "removed from", name);
+  if (list == 'w' && add && *count == 1)
+    off += snprintf(msg + off, sizeof(msg) - (size_t)off,
+                    " The allowlist is now on: only listed addresses may connect.");
+  else if (list == 'w' && !add && *count == 0)
+    off += snprintf(msg + off, sizeof(msg) - (size_t)off,
+                    " The allowlist is now empty: any address may connect.");
+  if (closing > 0)
+    snprintf(msg + off, sizeof(msg) - (size_t)off,
+             " Closing %d existing connection(s) it no longer permits.", closing);
+  return send_response(state, client, msg);
 }
 
 static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
@@ -4456,145 +4547,37 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     return send_response(state, client, "ERROR: Missing port number.");
   }
 
-  case CMD_ADMIN_LIST_ALLOWLIST: {
-    char list[MAX_BUFFER];
-    int offset = 0;
-    int count = 0;
-
-    offset += snprintf(list + offset, MAX_BUFFER - offset,
-                      "════════════════════════════════════════════\n");
-    offset += snprintf(list + offset, MAX_BUFFER - offset,
-                      "           IP ALLOWLIST\n");
-    offset += snprintf(list + offset, MAX_BUFFER - offset,
-                      "════════════════════════════════════════════\n\n");
-
-    for (int i = 0; i < state->global_entry_count && offset < MAX_BUFFER - 256; i++) {
-        if (strcmp(state->global_entries[i].key, "w") == 0) {
-            // Skip tombstones
-            if (strstr(state->global_entries[i].value, "|del") != NULL) {
-                continue;
-            }
-
-            // Extract IP pattern
-            char pattern[256];
-            const char *pipe = strchr(state->global_entries[i].value, '|');
-            if (pipe) {
-                size_t len = pipe - state->global_entries[i].value;
-                if (len >= sizeof(pattern)) len = sizeof(pattern) - 1;
-                memcpy(pattern, state->global_entries[i].value, len);
-                pattern[len] = '\0';
-            } else {
-                snprintf(pattern, sizeof(pattern), "%.*s",
-                         (int)(sizeof(pattern) - 1), state->global_entries[i].value);
-            }
-
-            offset += snprintf(list + offset, MAX_BUFFER - offset,
-                             "%3d. %s\n", ++count, pattern);
-        }
-    }
-
-    if (count == 0) {
-        offset += snprintf(list + offset, MAX_BUFFER - offset,
-                         "(No allowlist entries - all IPs allowed)\n");
-    }
-
-    return send_response(state, client, list);
-  }
-
-  case CMD_ADMIN_ADD_ALLOWLIST: {
-    if (payload && strlen(payload) > 0) {
-        time_t now = time(NULL);
-        hub_storage_update_global_entry(state, "w", payload, "", "add", now);
-        state->config_dirty = true;
-
-        // NOTE: Allowlist is local-only, do not broadcast to peers
-
-        return send_response(state, client, "SUCCESS: IP added to allowlist.");
-    }
-    return send_response(state, client, "ERROR: Missing IP pattern.");
-  }
-
-  case CMD_ADMIN_DEL_ALLOWLIST: {
-    if (payload && strlen(payload) > 0) {
-        time_t now = time(NULL);
-        hub_storage_update_global_entry(state, "w", payload, "", "del", now);
-        state->config_dirty = true;
-
-        // NOTE: Allowlist is local-only, do not broadcast to peers
-
-        return send_response(state, client, "SUCCESS: IP removed from allowlist.");
-    }
-    return send_response(state, client, "ERROR: Missing IP pattern.");
-  }
-
+  case CMD_ADMIN_LIST_ALLOWLIST:
   case CMD_ADMIN_LIST_DENYLIST: {
-    char list[MAX_BUFFER];
-    int offset = 0;
-    int count = 0;
+    bool allow = cmd == CMD_ADMIN_LIST_ALLOWLIST;
+    const hub_ip_acl_t *l = allow ? state->ip_allow : state->ip_deny;
+    int n = allow ? state->ip_allow_count : state->ip_deny_count;
+    char list[MAX_BUFFER];  /* 64 short lines: always fits */
+    int offset = snprintf(list, sizeof(list),
+                          "════════════════════════════════════════════\n"
+                          "           IP %s\n"
+                          "════════════════════════════════════════════\n\n",
+                          allow ? "ALLOWLIST" : "DENYLIST");
 
-    offset += snprintf(list + offset, MAX_BUFFER - offset,
-                      "════════════════════════════════════════════\n");
-    offset += snprintf(list + offset, MAX_BUFFER - offset,
-                      "           IP DENYLIST\n");
-    offset += snprintf(list + offset, MAX_BUFFER - offset,
-                      "════════════════════════════════════════════\n\n");
-
-    for (int i = 0; i < state->global_entry_count && offset < MAX_BUFFER - 256; i++) {
-        if (strcmp(state->global_entries[i].key, "x") == 0) {
-            if (strstr(state->global_entries[i].value, "|del") != NULL) {
-                continue;
-            }
-
-            char pattern[256];
-            const char *pipe = strchr(state->global_entries[i].value, '|');
-            if (pipe) {
-                size_t len = pipe - state->global_entries[i].value;
-                if (len >= sizeof(pattern)) len = sizeof(pattern) - 1;
-                memcpy(pattern, state->global_entries[i].value, len);
-                pattern[len] = '\0';
-            } else {
-                snprintf(pattern, sizeof(pattern), "%.*s",
-                         (int)(sizeof(pattern) - 1), state->global_entries[i].value);
-            }
-
-            offset += snprintf(list + offset, MAX_BUFFER - offset,
-                             "%3d. %s\n", ++count, pattern);
-        }
-    }
-
-    if (count == 0) {
-        offset += snprintf(list + offset, MAX_BUFFER - offset,
-                         "(No denylist entries)\n");
-    }
+    for (int i = 0; i < n; i++)
+      offset += snprintf(list + offset, sizeof(list) - (size_t)offset,
+                         "%3d. %s\n", i + 1, l[i].pattern);
+    if (n == 0)
+      snprintf(list + offset, sizeof(list) - (size_t)offset, "%s",
+               allow ? "(No allowlist entries - all IPs allowed)\n"
+                     : "(No denylist entries)\n");
 
     return send_response(state, client, list);
   }
 
-  case CMD_ADMIN_ADD_DENYLIST: {
-    if (payload && strlen(payload) > 0) {
-        time_t now = time(NULL);
-        hub_storage_update_global_entry(state, "x", payload, "", "add", now);
-        state->config_dirty = true;
-
-        // NOTE: Denylist is local-only, do not broadcast to peers
-
-        return send_response(state, client, "SUCCESS: IP added to denylist.");
-    }
-    return send_response(state, client, "ERROR: Missing IP pattern.");
-  }
-
-  case CMD_ADMIN_DEL_DENYLIST: {
-    if (payload && strlen(payload) > 0) {
-        time_t now = time(NULL);
-        hub_storage_update_global_entry(state, "x", payload, "", "del", now);
-        state->config_dirty = true;
-
-        // NOTE: Denylist is local-only, do not broadcast to peers
-
-        return send_response(state, client, "SUCCESS: IP removed from denylist.");
-    }
-    return send_response(state, client, "ERROR: Missing IP pattern.");
-  }
+  case CMD_ADMIN_ADD_ALLOWLIST:
+    return admin_ip_acl_change(state, client, 'w', true, payload);
+  case CMD_ADMIN_DEL_ALLOWLIST:
+    return admin_ip_acl_change(state, client, 'w', false, payload);
+  case CMD_ADMIN_ADD_DENYLIST:
+    return admin_ip_acl_change(state, client, 'x', true, payload);
+  case CMD_ADMIN_DEL_DENYLIST:
+    return admin_ip_acl_change(state, client, 'x', false, payload);
 
         case CMD_ADMIN_SET_LOG_LEVEL: {
             size_t len = payload ? strlen(payload) : 0;

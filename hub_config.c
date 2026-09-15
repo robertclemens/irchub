@@ -247,6 +247,14 @@ void hub_config_write(hub_state_t *state) {
                (long)state->global_entries[i].timestamp);
   }
 
+  // Local IP access lists: w|<pattern>|<added> (allow), x|... (deny)
+  for (int i = 0; i < state->ip_allow_count; i++)
+    SAFE_WRITE("w|%s|%ld\n", state->ip_allow[i].pattern,
+               (long)state->ip_allow[i].added);
+  for (int i = 0; i < state->ip_deny_count; i++)
+    SAFE_WRITE("x|%s|%ld\n", state->ip_deny[i].pattern,
+               (long)state->ip_deny[i].added);
+
   // Write named admin/oper records (a| and o| lines) — skip duplicates by type+name
   // Format: <a|o>|uuid|name|<pubkey_b64>|add/del|last_seen|timestamp|
   // (pubkey empty when has_pubkey == false; trailing field reserved, empty).
@@ -405,9 +413,45 @@ void hub_config_write(hub_state_t *state) {
   free(buffer);
 }
 
+/* Body of a w|/x| line, "<pattern>|<ts>", into the local IP list ('w' allow,
+ * 'x' deny).  A pattern that does not parse is dropped and logged rather than
+ * guessed at (the old matcher read "10.0.0.0/" as /0, i.e. every address).
+ * False when the line should not stay in the file as written: dropped, a
+ * duplicate, or not in canonical form. */
+static bool load_ip_acl_line(hub_state_t *state, char list, char *v) {
+  const char *name = list == 'w' ? "allowlist" : "denylist";
+  char *s_ts = strrchr(v, '|');
+  if (!s_ts) {
+    hub_log("[CONFIG] Dropping %s line without a timestamp\n", name);
+    return false;
+  }
+  *s_ts = 0;
+  char *op = strchr(v, '|');  /* never written; tolerate "<pattern>|add" */
+  if (op) {
+    *op++ = 0;
+    if (strcmp(op, "add") != 0) {
+      hub_log("[CONFIG] Dropping %s entry '%.40s' (op '%.8s')\n", name, v, op);
+      return false;
+    }
+  }
+  hub_ip_acl_t e;
+  if (!hub_ip_acl_parse(v, &e)) {
+    hub_log("[CONFIG] Dropping invalid %s entry '%.40s' (not an IPv4 address "
+            "or CIDR)\n", name, v);
+    return false;
+  }
+  e.added = (time_t)atoll(s_ts + 1);
+  ip_acl_add_t r = hub_ip_acl_add(state, list, &e);
+  if (r == IP_ACL_FULL)
+    hub_log("[CONFIG] %s full (%d); dropping %s\n", name, MAX_IP_ACL_ENTRIES,
+            e.pattern);
+  return r == IP_ACL_ADDED && !op && strcmp(v, e.pattern) == 0;
+}
+
 // FIXED: Use PBKDF2 and improved error handling
 bool hub_config_load(hub_state_t *state, const char *password) {
   int cfg_legacy_users = 0;  /* password-era a|/o| lines or a p| line seen */
+  int cfg_acl_fixed = 0;     /* w|/x| lines dropped, merged or canonicalised */
   struct stat cfg_st;
   if (stat(HUB_CONFIG_FILE, &cfg_st) == 0) {
     if ((cfg_st.st_mode & 0177) != 0)
@@ -706,6 +750,12 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           }
         }
       }
+      // Older layout of the local IP lists: g|<w|x>|<pattern>|<ts>
+      else if (strcmp(k, "g") == 0 &&
+               (strncmp(v, "w|", 2) == 0 || strncmp(v, "x|", 2) == 0)) {
+        load_ip_acl_line(state, v[0], v + 2);
+        cfg_acl_fixed++;  /* rewrite as w|/x| */
+      }
       // NEW: Handle Global Entries (g|key|value|timestamp)
       else if (strcmp(k, "g") == 0) {
         char *s2 = strchr(v, '|');
@@ -822,6 +872,9 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       } else if (strcmp(k, "p") == 0) {
         /* Retired shared bot password: dropped (bots use public keys). */
         cfg_legacy_users++;
+      } else if (strcmp(k, "w") == 0 || strcmp(k, "x") == 0) {
+        if (!load_ip_acl_line(state, k[0], v))
+          cfg_acl_fixed++;
       }
     }
     line = strtok_r(NULL, "\n", &saveptr);
@@ -937,8 +990,9 @@ bool hub_config_load(hub_state_t *state, const char *password) {
              sizeof(hub_mask_record_t) * (size_t)dedup_mask_count);
       state->mask_record_count = dedup_mask_count;
       hub_config_write(state);
-    } else if (cfg_legacy_users > 0) {
-      /* Rewrite once so the passwords / p| line leave the file for good. */
+    } else if (cfg_legacy_users > 0 || cfg_acl_fixed > 0) {
+      /* Rewrite once so the passwords / p| line, and IP-list lines that were
+       * dropped or canonicalised, leave the file for good. */
       hub_config_write(state);
     }
   }

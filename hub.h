@@ -269,6 +269,7 @@
     (size_t)MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
     (size_t)MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
     (size_t)MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
+    (size_t)2 * MAX_IP_ACL_ENTRIES * IP_ACL_LINE_MAX + \
     (size_t)MAX_PEERS            * 512 )
 #define HUB_CONFIG_PER_BOT_MAX ((size_t)MAX_BOT_ENTRIES * 1100)
 
@@ -373,6 +374,21 @@ typedef struct {
   int    churn_count;        // D1: new connections counted in current window
 } ip_rate_limit_t;
 
+/* IP allow/deny list entry (hub_admin 0x38-0x3D).  The lists are local to
+ * this hub: never replicated to peers, never pushed to bots; config lines
+ * w|<pattern>|<ts> (allow) and x|<pattern>|<ts> (deny).  IPv4 only (the hub
+ * listens on AF_INET).  pattern is canonical: a bare address, or network/N
+ * with the host bits cleared; net/mask are its parsed form. */
+#define MAX_IP_ACL_ENTRIES 64          /* per list */
+#define IP_ACL_PATTERN_MAX 19          /* "255.255.255.255/32" + NUL */
+#define IP_ACL_LINE_MAX    48          /* w|<pattern>|<ts>\n */
+typedef struct {
+  char     pattern[IP_ACL_PATTERN_MAX];
+  uint32_t net;              /* host byte order */
+  uint32_t mask;             /* host byte order */
+  time_t   added;
+} hub_ip_acl_t;
+
 typedef struct {
   char ip[64];              // Configured/advertised IP
   int port;
@@ -434,6 +450,7 @@ typedef struct {
   time_t last_seen;
   time_t last_pong_sent;
   time_t connected_at;             // D4: when the socket was accepted/created
+  bool inbound;                    // accepted on the listener (subject to the IP lists)
   bool admin_hello_seen;           // D4b: sent ADMIN-HELLO → longer pre-auth grace
   /* Admin login v2: the one-time challenge handed out in HUB-PUBKEY2.  Set on
    * ADMIN-HELLO, consumed (wiped) by the first ADMIN2 attempt either way. */
@@ -543,6 +560,14 @@ typedef struct {
 
   ip_rate_limit_t ip_limits[MAX_IP_RATE_LIMITS];
   int ip_limits_count;
+
+  /* IP allow/deny lists (local only, see hub_ip_acl_t).  ip_acl_changed makes
+   * hub_maintenance close inbound connections the lists no longer permit. */
+  hub_ip_acl_t ip_allow[MAX_IP_ACL_ENTRIES];
+  int ip_allow_count;
+  hub_ip_acl_t ip_deny[MAX_IP_ACL_ENTRIES];
+  int ip_deny_count;
+  bool ip_acl_changed;
 
   int purge_days_setting;  // Days threshold for tombstone purge (0 = disabled)
   bool trust_loopback;     // D3: if true, 127.0.0.1/::1 bypass rate limiting
@@ -686,7 +711,19 @@ bool hub_client_promote_buffers(hub_client_t *c);
 void increment_active_connections(hub_state_t *state, const char *ip);
 void decrement_active_connections(hub_state_t *state, const char *ip);
 void cleanup_old_ip_limits(hub_state_t *state);
+/* Accept-time allow/deny decision; logs a refusal. */
 bool check_ip_access_lists(hub_state_t *state, const char *ip);
+/* Same decision, silent: deny wins; a non-empty allowlist must match; an
+ * address that does not parse is refused whenever either list has entries. */
+bool hub_ip_acl_permits(const hub_state_t *state, const char *ip);
+/* "a.b.c.d" or "a.b.c.d/N" (N = 0..32, no sign or leading zero) into a
+ * canonical entry (added = 0).  False on anything else. */
+bool hub_ip_acl_parse(const char *in, hub_ip_acl_t *out);
+/* list: 'w' (allow) or 'x' (deny).  Add refuses a duplicate (same network
+ * and prefix) or a full list; remove matches the same way. */
+typedef enum { IP_ACL_ADDED, IP_ACL_DUPLICATE, IP_ACL_FULL, IP_ACL_BAD_LIST } ip_acl_add_t;
+ip_acl_add_t hub_ip_acl_add(hub_state_t *state, char list, const hub_ip_acl_t *e);
+bool hub_ip_acl_remove(hub_state_t *state, char list, const hub_ip_acl_t *e);
 
 void hub_storage_init(void);
 bool hub_storage_update_entry(hub_state_t *state, const char *uuid,

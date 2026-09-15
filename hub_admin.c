@@ -1063,10 +1063,12 @@ void admin_add_allowlist(void) {
     printf("\n═══════════════════════════════════════════════════\n");
     printf("              ADD IP TO ALLOWLIST\n");
     printf("═══════════════════════════════════════════════════\n\n");
-    printf("Format examples:\n");
+    printf("Format examples (IPv4):\n");
     printf("  192.168.1.5       - Single IP\n");
     printf("  192.168.1.0/24    - Subnet (CIDR notation)\n");
     printf("  10.0.0.0/8        - Large network\n\n");
+    printf("The first entry turns the allowlist on: only listed addresses\n");
+    printf("(bots, peer hubs, hub_admin) can connect after that.\n\n");
 
     get_input("IP or CIDR pattern: ", ip_pattern, sizeof(ip_pattern));
 
@@ -1125,10 +1127,11 @@ void admin_add_denylist(void) {
     printf("\n═══════════════════════════════════════════════════\n");
     printf("              ADD IP TO DENYLIST\n");
     printf("═══════════════════════════════════════════════════\n\n");
-    printf("Format examples:\n");
+    printf("Format examples (IPv4):\n");
     printf("  192.168.1.5       - Single IP\n");
     printf("  192.168.1.0/24    - Subnet (CIDR notation)\n");
     printf("  10.0.0.0/8        - Large network\n\n");
+    printf("A denied address is refused even if the allowlist has it.\n\n");
 
     get_input("IP or CIDR pattern: ", ip_pattern, sizeof(ip_pattern));
 

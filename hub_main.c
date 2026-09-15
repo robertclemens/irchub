@@ -440,6 +440,23 @@ void hub_maintenance(hub_state_t *state) {
         state->last_config_write = now;
     }
 
+    /* IP allow/deny lists changed: the accept-time check only sees new
+     * connections, so close the inbound ones the lists no longer permit.
+     * (The admin who made the change is permitted: the change is refused
+     * otherwise.)  Outbound peer links are operator-configured, not listed. */
+    if (state->ip_acl_changed) {
+        state->ip_acl_changed = false;
+        for (int i = 0; i < state->client_count; i++) {
+            hub_client_t *c = state->clients[i];
+            if (c->inbound && !hub_ip_acl_permits(state, c->ip)) {
+                hub_log("[ACCESS_CONTROL] Closing %s: no longer permitted by "
+                        "the allow/deny lists\n", c->ip);
+                hub_disconnect_client(state, c);
+                i--;
+            }
+        }
+    }
+
     /* IP rate-limit cleanup: every 5 minutes */
     if (now - last_ip_cleanup > 300) {
         cleanup_old_ip_limits(state);
@@ -1315,6 +1332,7 @@ int main(int argc, char *argv[]) {
                         snprintf(c->ip, sizeof(c->ip), "%s", incoming_ip);
                         c->last_seen = time(NULL);
                         c->connected_at = c->last_seen;  /* D4: pre-auth clock */
+                        c->inbound = true;
                         c->last_pong_sent = 0;
                         state.clients[state.client_count++] = c;
 
