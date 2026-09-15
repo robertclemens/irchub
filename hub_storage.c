@@ -134,9 +134,16 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
                               const char *key, const char *value,
                               const char *extra, const char *op, time_t ts) {
 
+  /* Retired password-era keys (docs/passwordless.md §3.3): the shared bot
+   * password 'p' and the legacy global admin password 'a' are never stored
+   * again, whichever path (delta, push, sync, load) offers them. */
+  if (strcmp(key, "p") == 0 || strcmp(key, "a") == 0) {
+    hub_log("[STORAGE] REJECTED retired key '%s' (passwordless)\n", key);
+    return false;
+  }
+
   // [MODIFIED] Global keys intercept
-  if (strcmp(key, "c") == 0 || strcmp(key, "m") == 0 || strcmp(key, "o") == 0 ||
-      strcmp(key, "a") == 0 || strcmp(key, "p") == 0) {
+  if (strcmp(key, "c") == 0 || strcmp(key, "m") == 0 || strcmp(key, "o") == 0) {
     return hub_storage_update_global_entry(state, key, value, extra, op, ts);
   }
 
@@ -472,17 +479,18 @@ int hub_storage_get_summary_list(hub_state_t *state, char *buffer,
 // Does NOT include "b|uuid|" prefix for global items, preserving protocol
 // compatibility
 void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
-                              char *buffer, int max_len) {
+                              bool proto_v2, char *buffer, int max_len) {
   int offset = 0;
   int written;
   buffer[0] = 0;
 
-  // 1. Add Global Entries (channels, bot-pass; skip h/n/a/m/o — now in typed arrays)
+  // 1. Add Global Entries (channels; skip h/n/a/m/o — now in typed arrays —
+  //    and the retired bot password p)
   for (int i = 0; i < state->global_entry_count; i++) {
     config_entry_t *e = &state->global_entries[i];
     if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0 ||
         strcmp(e->key, "a") == 0 || strcmp(e->key, "m") == 0 ||
-        strcmp(e->key, "o") == 0) {
+        strcmp(e->key, "o") == 0 || strcmp(e->key, "p") == 0) {
       continue;
     }
     written = snprintf(buffer + offset, max_len - offset, "%s|%s|%ld\n", e->key,
@@ -492,15 +500,14 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
     offset += written;
   }
 
-  // 1a. Add named admin/oper records (new format: a|/o| lines, 8-field with pubkey_b64)
+  // 1a. Named admin/oper records.  A v2 (passwordless) bot gets
+  //     uuid|name|pubkey|act|seen|ts|; any other connection gets the legacy
+  //     shape with an EMPTY password slot, so an old bot refuses every admin
+  //     command instead of reading the public key as a password.
   for (int i = 0; i < state->user_record_count; i++) {
     hub_user_record_t *u = &state->user_records[i];
-    written = snprintf(buffer + offset, max_len - offset,
-                       "%c|%s|%s|%s|%s|%ld|%ld|%s\n",
-                       u->type, u->uuid, u->name, u->password,
-                       u->is_active ? "add" : "del",
-                       (long)u->last_seen, (long)u->timestamp,
-                       u->has_pubkey ? u->pubkey_b64 : "");
+    written = hub_format_user_record(u, !proto_v2, buffer + offset,
+                                     (size_t)(max_len - offset));
     if (written < 0 || written >= (max_len - offset)) break;
     offset += written;
   }
@@ -526,13 +533,17 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
     offset += written;
   }
 
-  // 1c. Push network opt flag string (always, even when empty, so bots can
-  // observe a clear -> blank transition).  Capital 'O' for bot wire format.
-  written = snprintf(buffer + offset, max_len - offset, "O|%s|%ld\n",
-                     state->opt_flags[0] ? state->opt_flags : "",
-                     (long)(state->opt_flags_ts > 0 ? state->opt_flags_ts : now));
-  if (written > 0 && written < (max_len - offset)) {
-    offset += written;
+  // 1c. Push network opt flag string, even when empty, so bots observe a
+  // clear.  Capital 'O' for bot wire format.  Only with a real timestamp: a
+  // hub that has none (fresh, never synced) must not stamp "no flags" with
+  // `now` — bots would take that as newest, drop 'h' and then refuse the
+  // network's actual (older) value.
+  if (state->opt_flags_ts > 0) {
+    written = snprintf(buffer + offset, max_len - offset, "O|%s|%lld\n",
+                       state->opt_flags, (long long)state->opt_flags_ts);
+    if (written > 0 && written < (max_len - offset)) {
+      offset += written;
+    }
   }
 
   // 2. Add Bot-Specific Entries
@@ -559,8 +570,10 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
     }
   }
 
-  // 3. Add OTHER bots' hostmasks (for offline peer operation)
-  // This allows bots to operate independently when hub is unavailable
+  // 3. Add OTHER bots as trusted-bot lines (for offline peer operation):
+  //    v2:     b|<hostmask>|<uuid>|<pubkey>|<ts>   (pubkey seals ~B2 traffic)
+  //    legacy: b|<hostmask>|<uuid>|<ts>
+  //    ts = max(hostmask ts, pubkey ts) so a rekey alone is seen as newer.
   for (int i = 0; i < state->bot_count; i++) {
     if (strcmp(state->bots[i].uuid, uuid) == 0)
       continue; // Skip self
@@ -568,17 +581,25 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
       continue; // Skip inactive bots
 
     bot_config_t *b = &state->bots[i];
+    const config_entry_t *h = NULL, *pub = NULL;
     for (int j = 0; j < b->entry_count; j++) {
-      if (strcmp(b->entries[j].key, "h") == 0) {
-        // Format: b|hostmask|uuid|timestamp
-        // Cleaner format for storage and matching
-        written = snprintf(buffer + offset, max_len - offset, "b|%s|%s|%ld\n",
-                           b->entries[j].value, b->uuid,
-                           (long)b->entries[j].timestamp);
-        if (written < 0 || written >= (max_len - offset))
-          break;
-        offset += written;
-      }
+      if (strcmp(b->entries[j].key, "h") == 0) h = &b->entries[j];
+      else if (strcmp(b->entries[j].key, "pub") == 0) pub = &b->entries[j];
     }
+    if (!h) continue;
+    long ts = (long)h->timestamp;
+    if (proto_v2) {
+      unsigned char raw[COMBINED_KEY_LEN];
+      bool key_ok = pub && hub_crypto_pubkey_b64_decode(pub->value, raw);
+      if (key_ok && (long)pub->timestamp > ts) ts = (long)pub->timestamp;
+      written = snprintf(buffer + offset, max_len - offset, "b|%s|%s|%s|%ld\n",
+                         h->value, b->uuid, key_ok ? pub->value : "", ts);
+    } else {
+      written = snprintf(buffer + offset, max_len - offset, "b|%s|%s|%ld\n",
+                         h->value, b->uuid, ts);
+    }
+    if (written < 0 || written >= (max_len - offset))
+      break;
+    offset += written;
   }
 }

@@ -156,13 +156,15 @@ $(ADMIN_TARGET): $(ADMIN_OBJECTS)
 # Key Generator Utility
 # ============================================================================
 
-$(KEYGEN_TARGET): $(OBJ_DIR)/keygen.o $(OBJ_DIR)/hub_crypto.o
+# keygen.c is self-contained (OpenSSL only) and byte-identical to
+# ircbot/utils/keygen.c — it links nothing from the hub.
+$(KEYGEN_TARGET): $(OBJ_DIR)/keygen.o
 	@echo "Linking $@..."
 	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 	@echo "Built: $@ (mode: $(BUILD_MODE))"
 	@echo ""
 
-$(OBJ_DIR)/keygen.o: keygen.c hub.h
+$(OBJ_DIR)/keygen.o: keygen.c
 	@echo "Compiling $<..."
 	@$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -241,12 +243,12 @@ install: all
 	@echo "Installed to $(PREFIX)"
 	@echo ""
 	@echo "First-time setup:"
-	@echo "  1. Generate keys: $(BINDIR)/hub_keygen"
-	@echo "  2. Run setup: $(BINDIR)/irchub -setup"
-	@echo "  3. Set env and start: export HUB_PASS=<password> && $(BINDIR)/irchub"
+	@echo "  1. On the first admin's machine: $(BINDIR)/hub_keygen <name>"
+	@echo "  2. Run setup (imports that .public.b64): $(BINDIR)/irchub -setup"
+	@echo "  3. Start (prompts for the config password): $(BINDIR)/irchub"
 	@echo ""
 	@echo "Utilities:"
-	@echo "  - Admin client: $(BINDIR)/hub_admin <ip> <port> <pub.pem>"
+	@echo "  - Admin client: $(BINDIR)/hub_admin <ip> <port> <name>.private.b64"
 	@echo "  - Decrypt config: $(BINDIR)/hub_decrypt [config_file]"
 	@echo "  - Encrypt config: $(BINDIR)/hub_encrypt [input_file] [output_file]"
 	@echo ""
@@ -324,7 +326,7 @@ help:
 	@echo "  debug        - Build with debug symbols and sanitizers"
 	@echo "  release      - Build optimized release version"
 	@echo "  production   - Build maximum optimization for production"
-	@echo "  keygen       - Create and build key generator utility"
+	@echo "  keygen       - Build the keypair generator (bin/keygen)"
 	@echo "  install      - Install to $(PREFIX)"
 	@echo "  uninstall    - Remove installed files"
 	@echo "  test         - Run test suite"
@@ -347,10 +349,10 @@ help:
 	@echo "  make install PREFIX=/opt/irchub  # Install to /opt"
 	@echo ""
 	@echo "After building:"
-	@echo "  hub_keygen                    # Generate keys"
-	@echo "  irchub -setup                          # Initial setup"
-	@echo "  export HUB_PASS=mypass && irchub       # Run hub"
-	@echo "  hub_admin 127.0.0.1 6667 hub_public.pem  # Admin client"
+	@echo "  bin/keygen robert             # Keypair for admin 'robert' (on their machine)"
+	@echo "  bin/irchub -setup             # Initial setup (imports robert's .public.b64)"
+	@echo "  bin/irchub                    # Run hub (prompts for the config password)"
+	@echo "  bin/hub_admin 127.0.0.1 7000 <ts>_robert.private.b64  # Admin client"
 	@echo ""
 
 # ============================================================================

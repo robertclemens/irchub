@@ -21,6 +21,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <limits.h>
 
 
 FILE *log_fp = NULL;
@@ -246,7 +247,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
 
     if (!peer || !peer->has_pubkey) {
         hub_log("[PEER] Peer has no registered pubkey — refusing to connect. "
-                "Re-add this peer with its Curve25519 pubkey to enable v2 auth.\n");
+                "Re-add this peer with its Curve25519 pubkey (HUBv3 auth needs it).\n");
         hub_disconnect_client(state, c);
         return;
     }
@@ -264,11 +265,11 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
 
         char transcript[512];
         int tlen = snprintf(transcript, sizeof(transcript),
-                            "irchub-peer-auth-v2|%s|%s|%d|%s|%s",
+                            "irchub-peer-auth-v3|%s|%s|%d|%s|%s",
                             state->hub_uuid, ts_str, state->port,
                             state->hub_friendly_name, state->bind_ip);
         if (tlen < 0 || tlen >= (int)sizeof(transcript)) {
-            hub_log("[PEER] v2 transcript too long\n");
+            hub_log("[PEER] v3 transcript too long\n");
             hub_disconnect_client(state, c);
             return;
         }
@@ -277,20 +278,20 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
         if (!hub_crypto_ed25519_sign(state->hub_ed25519_priv,
                                      (unsigned char *)transcript, (size_t)tlen,
                                      sig)) {
-            hub_log("[PEER] v2 Ed25519 sign failed\n");
+            hub_log("[PEER] v3 Ed25519 sign failed\n");
             hub_disconnect_client(state, c);
             return;
         }
 
         char *sig_b64 = base64_encode(sig, ED25519_SIG_LEN);
         if (!sig_b64) {
-            hub_log("[PEER] v2 signature base64 encode failed\n");
+            hub_log("[PEER] v3 signature base64 encode failed\n");
             hub_disconnect_client(state, c);
             return;
         }
 
         msg_len = snprintf((char *)pack, sizeof(pack),
-                           "HUBv2|%s|%d|%s|%s|%s|%s",
+                           "HUBv3|%s|%d|%s|%s|%s|%s",
                            state->hub_uuid, state->port,
                            state->hub_friendly_name, state->bind_ip,
                            ts_str, sig_b64);
@@ -298,7 +299,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
         free(sig_b64);
 
         if (msg_len < 0 || msg_len >= (int)sizeof(pack)) {
-            hub_log("[PEER] v2 packet too long\n");
+            hub_log("[PEER] v3 packet too long\n");
             hub_disconnect_client(state, c);
             return;
         }
@@ -789,6 +790,57 @@ static void harden_process(void) {
 #endif
 }
 
+/* -setup: read a user's public key — the pasted 88-char key, or a path to
+ * their .public.b64 — show its fingerprint and confirm.  False on EOF. */
+static bool setup_read_pubkey(const char *who, char out[COMBINED_KEY_B64 + 1]) {
+    for (;;) {
+        char in[PATH_MAX];
+        unsigned char raw[COMBINED_KEY_LEN];
+        out[0] = '\0';
+        printf("Public key for '%s' (paste the 88 chars, or a path to the "
+               ".public.b64): ", who);
+        fflush(stdout);
+        if (!fgets(in, sizeof(in), stdin)) return false;
+        in[strcspn(in, "\r\n")] = '\0';
+        if (in[0] == '\0') {
+            printf("A public key is required (run ./keygen %s on the admin's "
+                   "machine).\n", who);
+            continue;
+        }
+        /* Private and public key files have the same shape; refuse a keygen
+         * private file by name before it gets published in the a| record. */
+        if (strstr(in, ".private.")) {
+            printf("That is a PRIVATE key file — it stays with the admin. "
+                   "Use the matching .public.b64.\n");
+            continue;
+        }
+        if (hub_crypto_pubkey_b64_decode(in, raw)) {
+            memcpy(out, in, COMBINED_KEY_B64);   /* validated: exactly 88 */
+        } else {
+            FILE *f = fopen(in, "r");
+            char line[256] = {0};
+            if (f) {
+                if (!fgets(line, sizeof(line), f)) line[0] = '\0';
+                fclose(f);
+                line[strcspn(line, " \t\r\n")] = '\0';
+            }
+            if (!line[0] || !hub_crypto_pubkey_b64_decode(line, raw)) {
+                printf("Not an 88-char public key%s. Use the .public.b64 — "
+                       "never the .private.b64.\n", f ? " in that file" : "");
+                continue;
+            }
+            memcpy(out, line, COMBINED_KEY_B64);
+        }
+        out[COMBINED_KEY_B64] = '\0';
+        char fp[KEY_FP_LEN + 1], yn[16] = {0};
+        hub_crypto_key_fingerprint(raw, fp);
+        printf("  Key fingerprint: %s — use this key? (Y/n): ", fp);
+        fflush(stdout);
+        if (!fgets(yn, sizeof(yn), stdin)) return false;
+        if (yn[0] != 'n' && yn[0] != 'N') return true;
+    }
+}
+
 int main(int argc, char *argv[]) {
     harden_process();
 
@@ -825,7 +877,6 @@ int main(int argc, char *argv[]) {
      * Best-effort; a failure here is not fatal. */
     {
         struct { void *p; size_t n; const char *what; } locks[] = {
-            { state.admin_password,   sizeof(state.admin_password),   "admin_password"   },
             { state.config_pass,      sizeof(state.config_pass),      "config_pass"      },
             { state.hub_ed25519_priv, sizeof(state.hub_ed25519_priv), "hub_ed25519_priv" },
             { state.hub_x25519_priv,  sizeof(state.hub_x25519_priv),  "hub_x25519_priv"  },
@@ -937,21 +988,19 @@ int main(int argc, char *argv[]) {
         }
         (void)ch;
 
-        /* The legacy single 'Hub Admin Password' is gone — auth is per-admin
-         * via the a| user records. state->admin_password remains in the struct
-         * but is not used or persisted by the v3 admin auth path. */
-        state.admin_password[0] = '\0';
-
-        /* Admin user setup — creates first a| and m| records.
-         * Each admin gets a Curve25519 keypair: pubkey lives in the a| record
-         * (replicated through the mesh); the matching priv is dumped to a file
-         * the operator must carry to the machine that runs hub_admin. */
+        /* Admin user setup — creates the first a| and m| records.  Admins
+         * have no password: the operator generates the admin's keypair on the
+         * admin's own machine (keygen <name>) and imports only the PUBLIC key
+         * here.  The hub never sees or prints a user's private key. */
         printf("\n--- First Admin Setup ---\n");
-        printf("This creates the first named admin for IRC bot command\n");
-        printf("authentication AND hub_admin login (per-admin password).\n\n");
+        printf("This creates the first named admin, who can log into hub_admin\n");
+        printf("and command bots over IRC. Admins sign in with a Curve25519 key,\n");
+        printf("not a password: on the admin's own machine run\n");
+        printf("    ./keygen <name>      (irchub/bin/keygen or ircbot/utils/keygen)\n");
+        printf("keep the <ts>_<name>.private.b64 there (chmod 600), and give this\n");
+        printf("wizard the <ts>_<name>.public.b64.\n\n");
         {
             char bot_admin_name[64] = {0};
-            char bot_admin_pass1[MAX_PASS] = {0}, bot_admin_pass2[MAX_PASS] = {0};
 
             /* Name */
             while (bot_admin_name[0] == '\0') {
@@ -964,56 +1013,16 @@ int main(int argc, char *argv[]) {
                     bot_admin_name[0] = '\0';
                 }
             }
+            if (!bot_admin_name[0]) {
+                fprintf(stderr, "No admin name given; setup aborted.\n");
+                return 1;
+            }
 
-            /* Password */
-            do {
-                read_pass_hidden("Admin Password: ", bot_admin_pass1, sizeof(bot_admin_pass1));
-                read_pass_hidden("Confirm Admin Password: ", bot_admin_pass2, sizeof(bot_admin_pass2));
-                if (strcmp(bot_admin_pass1, bot_admin_pass2) != 0)
-                    printf("Passwords do not match. Try again.\n");
-            } while (strcmp(bot_admin_pass1, bot_admin_pass2) != 0);
-
-            /* Generate per-admin Curve25519 keypair.  The PRIVATE key is
-             * displayed exactly once — never written to disk by this wizard.
-             * The operator must copy it (out of band) to a file on the host
-             * that will run hub_admin (e.g. ~/admin_<name>.b64, 0600).
-             * The PUBLIC key is stored in the a| record and replicates
-             * through the mesh. */
+            /* Public key: pasted, or a path to the .public.b64 */
             char admin_pub_b64[COMBINED_KEY_B64 + 1] = {0};
-            {
-                unsigned char ad_priv[COMBINED_KEY_LEN], ad_pub[COMBINED_KEY_LEN];
-                if (!hub_crypto_generate_combined_keypair(ad_priv, ad_pub)) {
-                    fprintf(stderr, "Admin keypair generation failed.\n");
-                    return 1;
-                }
-                char *priv_b64 = base64_encode(ad_priv, COMBINED_KEY_LEN);
-                char *pub_b64  = base64_encode(ad_pub,  COMBINED_KEY_LEN);
-                secure_wipe(ad_priv, COMBINED_KEY_LEN);
-                if (priv_b64 && pub_b64) {
-                    snprintf(admin_pub_b64, sizeof(admin_pub_b64), "%s", pub_b64);
-                    printf("\n");
-                    printf("    ┌──────────────────────────────────────────────────────────┐\n");
-                    printf("    │  ⚠ Admin '%s' PRIVATE key (save this NOW; not stored):  \n",
-                           bot_admin_name);
-                    printf("    │                                                          \n");
-                    printf("    │  %s  \n", priv_b64);
-                    printf("    │                                                          \n");
-                    printf("    │  Save to (e.g.) admin_%s.b64 with mode 0600 on the      \n",
-                           bot_admin_name);
-                    printf("    │  host that will run hub_admin, then:                     \n");
-                    printf("    │    ./hub_admin <ip> <port> admin_%s.b64                  \n",
-                           bot_admin_name);
-                    printf("    │                                                          \n");
-                    printf("    │  This key is NOT recoverable from .irchub.cnf if lost.   \n");
-                    printf("    └──────────────────────────────────────────────────────────┘\n");
-                    printf("\n    Admin public key (replicated through mesh in a| record):\n");
-                    printf("      %s\n\n", pub_b64);
-                    printf("    Press Enter when you have copied the private key...");
-                    fflush(stdout);
-                    { int c; while ((c = getchar()) != '\n' && c != EOF); }
-                }
-                if (priv_b64) { secure_wipe(priv_b64, strlen(priv_b64)); free(priv_b64); }
-                if (pub_b64)  free(pub_b64);
+            if (!setup_read_pubkey(bot_admin_name, admin_pub_b64)) {
+                fprintf(stderr, "No public key given; setup aborted.\n");
+                return 1;
             }
 
             /* Generate UUID and create the user record */
@@ -1024,17 +1033,12 @@ int main(int argc, char *argv[]) {
             if (state.user_record_count < MAX_HUB_USER_RECORDS) {
                 hub_user_record_t *u = &state.user_records[state.user_record_count++];
                 memset(u, 0, sizeof(*u));
-                snprintf(u->uuid,     sizeof(u->uuid),     "%s", new_uuid);
-                snprintf(u->name,     sizeof(u->name),     "%s", bot_admin_name);
-                snprintf(u->password, sizeof(u->password), "%s", bot_admin_pass1);
+                snprintf(u->uuid,       sizeof(u->uuid),       "%s", new_uuid);
+                snprintf(u->name,       sizeof(u->name),       "%s", bot_admin_name);
+                snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", admin_pub_b64);
+                u->has_pubkey = true;
                 u->type = 'a'; u->is_active = true; u->timestamp = now;
-                if (admin_pub_b64[0]) {
-                    snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", admin_pub_b64);
-                    u->has_pubkey = true;
-                }
             }
-            secure_wipe(bot_admin_pass1, sizeof(bot_admin_pass1));
-            secure_wipe(bot_admin_pass2, sizeof(bot_admin_pass2));
 
             /* Collect usermasks in a loop */
             int masks_added = 0;
@@ -1066,13 +1070,13 @@ int main(int argc, char *argv[]) {
                 masks_added++;
             }
 
-            printf("[+] Bot admin '%s' created with %d usermask(s), UUID %s\n",
+            printf("[+] Admin '%s' created with %d usermask(s), UUID %s\n",
                    bot_admin_name, masks_added, new_uuid);
+            printf("    Log in with:  ./hub_admin <ip> <port> <its .private.b64>\n");
         }
 
         hub_config_write(&state);
         secure_wipe(state.config_pass, sizeof(state.config_pass));
-        secure_wipe(state.admin_password, sizeof(state.admin_password));
         printf("Done.\n");
 
         secure_wipe(state.hub_ed25519_priv, 32);
@@ -1160,15 +1164,20 @@ int main(int argc, char *argv[]) {
     }
     state.pid_fd = pid_fd;
 
+    /* The config password must be in place BEFORE the load: hub_config_load()
+     * rewrites the file itself when it dedups or migrates records (passwordless
+     * migration drops every password on the first start), and that write reads
+     * state.config_pass — unset, it would re-encrypt the config under an empty
+     * password and lock the hub out on the next start. */
+    hub_set_config_pass(&state, _hub_plain_pass);
     if (!hub_config_load(&state, _hub_plain_pass)) {
         secure_wipe(_hub_plain_pass, sizeof(_hub_plain_pass));
+        OPENSSL_cleanse(state.config_pass, sizeof(state.config_pass));
         printf("Config load failed. Run -setup.\n");
         if (log_fp) fprintf(log_fp, "Config load failed.\n");
         remove(HUB_PID_FILE);
         return 1;
     }
-    /* XOR-protect config_pass; hub_config_write() decodes it on every save. */
-    hub_set_config_pass(&state, _hub_plain_pass);
     secure_wipe(_hub_plain_pass, sizeof(_hub_plain_pass));
 
     /* Ensure next_lamport_seq is above the time-based floor even on first

@@ -34,10 +34,11 @@
 #define HUB_TOOL_HDR_LEN (SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN)
 #define HUB_TOOL_KEY_LEN 32
 /* Largest config the hub itself can write: hub_config_write() sizes its
- * buffer as 8192 + bot_count * MAX_BOT_ENTRIES * 1100 and never writes past
- * it, with bot_count <= MAX_BOTS.  Keep in step with that estimate. */
+ * buffer as HUB_CONFIG_FIXED_MAX + bot_count * HUB_CONFIG_PER_BOT_MAX and
+ * never writes past it (it refuses rather than truncates), with bot_count <=
+ * MAX_BOTS.  Keep in step with that estimate. */
 #define HUB_TOOL_MAX_CONFIG \
-  ((size_t)8192 + (size_t)MAX_BOTS * MAX_BOT_ENTRIES * 1100)
+  (HUB_CONFIG_FIXED_MAX + (size_t)MAX_BOTS * HUB_CONFIG_PER_BOT_MAX)
 
 /* Disable core dumps and same-uid ptrace attach before any secret is loaded,
  * and ignore SIGPIPE so a closed output pipe surfaces as EPIPE and the wipe

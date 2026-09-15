@@ -42,11 +42,13 @@
 #define MAX_PENDING_BOTS 10
 #define MAX_PENDING_OP_REQUESTS 500
 #define PBKDF2_ITERATIONS 100000 // For config-file key derivation
-/* Admin-password hashing: ~250 ms on commodity hardware; much slower than
- * config-key derivation since this is an interactive auth path not a startup
- * hot path. Format on disk: "$pbkdf2$<salt_b64>$<hash_b64>" */
-#define ADMIN_PBKDF2_ITERATIONS 500000
-#define ADMIN_PASS_HASH_PREFIX "$pbkdf2$"
+/* Passwordless (docs/passwordless.md).  Admins/opers/bots authenticate with
+ * their Curve25519 combined keys only; the config-file password is the one
+ * password left.  A bot advertises protocol BOT_PROTO_PASSWORDLESS as "v|2"
+ * in its CMD_CONFIG_PUSH; until a connection has done so it is sent legacy
+ * record shapes with an empty password slot (old bots then fail closed). */
+#define BOT_PROTO_PASSWORDLESS 2
+#define KEY_FP_LEN 19              /* "ab12:cd34:ef56:7890" */
 #define HUB_PID_FILE ".irchub.pid"
 #define HUB_PASS_FILE ".irchub.pass"
 #define HUB_CONFIG_PURGE_DAYS_KEY "purge_days"
@@ -160,8 +162,10 @@
 #define CMD_ADMIN_LIST_OPERS 0x2C     // List oper masks
 #define CMD_ADMIN_ADD_OPER 0x2D       // Add oper mask
 #define CMD_ADMIN_DEL_OPER 0x2E       // Remove oper mask
-#define CMD_ADMIN_SET_ADMIN_PASS 0x2F // Change admin password
-#define CMD_ADMIN_SET_BOT_PASS 0x30   // Change bot password
+/* 0x2F (SET_ADMIN_PASS) and 0x30 (SET_BOT_PASS) are retired — passwordless.
+ * Kept as names so the hub can answer "retired"; never reuse the values. */
+#define CMD_ADMIN_SET_ADMIN_PASS 0x2F // RETIRED
+#define CMD_ADMIN_SET_BOT_PASS 0x30   // RETIRED
 #define CMD_ADMIN_OP_USER 0x31        // Op a user in a channel
 
 // Bot-to-Bot Op Commands (via Hub)
@@ -200,13 +204,14 @@
 #define CMD_ADMIN_DEL_OPER_RECORD 0x49  // Soft-delete oper + all its m| lines (payload: name)
 #define CMD_ADMIN_ADD_USERMASK   0x4A   // Add mask to admin or oper by name (payload: name|mask)
 #define CMD_ADMIN_DEL_USERMASK   0x4B   // Soft-delete one mask for named user (payload: name|mask)
-#define CMD_ADMIN_SET_USERPASS   0x4C   // Change password for named user (payload: name|newpassword)
+#define CMD_ADMIN_SET_USERPASS   0x4C   // RETIRED (passwordless); never reuse
 #define CMD_ADMIN_MATCH          0x4D   // Query all records for user or * (payload: name or *)
 #define CMD_ADMIN_LIST_ADMINS    0x4E   // List all admin records
 #define CMD_ADMIN_LIST_OPERS_V2  0x4F   // List all oper records
 #define CMD_ADMIN_SET_PEER_PUBKEY 0x52  // Set/replace pubkey on existing peer (payload: UUID:PUBKEY_B64)
 #define CMD_ADMIN_SET_OPT_FLAGS   0x53  // Set network opt flag string (payload: <letters>)
 #define CMD_ADMIN_GET_OPT_FLAGS   0x54  // Get current network opt flag string
+#define CMD_ADMIN_SET_USERKEY     0x55  // Replace a user's public key (payload: name|pubkey_b64)
 
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
@@ -229,9 +234,9 @@
 #define BOT_SYNC_FIELDS   8      /* {t,n,h,pub,seen,d} = 6, +slack */
 #define GLOBAL_LINE_MAX   1088   /* config_entry_t: key[32]+value[1024]+ts+seps */
 #define BOT_FIELD_LINE    320    /* per-bot line: capped value (<=MAX_MASK_LEN) */
-#define USER_LINE_MAX     384    /* a|/o|: uuid+name+MAX_PASS+COMBINED_KEY_B64 */
+#define USER_LINE_MAX     384    /* a|/o|: uuid+name+COMBINED_KEY_B64 (+legacy slot) */
 #define MASK_LINE_MAX     352    /* m|: uuid+MAX_MASK_LEN */
-#define BLINE_MAX         352    /* b|<mask>|<uuid>|<ts> trusted-bot line */
+#define BLINE_MAX         448    /* b|<mask>|<uuid>|<pubkey>|<ts> trusted-bot line */
 #define PEER_LINE_MAX     256    /* peer|/opt| sync lines */
 #define PAYLOAD_SLACK     8192
 
@@ -254,6 +259,18 @@
     MAX_BOTS * BOT_SYNC_FIELDS * BOT_FIELD_LINE + \
     MAX_PEERS            * PEER_LINE_MAX   + \
     PAYLOAD_SLACK )
+
+/* hub_config_write() buffer: every serialized section at its bound, with the
+ * per-bot term scaled by the bots actually present.  A config that does not
+ * fit is NOT written (the old file is kept) — never a truncated one.
+ * hub_tool.h's HUB_TOOL_MAX_CONFIG is this at MAX_BOTS; keep them in step. */
+#define HUB_CONFIG_FIXED_MAX \
+  ( (size_t)8192 + \
+    (size_t)MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
+    (size_t)MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
+    (size_t)MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
+    (size_t)MAX_PEERS            * 512 )
+#define HUB_CONFIG_PER_BOT_MAX ((size_t)MAX_BOT_ENTRIES * 1100)
 
 /* Largest bulk lane payload — buffers on the config/sync paths size to this. */
 #define MAX_BULK_PAYLOAD \
@@ -300,11 +317,12 @@ typedef struct {
   char   uuid[37];
   char   name[64];
   /* Per-user Curve25519 combined pubkey (Ed25519 + X25519), base64-encoded
-   * (88 chars + NUL).  Empty when no key on file.  Used by hub_admin to
-   * authenticate; the matching priv key lives only on the admin's machine. */
+   * (88 chars + NUL) — the user's only credential: hub_admin logins and bot
+   * ~A2 commands verify against it.  Empty (has_pubkey false) for a legacy
+   * record not yet given a key; such a user can authenticate nowhere.  The
+   * matching private key lives only on the user's machine. */
   char   pubkey_b64[COMBINED_KEY_B64 + 1];
   bool   has_pubkey;
-  char   password[MAX_PASS];
   char   type;         /* 'a' = admin, 'o' = oper */
   bool   is_active;    /* false when action == "del" */
   time_t last_seen;
@@ -368,9 +386,8 @@ typedef struct {
   time_t last_mesh_report;
   char last_gossip[MAX_BUFFER];
 
-  /* v2 peer auth: per-peer Curve25519 public keys. When has_pubkey is true
-   * the handshake uses Ed25519-signature-based auth and drops the shared
-   * admin_password from the wire. */
+  /* Peer auth (HUBv3): per-peer Curve25519 public keys. has_pubkey is
+   * required — a peer without one is refused (there is no shared secret). */
   unsigned char ed_pub[ED25519_KEY_LEN];
   unsigned char x25519_pub[X25519_KEY_LEN];
   bool has_pubkey;
@@ -418,6 +435,16 @@ typedef struct {
   time_t last_pong_sent;
   time_t connected_at;             // D4: when the socket was accepted/created
   bool admin_hello_seen;           // D4b: sent ADMIN-HELLO → longer pre-auth grace
+  /* Admin login v2: the one-time challenge handed out in HUB-PUBKEY2.  Set on
+   * ADMIN-HELLO, consumed (wiped) by the first ADMIN2 attempt either way. */
+  unsigned char admin_nonce[32];
+  bool admin_nonce_set;
+  /* Protocol version this bot connection advertised ("v|N" in its config
+   * push): 0 = not known yet, 1 = its push carried no v| (a pre-passwordless
+   * build; it was sent the legacy-shaped config at once), >= 2 = advertised.
+   * Per connection on purpose: a downgraded binary reconnecting is never
+   * mistaken for a passwordless one. */
+  int bot_proto;
   unsigned char *recv_buf;         // D2: heap; PREAUTH_BUF_SIZE then MAX_BUFFER
   int           recv_cap;          // D2: allocated capacity of recv_buf
   bot_auth_state_t bot_auth_state;
@@ -472,7 +499,6 @@ typedef struct {
   char bind_ip[64];          // IP this hub advertises itself as in mesh
   char hub_uuid[64];         // This hub's UUID
   char hub_friendly_name[64]; // This hub's friendly name
-  char admin_password[128];
   /* config_pass holds the plaintext AES-GCM config-file password for the
    * lifetime of the process (needed on every config write).  It is mlock'd
    * so the OS cannot page it to swap, and OPENSSL_cleanse'd at shutdown.
@@ -585,8 +611,31 @@ void hub_log(const char *format, ...);
 
 bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);
-bool hub_admin_hash_password(const char *plaintext, char *out, size_t out_len);
-bool hub_admin_verify_password(const char *plaintext, const char *stored);
+
+/* a|/o| record codec (docs/passwordless.md §3.1), shared by config load,
+ * peer sync and bot pushes.  Field 3 decides: a valid key = new format;
+ * anything else is a legacy password, dropped, key taken from field 7.
+ * *legacy (optional) reports which shape was seen. */
+bool hub_parse_user_record(const char *data, char type, hub_user_record_t *out,
+                           bool *legacy);
+/* Full line incl. "\n".  legacy_v1 emits the fail-closed shape for bots that
+ * have not advertised v|2: a|uuid|name||act|seen|ts|pubkey. */
+int hub_format_user_record(const hub_user_record_t *u, bool legacy_v1,
+                           char *buf, size_t len);
+/* Timestamp for changing an EXISTING replicated record: now, but always past
+ * its previous stamp.  Peers and bots accept only a strictly newer timestamp,
+ * so an add and a remove in the same second would tie and the remove would
+ * never replicate (a removed admin staying active elsewhere). */
+static inline time_t hub_lww_next_ts(time_t prev) {
+  time_t now = time(NULL);
+  return now > prev ? now : prev + 1;
+}
+
+/* Value of an opt line, "<letters>|<ts>" — including the "|<ts>" form a
+ * clear produces, which a plain "%[^|]|%lld" scan rejects.  flags gets only
+ * [a-zA-Z0-9]; false if the timestamp is missing or not positive. */
+bool hub_parse_opt_value(const char *v, char flags[MAX_OPT_FLAGS + 1],
+                         time_t *ts);
 
 // Curve25519 crypto functions
 bool hub_crypto_generate_combined_keypair(unsigned char priv_out[64],
@@ -607,6 +656,16 @@ bool hub_crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
                             const unsigned char *salt, size_t salt_len,
                             const unsigned char *info, size_t info_len,
                             unsigned char *out, size_t out_len);
+/* Combined public key (ed_pub || x_pub) from a combined private key. */
+bool hub_crypto_combined_pub_from_priv(const unsigned char priv[64],
+                                       unsigned char pub[64]);
+/* Strict: canonical base64 of exactly 64 bytes, neither half all zero. */
+bool hub_crypto_pubkey_b64_decode(const char *b64, unsigned char out[64]);
+/* "ab12:cd34:ef56:7890" — first 8 bytes of SHA-256(pub64). */
+void hub_crypto_key_fingerprint(const unsigned char pub[64],
+                                char out[KEY_FP_LEN + 1]);
+/* Fingerprint of an 88-char key string, or "(no key)"/"(bad key)". */
+void hub_crypto_key_fingerprint_b64(const char *b64, char out[KEY_FP_LEN + 1]);
 
 // AES-GCM
 int aes_gcm_decrypt(const unsigned char *input, int input_len,
@@ -641,8 +700,10 @@ int hub_storage_get_full_list(hub_state_t *state, char *buffer, int max_len);
 int hub_storage_get_summary_list(hub_state_t *state, char *buffer, int max_len);
 
 void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len);
+/* proto_v2: the receiving connection advertised v|2 (new a|/o|/b| shapes);
+ * false sends the fail-closed legacy shapes. */
 void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
-                              char *buffer, int max_len);
+                              bool proto_v2, char *buffer, int max_len);
 void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
                                  int exclude_fd);
 

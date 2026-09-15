@@ -1,12 +1,14 @@
 # irchub
 
-A hub server for coordinating networks of IRC bots. irchub handles centralized key management, encrypted configuration distribution, bot provisioning, and inter-hub mesh networking — so your bots always have up-to-date credentials and settings without manual intervention.
+A hub server for coordinating networks of IRC bots. irchub handles encrypted configuration distribution, bot registration, and inter-hub mesh networking — so your bots always have up-to-date users, keys and settings without manual intervention.
+
+There are no admin, oper or bot passwords: every hub, bot, admin and oper has its own Curve25519 keypair (Ed25519 for signatures + X25519 for encryption), and only public keys are ever exchanged. The one password left is each program's config-file password. Design: `docs/passwordless.md`.
 
 > **Companion project:** irchub is designed to work with [ircbot](https://github.com/robertclemens/ircbot/) — a C-based IRC bot that connects to irchub for secure configuration sync, op coordination, and inter-bot communication. You need both projects to run a complete setup.
 
 ## Overview
 
-irchub sits between your IRC bots and your admin console. Each [ircbot](https://github.com/robertclemens/ircbot/) instance authenticates to the hub using a Curve25519 keypair. The hub distributes encrypted configuration (channels, admin masks, oper credentials, passwords) to all connected bots and keeps everything synchronized across multiple hub instances via a peer mesh.
+irchub sits between your IRC bots and your admin console. Each [ircbot](https://github.com/robertclemens/ircbot/) instance authenticates to the hub using its own Curve25519 keypair. The hub distributes encrypted configuration (channels, admins and opers with their public keys and usermasks, the other bots' public keys) to all connected bots and keeps everything synchronized across multiple hub instances via a peer mesh.
 
 ```
 hub_admin ──► irchub ──► ircbot A
@@ -16,7 +18,7 @@ hub_admin ──► irchub ──► ircbot A
 
 **Key capabilities:**
 
-- **Bot provisioning** — generate Curve25519 keypairs and deliver credentials to bots via IRC
+- **Bot registration** — each bot makes its own keypair; you register its UUID and public key
 - **Encrypted config sync** — AES-256-GCM encrypted configuration pushed to all bots on connect and periodically
 - **Peer mesh** — multiple hub instances synchronize state; leader election prevents duplicate operations
 - **Admin console** — interactive TUI (`hub_admin`) for managing bots, channels, masks, and opers
@@ -30,7 +32,7 @@ hub_admin ──► irchub ──► ircbot A
 |--------|---------|
 | `irchub` | Hub server |
 | `hub_admin` | Interactive admin console |
-| `keygen` | Curve25519 keypair generator |
+| `keygen` | Makes an admin/oper keypair (`<ts>_<name>.private.b64` / `.public.b64`) |
 | `hub_decrypt` | Decrypt and inspect config file |
 | `hub_encrypt` | Re-encrypt a config file |
 
@@ -40,10 +42,10 @@ Built binaries are placed in `bin/`. Install them wherever suits your setup — 
 
 irchub is the hub — [ircbot](https://github.com/robertclemens/ircbot/) is the bot. The two projects are built to work together:
 
-- **[ircbot](https://github.com/robertclemens/ircbot/)** connects to irchub on startup, authenticates with its Curve25519 keypair, and receives its full configuration (channels to join, passwords, admin masks) automatically.
-- When a bot's config changes (new channel, password rotation, rekey), the hub pushes the update to all connected bots in real time.
-- Bots request op grants through the hub, which coordinates across the mesh so any bot can grant ops to any other bot regardless of which hub they are connected to.
-- Commands to the bot are authenticated using time-based hashes, and the hub distributes the shared secret needed to verify them.
+- **[ircbot](https://github.com/robertclemens/ircbot/)** connects to irchub on startup, authenticates with its Curve25519 keypair, and receives its full configuration (channels to join, admins and opers with their public keys and usermasks, the other bots' public keys) automatically.
+- When a bot's config changes (new channel, new user, a changed key, rekey), the hub pushes the update to all connected bots in real time.
+- Bots request op grants through the hub, which coordinates across the mesh so any bot can grant ops to any other bot regardless of which hub they are connected to. With no hub reachable, bots ask each other directly with PRIVMSGs sealed to each other's keys.
+- Admins and opers command a bot over IRC with their own key: a signed auth request, a lockbox reply carrying the bot's public key, then commands sealed to the bot. The hub only distributes public keys — it never holds a user's or a bot's private key.
 
 You provision bots and manage the network entirely through `hub_admin` — you never need to manually edit bot config files.
 
@@ -99,7 +101,15 @@ make clean        # Remove build artifacts
 
 ### 1. Run setup
 
-Run from the directory where irchub will store its files (config, PID, log, and password files are all created relative to the working directory):
+First make the first admin's keypair, on that admin's own machine:
+
+```bash
+./keygen robert        # or run ./keygen and type the name
+```
+
+This writes `YYYYMMDDHHMMSS_robert.private.b64` (mode 0600 — it stays on that machine; `hub_admin` and the IRC scripts use it) and `YYYYMMDDHHMMSS_robert.public.b64`, and prints the public key and its fingerprint. The private key is never printed. (`keygen.c` is byte-identical to `ircbot/utils/keygen.c`; `ircbot/utils/README.txt` has an equivalent openssl recipe.)
+
+Then run setup from the directory where irchub will store its files (config, PID, log, and password files are all created relative to the working directory):
 
 ```bash
 ./irchub -setup
@@ -113,10 +123,9 @@ You will be prompted for:
 | **Bind IP** | Interface to bind to — press Enter to default to `0.0.0.0` (all interfaces) |
 | **Friendly Name** | Human-readable name for this hub instance |
 | **Config Password** | Password used to encrypt the config file (hidden input) |
-| **Hub Keypair** | Choose `1` to generate a new Curve25519 keypair inline, or `2` to load an existing `.b64` file |
-| **Admin Password** | Password required by `hub_admin` to connect (hidden, confirmed twice) |
+| **First admin** | Name, then the admin's **public** key — paste the 88 characters or give the path of the `.public.b64` (a `.private.b64` is refused); confirm by fingerprint; then one or more usermasks |
 
-Setup writes the encrypted config file (`.irchub.cnf`) and exits. The hub does not start automatically.
+Setup generates this hub's own Curve25519 keypair (the private key stays inside the encrypted config), prints the hub's UUID and public key and saves the public key to `hub_public.b64`, writes the encrypted config file (`.irchub.cnf`) and exits. The hub does not start automatically.
 
 ### 2. Start the hub
 
@@ -164,13 +173,13 @@ Replace `/full/path/to/irchub` with the absolute path to the binary. Note that c
 
 ## Admin Console
 
-The admin console connects to a running hub. It requires the hub's public key (PEM) for the encrypted handshake:
+`hub_admin` logs in with an admin's **private key file** — there is no username or password:
 
 ```bash
-./hub_admin <hub-ip> <hub-port> <hub_public.b64>
+./hub_admin <hub-ip> <hub-port> <YYYYMMDDHHMMSS_name.private.b64>
 ```
 
-To obtain the public key from a running hub, connect with `hub_admin`, go to **Manage Peer Config → Export Public Key**, and save the file.
+The hub finds the admin record by the key and the admin proves it holds the key by signing a one-time challenge (a fresh ephemeral session key per login, so a captured login cannot be replayed). Keys an older hub created (`admin_<name>.b64`) are the same format and keep working. Keep the file `chmod 600`; `hub_admin` warns if it is not. Admins created on IRC with `+admin` can log in too — run production networks with opt `h` (below) if you want only hub admins to create users.
 
 ### Admin Menu
 
@@ -179,37 +188,40 @@ IRC HUB ADMIN CONSOLE
 
   1. Manage Bots
   2. Manage Peer Connections
-  3. Manage Peer Config
-  4. Admin Commands
-  5. Exit
+  3. Manage Local Peer Config
+  4. Manage Global Peer Config      (opt flags)
+  5. IRC Admin Commands             (admins, opers, usermasks, channels, op)
+  6. Exit
 ```
 
 ### Adding a Bot
 
-1. **Manage Bots → Add Bot**
-2. Enter the bot's IRC nickname
-3. The hub generates a Curve25519 keypair and UUID
-4. Choose how to distribute the private key:
-   - **Export to file** — saves `bot_<nick>_priv_key.b64`
-   - **Show private key** — prints the base64 key to the terminal
-   - **Show IRC commands** — prints the `/msg` commands to paste into IRC
+1. On the bot's machine run `./ircbot -setup`; the bot generates its own keypair and prints its UUID, public key and key fingerprint.
+2. **Manage Bots → Add Bot**, then enter the bot's nickname, UUID and 88-character public key.
 
-The IRC commands look like:
-```
-/msg <botnick> <hash> sethubkey <88-char-base64-Curve25519-key>
-/msg <botnick> <hash> setuuid <uuid>
-/msg <botnick> <hash> +hub <hub_ip>:<hub_port>
-```
-
-Once the bot receives all parts it will connect to the hub automatically.
+The hub never sees a bot's private key. Every bot receives the other bots' public keys (`b|` lines), which it uses to seal bot-to-bot requests (OPME, INVITE, SETNICK) when no hub is reachable.
 
 ### Rekeying a Bot
 
-**Manage Bots → Rekey Bot** generates a new keypair for a bot. If the bot is currently connected, the hub pushes the new key automatically and the bot reconnects. If offline, the same three-option distribution menu appears.
+Rekeying is bot-local: only the bot holds its private key. **Manage Bots → Rekey Bot** shows the instructions — an admin runs the bot's own `rekey` command, the bot makes a new keypair, pushes the new public key to the hub and reconnects.
+
+### Admins and Opers
+
+**IRC Admin Commands → Manage Admins / Manage Opers**:
+
+- **Add Admin / Add Oper** — name, the user's **public key** (they run `keygen <name>` and send you the `.public.b64`; paste it or give its path; a `.private.b64` is refused), confirm the fingerprint, then a usermask. Each key may belong to one user only.
+- **Change User Public Key** — replaces a key (rotation, a lost key, or a legacy user with no key). UUID and usermasks are kept; the old key stops working on the hub and on every bot as soon as it syncs.
+- **List Admins / Opers**, **Match User** — show each key's fingerprint.
+
+Only admins can log into `hub_admin`; an oper's key is refused.
+
+### Opt flags
+
+**Manage Global Peer Config → Set Opt Flags**. Flag `h` (hub-only mutations) makes every bot refuse local `+admin`/`-admin`, `+oper`/`-oper`, `+usermask`/`-usermask`, `+bot`/`-bot`, `join`/`part` and `chkey`, so users, masks, keys and channels change only through `hub_admin`. Set an empty string to clear it.
 
 ## Peer Mesh
 
-Multiple hub instances can be linked to share configuration and bot state. Add a peer from **Manage Peer Connections → Add Peer**. Provide the peer's IP, port, UUID, and optional friendly name.
+Multiple hub instances can be linked to share configuration and bot state. Add a peer from **Manage Peer Connections → Add Peer**. Provide the peer's IP, port, UUID, friendly name and public key (its `hub_public.b64`). Peers authenticate each other with Ed25519 signatures (`HUBv3`); a pre-passwordless hub (`HUBv2`) is refused, so upgrade all hubs together.
 
 Connected peers:
 - Synchronize bot config and global config entries
@@ -225,20 +237,19 @@ The config file (`.irchub.cnf`) is AES-256-GCM encrypted with a key derived from
 
 | Setting | Command |
 |---------|---------|
-| Bind IP | Manage Peer Config → Set Bind IP |
-| Bind Port | Manage Peer Config → Set Bind Port |
-| Hub Name | Manage Peer Config → Set Hub Name |
-| Log Level | Manage Peer Config → Set Log Level (0–4) |
-| Log Size Limit | Manage Peer Config → Set Log Size Limit |
-| IP Allowlist | Manage Peer Config → Manage IP Allowlist |
-| IP Denylist | Manage Peer Config → Manage IP Denylist |
-| Tombstone Purge | Manage Peer Config → Purge Tombstones |
-| Auto Purge Schedule | Manage Peer Config → Configure Automatic Purge |
-| Admin Password | Admin Commands → Change Admin Password |
-| Bot Password | Admin Commands → Change Bot Password |
-| Admin Masks | Admin Commands → Manage Admin Masks |
-| Oper Masks | Admin Commands → Manage Oper Masks |
-| Channels | Admin Commands → Manage Channels |
+| Bind IP | Manage Local Peer Config → Set Bind IP |
+| Bind Port | Manage Local Peer Config → Set Bind Port |
+| Hub Name | Manage Local Peer Config → Set Hub Name |
+| Log Level | Manage Local Peer Config → Set Log Level (0–4) |
+| Log Size Limit | Manage Local Peer Config → Set Log Size Limit |
+| IP Allowlist | Manage Local Peer Config → Manage IP Allowlist |
+| IP Denylist | Manage Local Peer Config → Manage IP Denylist |
+| Tombstone Purge | Manage Local Peer Config → Purge Tombstones |
+| Auto Purge Schedule | Manage Local Peer Config → Configure Automatic Purge |
+| Admins (keys, masks) | IRC Admin Commands → Manage Admins |
+| Opers (keys, masks) | IRC Admin Commands → Manage Opers |
+| Channels | IRC Admin Commands → Manage Channels |
+| Opt flags (`h`) | Manage Global Peer Config → Set Opt Flags |
 
 ## Utilities
 
@@ -259,13 +270,13 @@ Prompts for the config password (no echo) and writes the raw plaintext config to
 
 Re-encrypts a plaintext config file. Useful for migrating or restoring configs. Prompts for the password twice (or reads one line from a non-terminal stdin), then writes the output mode 0600 via a temp file and rename, so a failed run never leaves a truncated config. Input that does not look like a plaintext config (e.g. an already-encrypted file) is refused.
 
-### Generate keypair
+### Make an admin/oper keypair
 
 ```bash
-./keygen [private-key-out] [public-key-out]
+./keygen [name]          # prompts for the name when none is given
 ```
 
-Generates a Curve25519 keypair (Ed25519 + X25519). Defaults to `hub_private.b64` and `hub_public.b64`. Useful if you want to pre-generate a key before running `-setup` with option 2.
+Writes `YYYYMMDDHHMMSS_<name>.private.b64` (mode 0600) and `YYYYMMDDHHMMSS_<name>.public.b64` in the current directory, never overwriting an existing file, and prints the public key and its fingerprint (e.g. `763e:58a6:2dfd:ae02`) — never the private key. Names are 1–32 characters of `A-Z a-z 0-9 _ . -`, not starting with `.` or `-`. Hubs and bots make their own keys during `-setup`; keygen is for the people who command them.
 
 ## Security Notes
 
@@ -275,6 +286,8 @@ Generates a Curve25519 keypair (Ed25519 + X25519). Defaults to `hub_private.b64`
 - Failed authentication attempts are tracked per IP. After 3 failures the IP is blocked for 5 minutes; the failure counter resets after 1 hour. These thresholds are compile-time constants (`MAX_FAILED_AUTH_ATTEMPTS`, `FAILED_AUTH_BLOCK_DURATION`, `FAILED_AUTH_RESET_TIME` in `hub.h`) — adjust and rebuild to change them. Specific IPs and ranges can be permanently allowed or blocked at runtime via **Manage Peer Config → Manage IP Allowlist / Manage IP Denylist** in `hub_admin` (supports CIDR notation).
 - Each IP is limited to 5 simultaneous connections (`MAX_CONNECTIONS_PER_IP` in `hub.h` — compile-time constant).
 - Private key material is wiped from memory (`secure_wipe`) as soon as it is no longer needed.
+- No private key ever crosses the network: bots, admins and opers make their own keypairs and only public keys are registered and synced. `hub_admin` logins sign a one-time challenge; captured logins cannot be replayed.
+- Mixed-version rollout is fail-closed: bots that have not advertised protocol `v|2` get records with an empty password slot, and pre-passwordless hubs are refused as peers (`docs/passwordless.md` §9).
 
 ## Files
 
@@ -320,9 +333,12 @@ kill $(cat .irchub.pid)
 # (Optional) Auto-start via crontab — check every 5 minutes
 # */5 * * * * /full/path/to/irchub
 
-# Connect admin console (needs hub's public key)
-#./hub_admin <hub ip> <hub port> <public key b64>
-./hub_admin 127.0.0.1 6697 hub_public.b64
+# Make an admin keypair (on the admin's machine)
+./keygen robert
+
+# Connect admin console (with the admin's PRIVATE key file)
+#./hub_admin <hub ip> <hub port> <private key file>
+./hub_admin 127.0.0.1 6697 20260914120000_robert.private.b64
 
 # View logs (if logging has been turned on)
 tail -f .irchub.log

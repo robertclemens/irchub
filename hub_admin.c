@@ -1,5 +1,4 @@
 #include "hub.h"
-#include <termios.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -158,24 +157,6 @@ bool wait_for_input_or_socket(char *buf, size_t len) {
             return true;
         }
     }
-}
-
-void get_password_secure(const char *prompt, char *buf, size_t len) {
-    struct termios oldt, newt;
-    int is_tty = (tcgetattr(STDIN_FILENO, &oldt) == 0);
-    printf("%s", prompt);
-    fflush(stdout);
-    if (is_tty) {
-        newt = oldt;
-        newt.c_lflag &= ~(tcflag_t)(ECHO | ECHONL);
-        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    }
-    if (!fgets(buf, (int)len, stdin)) buf[0] = 0;
-    if (is_tty) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-    }
-    printf("\n");
-    buf[strcspn(buf, "\n")] = 0;
 }
 
 void get_input(const char *prompt, char *buf, size_t len) {
@@ -494,11 +475,11 @@ void peer_set_pubkey(void) {
     char uuid[64], pubkey[128];
 
     printf("\n═══════════════════════════════════════════════════\n");
-    printf("              SET PEER PUBKEY (v2 upgrade)\n");
+    printf("                 SET PEER PUBKEY\n");
     printf("═══════════════════════════════════════════════════\n");
     printf("Registers the peer's 88-char Curve25519 pubkey on an\n");
     printf("existing peer entry. The next connection from that peer\n");
-    printf("will use Ed25519-signature auth (no admin_password).\n\n");
+    printf("authenticates with it (HUBv3 Ed25519 signature).\n\n");
     printf("Get the pubkey from the peer's hub_public.b64 file.\n\n");
 
     get_input("Peer UUID: ", uuid, sizeof(uuid));
@@ -654,60 +635,109 @@ void admin_list_admins(void) {
     pause_and_continue();
 }
 
-void admin_add_admin_record(void) {
+/* Prompt for a user's public key: the pasted 88-char key, or a path to
+ * their .public.b64.  Shows the fingerprint and asks to confirm.  Returns
+ * false if the operator gives up (empty input). */
+static bool prompt_user_pubkey(const char *who, char out[COMBINED_KEY_B64 + 1]) {
+    for (;;) {
+        char in[1024];
+        unsigned char raw[COMBINED_KEY_LEN];
+        out[0] = '\0';
+        get_input("Public key (paste the 88 chars, or a path to the .public.b64; "
+                  "blank to cancel): ", in, sizeof(in));
+        if (!in[0]) return false;
+        /* A private and a public key file have the same shape (88-char
+         * base64 of 64 bytes), so the content cannot tell them apart; refuse
+         * a keygen private file by name before it gets published. */
+        if (strstr(in, ".private.")) {
+            printf("  That is a PRIVATE key file — never hand it out. Use the "
+                   "matching .public.b64.\n");
+            continue;
+        }
+        if (hub_crypto_pubkey_b64_decode(in, raw)) {
+            memcpy(out, in, COMBINED_KEY_B64);          /* validated: 88 chars */
+        } else {
+            FILE *f = fopen(in, "r");
+            char line[256] = {0};
+            if (f) {
+                if (!fgets(line, sizeof(line), f)) line[0] = '\0';
+                fclose(f);
+                line[strcspn(line, " \t\r\n")] = '\0';
+            }
+            if (!line[0] || !hub_crypto_pubkey_b64_decode(line, raw)) {
+                printf("  Not an 88-char public key%s. Use the .public.b64 — "
+                       "never the .private.b64.\n", f ? " in that file" : "");
+                continue;
+            }
+            memcpy(out, line, COMBINED_KEY_B64);
+        }
+        out[COMBINED_KEY_B64] = '\0';
+        char fp[KEY_FP_LEN + 1];
+        hub_crypto_key_fingerprint(raw, fp);
+        printf("  Key fingerprint for %s: %s  (keygen printed it with the "
+               "PUBLIC key)\n", who, fp);
+        if (get_confirmation("  Use this key?")) return true;
+    }
+}
+
+static void keygen_hint(void) {
+    printf("The user makes their own keypair on their own machine:\n");
+    printf("    ./keygen <name>     (irchub/bin/keygen or ircbot/utils/keygen)\n");
+    printf("They keep <ts>_<name>.private.b64 (chmod 600) and give you only\n");
+    printf("<ts>_<name>.public.b64. The hub never sees a private key.\n\n");
+}
+
+static void admin_add_user_record(bool admin) {
     char response[MAX_BUFFER];
-    char name[64], pass[MAX_PASS], mask[256];
+    char name[64], pub[COMBINED_KEY_B64 + 1], mask[256];
 
     printf("\n═══════════════════════════════════════════════════\n");
-    printf("                   ADD ADMIN\n");
+    printf("                   ADD %s\n", admin ? "ADMIN" : "OPER");
     printf("═══════════════════════════════════════════════════\n\n");
-    printf("Friendly name (no spaces, e.g. robert): ");
-    get_input("Name: ", name, sizeof(name));
-    get_password_secure("Admin Password: ", pass, sizeof(pass));
-    printf("First usermask (e.g. nick!*@*.example.com): ");
-    get_input("Mask: ", mask, sizeof(mask));
+    keygen_hint();
+    get_input("Name (no spaces, e.g. robert): ", name, sizeof(name));
+    if (!name[0] || strchr(name, ' ') || strchr(name, '|')) {
+        printf("Invalid name.\n");
+        pause_and_continue();
+        return;
+    }
+    if (!prompt_user_pubkey(name, pub)) {
+        printf("Cancelled.\n");
+        pause_and_continue();
+        return;
+    }
+    get_input("First usermask (e.g. nick!*@*.example.com): ", mask, sizeof(mask));
+    if (!strchr(mask, '!') || !strchr(mask, '@')) {
+        printf("Mask must contain '!' and '@'.\n");
+        pause_and_continue();
+        return;
+    }
 
-    if (strlen(name) > 0 && strlen(pass) > 0 && strlen(mask) > 0) {
-        char payload[MAX_BUFFER];
-        snprintf(payload, sizeof(payload), "%s|%s|%s", name, pass, mask);
-        send_packet(g_fd, CMD_ADMIN_ADD_ADMIN, payload, g_key);
-        read_response(g_fd, g_key, response, sizeof(response));
-        secure_wipe(pass, sizeof(pass));
-        secure_wipe(payload, sizeof(payload));
-        /* Response format: SUCCESS|<a|o>|<name>|<mask>|<priv_b64>|<pub_b64>
-         * Pull out the priv_b64 and offer to save it. */
-        if (strncmp(response, "SUCCESS|", 8) == 0) {
-            char *toks[6] = {0}; int n = 0;
-            char *save_ptr2 = NULL;
-            char *t = strtok_r(response, "|", &save_ptr2);
-            while (t && n < 6) { toks[n++] = t; t = strtok_r(NULL, "|", &save_ptr2); }
-            const char *priv_b64 = (n > 4) ? toks[4] : "";
-            const char *pub_b64  = (n > 5) ? toks[5] : "";
-            printf("\n[+] Admin '%s' created.\n", name);
-            if (priv_b64 && priv_b64[0]) {
-                printf("\n    ┌──────────────────────────────────────────────────────────┐\n");
-                printf("    │ ⚠ Admin '%s' PRIVATE key (save NOW; NOT stored on hub):\n",
-                       name);
-                printf("    │                                                          \n");
-                printf("    │  %s\n", priv_b64);
-                printf("    │                                                          \n");
-                printf("    │ Save to admin_%s.b64 (mode 0600) on the host that will  \n",
-                       name);
-                printf("    │ run hub_admin under this name.  Then:                    \n");
-                printf("    │   ./hub_admin <ip> <port> admin_%s.b64                   \n",
-                       name);
-                printf("    │                                                          \n");
-                printf("    │ Not recoverable if lost — admin must be re-created.      \n");
-                printf("    └──────────────────────────────────────────────────────────┘\n");
-                if (pub_b64 && pub_b64[0])
-                    printf("\n    Public key (mesh-replicated): %s\n", pub_b64);
-            }
-        } else {
-            printf("\nHub: %s\n", response);
-        }
+    char payload[512];
+    snprintf(payload, sizeof(payload), "%s|%s|%s", name, pub, mask);
+    send_packet(g_fd, admin ? CMD_ADMIN_ADD_ADMIN : CMD_ADMIN_ADD_OPER_RECORD,
+                payload, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    /* Response: SUCCESS|<a|o>|<name>|<mask>|<key fingerprint> */
+    if (strncmp(response, "SUCCESS|", 8) == 0) {
+        char *toks[5] = {0}; int n = 0;
+        char *sp = NULL;
+        char *t = strtok_r(response, "|", &sp);
+        while (t && n < 5) { toks[n++] = t; t = strtok_r(NULL, "|", &sp); }
+        printf("\n[+] %s '%s' created with mask %s (key %s).\n",
+               admin ? "Admin" : "Oper", name, n > 3 ? toks[3] : mask,
+               n > 4 ? toks[4] : "?");
+        if (admin)
+            printf("    They log in with: ./hub_admin <ip> <port> <their .private.b64>\n");
+        printf("    IRC: their client script (ircbot/utils) uses the same "
+               ".private.b64.\n");
+    } else {
+        printf("\nHub: %s\n", response);
     }
     pause_and_continue();
 }
+
+void admin_add_admin_record(void) { admin_add_user_record(true); }
 
 void admin_del_admin_record(void) {
     char response[MAX_BUFFER];
@@ -736,51 +766,7 @@ void admin_list_opers(void) {
     pause_and_continue();
 }
 
-void admin_add_oper_record(void) {
-    char response[MAX_BUFFER];
-    char name[64], pass[MAX_PASS], mask[256];
-
-    printf("\n═══════════════════════════════════════════════════\n");
-    printf("                    ADD OPER\n");
-    printf("═══════════════════════════════════════════════════\n\n");
-    get_input("Name: ", name, sizeof(name));
-    get_password_secure("Oper Password: ", pass, sizeof(pass));
-    get_input("First usermask (e.g. nick!*@hostname.com): ", mask, sizeof(mask));
-
-    if (strlen(name) > 0 && strlen(pass) > 0 && strlen(mask) > 0) {
-        char payload[MAX_BUFFER];
-        snprintf(payload, sizeof(payload), "%s|%s|%s", name, pass, mask);
-        send_packet(g_fd, CMD_ADMIN_ADD_OPER_RECORD, payload, g_key);
-        read_response(g_fd, g_key, response, sizeof(response));
-        secure_wipe(pass, sizeof(pass));
-        secure_wipe(payload, sizeof(payload));
-        if (strncmp(response, "SUCCESS|", 8) == 0) {
-            char *toks[6] = {0}; int n = 0;
-            char *save_ptr2 = NULL;
-            char *t = strtok_r(response, "|", &save_ptr2);
-            while (t && n < 6) { toks[n++] = t; t = strtok_r(NULL, "|", &save_ptr2); }
-            const char *priv_b64 = (n > 4) ? toks[4] : "";
-            const char *pub_b64  = (n > 5) ? toks[5] : "";
-            printf("\n[+] Oper '%s' created.\n", name);
-            if (priv_b64 && priv_b64[0]) {
-                printf("\n    ┌──────────────────────────────────────────────────────────┐\n");
-                printf("    │ ⚠ Oper '%s' PRIVATE key (save NOW; NOT stored on hub): \n",
-                       name);
-                printf("    │                                                          \n");
-                printf("    │  %s\n", priv_b64);
-                printf("    │                                                          \n");
-                printf("    │ Opers currently do not need this key for hub_admin login \n");
-                printf("    │ (only admins do), but save it for future use.            \n");
-                printf("    └──────────────────────────────────────────────────────────┘\n");
-                if (pub_b64 && pub_b64[0])
-                    printf("\n    Public key (mesh-replicated): %s\n", pub_b64);
-            }
-        } else {
-            printf("\nHub: %s\n", response);
-        }
-    }
-    pause_and_continue();
-}
+void admin_add_oper_record(void) { admin_add_user_record(false); }
 
 void admin_del_oper_record(void) {
     char response[MAX_BUFFER];
@@ -862,24 +848,26 @@ void admin_match_user(void) {
     pause_and_continue();
 }
 
-void admin_change_userpass(void) {
+void admin_change_userkey(void) {
     char response[MAX_BUFFER];
-    char name[64], pass[MAX_PASS];
+    char name[64], pub[COMBINED_KEY_B64 + 1];
 
     printf("\n═══════════════════════════════════════════════════\n");
-    printf("               CHANGE USER PASSWORD\n");
+    printf("              CHANGE USER PUBLIC KEY\n");
     printf("═══════════════════════════════════════════════════\n\n");
+    printf("Replaces the key of an admin or oper (rotation, a lost key, or a\n");
+    printf("legacy user with no key). UUID and usermasks are kept; the old key\n");
+    printf("stops working on the hub and on every bot as soon as it syncs.\n\n");
+    keygen_hint();
     get_input("User name: ", name, sizeof(name));
-    get_password_secure("New Password: ", pass, sizeof(pass));
-
-    if (strlen(name) > 0 && strlen(pass) > 0) {
-        char payload[MAX_PASS + 70];
-        snprintf(payload, sizeof(payload), "%s|%s", name, pass);
-        send_packet(g_fd, CMD_ADMIN_SET_USERPASS, payload, g_key);
+    if (name[0] && prompt_user_pubkey(name, pub)) {
+        char payload[256];
+        snprintf(payload, sizeof(payload), "%s|%s", name, pub);
+        send_packet(g_fd, CMD_ADMIN_SET_USERKEY, payload, g_key);
         read_response(g_fd, g_key, response, sizeof(response));
         printf("\nHub: %s\n", response);
-        secure_wipe(pass, sizeof(pass));
-        secure_wipe(payload, sizeof(payload));
+    } else {
+        printf("Cancelled.\n");
     }
     pause_and_continue();
 }
@@ -950,55 +938,6 @@ void admin_del_channel(void) {
     wait_for_input_or_socket(dummy, sizeof(dummy));
 }
 
-void admin_change_admin_password(void) {
-    char response[MAX_BUFFER];
-    char pass[128];
-
-    printf("\n═══════════════════════════════════════════════════\n");
-    printf("             CHANGE ADMIN PASSWORD\n");
-    printf("═══════════════════════════════════════════════════\n\n");
-
-    get_password_secure("New Admin Password: ", pass, sizeof(pass));
-
-    if (strlen(pass) > 0 && get_confirmation("Update admin password?")) {
-        send_packet(g_fd, CMD_ADMIN_SET_ADMIN_PASS, pass, g_key);
-        read_response(g_fd, g_key, response, sizeof(response));
-        printf("\nHub: %s\n", response);
-    }
-
-    secure_wipe(pass, sizeof(pass));
-
-    printf("\nPress Enter to continue...");
-    fflush(stdout);
-    char dummy[10];
-    wait_for_input_or_socket(dummy, sizeof(dummy));
-}
-
-void admin_change_bot_password(void) {
-    char response[MAX_BUFFER];
-    char pass[128];
-
-    printf("\n═══════════════════════════════════════════════════\n");
-    printf("              CHANGE BOT PASSWORD\n");
-    printf("═══════════════════════════════════════════════════\n\n");
-    printf("This will update the bot communication password\n");
-    printf("synced to all bots.\n\n");
-
-    get_password_secure("New Bot Password: ", pass, sizeof(pass));
-
-    if (strlen(pass) > 0 && get_confirmation("Update bot password on all bots?")) {
-        send_packet(g_fd, CMD_ADMIN_SET_BOT_PASS, pass, g_key);
-        read_response(g_fd, g_key, response, sizeof(response));
-        printf("\nHub: %s\n", response);
-    }
-
-    secure_wipe(pass, sizeof(pass));
-
-    printf("\nPress Enter to continue...");
-    fflush(stdout);
-    char dummy[10];
-    wait_for_input_or_socket(dummy, sizeof(dummy));
-}
 
 void admin_purge_tombstones(void) {
     char response[MAX_BUFFER];
@@ -1565,7 +1504,7 @@ void menu_manage_admins(void) {
         printf("  3. Remove Admin\n");
         printf("  4. Add Usermask to Admin/Oper\n");
         printf("  5. Remove Usermask from Admin/Oper\n");
-        printf("  6. Change User Password\n");
+        printf("  6. Change User Public Key\n");
         printf("  7. Match User (show all records)\n");
         printf("  8. Back\n");
         printf("\n");
@@ -1584,7 +1523,7 @@ void menu_manage_admins(void) {
             case 3: admin_del_admin_record();  break;
             case 4: admin_add_usermask();      break;
             case 5: admin_del_usermask();      break;
-            case 6: admin_change_userpass();   break;
+            case 6: admin_change_userkey();    break;
             case 7: admin_match_user();        break;
             case 8: return;
             default: printf("Invalid choice.\n"); break;
@@ -1604,7 +1543,7 @@ void menu_manage_opers(void) {
         printf("  3. Remove Oper\n");
         printf("  4. Add Usermask to Oper\n");
         printf("  5. Remove Usermask from Oper\n");
-        printf("  6. Change Oper Password\n");
+        printf("  6. Change Oper Public Key\n");
         printf("  7. Match User (show all records)\n");
         printf("  8. Back\n");
         printf("\n");
@@ -1623,7 +1562,7 @@ void menu_manage_opers(void) {
             case 3: admin_del_oper_record();    break;
             case 4: admin_add_usermask();       break;
             case 5: admin_del_usermask();       break;
-            case 6: admin_change_userpass();    break;
+            case 6: admin_change_userkey();     break;
             case 7: admin_match_user();         break;
             case 8: return;
             default: printf("Invalid choice.\n"); break;
@@ -1692,7 +1631,7 @@ static void admin_set_opt_flags_cli(void) {
     printf("Known options:\n");
     printf("  h  hub-only mutations (bots refuse local +admin/-admin,\n");
     printf("     +oper/-oper, +usermask/-usermask, +bot/-bot, join/part,\n");
-    printf("     botpass, chpass, +hub/-hub)\n\n");
+    printf("     chkey; users, masks, keys and channels change only here)\n\n");
     printf("Enter the full flag string (empty to clear): ");
     fflush(stdout);
     if (!wait_for_input_or_socket(flags, sizeof(flags))) return;
@@ -1743,8 +1682,7 @@ void menu_admin_commands(void) {
         printf("  2. Manage Admins\n");
         printf("  3. Manage Opers\n");
         printf("  4. Manage Channels\n");
-        printf("  5. Change Bot Password\n");
-        printf("  6. Back to Main Menu\n");
+        printf("  5. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1771,9 +1709,6 @@ void menu_admin_commands(void) {
                 menu_manage_channels();
                 break;
             case 5:
-                admin_change_bot_password();
-                break;
-            case 6:
                 return;
             default:
                 printf("Invalid choice.\n");
@@ -1842,7 +1777,7 @@ void menu_manage_peer_connections(void) {
         printf("  1. List Peers (Mesh Matrix)\n");
         printf("  2. Add Peer\n");
         printf("  3. Remove Peer\n");
-        printf("  4. Set Peer Pubkey (upgrade to v2 auth)\n");
+        printf("  4. Set Peer Pubkey\n");
         printf("  5. Force Mesh Sync\n");
         printf("  6. Rekey Hubs (DANGER)\n");
         printf("  7. Back to Main Menu\n");
@@ -1904,8 +1839,7 @@ void menu_manage_peer_config(void) {
         printf("  9. Export Public Key\n");
         printf(" 10. Set Log Level\n");
         printf(" 11. Set Log Size Limit\n");
-        printf(" 12. Change Hub Admin Password\n");
-        printf(" 13. Back to Main Menu\n");
+        printf(" 12. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1953,9 +1887,6 @@ void menu_manage_peer_config(void) {
                 admin_set_log_size_limit();
                 break;
             case 12:
-                admin_change_admin_password();
-                break;
-            case 13:
                 return;  // Back to main menu
             default:
                 printf("Invalid choice.\n");
@@ -1968,206 +1899,234 @@ void menu_manage_peer_config(void) {
 // MAIN
 // ============================================================================
 
+static void usage(void) {
+    printf("Usage: ./hub_admin <ip> <port> <private-key-file>\n");
+    printf("\n");
+    printf("<private-key-file> is your <YYYYMMDDHHMMSS>_<name>.private.b64 from\n");
+    printf("keygen (or the admin_<name>.b64 an older hub printed when it created\n");
+    printf("you). There is no username or password: the hub finds your admin\n");
+    printf("record by the key and you prove you hold it by signing a one-time\n");
+    printf("challenge. Keep the file chmod 600.\n");
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 4) {
-        printf("Usage: ./hub_admin <ip> <port> <admin_<name>_priv.b64>\n");
-        printf("\n");
-        printf("The admin's Curve25519 private key file (88-char base64 of\n");
-        printf("the 64-byte combined Ed25519+X25519 key) is the only credential\n");
-        printf("required.  The hub's public key is fetched at connect time over\n");
-        printf("the same TCP connection (no hub_public.b64 file needed).\n");
+        usage();
         return 1;
     }
 
-    /* Load admin's combined Curve25519 PRIVATE key (88 chars base64). */
+    /* Load the admin's combined Curve25519 PRIVATE key (88 chars base64). */
+    struct stat kst;
+    if (stat(argv[3], &kst) == 0 && (kst.st_mode & 0077) != 0)
+        fprintf(stderr, "[!] Warning: %s is readable by others (mode %04o) — "
+                        "chmod 600 it.\n", argv[3], (unsigned)(kst.st_mode & 0777));
     FILE *f = fopen(argv[3], "r");
     if (!f) {
-        perror("Failed to open admin priv key file");
+        perror("Failed to open private key file");
         return 1;
     }
     char ab64[128] = {0};
     if (!fgets(ab64, sizeof(ab64), f)) {
-        fprintf(stderr, "Failed to read admin priv key file\n");
+        fprintf(stderr, "Failed to read private key file\n");
         fclose(f);
         return 1;
     }
     fclose(f);
-    ab64[strcspn(ab64, "\r\n")] = 0;
+    ab64[strcspn(ab64, " \t\r\n")] = 0;
 
     int adec_len = 0;
     unsigned char *admin_priv_combined = base64_decode(ab64, &adec_len);
     secure_wipe(ab64, sizeof(ab64));
-    if (!admin_priv_combined || adec_len != 64) {
-        fprintf(stderr, "Invalid admin priv key file: expected 64-byte "
-                        "Curve25519 combined key (88 chars base64).\n");
-        if (admin_priv_combined) free(admin_priv_combined);
+    if (!admin_priv_combined || adec_len != COMBINED_KEY_LEN) {
+        fprintf(stderr, "Invalid private key file: expected the 88-char base64 "
+                        "of a 64-byte Curve25519 combined key (a .private.b64).\n");
+        if (admin_priv_combined) { secure_wipe(admin_priv_combined, adec_len); free(admin_priv_combined); }
         return 1;
     }
-    /* Layout: ed_priv(32) || x_priv(32).  We only use x_priv for the
-     * ECDH that derives the session key.  Could later sign a challenge
-     * with ed_priv for stronger anti-replay (not yet implemented). */
-    unsigned char admin_x_priv[32], admin_ed_priv[32];
-    memcpy(admin_ed_priv, admin_priv_combined,      32);
-    memcpy(admin_x_priv,  admin_priv_combined + 32, 32);
-    secure_wipe(admin_priv_combined, 64);
+    /* Layout: ed_priv(32) || x_priv(32).  The Ed25519 half signs the login
+     * challenge; the public key identifies the admin record. */
+    unsigned char admin_priv[COMBINED_KEY_LEN], admin_pub[COMBINED_KEY_LEN];
+    memcpy(admin_priv, admin_priv_combined, COMBINED_KEY_LEN);
+    secure_wipe(admin_priv_combined, COMBINED_KEY_LEN);
     free(admin_priv_combined);
-    (void)admin_ed_priv; /* reserved for future signed handshake */
-
-    /* Derive admin X25519 public key from the loaded priv. */
-    unsigned char admin_x_pub[32];
-    {
-        EVP_PKEY *pk = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL,
-                                                    admin_x_priv, 32);
-        size_t l = 32;
-        bool ok = pk && EVP_PKEY_get_raw_public_key(pk, admin_x_pub, &l) == 1 && l == 32;
-        if (pk) EVP_PKEY_free(pk);
-        if (!ok) {
-            fprintf(stderr, "Failed to derive admin pubkey from priv key.\n");
-            secure_wipe(admin_x_priv, 32);
-            return 1;
-        }
+    if (!hub_crypto_combined_pub_from_priv(admin_priv, admin_pub)) {
+        fprintf(stderr, "Failed to derive the public key from the private key.\n");
+        secure_wipe(admin_priv, sizeof(admin_priv));
+        return 1;
     }
-    (void)admin_x_pub;
+    {
+        char fp[KEY_FP_LEN + 1];
+        hub_crypto_key_fingerprint(admin_pub, fp);
+        printf("[*] Using key %s\n", fp);
+    }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_port = htons(atoi(argv[2]))
     };
-    inet_pton(AF_INET, argv[1], &addr.sin_addr);
+    if (fd < 0 || inet_pton(AF_INET, argv[1], &addr.sin_addr) != 1) {
+        fprintf(stderr, "Bad hub address '%s' (IPv4 literal expected).\n", argv[1]);
+        secure_wipe(admin_priv, sizeof(admin_priv));
+        return 1;
+    }
 
     if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         perror("Connect failed");
-        secure_wipe(admin_x_priv, 32);
+        secure_wipe(admin_priv, sizeof(admin_priv));
         return 1;
     }
 
     signal(SIGPIPE, SIG_IGN);
     g_fd = fd;
 
-    /* Step 1: ADMIN-HELLO probe.  Hub responds with its X25519 pubkey + UUID
-     * over the same TCP socket — no hub_public.b64 file needed. */
+    /* Step 1: ADMIN-HELLO.  The hub answers with its X25519 pubkey, its UUID
+     * and a one-time 32-byte login challenge:
+     *   HUB-PUBKEY2|<x_pub_b64>|<hub_uuid>|<nonce_b64> */
     {
         const char *hello = "ADMIN-HELLO";
         uint32_t nl = htonl(11);
         if (write(fd, &nl, 4) != 4 || write(fd, hello, 11) != 11) {
             perror("HELLO write failed");
-            secure_wipe(admin_x_priv, 32);
+            secure_wipe(admin_priv, sizeof(admin_priv));
             close(fd);
             return 1;
         }
     }
 
-    unsigned char hub_x25519_pub[32] = {0};
+    unsigned char hub_x25519_pub[32] = {0}, nonce[32] = {0};
+    char hub_uuid[64] = {0};
     {
         uint32_t rnl;
-        if (recv_all(fd, &rnl, 4) != 4) {
-            fprintf(stderr, "No HELLO reply from hub.\n");
-            secure_wipe(admin_x_priv, 32);
-            close(fd);
-            return 1;
-        }
-        int rl = (int)ntohl(rnl);
-        if (rl < 14 || rl > 200) {
-            fprintf(stderr, "HELLO reply length out of range: %d\n", rl);
-            secure_wipe(admin_x_priv, 32);
-            close(fd);
-            return 1;
-        }
         char reply[256] = {0};
-        if (recv_all(fd, reply, rl) != rl) {
-            fprintf(stderr, "Short HELLO reply.\n");
-            secure_wipe(admin_x_priv, 32);
+        int rl = -1;
+        if (recv_all(fd, &rnl, 4) == 4) {
+            rl = (int)ntohl(rnl);
+            if (rl < 14 || rl > 200 || recv_all(fd, reply, rl) != rl) rl = -1;
+        }
+        if (rl < 0) {
+            fprintf(stderr, "No usable HELLO reply from hub.\n");
+            secure_wipe(admin_priv, sizeof(admin_priv));
             close(fd);
             return 1;
         }
         reply[rl] = 0;
-        if (strncmp(reply, "HUB-PUBKEY|", 11) != 0) {
-            fprintf(stderr, "Unexpected HELLO reply: %s\n", reply);
-            secure_wipe(admin_x_priv, 32);
+        if (strncmp(reply, "HUB-PUBKEY|", 11) == 0) {
+            fprintf(stderr, "This hub predates passwordless login (HUB-PUBKEY v1); "
+                            "upgrade it.\n");
+            secure_wipe(admin_priv, sizeof(admin_priv));
             close(fd);
             return 1;
         }
-        char *pub_b64 = reply + 11;
-        char *bar = strchr(pub_b64, '|');
-        if (bar) *bar = 0;
-        int xpd = 0;
-        unsigned char *xpd_buf = base64_decode(pub_b64, &xpd);
-        if (!xpd_buf || xpd != 32) {
-            fprintf(stderr, "HELLO reply pubkey not 32 bytes.\n");
-            if (xpd_buf) free(xpd_buf);
-            secure_wipe(admin_x_priv, 32);
+        char *f_pub = NULL, *f_uuid = NULL, *f_nonce = NULL, *sp = NULL;
+        if (strncmp(reply, "HUB-PUBKEY2|", 12) == 0) {
+            f_pub = strtok_r(reply + 12, "|", &sp);
+            f_uuid = strtok_r(NULL, "|", &sp);
+            f_nonce = strtok_r(NULL, "|", &sp);
+        }
+        int xl = 0, nlen = 0;
+        unsigned char *xb = f_pub ? base64_decode(f_pub, &xl) : NULL;
+        unsigned char *nb = f_nonce ? base64_decode(f_nonce, &nlen) : NULL;
+        bool ok = xb && xl == 32 && nb && nlen == 32 && f_uuid &&
+                  strlen(f_uuid) < sizeof(hub_uuid);
+        if (ok) {
+            memcpy(hub_x25519_pub, xb, 32);
+            memcpy(nonce, nb, 32);
+            snprintf(hub_uuid, sizeof(hub_uuid), "%s", f_uuid);
+        }
+        free(xb);
+        if (nb) { secure_wipe(nb, (size_t)nlen); free(nb); }
+        if (!ok) {
+            fprintf(stderr, "Unexpected HELLO reply from hub.\n");
+            secure_wipe(admin_priv, sizeof(admin_priv));
             close(fd);
             return 1;
         }
-        memcpy(hub_x25519_pub, xpd_buf, 32);
-        free(xpd_buf);
-        printf("[*] Discovered hub X25519 pubkey via HELLO.\n");
+        printf("[*] Hub %s answered; signing its login challenge.\n", hub_uuid);
     }
 
-    /* Step 2: prompt for admin name + password, then sealed-box AUTH using
-     * the admin's STATIC X25519 priv (instead of an ephemeral) so the hub
-     * can identify the admin by the pubkey on the wire. */
-    char auth_name[64];
-    char auth_pass[128];
-    printf("Admin name: ");
-    fflush(stdout);
-    if (!fgets(auth_name, sizeof(auth_name), stdin)) {
-        fprintf(stderr, "No name provided.\n");
-        secure_wipe(admin_x_priv, 32);
+    /* Step 2: fresh ephemeral X25519 key -> session key (forward secrecy);
+     * Ed25519 signature over the transcript proves we hold the admin key and
+     * binds it to this hub, this challenge and this session. */
+    unsigned char eph_priv[32], eph_pub[32];
+    {
+        EVP_PKEY_CTX *kc = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+        EVP_PKEY *ek = NULL;
+        size_t l1 = 32, l2 = 32;
+        bool ok = kc && EVP_PKEY_keygen_init(kc) == 1 && EVP_PKEY_keygen(kc, &ek) == 1 &&
+                  EVP_PKEY_get_raw_private_key(ek, eph_priv, &l1) == 1 && l1 == 32 &&
+                  EVP_PKEY_get_raw_public_key(ek, eph_pub, &l2) == 1 && l2 == 32;
+        if (ek) EVP_PKEY_free(ek);
+        if (kc) EVP_PKEY_CTX_free(kc);
+        if (!ok) {
+            fprintf(stderr, "Ephemeral key generation failed.\n");
+            secure_wipe(admin_priv, sizeof(admin_priv));
+            close(fd);
+            return 1;
+        }
+    }
+
+    unsigned char transcript[64 + 64 + 32 + 32 + 32 + COMBINED_KEY_LEN];
+    size_t tl = 0;
+    {
+        static const char AUTH_CTX[] = "irchub-admin-auth-v2";
+        size_t ul = strlen(hub_uuid);
+        memcpy(transcript + tl, AUTH_CTX, sizeof(AUTH_CTX)); tl += sizeof(AUTH_CTX);
+        memcpy(transcript + tl, hub_uuid, ul);               tl += ul;
+        transcript[tl++] = '\0';
+        memcpy(transcript + tl, hub_x25519_pub, 32);         tl += 32;
+        memcpy(transcript + tl, nonce, 32);                  tl += 32;
+        memcpy(transcript + tl, eph_pub, 32);                tl += 32;
+        memcpy(transcript + tl, admin_pub, COMBINED_KEY_LEN); tl += COMBINED_KEY_LEN;
+    }
+    unsigned char sig[ED25519_SIG_LEN];
+    bool signed_ok = hub_crypto_ed25519_sign(admin_priv, transcript, tl, sig);
+    secure_wipe(admin_priv, sizeof(admin_priv));
+    secure_wipe(nonce, sizeof(nonce));
+    if (!signed_ok) {
+        fprintf(stderr, "Signing the login challenge failed.\n");
+        secure_wipe(eph_priv, sizeof(eph_priv));
         close(fd);
         return 1;
     }
-    auth_name[strcspn(auth_name, "\r\n")] = '\0';
-    if (!auth_name[0]) {
-        fprintf(stderr, "Empty admin name.\n");
-        secure_wipe(admin_x_priv, 32);
-        close(fd);
-        return 1;
-    }
-    get_password_secure("Admin Password: ", auth_pass, sizeof(auth_pass));
 
-    unsigned char plain[256];
-    int msg_len = snprintf((char*)plain, sizeof(plain), "ADMIN|%s|%s|%s:%s",
-                           auth_name, auth_pass, argv[1], argv[2]);
-    secure_wipe(auth_pass, sizeof(auth_pass));
-    secure_wipe(auth_name, sizeof(auth_name));
-
-    /* Derive session key from STATIC admin X25519 priv + hub X25519 pub.
-     * This binds the wire to possession of the admin priv key — only the
-     * admin (and the hub) can reconstruct the same key. */
     unsigned char shared[32], session_key[32];
-    if (!hub_crypto_x25519_derive(admin_x_priv, hub_x25519_pub, shared)) {
-        fprintf(stderr, "X25519 derive failed\n");
-        secure_wipe(admin_x_priv, 32);
+    static const unsigned char ADMIN_INFO[] = "irchub-admin-session-v2";
+    bool kdf_ok = hub_crypto_x25519_derive(eph_priv, hub_x25519_pub, shared) &&
+                  hub_crypto_hkdf_sha256(shared, 32, eph_pub, 32,
+                                         ADMIN_INFO, sizeof(ADMIN_INFO) - 1,
+                                         session_key, 32);
+    secure_wipe(eph_priv, sizeof(eph_priv));
+    secure_wipe(shared, sizeof(shared));
+    if (!kdf_ok) {
+        fprintf(stderr, "Session key derivation failed.\n");
         close(fd);
         return 1;
     }
-    secure_wipe(admin_x_priv, 32);
-
-    static const unsigned char ADMIN_INFO[] = "irchub-admin-session-v1";
-    if (!hub_crypto_hkdf_sha256(shared, 32, admin_x_pub, 32,
-                                ADMIN_INFO, sizeof(ADMIN_INFO) - 1,
-                                session_key, 32)) {
-        fprintf(stderr, "HKDF failed\n");
-        secure_wipe(shared, 32);
-        close(fd);
-        return 1;
-    }
-    secure_wipe(shared, 32);
     memcpy(g_key, session_key, 32);
-    secure_wipe(session_key, 32);
+    secure_wipe(session_key, sizeof(session_key));
 
-    /* Wire layout for hub_handle_client_data's sealed-box decode is:
-     *   eph_pub(32) || iv(GCM_IV_LEN) || ct || tag
-     * where the hub uses its own X25519 priv with eph_pub to recover the
-     * shared secret.  We slot the admin's STATIC X25519 pub into that
-     * field — semantics on the hub side are identical (X25519(hub_priv,
-     * admin_pub) == X25519(admin_priv, hub_pub)). */
-    unsigned char enc[512];
+    char *pub_b64 = base64_encode(admin_pub, COMBINED_KEY_LEN);
+    char *sig_b64 = base64_encode(sig, ED25519_SIG_LEN);
+    char plain[512];
+    int msg_len = (pub_b64 && sig_b64)
+        ? snprintf(plain, sizeof(plain), "ADMIN2|%s|%s|%s:%s", pub_b64, sig_b64,
+                   argv[1], argv[2])
+        : -1;
+    free(pub_b64);
+    free(sig_b64);
+    if (msg_len <= 0 || msg_len >= (int)sizeof(plain)) {
+        fprintf(stderr, "Could not build the login message.\n");
+        close(fd);
+        return 1;
+    }
+
+    /* Sealed-box wire layout (hub_seal_open): eph_pub(32) || iv || ct || tag */
+    unsigned char enc[32 + GCM_IV_LEN + sizeof(plain) + GCM_TAG_LEN];
     unsigned char tag[GCM_TAG_LEN];
-    memcpy(enc, admin_x_pub, 32);
-    int ct_len = aes_gcm_encrypt(plain, msg_len + 1, g_key, enc + 32, tag);
+    memcpy(enc, eph_pub, 32);
+    int ct_len = aes_gcm_encrypt((unsigned char *)plain, msg_len + 1, g_key,
+                                 enc + 32, tag);
     secure_wipe(plain, sizeof(plain));
     if (ct_len <= 0) {
         fprintf(stderr, "AES-GCM encryption failed\n");
@@ -2184,7 +2143,20 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("[+] Authenticated to hub (per-admin Curve25519).\n");
+    /* Step 3: the hub confirms (encrypted) or hangs up. */
+    {
+        char response[256];
+        read_response(fd, g_key, response, sizeof(response));
+        if (strncmp(response, "AUTH-OK|", 8) != 0) {
+            fprintf(stderr, "[!] Login refused by the hub (%s).\n"
+                            "    The key must be on an active admin record; "
+                            "see the hub log for the reason.\n", response);
+            secure_wipe(g_key, sizeof(g_key));
+            close(fd);
+            return 1;
+        }
+        printf("[+] Authenticated to hub as '%s'.\n", response + 8);
+    }
 
     // MAIN MENU LOOP
     while (1) {

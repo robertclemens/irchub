@@ -175,8 +175,79 @@ bool hub_crypto_x25519_derive(const unsigned char x_priv[32],
     if (ctx)  EVP_PKEY_CTX_free(ctx);
     if (priv) EVP_PKEY_free(priv);
     if (peer) EVP_PKEY_free(peer);
-    if (!ok)  memset(shared_out, 0, 32);
+    if (ok) {
+        /* A low-order peer point yields an all-zero secret that anyone can
+         * compute: never let it key a session. */
+        unsigned char acc = 0;
+        for (int i = 0; i < 32; i++) acc |= shared_out[i];
+        ok = (acc != 0);
+    }
+    if (!ok)  secure_wipe(shared_out, 32);
     return ok;
+}
+
+bool hub_crypto_combined_pub_from_priv(const unsigned char priv[64],
+                                       unsigned char pub[64]) {
+    EVP_PKEY *ep = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, priv, 32);
+    EVP_PKEY *xp = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, priv + 32, 32);
+    size_t l1 = 32, l2 = 32;
+    bool ok = (ep && xp
+            && EVP_PKEY_get_raw_public_key(ep, pub, &l1) == 1 && l1 == 32
+            && EVP_PKEY_get_raw_public_key(xp, pub + 32, &l2) == 1 && l2 == 32);
+    if (ep) EVP_PKEY_free(ep);
+    if (xp) EVP_PKEY_free(xp);
+    if (!ok) memset(pub, 0, 64);
+    return ok;
+}
+
+/* Strict decode of an 88-char combined public key: only the canonical base64
+ * of exactly 64 bytes (one key, one spelling — uniqueness checks and
+ * record matching compare strings), neither half all zero. */
+bool hub_crypto_pubkey_b64_decode(const char *b64, unsigned char out[64]) {
+    memset(out, 0, 64);
+    if (!b64 || strlen(b64) != COMBINED_KEY_B64) return false;
+    for (int i = 0; i < COMBINED_KEY_B64; i++) {
+        char c = b64[i];
+        bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                     (c >= '0' && c <= '9') || c == '+' || c == '/';
+        if (i >= COMBINED_KEY_B64 - 2 ? c != '=' : !alpha) return false;
+    }
+    int n = 0;
+    unsigned char *dec = base64_decode(b64, &n);
+    if (!dec || n != 64) { free(dec); return false; }
+    char *re = base64_encode(dec, n);
+    bool ok = re && strcmp(re, b64) == 0;
+    free(re);
+    if (ok) {
+        unsigned char a = 0, b = 0;
+        for (int i = 0; i < 32; i++) { a |= dec[i]; b |= dec[32 + i]; }
+        ok = (a != 0 && b != 0);
+    }
+    if (ok) memcpy(out, dec, 64);
+    free(dec);
+    return ok;
+}
+
+void hub_crypto_key_fingerprint(const unsigned char pub[64],
+                                char out[KEY_FP_LEN + 1]) {
+    unsigned char h[32];
+    unsigned int hl = 0;
+    if (EVP_Digest(pub, 64, h, &hl, EVP_sha256(), NULL) != 1 || hl != 32) {
+        snprintf(out, KEY_FP_LEN + 1, "????:????:????:????");
+        return;
+    }
+    snprintf(out, KEY_FP_LEN + 1, "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+             h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+}
+
+void hub_crypto_key_fingerprint_b64(const char *b64, char out[KEY_FP_LEN + 1]) {
+    unsigned char pub[64];
+    if (!b64 || !b64[0])
+        snprintf(out, KEY_FP_LEN + 1, "(no key)");
+    else if (!hub_crypto_pubkey_b64_decode(b64, pub))
+        snprintf(out, KEY_FP_LEN + 1, "(bad key)");
+    else
+        hub_crypto_key_fingerprint(pub, out);
 }
 
 bool hub_crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
