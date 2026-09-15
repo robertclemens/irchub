@@ -695,6 +695,10 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
 bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
                                      const char *value, const char *extra,
                                      const char *op, time_t ts);
+/* Stored timestamp of the global entry that `value` under `key` addresses
+ * (same match as the update above), or 0 if there is none. */
+time_t hub_storage_global_ts(const hub_state_t *state, const char *key,
+                             const char *value);
 bool hub_storage_delete(hub_state_t *state, const char *uuid);
 int hub_storage_get_full_list(hub_state_t *state, char *buffer, int max_len);
 int hub_storage_get_summary_list(hub_state_t *state, char *buffer, int max_len);

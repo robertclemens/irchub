@@ -4046,7 +4046,9 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       char chan[128], key[64];
       key[0] = '\0';
       if (sscanf(payload, "%127[^|]|%63s", chan, key) >= 1) {
-        time_t now = time(NULL);
+        /* Past the stored stamp: a remove in this same second would tie,
+         * and the newest command must be the one that sticks. */
+        time_t now = hub_lww_next_ts(hub_storage_global_ts(state, "c", chan));
 
         /* Carry forward any modes a bot previously reported for this channel.
          * The admin console only prompts for name + key, and the storage layer
@@ -4072,7 +4074,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
   case CMD_ADMIN_DEL_CHANNEL: {
     if (payload && strlen(payload) > 0) {
-      time_t now = time(NULL);
+      time_t now = hub_lww_next_ts(hub_storage_global_ts(state, "c", payload));
       hub_storage_update_global_entry(state, "c", payload, "", "del", now);
       state->config_dirty = true;
 

@@ -20,7 +20,42 @@ static bot_config_t *get_or_create_bot(hub_state_t *state, const char *uuid) {
   return NULL;
 }
 
-// Global Storage Update
+/* Index of the stored global entry that `value` under `key` addresses: a|/p|
+ * are singletons, every other key matches on its first field.  -1 if none. */
+static int global_entry_find(const hub_state_t *state, const char *key,
+                             const char *value) {
+  bool is_singleton = (strcmp(key, "a") == 0 || strcmp(key, "p") == 0);
+
+  for (int i = 0; i < state->global_entry_count; i++) {
+    if (strcmp(state->global_entries[i].key, key) != 0)
+      continue;
+    if (is_singleton)
+      return i;
+    // List match logic (similar to per-bot)
+    char stored_first[256];
+    const char *pipe = strchr(state->global_entries[i].value, '|');
+    if (pipe) {
+      size_t len = pipe - state->global_entries[i].value;
+      if (len >= sizeof(stored_first))
+        len = sizeof(stored_first) - 1;
+      memcpy(stored_first, state->global_entries[i].value, len);
+      stored_first[len] = 0;
+    } else {
+      snprintf(stored_first, sizeof(stored_first), "%.*s",
+               (int)(sizeof(stored_first) - 1), state->global_entries[i].value);
+    }
+    if (strcmp(stored_first, value) == 0)
+      return i;
+  }
+  return -1;
+}
+
+time_t hub_storage_global_ts(const hub_state_t *state, const char *key,
+                             const char *value) {
+  int i = global_entry_find(state, key, value);
+  return i >= 0 ? state->global_entries[i].timestamp : 0;
+}
+
 // Global Storage Update
 bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
                                      const char *value, const char *extra,
@@ -68,49 +103,22 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
     snprintf(combined_value, sizeof(combined_value), "%s", value);
   }
 
-  bool is_singleton = (strcmp(key, "a") == 0 || strcmp(key, "p") == 0);
-
-  for (int i = 0; i < state->global_entry_count; i++) {
-    bool match = false;
-    if (is_singleton) {
-      if (strcmp(state->global_entries[i].key, key) == 0)
-        match = true;
-    } else {
-      // List match logic (similar to per-bot)
-      char stored_first[256];
-      const char *pipe = strchr(state->global_entries[i].value, '|');
-      if (pipe) {
-        size_t len = pipe - state->global_entries[i].value;
-        if (len >= sizeof(stored_first))
-          len = sizeof(stored_first) - 1;
-        memcpy(stored_first, state->global_entries[i].value, len);
-        stored_first[len] = 0;
-      } else {
-        snprintf(stored_first, sizeof(stored_first), "%.*s",
-                 (int)(sizeof(stored_first) - 1), state->global_entries[i].value);
-      }
-      if (strcmp(state->global_entries[i].key, key) == 0 &&
-          strcmp(stored_first, value) == 0) {
-        match = true;
-      }
-    }
-
-    if (match) {
-      if (ts > state->global_entries[i].timestamp) {
-        hub_log("[STORAGE] Global %s=%s: incoming_ts=%ld > stored_ts=%ld -> UPDATED\n",
-                key, value, (long)ts, (long)state->global_entries[i].timestamp);
-        size_t len = strlen(combined_value);
-        if (len >= sizeof(state->global_entries[i].value))
-          len = sizeof(state->global_entries[i].value) - 1;
-        memcpy(state->global_entries[i].value, combined_value, len);
-        state->global_entries[i].value[len] = 0;
-        state->global_entries[i].timestamp = ts;
-        return true;
-      }
-      hub_log("[STORAGE] Global %s=%s: incoming_ts=%ld <= stored_ts=%ld -> REJECTED\n",
+  int i = global_entry_find(state, key, value);
+  if (i >= 0) {
+    if (ts > state->global_entries[i].timestamp) {
+      hub_log("[STORAGE] Global %s=%s: incoming_ts=%ld > stored_ts=%ld -> UPDATED\n",
               key, value, (long)ts, (long)state->global_entries[i].timestamp);
-      return false;
+      size_t len = strlen(combined_value);
+      if (len >= sizeof(state->global_entries[i].value))
+        len = sizeof(state->global_entries[i].value) - 1;
+      memcpy(state->global_entries[i].value, combined_value, len);
+      state->global_entries[i].value[len] = 0;
+      state->global_entries[i].timestamp = ts;
+      return true;
     }
+    hub_log("[STORAGE] Global %s=%s: incoming_ts=%ld <= stored_ts=%ld -> REJECTED\n",
+            key, value, (long)ts, (long)state->global_entries[i].timestamp);
+    return false;
   }
 
   if (state->global_entry_count < MAX_BOT_ENTRIES) {
