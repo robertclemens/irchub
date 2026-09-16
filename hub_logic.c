@@ -190,7 +190,12 @@ static int peer_encrypt_into_writing(hub_client_t *peer, queued_msg_t *m) {
    */
   plain[0] = m->cmd;
   uint32_t inner_len_field;
-  if (m->cmd == CMD_CONFIG_DATA) {
+  /* The bot's frame parser ntohl()s this field unconditionally, so every
+   * BOT-destined opcode must be stamped in network order -- peers and admins
+   * keep host order for wire compatibility.  CMD_BOT_TREE joined that list;
+   * without it the bot computed a garbage length, failed its bounds check and
+   * silently dropped every tree push. */
+  if (m->cmd == CMD_CONFIG_DATA || m->cmd == CMD_BOT_TREE) {
     inner_len_field = htonl((uint32_t)m->payload_len);
   } else {
     inner_len_field = (uint32_t)m->payload_len;
