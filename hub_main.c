@@ -166,7 +166,17 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
             state->peers[p].connected = false;
             state->peers[p].fd = -1;
             state->mesh_state_dirty = true;
+            /* Its uptime stops being a fact the moment the link drops; the
+             * bots beneath it age out of the roster on the TTL. */
+            state->peers[p].remote_started = 0;
+            hub_roster_mark_dirty(state);   /* a whole branch just went away */
         }
+    }
+    /* A bot leaving changes the tree; gossip it on the next tick rather than
+     * waiting for its roster entry to time out on the peers. */
+    if (c->type == CLIENT_BOT && c->authenticated) {
+        hub_roster_mark_dirty(state);
+        state->last_presence_gossip = 0;
     }
 
     // 2. Close Socket
@@ -404,6 +414,11 @@ void hub_maintenance(hub_state_t *state) {
     if (last_client_scan == 0) last_client_scan = now;
     if (last_ip_cleanup  == 0) last_ip_cleanup  = now;
     if (last_status_dump == 0) last_status_dump = now;
+
+    /* Bot presence: gossip our own bots to the peers, expire entries nobody
+     * refreshed, and push the tree to bots when it changed.  All volatile —
+     * see the CMD_BOT_PRESENCE block in hub.h. */
+    hub_presence_tick(state, now);
 
     /* Mesh state gossip: every 5 min as heartbeat, or immediately when peer
      * topology changes (connect/disconnect sets mesh_state_dirty). */

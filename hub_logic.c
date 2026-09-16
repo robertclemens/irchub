@@ -1028,6 +1028,11 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
 
     hub_storage_update_entry(state, client->id, "seen", "", "", "", client->last_seen);
 
+    /* A new bot joins the tree: gossip and push on the next tick instead of
+     * leaving it invisible to the mesh until the periodic refresh. */
+    hub_roster_mark_dirty(state);
+    state->last_presence_gossip = 0;
+
     hub_log("[HUB] Bot %s authenticated (Curve25519)\n", client->id);
     return true;
   }
@@ -1376,6 +1381,462 @@ static void process_mesh_state(hub_state_t *state, hub_client_t *c,
         return;
       }
     }
+  }
+}
+
+/* ==========================================================================
+ * Bot presence — the data behind the bot's 'bots' tree.
+ *
+ * Three hops, none of which touch the config store:
+ *   1. bot  -> hub   CMD_BOT_PRESENCE  its version, IRC server, start time
+ *   2. hub <-> hub   CMD_BOT_ROSTER    the bots connected to THIS hub
+ *   3. hub  -> bot   CMD_BOT_TREE      the assembled tree, DFS pre-order
+ *
+ * Everything here is volatile and TTL'd.  A bot that disconnects stops being
+ * reported and ages out; a hub that dies takes its whole branch with it.  The
+ * only persisted data read is identity (nick) and 'seen', both already in the
+ * config, used to list bots that are known but currently offline.
+ * ========================================================================== */
+
+/* Sanitize one field arriving from a bot or a peer before it is stored or
+ * echoed into a tree row.  Presence text is attacker-controlled: it reaches
+ * other operators' IRC clients, so '|' (our field separator), CR/LF and any
+ * other control byte are dropped outright rather than escaped. */
+static void roster_clean(char *dst, size_t cap, const char *src) {
+  size_t o = 0;
+  if (cap == 0) return;
+  for (size_t i = 0; src && src[i] && o + 1 < cap; i++) {
+    unsigned char ch = (unsigned char)src[i];
+    if (ch < 0x20 || ch == 0x7f || ch == '|') continue;
+    dst[o++] = (char)ch;
+  }
+  dst[o] = '\0';
+}
+
+void hub_roster_mark_dirty(hub_state_t *state) { state->tree_dirty = true; }
+
+void hub_roster_expire(hub_state_t *state, time_t now) {
+  for (int i = 0; i < state->roster_count;) {
+    if (now - state->roster[i].reported_at > BOT_ROSTER_TTL) {
+      hub_log("[PRESENCE] %s on hub %s aged out of the roster\n",
+              state->roster[i].nick[0] ? state->roster[i].nick
+                                       : state->roster[i].bot_uuid,
+              state->roster[i].hub_name);
+      state->roster[i] = state->roster[--state->roster_count];
+      state->tree_dirty = true;
+      continue; /* the swapped-in entry still needs checking */
+    }
+    i++;
+  }
+}
+
+/* Upsert one reported bot.  Keyed on (reporting hub, bot) so the same bot
+ * briefly reported by two hubs mid-migration shows up once per hub rather
+ * than flapping — the stale one expires on its own. */
+static void roster_upsert(hub_state_t *state, const bot_roster_t *in) {
+  for (int i = 0; i < state->roster_count; i++) {
+    bot_roster_t *e = &state->roster[i];
+    if (strcmp(e->hub_uuid, in->hub_uuid) != 0 ||
+        strcmp(e->bot_uuid, in->bot_uuid) != 0)
+      continue;
+    /* An unchanged report just refreshes the TTL; only a real change is worth
+     * re-rendering every bot's tree for. */
+    bool changed = strcmp(e->nick, in->nick) != 0 ||
+                   strcmp(e->version, in->version) != 0 ||
+                   strcmp(e->server, in->server) != 0 ||
+                   e->connected_at != in->connected_at;
+    *e = *in;
+    if (changed) state->tree_dirty = true;
+    return;
+  }
+  if (state->roster_count >= MAX_BOT_ROSTER) {
+    hub_log("[PRESENCE] Roster full (%d) — dropping report for %s\n",
+            MAX_BOT_ROSTER, in->bot_uuid);
+    return;
+  }
+  state->roster[state->roster_count++] = *in;
+  state->tree_dirty = true;
+}
+
+/* This bot just told us what it is running.  Per connection and volatile. */
+static void process_bot_presence(hub_state_t *state, hub_client_t *client,
+                                 const char *payload) {
+  char version[ROSTER_VERSION_MAX + 1] = "";
+  char server[ROSTER_SERVER_MAX + 1] = "";
+  long long started = 0;
+
+  /* "<version>|<server>|<started>" — a short, fixed shape.  Anything longer
+   * than the field caps is truncated by roster_clean, never rejected, so a
+   * newer bot advertising more never drops off the tree entirely. */
+  char work[ROSTER_VERSION_MAX + ROSTER_SERVER_MAX + 64];
+  snprintf(work, sizeof(work), "%s", payload ? payload : "");
+  char *p1 = strchr(work, '|');
+  if (p1) {
+    *p1 = '\0';
+    char *p2 = strchr(p1 + 1, '|');
+    if (p2) {
+      *p2 = '\0';
+      started = atoll(p2 + 1);
+    }
+    roster_clean(server, sizeof(server), p1 + 1);
+  }
+  roster_clean(version, sizeof(version), work);
+
+  /* A bot cannot claim to have started in the future, nor before the epoch of
+   * this mesh; an out-of-range value just means "unknown uptime". */
+  time_t now = time(NULL);
+  if (started <= 0 || (time_t)started > now) started = 0;
+
+  bool changed = strcmp(client->bot_version, version) != 0 ||
+                 strcmp(client->bot_server, server) != 0 ||
+                 client->bot_started != (time_t)started;
+  snprintf(client->bot_version, sizeof(client->bot_version), "%s", version);
+  snprintf(client->bot_server, sizeof(client->bot_server), "%s", server);
+  client->bot_started = (time_t)started;
+
+  if (changed) {
+    hub_log("[PRESENCE] Bot %s: version %s on %s\n", client->id,
+            version[0] ? version : "?", server[0] ? server : "(no server)");
+    state->tree_dirty = true;
+    state->last_presence_gossip = 0; /* gossip the change on the next tick */
+  }
+}
+
+/* The nick the config knows this bot by (persisted 'n' key); empty if none. */
+static void bot_nick_from_config(hub_state_t *state, const char *uuid,
+                                 char *out, size_t cap) {
+  if (cap) out[0] = '\0';
+  for (int i = 0; i < state->bot_count; i++) {
+    if (strcmp(state->bots[i].uuid, uuid) != 0) continue;
+    for (int k = 0; k < state->bots[i].entry_count; k++) {
+      if (strcmp(state->bots[i].entries[k].key, "n") == 0) {
+        roster_clean(out, cap, state->bots[i].entries[k].value);
+        return;
+      }
+    }
+    return;
+  }
+}
+
+/* One roster frame to every authenticated peer.  Deliberately NOT coalesced:
+ * a large roster is chunked into several frames and coalescing on one key
+ * would collapse them into whichever arrived last.  Best-effort on the BULK
+ * lane — a dropped frame just means those bots refresh on the next tick. */
+static void roster_send_to_peers(hub_state_t *state, const char *frame,
+                                 int len) {
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_HUB || !c->authenticated) continue;
+    queued_msg_t *m = queued_msg_new(CMD_BOT_ROSTER, LANE_BULK,
+                                     (const unsigned char *)frame, len);
+    if (!m) continue;
+    if (!peer_enqueue(c, m))
+      hub_log("[PRESENCE] roster enqueue failed for peer %s\n", c->ip);
+  }
+}
+
+/* Gossip the bots connected to THIS hub out to the peers.  Chunked to a byte
+ * budget: each frame repeats the h| header and carries whole rows only, so a
+ * receiver can apply any frame on its own without waiting for the rest. */
+static void hub_gossip_bot_roster(hub_state_t *state) {
+  if (state->peer_count == 0) return;
+
+  char frame[ROSTER_FRAME_BUDGET];
+  time_t now = time(NULL);
+  int header_len = snprintf(frame, sizeof(frame), "h|%s|%s|%lld|%s\n",
+                            state->hub_uuid[0] ? state->hub_uuid : "-",
+                            state->hub_friendly_name[0]
+                                ? state->hub_friendly_name : "-",
+                            (long long)state->hub_started, HUB_VERSION);
+  if (header_len <= 0 || header_len >= (int)sizeof(frame)) return;
+  int offset = header_len, rows = 0, frames = 0;
+
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_BOT || !c->authenticated) continue;
+
+    char nick[MAX_NICK];
+    bot_nick_from_config(state, c->id, nick, sizeof(nick));
+    char row[TREE_ROW_MAX];
+    int rl = snprintf(row, sizeof(row), "b|%s|%s|%s|%s|%lld\n", c->id,
+                      nick[0] ? nick : "-",
+                      c->bot_version[0] ? c->bot_version : "-",
+                      c->bot_server[0] ? c->bot_server : "-",
+                      (long long)c->bot_started);
+    if (rl <= 0 || rl >= (int)sizeof(row)) continue; /* unrepresentable row */
+
+    if (offset + rl >= (int)sizeof(frame)) { /* full: flush, restart */
+      roster_send_to_peers(state, frame, offset);
+      frames++;
+      offset = header_len;
+      rows = 0;
+    }
+    if (offset + rl >= (int)sizeof(frame)) continue; /* still won't fit */
+    memcpy(frame + offset, row, (size_t)rl);
+    offset += rl;
+    rows++;
+  }
+
+  /* Always send a final frame, even carrying no bots: the header doubles as
+   * this hub's liveness and uptime beacon, which is what lets a peer show an
+   * empty hub in the tree with a real uptime instead of a blank. */
+  if (rows > 0 || frames == 0)
+    roster_send_to_peers(state, frame, offset);
+  state->last_presence_gossip = now;
+}
+
+/* A peer told us which bots are on it. */
+static void process_bot_roster(hub_state_t *state, char *payload) {
+  char hub_uuid[64] = "", hub_name[64] = "";
+  time_t now = time(NULL);
+  char *saveptr = NULL;
+
+  for (char *line = strtok_r(payload, "\n", &saveptr); line;
+       line = strtok_r(NULL, "\n", &saveptr)) {
+    if (strncmp(line, "h|", 2) == 0) {
+      char *f1 = strchr(line + 2, '|');
+      if (!f1) continue;
+      *f1 = '\0';
+      char *f2 = strchr(f1 + 1, '|');
+      long long started = 0;
+      char hub_ver[ROSTER_VERSION_MAX + 1] = "";
+      if (f2) {
+        *f2 = '\0';
+        char *f3 = strchr(f2 + 1, '|');
+        if (f3) { *f3 = '\0'; roster_clean(hub_ver, sizeof(hub_ver), f3 + 1); }
+        started = atoll(f2 + 1);
+      }
+      roster_clean(hub_uuid, sizeof(hub_uuid), line + 2);
+      roster_clean(hub_name, sizeof(hub_name), f1 + 1);
+      /* The header doubles as the remote hub's uptime and version beacon.
+       * Clamp rather than trust: a peer's clock skew would render as a
+       * negative uptime. */
+      if (hub_uuid[0]) {
+        for (int p = 0; p < state->peer_count; p++) {
+          if (!state->peers[p].uuid[0] ||
+              strcmp(state->peers[p].uuid, hub_uuid) != 0)
+            continue;
+          if (started > 0 && (time_t)started <= now &&
+              state->peers[p].remote_started != (time_t)started) {
+            state->peers[p].remote_started = (time_t)started;
+            state->tree_dirty = true;
+          }
+          if (strcmp(state->peers[p].remote_version, hub_ver) != 0) {
+            snprintf(state->peers[p].remote_version,
+                     sizeof(state->peers[p].remote_version), "%s", hub_ver);
+            state->tree_dirty = true;
+          }
+          break;
+        }
+      }
+      continue;
+    }
+    if (strncmp(line, "b|", 2) != 0) continue;
+    /* A row before its header has no hub to hang off — ignore it rather than
+     * guess, so a malformed frame cannot graft bots onto the wrong branch. */
+    if (!hub_uuid[0] || strcmp(hub_uuid, "-") == 0) continue;
+    /* Never let a peer report bots as belonging to US: our own branch is
+     * built from our live client list and nothing else. */
+    if (state->hub_uuid[0] && strcmp(hub_uuid, state->hub_uuid) == 0) continue;
+
+    char *fields[5] = {NULL, NULL, NULL, NULL, NULL};
+    char *cur = line + 2;
+    int n = 0;
+    while (n < 5) {
+      fields[n++] = cur;
+      char *sep = strchr(cur, '|');
+      if (!sep) break;
+      *sep = '\0';
+      cur = sep + 1;
+    }
+    if (n < 5 || !fields[0] || !fields[0][0]) continue;
+
+    bot_roster_t e;
+    memset(&e, 0, sizeof(e));
+    snprintf(e.hub_uuid, sizeof(e.hub_uuid), "%s", hub_uuid);
+    snprintf(e.hub_name, sizeof(e.hub_name), "%s",
+             hub_name[0] ? hub_name : hub_uuid);
+    roster_clean(e.bot_uuid, sizeof(e.bot_uuid), fields[0]);
+    if (!e.bot_uuid[0]) continue;
+    if (strcmp(fields[1], "-") != 0) roster_clean(e.nick, sizeof(e.nick), fields[1]);
+    if (strcmp(fields[2], "-") != 0) roster_clean(e.version, sizeof(e.version), fields[2]);
+    if (strcmp(fields[3], "-") != 0) roster_clean(e.server, sizeof(e.server), fields[3]);
+    long long started = atoll(fields[4]);
+    /* Clamp a peer's clock skew rather than trusting it: a future start time
+     * would render as a negative uptime. */
+    e.connected_at = (started > 0 && (time_t)started <= now) ? (time_t)started : 0;
+    e.reported_at = now;
+    roster_upsert(state, &e);
+  }
+}
+
+/* Build the tree for the bots on THIS hub, in DFS pre-order.  Row shapes:
+ *   H|<depth>|<name>|<uuid>|<online>|<uptime>
+ *   B|<depth>|<nick>|<uuid>|<version>|<server>|<uptime>
+ *   D|<nick>|<uuid>|<last_seen>            (offline; always the tail)
+ * Depth plus pre-order is all a renderer needs to draw the connectors: a node
+ * is the last child at its level when no later row shares its depth before a
+ * shallower one appears.  The bot does the drawing (commands.c) so the glyphs
+ * can change without a hub deploy.
+ *
+ * Rooted at this hub because that is the vantage point the asking bot has:
+ * its own hub first, peer hubs beneath it.  The mesh is flat, so the same
+ * network legitimately renders differently depending on which bot you ask. */
+static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
+  int offset = 0, written;
+  time_t now = time(NULL);
+  buf[0] = '\0';
+
+  written = snprintf(buf, max_len, "H|0|%s|%s|1|%lld|%s\n",
+                     state->hub_friendly_name[0] ? state->hub_friendly_name
+                                                 : "hub",
+                     state->hub_uuid[0] ? state->hub_uuid : "-",
+                     (long long)(state->hub_started
+                                     ? now - state->hub_started : 0),
+                     HUB_VERSION);
+  if (written < 0 || written >= max_len) return 0;
+  offset += written;
+
+  /* Our own bots, from the live client list — never from a peer's report. */
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_BOT || !c->authenticated) continue;
+    if (max_len - offset <= TREE_ROW_MAX) break;
+    char nick[MAX_NICK];
+    bot_nick_from_config(state, c->id, nick, sizeof(nick));
+    written = snprintf(buf + offset, max_len - offset, "B|1|%s|%s|%s|%s|%lld\n",
+                       nick[0] ? nick : "-", c->id,
+                       c->bot_version[0] ? c->bot_version : "-",
+                       c->bot_server[0] ? c->bot_server : "-",
+                       (long long)(c->bot_started ? now - c->bot_started : 0));
+    if (written < 0 || written >= max_len - offset) break;
+    offset += written;
+  }
+
+  /* Peer hubs at depth 1, each followed by its bots at depth 2.  A peer we
+   * have no roster for still gets its node — "linked, nothing reported yet"
+   * is more useful than silently omitting a hub that is plainly there. */
+  for (int p = 0; p < state->peer_count; p++) {
+    hub_peer_config_t *peer = &state->peers[p];
+    if (max_len - offset <= TREE_ROW_MAX) break;
+    const char *puuid = peer->uuid[0] ? peer->uuid : "";
+    bool online = false;
+    for (int c = 0; c < state->client_count; c++) {
+      if (state->clients[c]->type == CLIENT_HUB &&
+          state->clients[c]->authenticated && peer->fd > 0 &&
+          state->clients[c]->fd == peer->fd) { online = true; break; }
+    }
+    char pname[64];
+    roster_clean(pname, sizeof(pname),
+                 peer->friendly_name[0] ? peer->friendly_name : peer->ip);
+    written = snprintf(buf + offset, max_len - offset, "H|1|%s|%s|%d|%lld|%s\n",
+                       pname[0] ? pname : "peer", puuid[0] ? puuid : "-",
+                       online ? 1 : 0,
+                       (long long)(peer->remote_started
+                                       ? now - peer->remote_started : 0),
+                       peer->remote_version[0] ? peer->remote_version : "-");
+    if (written < 0 || written >= max_len - offset) break;
+    offset += written;
+
+    if (!puuid[0]) continue;
+    for (int r = 0; r < state->roster_count; r++) {
+      bot_roster_t *e = &state->roster[r];
+      if (strcmp(e->hub_uuid, puuid) != 0) continue;
+      if (max_len - offset <= TREE_ROW_MAX) break;
+      written = snprintf(buf + offset, max_len - offset,
+                         "B|2|%s|%s|%s|%s|%lld\n",
+                         e->nick[0] ? e->nick : "-", e->bot_uuid,
+                         e->version[0] ? e->version : "-",
+                         e->server[0] ? e->server : "-",
+                         (long long)(e->connected_at ? now - e->connected_at
+                                                     : 0));
+      if (written < 0 || written >= max_len - offset) break;
+      offset += written;
+    }
+  }
+
+  /* Bots the config knows but nobody currently reports.  'seen' is already
+   * persisted and replicated, so this needs no new storage — it is the one
+   * place the tree reads the config store, and it reads it read-only. */
+  for (int i = 0; i < state->bot_count; i++) {
+    bot_config_t *b = &state->bots[i];
+    if (!b->is_active) continue;
+    if (max_len - offset <= TREE_ROW_MAX) break;
+
+    bool live = false;
+    for (int c = 0; c < state->client_count && !live; c++)
+      if (state->clients[c]->type == CLIENT_BOT &&
+          state->clients[c]->authenticated &&
+          strcmp(state->clients[c]->id, b->uuid) == 0)
+        live = true;
+    for (int r = 0; r < state->roster_count && !live; r++)
+      if (strcmp(state->roster[r].bot_uuid, b->uuid) == 0) live = true;
+    if (live) continue;
+
+    time_t last_seen = b->last_sync_time;
+    char nick[MAX_NICK] = "";
+    for (int k = 0; k < b->entry_count; k++) {
+      if (strcmp(b->entries[k].key, "seen") == 0) {
+        if (b->entries[k].timestamp > last_seen) last_seen = b->entries[k].timestamp;
+      } else if (strcmp(b->entries[k].key, "n") == 0) {
+        roster_clean(nick, sizeof(nick), b->entries[k].value);
+      }
+    }
+    written = snprintf(buf + offset, max_len - offset, "D|%s|%s|%lld\n",
+                       nick[0] ? nick : "-", b->uuid, (long long)last_seen);
+    if (written < 0 || written >= max_len - offset) break;
+    offset += written;
+  }
+  return offset;
+}
+
+/* Push the assembled tree to every connected bot.  Coalesced per bot so a
+ * burst of roster changes collapses to one send per drain cycle. */
+static void hub_push_tree_to_bots(hub_state_t *state) {
+  int bots = 0;
+  for (int i = 0; i < state->client_count; i++)
+    if (state->clients[i]->type == CLIENT_BOT && state->clients[i]->authenticated)
+      bots++;
+  if (bots == 0) return;
+
+  char *payload = malloc(MAX_TREE_PAYLOAD);
+  if (!payload) {
+    hub_log("[PRESENCE] OOM building bot tree\n");
+    return;
+  }
+  int len = hub_build_tree(state, payload, MAX_TREE_PAYLOAD);
+  if (len <= 0) { free(payload); return; }
+
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_BOT || !c->authenticated) continue;
+    queued_msg_t *m = queued_msg_new(CMD_BOT_TREE, LANE_BULK,
+                                     (const unsigned char *)payload, len);
+    if (!m) continue;
+    char coalesce[160];
+    snprintf(coalesce, sizeof(coalesce), "%s|bot_tree|%s", state->hub_uuid,
+             c->id);
+    queued_msg_set_coalesce(m, state->hub_uuid, hub_next_lamport_seq(state),
+                            coalesce);
+    peer_enqueue(c, m);
+  }
+  free(payload);
+}
+
+void hub_presence_tick(hub_state_t *state, time_t now) {
+  if (state->hub_started == 0) state->hub_started = now;
+
+  hub_roster_expire(state, now);
+
+  if (now - state->last_presence_gossip >= BOT_PRESENCE_INTERVAL)
+    hub_gossip_bot_roster(state);
+
+  /* Push on change, with an unconditional refresh so a bot that missed a
+   * frame — or connected between changes — still converges. */
+  if (state->tree_dirty || now - state->last_tree_push >= BOT_TREE_REFRESH) {
+    state->tree_dirty = false;
+    state->last_tree_push = now;
+    hub_push_tree_to_bots(state);
   }
 }
 
@@ -5455,7 +5916,12 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
                                 int cmd, char *payload) {
   switch (cmd) {
   case CMD_PING:
-    hub_log("[HUB] Bot %s PING\n", client->id);
+    if (!HIDEPINGPONG)
+      hub_log("[HUB] Bot %s PING\n", client->id);
+    break;
+
+  case CMD_BOT_PRESENCE:
+    process_bot_presence(state, client, payload);
     break;
 
   case CMD_CONFIG_PUSH: {
@@ -6383,6 +6849,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 process_peer_sync(state, payload_ptr, client->fd);
               } else if (cmd == CMD_MESH_STATE) {
                 process_mesh_state(state, client, payload_ptr);
+              } else if (cmd == CMD_BOT_ROSTER) {
+                process_bot_roster(state, payload_ptr);
               } else if (cmd == CMD_OP_FORWARD_REQUEST) {
                 process_forward_op_request(state, client, payload_ptr);
               } else if (cmd == CMD_OP_FORWARD_GRANT) {

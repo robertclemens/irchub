@@ -92,6 +92,17 @@
 #define OP_FORWARD_TTL_SECONDS 60        // Drop forwarded OP requests older than 60s
 #define MAX_SEEN_FORWARD_IDS   256       // LRU ring of recently-seen OP forward request IDs
 
+/* Keepalive traffic (CMD_PING and the PONG it draws) is pure noise in the hub
+ * log: with every bot and peer exchanging one a minute it buries the lines
+ * that matter.  true = never log it; false = log it like any other frame.
+ * Only the logging is suppressed -- the keepalives themselves still run.
+ * Mirrors HIDEPINGPONG in ircbot/bot.h. */
+#define HIDEPINGPONG true
+
+/* This hub's version, reported in the bots tree beside each hub node.  Keep in
+ * step with VERSION in the Makefile. */
+#define HUB_VERSION "2.0"
+
 // Timeout Settings
 #define PING_INTERVAL 60
 #define CLIENT_TIMEOUT 180
@@ -213,6 +224,24 @@
 #define CMD_ADMIN_GET_OPT_FLAGS   0x54  // Get current network opt flag string
 #define CMD_ADMIN_SET_USERKEY     0x55  // Replace a user's public key (payload: name|pubkey_b64)
 
+/* ---- Bot presence (the 'bots' tree) --------------------------------------
+ * Deliberately OUTSIDE the config store.  Version / IRC server / uptime are
+ * volatile runtime facts: parking them in the LWW config would persist them to
+ * disk, replicate them with tombstones, drag them through the purge policy and
+ * leave a dead hub's bots reading "online, uptime 40d" forever.  They also do
+ * not belong in the per-bot ingest whitelist {t,n,h,pub,seen,d} -- that bound
+ * is what makes the payload ceilings above provable, and it stays untouched.
+ *
+ * So presence rides its own gossip: every hub reports the bots currently
+ * connected to IT, peers hold that in memory only, and an entry nobody has
+ * refreshed within BOT_ROSTER_TTL is simply dropped.  Nothing to tombstone,
+ * nothing to purge, and a hub that dies ages out of the tree on its own.
+ * Identity (nick, last-seen) still comes from the persisted config -- read
+ * only -- so disconnected bots can still be listed with a real timestamp. */
+#define CMD_BOT_PRESENCE 0x56  // Bot -> Hub: version|server|started (volatile)
+#define CMD_BOT_ROSTER   0x57  // Hub <-> Hub: presence gossip (volatile)
+#define CMD_BOT_TREE     0x58  // Hub -> Bot: rendered tree rows (volatile)
+
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
 
@@ -277,6 +306,27 @@
 #define MAX_BULK_PAYLOAD \
   ((MAX_CONFIG_PAYLOAD) > (MAX_SYNC_PAYLOAD) ? (MAX_CONFIG_PAYLOAD) \
                                              : (MAX_SYNC_PAYLOAD))
+
+/* ==========================================================================
+ * Bot-presence gossip sizing (the 'bots' tree).  Same macro-derived discipline
+ * as the ceilings above: every bound below follows from MAX_BOTS / MAX_PEERS,
+ * so raising either retracks the buffers automatically.  None of this touches
+ * the config store — see the CMD_BOT_PRESENCE block near the opcodes.
+ * ========================================================================== */
+#define BOT_PRESENCE_INTERVAL 60   /* how often a hub gossips its own bots   */
+#define BOT_TREE_REFRESH      300  /* unconditional re-push to bots          */
+#define BOT_ROSTER_TTL        240  /* entry nobody refreshed since -> dropped */
+#define ROSTER_VERSION_MAX    15   /* "2.3.0", with room to grow             */
+#define ROSTER_SERVER_MAX     63   /* host:port of the bot's IRC link        */
+#define ROSTER_FRAME_BUDGET   8192 /* chunk gossip well under MAX_BUFFER     */
+#define TREE_ROW_MAX          256  /* one tree row at its field caps         */
+/* One entry per (reporting hub, bot).  A hub only ever reports bots connected
+ * to itself, so the mesh-wide worst case is every hub carrying MAX_BOTS. */
+#define MAX_BOT_ROSTER        ((MAX_PEERS + 1) * MAX_BOTS)
+/* Tree rows: every hub node, every bot beneath one, plus the disconnected
+ * tail (bounded by the bots the config knows about). */
+#define MAX_TREE_ROWS         (MAX_PEERS + 1 + MAX_BOT_ROSTER + MAX_BOTS)
+#define MAX_TREE_PAYLOAD      ((MAX_TREE_ROWS) * TREE_ROW_MAX + PAYLOAD_SLACK)
 
 /* ==========================================================================
  * Mesh transport tuning (see docs/mesh.md)
@@ -400,6 +450,10 @@ typedef struct {
   int remote_connected_count;
   int remote_total_peers;
   time_t last_mesh_report;
+  /* What the remote hub reported in its CMD_BOT_ROSTER header.  Volatile and
+   * never serialized: these only feed the bots tree's uptime/version columns. */
+  time_t remote_started;
+  char   remote_version[ROSTER_VERSION_MAX + 1];
   char last_gossip[MAX_BUFFER];
 
   /* Peer auth (HUBv3): per-peer Curve25519 public keys. has_pubkey is
@@ -488,6 +542,13 @@ typedef struct {
   /* Per-peer/client byte-rate accounting (1-second window). */
   time_t        bw_window_start;
   int           bw_bytes_in_window;
+
+  /* Presence this bot reported via CMD_BOT_PRESENCE.  Per connection, and
+   * volatile on purpose: a bot that reconnects re-reports, and a bot that
+   * never reports simply shows blank fields in the tree.  Never persisted. */
+  char   bot_version[ROSTER_VERSION_MAX + 1];
+  char   bot_server[ROSTER_SERVER_MAX + 1];
+  time_t bot_started;              /* bot's own start time, 0 = unreported  */
 } hub_client_t;
 
 // Track recently processed PURGE messages to prevent feedback loops
@@ -501,6 +562,21 @@ typedef struct {
   char   request_id[64]; // Unique request ID
   time_t seen_at;        // When we first processed this request
 } seen_forward_t;
+
+/* One bot's live presence, as reported by the hub it is connected to.  Purely
+ * in-memory: never written to the config, never tombstoned, never purged.  An
+ * entry whose reported_at falls behind BOT_ROSTER_TTL is dropped, so a bot
+ * that disconnects — or a whole hub that dies — ages out on its own. */
+typedef struct {
+  char   hub_uuid[64];                    /* hub that reported this bot   */
+  char   hub_name[64];                    /* its friendly name, for display */
+  char   bot_uuid[64];
+  char   nick[MAX_NICK];
+  char   version[ROSTER_VERSION_MAX + 1];
+  char   server[ROSTER_SERVER_MAX + 1];   /* the bot's IRC link           */
+  time_t connected_at;                    /* bot -> hub, for uptime       */
+  time_t reported_at;                     /* local clock: drives the TTL  */
+} bot_roster_t;
 
 /* Loop-prevention seen-set: highest lamport_seq observed per (origin, bot). */
 typedef struct {
@@ -610,6 +686,14 @@ typedef struct {
    * LRU-evicted past MAX_DELTA_SEEN. */
   delta_seen_t delta_seen[MAX_DELTA_SEEN];
   int          delta_seen_count;
+
+  /* ---- Bot presence (volatile; never serialized) ---- */
+  bot_roster_t roster[MAX_BOT_ROSTER];
+  int          roster_count;
+  time_t       hub_started;        /* this hub's own uptime base           */
+  time_t       last_presence_gossip;
+  time_t       last_tree_push;
+  bool         tree_dirty;         /* roster changed: push to bots next tick */
 } hub_state_t;
 
 #define CONFIG_WRITE_DEBOUNCE_S 5
@@ -761,6 +845,16 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
                                unsigned char *data, int packet_len);
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c);
 void hub_broadcast_mesh_state(hub_state_t *state);
+
+/* ---- Bot presence / the 'bots' tree (hub_logic.c) ----
+ * hub_presence_tick drives both halves on the maintenance clock: it gossips
+ * this hub's own connected bots to the peers every BOT_PRESENCE_INTERVAL and
+ * pushes a refreshed tree down to the bots when the roster changed (or every
+ * BOT_TREE_REFRESH regardless).  hub_roster_expire drops entries past the
+ * TTL; hub_roster_mark_dirty asks for a push on the next tick. */
+void hub_presence_tick(hub_state_t *state, time_t now);
+void hub_roster_expire(hub_state_t *state, time_t now);
+void hub_roster_mark_dirty(hub_state_t *state);
 
 /* ---- Mesh transport: per-peer outbound queue (see docs/mesh.md) ---- */
 
