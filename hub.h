@@ -87,6 +87,7 @@
 #define CHURN_BLOCK_SEC  30
 #define MAX_RECENT_PURGES 5             // Track recent PURGE cutoffs to prevent loops
 #define PURGE_DEDUP_WINDOW 60            // Seconds to remember PURGE (prevents loops)
+#define PURGE_ID_HEX 16                  // PURGE|<cutoff>|<id>: 8 random bytes, hex
 
 // OP_FORWARD_REQUEST deduplication — prevents packet storms
 #define OP_FORWARD_TTL_SECONDS 60        // Drop forwarded OP requests older than 60s
@@ -554,6 +555,7 @@ typedef struct {
 // Track recently processed PURGE messages to prevent feedback loops
 typedef struct {
   time_t cutoff;       // PURGE cutoff timestamp
+  char id[PURGE_ID_HEX + 1]; // origin's purge id ("" from pre-id hubs)
   time_t received_at;  // When this PURGE was received/processed
 } recent_purge_t;
 
@@ -740,6 +742,35 @@ static inline time_t hub_lww_next_ts(time_t prev) {
   return now > prev ? now : prev + 1;
 }
 
+/* LWW acceptance for a replicated add/del record: a strictly newer stamp wins,
+ * and on an exact tie a delete beats an add.  hub_lww_next_ts only separates
+ * writes made on ONE node; two nodes stamping the same second (a bot's part
+ * reaching one hub while another hub still holds the add) tie, and with a
+ * plain "newer wins" each side keeps its own copy and refuses the other's
+ * forever.  Delete-over-add is deterministic, so every node converges.
+ * Mirrored in ircbot bot.h (lww_accepts) -- the rule must match on both. */
+static inline bool hub_lww_accepts(time_t in_ts, bool in_active,
+                                   time_t cur_ts, bool cur_active) {
+  return in_ts > cur_ts || (in_ts == cur_ts && cur_active && !in_active);
+}
+
+/* LWW acceptance for the network opt flags (one value, no add/del).  Newer
+ * stamp wins; on a tie the byte-wise greater flag string wins, so every node
+ * picks the same side -- and a set ("h") beats a clear (""), the stricter
+ * policy.  Mirrored in ircbot bot.h (opt_accepts). */
+static inline bool hub_opt_accepts(time_t in_ts, const char *in_flags,
+                                   time_t cur_ts, const char *cur_flags) {
+  return in_ts > cur_ts ||
+         (in_ts == cur_ts && strcmp(in_flags, cur_flags) > 0);
+}
+
+/* Whether a stored c/m/o global value ("...|add" / "...|del") is live: its op
+ * is the last '|' field. */
+static inline bool hub_global_value_active(const char *value) {
+  const char *last = value ? strrchr(value, '|') : NULL;
+  return !(last && strcmp(last + 1, "del") == 0);
+}
+
 /* Value of an opt line, "<letters>|<ts>" — including the "|<ts>" form a
  * clear produces, which a plain "%[^|]|%lld" scan rejects.  flags gets only
  * [a-zA-Z0-9]; false if the timestamp is missing or not positive. */
@@ -803,6 +834,18 @@ bool hub_ip_acl_permits(const hub_state_t *state, const char *ip);
 /* "a.b.c.d" or "a.b.c.d/N" (N = 0..32, no sign or leading zero) into a
  * canonical entry (added = 0).  False on anything else. */
 bool hub_ip_acl_parse(const char *in, hub_ip_acl_t *out);
+/* Strict unsigned decimal for admin numeric fields (indices, days, ports):
+ * 1-10 ASCII digits, nothing else -- no sign, space, suffix or empty string --
+ * and value <= max.  atoi() read "7d" as 7, "c3cd..." as 0 and "" as 0; in
+ * DEL_PEER a UUID starting with digits deleted the peer at that index, and in
+ * PURGE_TOMBSTONES a typo meant "purge every tombstone now". */
+bool hub_parse_uint(const char *s, unsigned long max, unsigned long *out);
+/* A hub friendly name: 1-63 bytes of [A-Za-z0-9._-].  The name travels inside
+ * '|'-separated config lines and handshakes, ':'/','-separated mesh gossip and
+ * the ':'-separated ADD_PEER payload, so any other byte could forge a field or
+ * a whole record ("x|203.0.113.77|0" after a newline).  Applied to
+ * SET_HUB_NAME, the setup wizard and names learned from peers. */
+bool hub_name_valid(const char *name);
 /* list: 'w' (allow) or 'x' (deny).  Add refuses a duplicate (same network
  * and prefix) or a full list; remove matches the same way. */
 typedef enum { IP_ACL_ADDED, IP_ACL_DUPLICATE, IP_ACL_FULL, IP_ACL_BAD_LIST } ip_acl_add_t;
@@ -820,7 +863,9 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
  * (same match as the update above), or 0 if there is none. */
 time_t hub_storage_global_ts(const hub_state_t *state, const char *key,
                              const char *value);
-bool hub_storage_delete(hub_state_t *state, const char *uuid);
+/* Soft-delete a registered bot: a d|1 tombstone stamped past any earlier 'd'.
+ * False when the uuid is unknown or already deleted; *ts_out = the stamp. */
+bool hub_storage_delete(hub_state_t *state, const char *uuid, time_t *ts_out);
 int hub_storage_get_full_list(hub_state_t *state, char *buffer, int max_len);
 int hub_storage_get_summary_list(hub_state_t *state, char *buffer, int max_len);
 
@@ -835,6 +880,10 @@ void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
 // cutoff==0: purge all tombstones; cutoff>0: purge tombstones older than cutoff
 int hub_execute_purge(hub_state_t *state, time_t cutoff,
                       char *log_out, int log_max_len);
+
+/* Send PURGE|<cutoff>|<id> to every peer hub, under a fresh random id that
+ * this hub records as seen.  False (nothing sent) if no id could be drawn. */
+bool hub_broadcast_purge(hub_state_t *state, time_t cutoff);
 
 // Leader election: Check if this hub should initiate scheduled purges
 // (Hub with smallest UUID in connected mesh leads)
@@ -881,6 +930,12 @@ void peer_drain_writable(hub_state_t *state, hub_client_t *peer);
 /* True if peer has anything pending — either a partial in-flight write or
  * any non-empty lane.  Used by main loop to decide whether to set POLLOUT. */
 bool peer_has_pending_writes(hub_client_t *peer);
+
+/* True when recv_buf already holds a whole frame (or a length prefix the pump
+ * will refuse).  hub_handle_client_data takes at most 8 frames per call for
+ * fairness; the main loop must come back for the rest without waiting for
+ * new bytes, or they sit unread until the sender's next packet. */
+bool hub_client_has_buffered_frame(const hub_client_t *c);
 
 /* Free all queued messages (called from hub_disconnect_client). */
 void peer_queue_destroy(hub_client_t *peer);

@@ -145,6 +145,17 @@ bool peer_has_pending_writes(hub_client_t *peer) {
   return false;
 }
 
+bool hub_client_has_buffered_frame(const hub_client_t *c) {
+  if (!c || c->fd <= 0 || !c->recv_buf || c->recv_len < 4) return false;
+  uint32_t net_len;
+  memcpy(&net_len, c->recv_buf, 4);
+  int packet_len = (int)ntohl(net_len);
+  /* An out-of-range prefix counts: the pump refuses it and drops the client
+   * rather than leaving it parked on a length that can never complete. */
+  if (packet_len < 0 || packet_len > c->recv_cap - 4) return true;
+  return c->recv_len >= 4 + packet_len;
+}
+
 void peer_queue_destroy(hub_client_t *peer) {
   if (!peer) return;
   for (int i = 0; i < LANE_COUNT; i++) {
@@ -404,7 +415,7 @@ static void process_mesh_state(hub_state_t *state, hub_client_t *c,
                                char *payload);
 static void process_peer_sync(hub_state_t *state, char *payload, int origin_fd);
 static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
-                                 int cmd, char *payload);
+                                 int cmd, char *payload, int payload_len);
 static void process_bot_command(hub_state_t *state, hub_client_t *client,
                                 int cmd, char *payload);
 
@@ -437,42 +448,93 @@ static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
 
 // --- Helper Functions ---
 
-// Check if PURGE with this cutoff was recently seen (deduplication)
-static bool is_purge_recent(hub_state_t *state, time_t cutoff) {
+/* PURGE deduplication.  A purge is known by its cutoff plus the random id its
+ * origin hub gave it.  Keyed on the cutoff alone, every "immediate" purge
+ * (cutoff 0) looked like the previous one for PURGE_DEDUP_WINDOW seconds, and
+ * peers skipped a second purge sent inside that window.  A line from a hub
+ * that predates the id carries id "" and dedupes on its cutoff as before. */
+static bool is_purge_recent(hub_state_t *state, time_t cutoff, const char *id) {
   time_t now = time(NULL);
   for (int i = 0; i < state->recent_purge_count; i++) {
-    if (state->recent_purges[i].cutoff == cutoff) {
-      // Check if still within dedup window
-      if (now - state->recent_purges[i].received_at < PURGE_DEDUP_WINDOW) {
-        return true;  // This PURGE was recently processed, skip it
-      }
-    }
+    if (state->recent_purges[i].cutoff == cutoff &&
+        strcmp(state->recent_purges[i].id, id) == 0 &&
+        now - state->recent_purges[i].received_at < PURGE_DEDUP_WINDOW)
+      return true;
   }
   return false;
 }
 
 // Record a recently processed PURGE
-static void record_recent_purge(hub_state_t *state, time_t cutoff) {
+static void record_recent_purge(hub_state_t *state, time_t cutoff, const char *id) {
   time_t now = time(NULL);
+  int slot = -1;
 
-  // Check if already exists (update timestamp)
   for (int i = 0; i < state->recent_purge_count; i++) {
-    if (state->recent_purges[i].cutoff == cutoff) {
-      state->recent_purges[i].received_at = now;
-      return;
+    if (state->recent_purges[i].cutoff == cutoff &&
+        strcmp(state->recent_purges[i].id, id) == 0) {
+      slot = i;
+      break;
     }
   }
-
-  // Add new entry (circular buffer)
-  if (state->recent_purge_count < MAX_RECENT_PURGES) {
-    state->recent_purges[state->recent_purge_count].cutoff = cutoff;
-    state->recent_purges[state->recent_purge_count].received_at = now;
-    state->recent_purge_count++;
-  } else {
-    // Overwrite oldest entry
-    state->recent_purges[0].cutoff = cutoff;
-    state->recent_purges[0].received_at = now;
+  if (slot < 0 && state->recent_purge_count < MAX_RECENT_PURGES)
+    slot = state->recent_purge_count++;
+  if (slot < 0) {
+    // Full: overwrite the oldest entry (slot 0 used to be overwritten always)
+    slot = 0;
+    for (int i = 1; i < state->recent_purge_count; i++)
+      if (state->recent_purges[i].received_at <
+          state->recent_purges[slot].received_at)
+        slot = i;
   }
+  state->recent_purges[slot].cutoff = cutoff;
+  snprintf(state->recent_purges[slot].id, sizeof(state->recent_purges[slot].id),
+           "%s", id);
+  state->recent_purges[slot].received_at = now;
+}
+
+/* "PURGE|<cutoff>" or "PURGE|<cutoff>|<id>", id 1..PURGE_ID_HEX hex digits.
+ * False on anything else (the line is dropped, not forwarded). */
+static bool parse_purge_line(const char *line, time_t *cutoff,
+                             char id[PURGE_ID_HEX + 1]) {
+  const char *p = line + 6; /* past "PURGE|" */
+  char *end = NULL;
+  if (*p < '0' || *p > '9')
+    return false;
+  errno = 0;
+  long long v = strtoll(p, &end, 10);
+  if (errno || v < 0)
+    return false;
+  id[0] = '\0';
+  if (*end == '|') {
+    const char *h = end + 1;
+    size_t n = strspn(h, "0123456789abcdefABCDEF");
+    if (n == 0 || n > PURGE_ID_HEX || h[n] != '\0')
+      return false;
+    memcpy(id, h, n);
+    id[n] = '\0';
+  } else if (*end != '\0') {
+    return false;
+  }
+  *cutoff = (time_t)v;
+  return true;
+}
+
+bool hub_broadcast_purge(hub_state_t *state, time_t cutoff) {
+  unsigned char rnd[PURGE_ID_HEX / 2];
+  char id[PURGE_ID_HEX + 1];
+  if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
+    hub_log("[PURGE][ERROR] no random bytes for a purge id; purge not broadcast\n");
+    return false;
+  }
+  for (size_t i = 0; i < sizeof(rnd); i++)
+    snprintf(id + 2 * i, 3, "%02x", rnd[i]);
+  /* Seen here too: the copies peers forward back are not run again. */
+  record_recent_purge(state, cutoff, id);
+
+  char msg[64];
+  snprintf(msg, sizeof(msg), "PURGE|%lld|%s\n", (long long)cutoff, id);
+  hub_broadcast_sync_to_peers(state, msg, -1);
+  return true;
 }
 
 // Check if this hub should initiate scheduled purges (leader election)
@@ -692,6 +754,34 @@ void cleanup_old_ip_limits(hub_state_t *state) {
 }
 
 // ============ IP ACCESS CONTROL FUNCTIONS ============
+
+bool hub_name_valid(const char *name) {
+  if (!name) return false;
+  size_t n = strnlen(name, 64);
+  if (n == 0 || n > 63) return false;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char ch = (unsigned char)name[i];
+    if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+          (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-'))
+      return false;
+  }
+  return true;
+}
+
+bool hub_parse_uint(const char *s, unsigned long max, unsigned long *out) {
+    if (!s || !out) return false;
+    size_t n = strnlen(s, 11);
+    if (n == 0 || n > 10) return false;
+    unsigned long v = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        unsigned long d = (unsigned long)(s[i] - '0');
+        if (v > (max - d) / 10) return false;  /* v*10 + d would pass max */
+        v = v * 10 + d;
+    }
+    *out = v;
+    return true;
+}
 
 bool hub_ip_acl_parse(const char *in, hub_ip_acl_t *out) {
     if (!in || !out) return false;
@@ -1153,6 +1243,9 @@ static void hub_state_add_bot_memory(hub_state_t *state, const char *uuid,
     bot_config_t *b = &state->bots[idx];
     memset(b, 0, sizeof(bot_config_t));
     snprintf(b->uuid, sizeof(b->uuid), "%s", uuid);
+    /* A new registration is live.  is_active follows the 'd' entry alone,
+     * so it must be set here (the memset leaves it false). */
+    b->is_active = true;
     b->last_sync_time = 0;
 
     time_t now = time(NULL);
@@ -1357,8 +1450,10 @@ static void process_mesh_state(hub_state_t *state, hub_client_t *c,
 
           bool config_updated = false;
 
-          // Update friendly_name if it changed
-          if (fields >= 4 && remote_name[0] && strcmp(remote_name, "-") != 0) {
+          // Update friendly_name if it changed (and is a well-formed name:
+          // it is written to our config and shown to operators)
+          if (fields >= 4 && remote_name[0] && strcmp(remote_name, "-") != 0 &&
+              hub_name_valid(remote_name)) {
             if (strcmp(state->peers[i].friendly_name, remote_name) != 0) {
               snprintf(state->peers[i].friendly_name,
                       sizeof(state->peers[i].friendly_name), "%s", remote_name);
@@ -2080,7 +2175,8 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
             snprintf(found_m->uuid,sizeof(found_m->uuid),"%s",uuid);
             snprintf(found_m->mask,sizeof(found_m->mask),"%s",mask_s);
           }
-          if (found_m && ts > found_m->timestamp) {
+          if (found_m && hub_lww_accepts(ts, is_active, found_m->timestamp,
+                                         found_m->is_active)) {
             found_m->is_active = is_active;
             if (last_used > found_m->last_used) found_m->last_used = last_used;
             found_m->timestamp = ts;
@@ -2110,7 +2206,8 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
           memset(found_u, 0, sizeof(*found_u));
           snprintf(found_u->uuid, sizeof(found_u->uuid), "%s", in.uuid);
         }
-        if (found_u && in.timestamp > found_u->timestamp) {
+        if (found_u && hub_lww_accepts(in.timestamp, in.is_active,
+                                       found_u->timestamp, found_u->is_active)) {
           snprintf(found_u->name, sizeof(found_u->name), "%s", in.name);
           found_u->type      = type;
           found_u->is_active = in.is_active;
@@ -2350,7 +2447,9 @@ static bool store_global_entry_raw(hub_state_t *state, const char *key,
     }
 
     if (match) {
-      if (ts > state->global_entries[i].timestamp) {
+      if (hub_lww_accepts(ts, hub_global_value_active(value),
+                          state->global_entries[i].timestamp,
+                          hub_global_value_active(state->global_entries[i].value))) {
         snprintf(state->global_entries[i].value,
                  sizeof(state->global_entries[i].value), "%s", value);
         state->global_entries[i].timestamp = ts;
@@ -2463,31 +2562,44 @@ static int global_channel_modes(hub_state_t *state, const char *chan) {
 static void process_peer_sync(hub_state_t *state, char *payload,
                               int origin_fd) {
   char *saveptr;
-  char work_buf[MAX_BUFFER];
-  snprintf(work_buf, sizeof(work_buf), "%.*s", MAX_BUFFER - 1, payload);
+  /* Change 5: a full-state peer sync can far exceed MAX_BUFFER (usermasks
+   * alone reach tens of KB), so both the tokenizing copy and the re-forward
+   * buffer are heap-allocated to the sync ceiling.  A stack MAX_BUFFER here
+   * silently truncated the sync, dropping every record past 16 KB. */
+  const size_t sync_cap = MAX_SYNC_PAYLOAD;
+  char *work_buf = malloc(sync_cap);
+  char *forward_buf = malloc(sync_cap);
+  if (!work_buf || !forward_buf) {
+    free(work_buf);
+    free(forward_buf);
+    return;
+  }
+  snprintf(work_buf, sync_cap, "%s", payload);
 
   char *line = strtok_r(work_buf, "\n", &saveptr);
   int updates = 0;
   int bot_push_updates = 0; /* only keys bots actually consume; gates full config push */
-  char forward_buf[MAX_BUFFER];
   int fwd_offset = 0;
   forward_buf[0] = 0;
 
   while (line) {
     // Check for PURGE command
     if (strncmp(line, "PURGE|", 6) == 0) {
-      long long cutoff_val;
-      if (sscanf(line + 6, "%lld", &cutoff_val) == 1) {
-        time_t cutoff = (time_t)cutoff_val;
-        hub_log("[MESH] Received PURGE from peer: cutoff=%ld\n", (long)cutoff);
+      time_t cutoff;
+      char purge_id[PURGE_ID_HEX + 1];
+      if (!parse_purge_line(line, &cutoff, purge_id)) {
+        hub_log("[MESH] Dropped malformed PURGE line from peer\n");
+      } else {
+        hub_log("[MESH] Received PURGE from peer: cutoff=%ld id=%s\n",
+                (long)cutoff, purge_id[0] ? purge_id : "-");
 
         // DEDUPLICATION: Check if this PURGE was recently seen
-        if (is_purge_recent(state, cutoff)) {
-          hub_log("[MESH] PURGE cutoff=%ld already processed recently, skipping to prevent loop\n",
-                  (long)cutoff);
+        if (is_purge_recent(state, cutoff, purge_id)) {
+          hub_log("[MESH] PURGE cutoff=%ld id=%s already processed recently, skipping to prevent loop\n",
+                  (long)cutoff, purge_id[0] ? purge_id : "-");
         } else {
           // Record this PURGE and process it
-          record_recent_purge(state, cutoff);
+          record_recent_purge(state, cutoff, purge_id);
 
           char purge_log[MAX_BUFFER];
           int purged = hub_execute_purge(state, cutoff,
@@ -2551,15 +2663,16 @@ static void process_peer_sync(hub_state_t *state, char *payload,
       char incoming_flags[MAX_OPT_FLAGS + 1];
       time_t incoming_ts;
       if (hub_parse_opt_value(line + 4, incoming_flags, &incoming_ts)) {
-        if (incoming_ts > state->opt_flags_ts) {
+        if (hub_opt_accepts(incoming_ts, incoming_flags, state->opt_flags_ts,
+                            state->opt_flags)) {
           memcpy(state->opt_flags, incoming_flags, sizeof(incoming_flags));
           state->opt_flags_ts = incoming_ts;
           state->config_dirty = true;
           updates++;
           bot_push_updates++;
-          if (fwd_offset < (int)sizeof(forward_buf) - 64) {
+          if (fwd_offset < (int)sync_cap - 64) {
             int wfwd = snprintf(forward_buf + fwd_offset,
-                                sizeof(forward_buf) - fwd_offset,
+                                sync_cap - fwd_offset,
                                 "%s\n", line);
             if (wfwd > 0) fwd_offset += wfwd;
           }
@@ -2649,7 +2762,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                     memset(found_u,0,sizeof(*found_u));
                     snprintf(found_u->uuid,sizeof(found_u->uuid),"%s",uuid);
                   }
-                  if (!discard_incoming && found_u && ts > found_u->timestamp) {
+                  if (!discard_incoming && found_u &&
+                      hub_lww_accepts((time_t)ts, in.is_active,
+                                      found_u->timestamp, found_u->is_active)) {
                     snprintf(found_u->name, sizeof(found_u->name), "%s", uname);
                     found_u->type      = key[0];
                     found_u->is_active = in.is_active;
@@ -2669,7 +2784,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                     int ul = hub_format_user_record(found_u, false, uline,
                                                     sizeof(uline));
                     if (ul > 0 && ul < (int)sizeof(uline) &&
-                        fwd_offset < (int)sizeof(forward_buf) - USER_LINE_MAX) {
+                        fwd_offset < (int)sync_cap - USER_LINE_MAX) {
                       memcpy(forward_buf + fwd_offset, uline, (size_t)ul);
                       fwd_offset += ul;
                       forward_buf[fwd_offset] = '\0';
@@ -2712,16 +2827,17 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                     snprintf(found_m->uuid,sizeof(found_m->uuid),"%s",uuid);
                     snprintf(found_m->mask,sizeof(found_m->mask),"%s",mask_s);
                   }
-                  if (found_m && ts > found_m->timestamp) {
+                  if (found_m && hub_lww_accepts(ts, is_active, found_m->timestamp,
+                                                 found_m->is_active)) {
                     found_m->is_active = is_active;
                     if (last_used > found_m->last_used) found_m->last_used = last_used;
                     found_m->timestamp = ts;
                     state->config_dirty = true;
                     updates++;
                     bot_push_updates++; /* mask record — bots need this */
-                    if (fwd_offset < (int)sizeof(forward_buf) - 200) {
+                    if (fwd_offset < (int)sync_cap - 200) {
                       int w = snprintf(forward_buf+fwd_offset,
-                                       sizeof(forward_buf)-fwd_offset,
+                                       sync_cap-fwd_offset,
                                        "%s\n", line);
                       if (w>0) fwd_offset += w;
                     }
@@ -2754,11 +2870,11 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                   updates++;
                   bot_push_updates++; /* channel/password/global — bots need this */
                   // Forward to other peers
-                  if (sizeof(forward_buf) - fwd_offset > 1200) {
+                  if (sync_cap - fwd_offset > 1200) {
                     int w = snprintf(forward_buf + fwd_offset,
-                                     sizeof(forward_buf) - fwd_offset,
+                                     sync_cap - fwd_offset,
                                      "%s|%s|%lld\n", key, val, ts);
-                    if (w > 0 && w < (int)(sizeof(forward_buf) - fwd_offset)) {
+                    if (w > 0 && w < (int)(sync_cap - fwd_offset)) {
                       fwd_offset += w;
                     }
                   }
@@ -2797,11 +2913,11 @@ static void process_peer_sync(hub_state_t *state, char *payload,
           ts = atoll(p2 + 1);
           if (hub_storage_update_entry(state, uuid, key, "", "", "", ts)) {
             updates++;
-            if (sizeof(forward_buf) - fwd_offset > 200) {
+            if (sync_cap - fwd_offset > 200) {
               int w = snprintf(forward_buf + fwd_offset,
-                               sizeof(forward_buf) - fwd_offset,
+                               sync_cap - fwd_offset,
                                "b|%s|%s|%lld\n", uuid, key, ts);
-              if (w > 0 && w < (int)(sizeof(forward_buf) - fwd_offset))
+              if (w > 0 && w < (int)(sync_cap - fwd_offset))
                 fwd_offset += w;
             }
           }
@@ -2815,17 +2931,24 @@ static void process_peer_sync(hub_state_t *state, char *payload,
           snprintf(val, sizeof(val), "%s", p2 + 1);
           ts = atoll(p3 + 1);
 
-          // For c/m/o keys, parse the combined value format
+          // For c/m/o keys, parse the combined value format.  The split
+          // works on a scratch copy: val itself is re-forwarded to the other
+          // peers below and must leave exactly as it arrived.  Splitting val
+          // in place forwarded "b|uuid|c|#chan|ts" -- no key, modes or op --
+          // which the next hub stored as an add, turning deletes into adds
+          // one hop out.
           char parsed_val[512] = "", parsed_extra[256] = "", parsed_op[16] = "";
+          char split[sizeof(val)];
+          memcpy(split, val, strlen(val) + 1);
           if (strcmp(key, "c") == 0 || strcmp(key, "o") == 0) {
             /* Format: chan|key[|modes]|op  (3 or 4 fields)
              * Use first pipe for chan, last pipe for op, middle = extra */
-            char *vp1 = strchr(val, '|');
+            char *vp1 = strchr(split, '|');
             if (vp1) {
               *vp1 = 0;
-              size_t len = strlen(val);
+              size_t len = strlen(split);
               if (len >= sizeof(parsed_val)) len = sizeof(parsed_val) - 1;
-              memcpy(parsed_val, val, len);
+              memcpy(parsed_val, split, len);
               parsed_val[len] = 0;
               /* last pipe gives op (add/del), everything between = extra */
               char *last = strrchr(vp1 + 1, '|');
@@ -2844,12 +2967,12 @@ static void process_peer_sync(hub_state_t *state, char *payload,
             }
           } else if (strcmp(key, "m") == 0) {
             // Format: value|op
-            char *vp1 = strchr(val, '|');
+            char *vp1 = strchr(split, '|');
             if (vp1) {
               *vp1 = 0;
-              size_t len = strlen(val);
+              size_t len = strlen(split);
               if (len >= sizeof(parsed_val)) len = sizeof(parsed_val) - 1;
-              memcpy(parsed_val, val, len);
+              memcpy(parsed_val, split, len);
               parsed_val[len] = 0;
               len = strlen(vp1 + 1);
               if (len >= sizeof(parsed_op)) len = sizeof(parsed_op) - 1;
@@ -2869,11 +2992,11 @@ static void process_peer_sync(hub_state_t *state, char *payload,
             if (strcmp(key, "seen") != 0 && strcmp(key, "t") != 0)
               bot_push_updates++;
 
-            if (sizeof(forward_buf) - fwd_offset > 1200) {
+            if (sync_cap - fwd_offset > 1200) {
               int w = snprintf(forward_buf + fwd_offset,
-                               sizeof(forward_buf) - fwd_offset,
+                               sync_cap - fwd_offset,
                                "b|%s|%s|%s|%lld\n", uuid, key, val, ts);
-              if (w > 0 && w < (int)(sizeof(forward_buf) - fwd_offset)) {
+              if (w > 0 && w < (int)(sync_cap - fwd_offset)) {
                 fwd_offset += w;
               }
             }
@@ -2895,6 +3018,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
     if (bot_push_updates > 0)
       broadcast_full_config_to_all_bots(state);
   }
+
+  free(work_buf);
+  free(forward_buf);
 }
 
 static bool send_response(hub_state_t *state, hub_client_t *client,
@@ -3037,12 +3163,25 @@ int hub_execute_purge(hub_state_t *state, time_t cutoff,
   memcpy(state->user_records, new_users, sizeof(hub_user_record_t) * new_user_count);
   state->user_record_count = new_user_count;
 
-  // --- Purge tombstoned mask_records ---
+  // --- Purge tombstoned mask_records, and masks whose user is gone ---
+  /* A mask with no user record left (its user purged above or earlier) can
+   * never authenticate anyone and only holds a slot of the shared table.
+   * Such orphans were left live on peers and bots by user deletes that did
+   * not send the masks' tombstones; every hub applies the same rule on the
+   * same PURGE, so they converge away. */
   hub_mask_record_t new_masks[MAX_HUB_USER_MASKS];
   int new_mask_count = 0;
   for (int i = 0; i < state->mask_record_count; i++) {
-    if (!state->mask_records[i].is_active &&
-        (cutoff == 0 || state->mask_records[i].timestamp < cutoff)) {
+    bool owned = false;
+    for (int u = 0; u < state->user_record_count; u++) {
+      if (strcmp(state->user_records[u].uuid, state->mask_records[i].uuid) == 0) {
+        owned = true;
+        break;
+      }
+    }
+    if (!owned ||
+        (!state->mask_records[i].is_active &&
+         (cutoff == 0 || state->mask_records[i].timestamp < cutoff))) {
       purged_count++;
     } else {
       if (new_mask_count < MAX_HUB_USER_MASKS)
@@ -3116,10 +3255,29 @@ int hub_execute_purge(hub_state_t *state, time_t cutoff,
 write_and_notify:
   state->config_dirty = true;
 
-  // Notify locally-connected bots so they can purge their own lists.
+  /* Local bots: first the purged config, then the PURGE line itself.
+   * hub_broadcast_config_to_bots only logs its line and re-sends each bot its
+   * full config — that replaces a bot's user/mask tables, but channel
+   * tombstones are merged on the bot and only a PURGE| line removes them.
+   * The PURGE frame is queued behind the (coalesced) config push on the same
+   * lane, so a pre-purge config still queued cannot re-add what it purged. */
   char purge_msg[64];
-  snprintf(purge_msg, sizeof(purge_msg), "PURGE|%ld\n", (long)cutoff);
+  int purge_len = snprintf(purge_msg, sizeof(purge_msg), "PURGE|%lld\n",
+                           (long long)cutoff);
   hub_broadcast_config_to_bots(state, purge_msg);
+  for (int i = 0; purge_len > 0 && i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_BOT || !c->authenticated) continue;
+    queued_msg_t *m = queued_msg_new(CMD_CONFIG_DATA, LANE_BULK,
+                                     (const unsigned char *)purge_msg,
+                                     purge_len);
+    if (!m) {
+      hub_log("[PURGE] OOM queueing PURGE for bot %s\n", c->id);
+      continue;
+    }
+    if (!peer_enqueue(c, m))
+      hub_log("[PURGE] could not queue PURGE for bot %s\n", c->id);
+  }
 
   return purged_count;
 }
@@ -3198,8 +3356,11 @@ static bool admin_ip_acl_change(hub_state_t *state, hub_client_t *client,
   return send_response(state, client, msg);
 }
 
+/* payload is NUL-terminated for the text opcodes; payload_len is the byte
+ * count the frame carried, for the binary ones (a log level of 0 or a log size
+ * with a zero byte has strlen < its real length). */
 static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
-                                 int cmd, char *payload) {
+                                 int cmd, char *payload, int payload_len) {
   char response[MAX_BUFFER];
   int offset;
   int written;
@@ -3256,11 +3417,12 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
           break;
         }
       }
-      char msg[384];
+      char msg[640];
       snprintf(msg, sizeof(msg),
                "INSTRUCT|%s|rekey is bot-local (only the bot holds its private "
-               "key). On the bot host, as an admin, message the bot:\n"
-               "  /msg <bot> ~A1c... rekey\n"
+               "key). As an admin, send the bot the command 'rekey' through "
+               "your IRC client's ircbot auth script (a sealed ~A2 command "
+               "signed with your key).\n"
                "The bot generates a new keypair, pushes its new pubkey here, "
                "and reconnects; peers auto-sync. Bot is currently %s.",
                payload,
@@ -3293,8 +3455,9 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     return send_response(state, client, "ERROR: Missing UUID");
 
   // ENHANCEMENT: Update existing CMD_ADMIN_DEL to disconnect bot
-  case CMD_ADMIN_DEL:
-    if (payload && hub_storage_delete(state, payload)) {
+  case CMD_ADMIN_DEL: {
+    time_t del_ts = 0;
+    if (payload && hub_storage_delete(state, payload, &del_ts)) {
       // Disconnect bot if currently connected
       for (int i = 0; i < state->client_count; i++) {
         if (state->clients[i]->type == CLIENT_BOT &&
@@ -3305,13 +3468,18 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         }
       }
 
-      time_t now = time(NULL);
+      /* Peers store the same tombstone (same stamp); every bot gets a config
+       * that no longer lists the deleted bot and ends in the T| marker, so
+       * it drops the bot from its trusted list (no more ~B2 or op grants). */
       char sync[256];
-      snprintf(sync, sizeof(sync), "%s|d|1|%ld\n", payload, (long)now);
+      snprintf(sync, sizeof(sync), "b|%s|d|1|%lld\n", payload,
+               (long long)del_ts);
       hub_broadcast_sync_to_peers(state, sync, -1);
+      hub_broadcast_config_to_bots(state, sync);
       return send_response(state, client, "SUCCESS: Deleted & Synced.");
     }
     return send_response(state, client, "ERROR: Not found.");
+  }
 
   case CMD_ADMIN_LIST_FULL: {
     /* Up to MAX_BOTS (100) entries × ~250 bytes each = ~25 KB; use 65536 to
@@ -3465,7 +3633,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       char target_uuid[64] = {0};
 
       if (strlen(payload) < 4) {
-        int idx = atoi(payload);
+        unsigned long uidx = 0;
+        int idx = hub_parse_uint(payload, 999, &uidx) ? (int)uidx : 0;
         if (idx > 0 && idx <= state->pending_count) {
           snprintf(target_uuid, sizeof(target_uuid), "%s",
                    state->pending[idx - 1].uuid);
@@ -3686,20 +3855,34 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     }
     return send_response(state, client, "ERROR: No Private Key in Memory.");
 
-  case CMD_ADMIN_SET_PUBKEY:
-    if (payload && strlen(payload) >= COMBINED_KEY_B64) {
-      int dec_len = 0;
-      unsigned char *dec = base64_decode(payload, &dec_len);
-      if (!dec || dec_len != 64) {
-        if (dec) free(dec);
-        return send_response(state, client, "ERROR: Invalid Curve25519 public key.");
-      }
-      hub_crypto_split_combined(dec, state->hub_ed25519_pub, state->hub_x25519_pub);
-      free(dec);
-      state->config_dirty = true;
-      return send_response(state, client, "SUCCESS: Public Key Imported & Saved.");
-    }
-    return send_response(state, client, "ERROR: Empty Payload.");
+  case CMD_ADMIN_SET_PUBKEY: {
+    if (!payload || strlen(payload) < COMBINED_KEY_B64)
+      return send_response(state, client, "ERROR: Empty Payload.");
+    unsigned char want[COMBINED_KEY_LEN];
+    if (!hub_crypto_pubkey_b64_decode(payload, want))
+      return send_response(state, client, "ERROR: Invalid Curve25519 public key.");
+    /* The public key is not a setting of its own: it is fixed by the private
+     * key.  Storing any other key made every signature this hub produces
+     * (admin logins, bot and peer handshakes) fail against what it announces
+     * — an admin lockout.  Accept only the key the private key derives; a new
+     * identity goes through Set Private Key or Regenerate. */
+    if (!state->hub_keys_loaded)
+      return send_response(state, client,
+                           "ERROR: No private key loaded; cannot verify the public key.");
+    unsigned char priv[64], derived[COMBINED_KEY_LEN];
+    memcpy(priv, state->hub_ed25519_priv, 32);
+    memcpy(priv + 32, state->hub_x25519_priv, 32);
+    bool derived_ok = hub_crypto_combined_pub_from_priv(priv, derived);
+    secure_wipe(priv, sizeof(priv));
+    if (!derived_ok || CRYPTO_memcmp(derived, want, COMBINED_KEY_LEN) != 0)
+      return send_response(state, client,
+                           "ERROR: That public key does not belong to this hub's "
+                           "private key (use Set Private Key or Regenerate to "
+                           "change the hub identity).");
+    hub_crypto_split_combined(derived, state->hub_ed25519_pub, state->hub_x25519_pub);
+    state->config_dirty = true;
+    return send_response(state, client, "SUCCESS: Public Key Imported & Saved.");
+  }
 
   case CMD_ADMIN_ADD_PEER:
     if (payload && strlen(payload) > 0) {
@@ -3782,7 +3965,13 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
   case CMD_ADMIN_DEL_PEER:
     if (payload && strlen(payload) > 0) {
-      int idx = atoi(payload);
+      /* The payload is the index LIST_PEERS printed.  Anything that is not a
+       * plain number is refused outright rather than read as some index. */
+      unsigned long uidx;
+      if (!hub_parse_uint(payload, (unsigned long)MAX_PEERS + 1, &uidx))
+        return send_response(state, client,
+                             "ERROR: Invalid Index (expected the number from the peer list).");
+      int idx = (int)uidx;
       if (idx == 1) {
         return send_response(state, client,
                              "ERROR: Cannot remove local hub (Index 1).");
@@ -4726,69 +4915,50 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   }
 
   case CMD_ADMIN_LIST_OPERS: {
+    /* Legacy global oper masks (pre-passwordless).  They authenticate no one
+     * any more; they are listed only so they can be removed.  Their stored
+     * password is never shown (and is no longer stored, see
+     * hub_storage_update_global_entry). */
     offset = 0;
-    written = snprintf(response, sizeof(response), "--- Oper Masks ---\n");
+    written = snprintf(response, sizeof(response),
+                       "--- Legacy Oper Masks (retired: no password, no login; "
+                       "remove them) ---\n");
     if (written >= (int)sizeof(response))
-      return send_response(state, client, "ERROR: Buffer overflow");
-    offset += written;
-
-    written = snprintf(response + offset, sizeof(response) - offset,
-                       "%-40s %-20s\n", "Mask", "Password");
-    if (written >= (int)(sizeof(response) - offset))
-      return send_response(state, client, "ERROR: Buffer overflow");
-    offset += written;
-
-    written = snprintf(response + offset, sizeof(response) - offset,
-                       "%-40s %-20s\n", "----", "--------");
-    if (written >= (int)(sizeof(response) - offset))
       return send_response(state, client, "ERROR: Buffer overflow");
     offset += written;
 
     int oper_count = 0;
     for (int i = 0; i < state->global_entry_count; i++) {
-      if (strcmp(state->global_entries[i].key, "o") == 0) {
-        char mask[256], pass[128], op[16];
-        if (sscanf(state->global_entries[i].value, "%255[^|]|%127[^|]|%15s",
-                   mask, pass, op) == 3) {
-          // Skip deleted opers
-          if (strcmp(op, "del") == 0)
-            continue;
-
-          oper_count++;
-          written = snprintf(response + offset, sizeof(response) - offset,
-                             "%-40s %-20s\n", mask, pass);
-          if (written >= (int)(sizeof(response) - offset))
-            break;
-          offset += written;
-        }
-      }
+      if (strcmp(state->global_entries[i].key, "o") != 0)
+        continue;
+      const char *v = state->global_entries[i].value;
+      const char *first = strchr(v, '|');
+      const char *last = strrchr(v, '|');
+      if (!first || !last || strcmp(last + 1, "del") == 0)
+        continue;
+      oper_count++;
+      written = snprintf(response + offset, sizeof(response) - offset,
+                         "  %.*s\n", (int)(first - v), v);
+      if (written < 0 || written >= (int)(sizeof(response) - offset))
+        break;
+      offset += written;
     }
     if (oper_count == 0) {
       written = snprintf(response + offset, sizeof(response) - offset,
                          "  (No oper masks configured)\n");
-      offset += written;
+      if (written > 0 && written < (int)(sizeof(response) - offset))
+        offset += written;
     }
     return send_response(state, client, response);
   }
 
-  case CMD_ADMIN_ADD_OPER: {
-    if (payload && strlen(payload) > 0) {
-      char mask[256], pass[128];
-      if (sscanf(payload, "%255[^|]|%127s", mask, pass) == 2) {
-        time_t now = time(NULL);
-        hub_storage_update_global_entry(state, "o", mask, pass, "add", now);
-        state->config_dirty = true;
-
-        char sync_msg[512];
-        snprintf(sync_msg, sizeof(sync_msg), "o|%s|%s|add|%ld\n", mask, pass,
-                 (long)now);
-        hub_broadcast_config_to_bots(state, sync_msg);
-        hub_broadcast_sync_to_peers(state, sync_msg, -1);
-        return send_response(state, client, "SUCCESS: Oper mask added and synced.");
-      }
-    }
-    return send_response(state, client, "ERROR: Invalid payload (need mask|password).");
-  }
+  case CMD_ADMIN_ADD_OPER:
+    /* Retired with passwordless: a mask|password oper stored the password in
+     * plaintext, replicated it to every hub and listed it back.  Opers are
+     * key-based records now (CMD_ADMIN_ADD_OPER_RECORD). */
+    return send_response(state, client,
+                         "ERR:retired (oper passwords removed; add an oper "
+                         "with a public key instead)");
 
   case CMD_ADMIN_DEL_OPER: {
     if (payload && strlen(payload) > 0) {
@@ -4886,22 +5056,26 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     time_t cutoff = 0; // default: purge everything
     int days_label = 0;
 
-    if (payload && strlen(payload) > 0 && strcmp(payload, "immediate") != 0) {
-      int days = atoi(payload);
-      if (days > 0) {
-        cutoff = now - ((time_t)days * 86400);
-        days_label = days;
-      }
+    /* Fail closed: only "immediate" purges everything.  A payload that is not
+     * a whole number of days >= 1 is refused -- atoi() used to read "7d",
+     * "-3" or an empty payload as 0, i.e. purge every tombstone now. */
+    if (!payload || strcmp(payload, "immediate") != 0) {
+      unsigned long udays;
+      if (!payload || !hub_parse_uint(payload, 36500, &udays) || udays == 0)
+        return send_response(state, client,
+                             "ERROR: Purge needs 'immediate' or a number of days >= 1.");
+      cutoff = now - ((time_t)udays * 86400);
+      days_label = (int)udays;
     }
 
     char purge_log[MAX_BUFFER / 2];
     int purged_count = hub_execute_purge(state, cutoff,
                                           purge_log, sizeof(purge_log));
 
-    // Broadcast PURGE|<cutoff> to all peer hubs.
-    char peer_purge_msg[64];
-    snprintf(peer_purge_msg, sizeof(peer_purge_msg), "PURGE|%ld\n", (long)cutoff);
-    hub_broadcast_sync_to_peers(state, peer_purge_msg, -1);
+    // Broadcast PURGE|<cutoff>|<id> to all peer hubs.
+    if (!hub_broadcast_purge(state, cutoff))
+      return send_response(state, client,
+                           "ERROR: Purged locally, but the purge could not be sent to peers.");
 
     // Report what happened locally; peers purge asynchronously.
     if (purged_count > 0) {
@@ -4922,8 +5096,11 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
   case CMD_ADMIN_SET_PURGE_DAYS: {
     if (payload && strlen(payload) > 0) {
-      int days = atoi(payload);
-      if (days < 0) days = 0;  // 0 = disabled
+      unsigned long udays;
+      if (!hub_parse_uint(payload, 36500, &udays))
+        return send_response(state, client,
+                             "ERROR: Purge days must be a whole number (0 disables).");
+      int days = (int)udays;  // 0 = disabled
 
       state->purge_days_setting = days;
       state->config_dirty = true;
@@ -4968,29 +5145,33 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   }
 
   case CMD_ADMIN_SET_HUB_NAME: {
-    if (payload && strlen(payload) > 0) {
-      // Update hub friendly name in memory
-      snprintf(state->hub_friendly_name, sizeof(state->hub_friendly_name), "%s", payload);
-
-      // Save to config
-      state->config_dirty = true;
-
-      // Sync to peers
-      time_t now = time(NULL);
-      char sync_msg[256];
-      snprintf(sync_msg, sizeof(sync_msg), "hub_name|%s|%ld\n", payload, (long)now);
-      hub_broadcast_sync_to_peers(state, sync_msg, -1);
-
-      char response[256];
-      snprintf(response, sizeof(response), "SUCCESS: Hub name updated to '%s'", payload);
-      return send_response(state, client, response);
-    }
-    return send_response(state, client, "ERROR: Missing hub name.");
+    if (!payload || !payload[0])
+      return send_response(state, client, "ERROR: Missing hub name.");
+    /* The name is written into '|'-separated config lines and sent inside
+     * handshakes and ':'/','-separated gossip: a newline or separator in it
+     * forged config records ("x|203.0.113.77|0" became a denylist entry). */
+    if (!hub_name_valid(payload))
+      return send_response(state, client,
+                           "ERR:hub name must be 1-63 characters of A-Z a-z "
+                           "0-9 . _ -");
+    snprintf(state->hub_friendly_name, sizeof(state->hub_friendly_name), "%s",
+             payload);
+    state->config_dirty = true;
+    /* Peers learn names from mesh-state gossip (process_mesh_state), not from
+     * sync lines: the 'hub_name|<name>|<ts>' line sent here before was
+     * ignored by every receiver, so a rename reached them only at the next
+     * 5-minute gossip.  Gossip now. */
+    state->mesh_state_dirty = true;
+    char response[256];
+    snprintf(response, sizeof(response), "SUCCESS: Hub name updated to '%s'",
+             state->hub_friendly_name);
+    return send_response(state, client, response);
   }
 
   case CMD_ADMIN_SET_BIND_PORT: {
     if (payload && strlen(payload) > 0) {
-      int port = atoi(payload);
+      unsigned long uport = 0;
+      int port = hub_parse_uint(payload, 65535, &uport) ? (int)uport : 0;
       if (port <= 0 || port > 65535) {
         return send_response(state, client, "ERROR: Port must be between 1 and 65535.");
       }
@@ -5046,8 +5227,9 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     return admin_ip_acl_change(state, client, 'x', false, payload);
 
         case CMD_ADMIN_SET_LOG_LEVEL: {
-            size_t len = payload ? strlen(payload) : 0;
-            if (len < 1) {
+            /* One raw byte (hub_admin): level 0 is the byte 0x00, so the
+             * frame length decides, never strlen. */
+            if (!payload || payload_len != 1) {
                 send_response(state, client, "ERR:invalid payload");
                 break;
             }
@@ -5062,8 +5244,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         }
 
         case CMD_ADMIN_SET_LOG_SIZE: {
-            size_t len = payload ? strlen(payload) : 0;
-            if (len < 4) {
+            /* Four raw bytes, network order: 10 MB is 00 A0 00 00. */
+            if (!payload || payload_len != 4) {
                 send_response(state, client, "ERR:invalid payload");
                 break;
             }
@@ -5111,7 +5293,9 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     }
     dedup[dw] = '\0';
     snprintf(state->opt_flags, sizeof(state->opt_flags), "%s", dedup);
-    state->opt_flags_ts = time(NULL);
+    /* Past the previous stamp: a set and a clear in the same second must not
+     * tie, or peers keep whichever arrived and the mesh splits. */
+    state->opt_flags_ts = hub_lww_next_ts(state->opt_flags_ts);
     state->config_dirty = true;
 
     /* Broadcast to peer hubs */
@@ -5276,23 +5460,46 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     }
     if (!target)
       return send_response(state, client, "ERR:user not found");
+    /* Peers get ONE sync payload: the user tombstone, then a tombstone for
+     * every mask the user owned.  No peer or bot cascades a user delete to
+     * its masks, so a mask tombstone that is not sent leaves the mask live
+     * there: an orphan holding a slot of the shared 200-mask table on every
+     * other hub and on their bots.  One payload keeps the lines in order and
+     * off the per-lane message cap (a user may own every mask slot). */
+    size_t sync_cap = (size_t)USER_LINE_MAX +
+                      (size_t)MAX_HUB_USER_MASKS * MASK_LINE_MAX + 1;
+    char *sync = malloc(sync_cap);
+    if (!sync)
+      return send_response(state, client, "ERR:out of memory");
     target->is_active = false;
-    /* Soft-delete all masks owned by this uuid */
-    for (int i = 0; i < state->mask_record_count; i++) {
-      if (strcmp(state->mask_records[i].uuid, target->uuid) == 0 &&
-          state->mask_records[i].is_active) {
-        state->mask_records[i].is_active = false;
-        state->mask_records[i].timestamp =
-            hub_lww_next_ts(state->mask_records[i].timestamp);
-      }
-    }
-    state->config_dirty = true;
     target->timestamp = hub_lww_next_ts(target->timestamp);
-    /* Broadcast the tombstone record. */
-    char sync[MAX_BUFFER];
-    hub_format_user_record(target, false, sync, sizeof(sync));
-    hub_broadcast_config_to_bots(state, sync);
+    state->config_dirty = true;
+    char uline[USER_LINE_MAX];
+    int sync_len = hub_format_user_record(target, false, uline, sizeof(uline));
+    if (sync_len < 0 || sync_len >= (int)sizeof(uline)) sync_len = 0;
+    memcpy(sync, uline, (size_t)sync_len);
+    sync[sync_len] = '\0';
+    int masks_dropped = 0;
+    for (int i = 0; i < state->mask_record_count; i++) {
+      hub_mask_record_t *mr = &state->mask_records[i];
+      if (strcmp(mr->uuid, target->uuid) != 0 || !mr->is_active)
+        continue;
+      mr->is_active = false;
+      mr->timestamp = hub_lww_next_ts(mr->timestamp);
+      masks_dropped++;
+      int w = snprintf(sync + sync_len, sync_cap - (size_t)sync_len,
+                       "m|%s|%s|del|%lld|%lld\n", mr->uuid, mr->mask,
+                       (long long)mr->last_used, (long long)mr->timestamp);
+      /* cannot overflow: sync_cap holds a line for every mask slot */
+      if (w > 0 && (size_t)w < sync_cap - (size_t)sync_len)
+        sync_len += w;
+    }
+    hub_broadcast_config_to_bots(state, uline);   /* logs the user line only */
     hub_broadcast_sync_to_peers(state, sync, -1);
+    hub_log("[ADMIN] %s %s removed with %d usermask(s)\n",
+            cmd == CMD_ADMIN_DEL_ADMIN ? "Admin" : "Oper", target->name,
+            masks_dropped);
+    free(sync);
     char resp[512];
     snprintf(resp, sizeof(resp), "SUCCESS: %s removed", payload);
     return send_response(state, client, resp);
@@ -6758,7 +6965,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             state->peers[peer_idx].fd = client->fd;
             snprintf(state->peers[peer_idx].remote_ip,
                      sizeof(state->peers[peer_idx].remote_ip), "%s", client->ip);
-            if (!state->peers[peer_idx].friendly_name[0] && peer_name[0]) {
+            if (!state->peers[peer_idx].friendly_name[0] &&
+                hub_name_valid(peer_name)) {
               snprintf(state->peers[peer_idx].friendly_name,
                        sizeof(state->peers[peer_idx].friendly_name),
                        "%s", peer_name);
@@ -6766,7 +6974,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             snprintf(client->id, sizeof(client->id), "%s",
                      state->peers[peer_idx].friendly_name[0] ?
                      state->peers[peer_idx].friendly_name :
-                     (peer_name[0] ? peer_name : "HUB-PEER"));
+                     (hub_name_valid(peer_name) ? peer_name : "HUB-PEER"));
             client->id[sizeof(client->id) - 1] = 0;
 
             hub_log("[HUB] v3 Peer authenticated by Ed25519 signature: %s (%s)\n",
@@ -6816,7 +7024,20 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
     // ========================================================================
     else {
       if (packet_len > GCM_TAG_LEN) {
-        unsigned char plain[MAX_BUFFER], tag[GCM_TAG_LEN];
+        /* Change 5: an authenticated peer frame (full CMD_PEER_SYNC) can be
+         * far larger than MAX_BUFFER — recv_cap was promoted to
+         * MAX_SYNC_PAYLOAD for it — so the plaintext must be heap-sized to the
+         * frame, not a 16 KB stack buffer.  A stack MAX_BUFFER here both
+         * truncated large peer syncs (records past 16 KB were lost) and risked
+         * a stack overwrite.  Bot/admin frames stay small; the alloc is sized
+         * to this frame and freed on every path. */
+        unsigned char tag[GCM_TAG_LEN];
+        unsigned char *plain = malloc((size_t)packet_len + 1);
+        if (!plain) {
+          hub_log("[HUB] OOM decrypting frame from %s\n", client->ip);
+          hub_disconnect_client(state, client);
+          return false;
+        }
 
         memcpy(tag, data + packet_len - GCM_TAG_LEN, GCM_TAG_LEN);
 
@@ -6835,6 +7056,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             time_t now = time(NULL);
             if (now - client->last_pong_sent >= 5) {
               if (!send_pong(state, client)) {
+                secure_wipe(plain, (size_t)packet_len + 1);
+                free(plain);
                 return false;
               }
               client->last_pong_sent = now;
@@ -6844,7 +7067,10 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             char *payload_ptr = (char *)plain + 5;
 
             if (client->type == CLIENT_ADMIN) {
-              if (!handle_admin_command(state, client, cmd, payload_ptr)) {
+              if (!handle_admin_command(state, client, cmd, payload_ptr,
+                                        pl >= 5 ? pl - 5 : 0)) {
+                secure_wipe(plain, (size_t)packet_len + 1);
+                free(plain);
                 return false;
               }
             } else if (client->type == CLIENT_BOT) {
@@ -6896,9 +7122,14 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
           }
         } else {
           hub_log("[HUB] GCM decrypt failed from %s\n", client->ip);
+          secure_wipe(plain, (size_t)packet_len + 1);
+          free(plain);
           hub_disconnect_client(state, client);
           return false;
         }
+
+        secure_wipe(plain, (size_t)packet_len + 1);
+        free(plain);
       }
     }
 

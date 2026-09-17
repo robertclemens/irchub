@@ -44,6 +44,55 @@ static FILE *hub_log_open(bool truncate) {
     return fp;
 }
 
+/* Length of the valid UTF-8 sequence starting at p (at most n bytes long), or
+ * 0 when the bytes there are not one (overlong, surrogate, > U+10FFFF, cut). */
+static size_t hub_log_utf8_len(const unsigned char *p, size_t n) {
+    size_t len;
+    unsigned min;
+    unsigned cp;
+    if (p[0] >= 0xC2 && p[0] <= 0xDF)      { len = 2; min = 0x80;    cp = p[0] & 0x1F; }
+    else if (p[0] >= 0xE0 && p[0] <= 0xEF) { len = 3; min = 0x800;   cp = p[0] & 0x0F; }
+    else if (p[0] >= 0xF0 && p[0] <= 0xF4) { len = 4; min = 0x10000; cp = p[0] & 0x07; }
+    else return 0;
+    if (n < len) return 0;
+    for (size_t i = 1; i < len; i++) {
+        if ((p[i] & 0xC0) != 0x80) return 0;
+        cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return 0;
+    return len;
+}
+
+/* Write one formatted log message with every byte an attacker could use to
+ * forge or garble the log made inert.  Log arguments routinely carry
+ * pre-authentication network input (a claimed bot UUID, a peer name), so:
+ * control bytes and invalid UTF-8 become \xHH, and a newline inside the
+ * message is followed by an indent so it can never start a line that looks
+ * like a fresh "[timestamp]" entry.  Only the message's final newline is kept
+ * as-is. */
+static void hub_log_write_sanitized(FILE *fp, const char *msg, size_t n) {
+    const unsigned char *p = (const unsigned char *)msg;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = p[i];
+        if (c == '\n') {
+            fputc('\n', fp);
+            if (i + 1 < n) fputs("    ", fp);
+        } else if (c == '\t' || (c >= 0x20 && c < 0x7F)) {
+            fputc(c, fp);
+        } else if (c >= 0x80) {
+            size_t ul = hub_log_utf8_len(p + i, n - i);
+            if (ul) {
+                fwrite(p + i, 1, ul, fp);
+                i += ul - 1;
+            } else {
+                fprintf(fp, "\\x%02X", c);
+            }
+        } else {
+            fprintf(fp, "\\x%02X", c);
+        }
+    }
+}
+
 void hub_log(const char *format, ...) {
     va_list args;
     time_t now = time(NULL);
@@ -107,11 +156,31 @@ void hub_log(const char *format, ...) {
     }
 
     // Write log entry (log level filtering would be done by caller in Task 5)
-    fprintf(log_fp, "[%s] ", time_buf);
+    char stack_msg[2048];
+    char *msg = stack_msg;
     va_start(args, format);
-    vfprintf(log_fp, format, args);
+    int need = vsnprintf(stack_msg, sizeof(stack_msg), format, args);
     va_end(args);
+    if (need < 0) return;
+    if ((size_t)need >= sizeof(stack_msg)) {
+        msg = malloc((size_t)need + 1);
+        if (!msg) {
+            msg = stack_msg;  /* keep the (cut) message rather than nothing */
+            need = (int)sizeof(stack_msg) - 1;
+        } else {
+            va_start(args, format);
+            vsnprintf(msg, (size_t)need + 1, format, args);
+            va_end(args);
+        }
+    }
+    fprintf(log_fp, "[%s] ", time_buf);
+    hub_log_write_sanitized(log_fp, msg, (size_t)need);
     fflush(log_fp);
+    if (msg != stack_msg) {
+        secure_wipe(msg, (size_t)need);  /* log args can hold key material */
+        free(msg);
+    }
+    secure_wipe(stack_msg, sizeof(stack_msg));
 }
 
 static void daemonize(void) {
@@ -142,15 +211,14 @@ static void daemonize(void) {
     if (devnull > STDERR_FILENO) close(devnull);
 }
 
-void handle_signal(int sig) {
-    (void)sig;
-    if (log_fp) {
-        if (!g_state || g_state->log_level != LOG_NONE)
-            fprintf(log_fp, "[HUB] Shutting down signal received.\n");
-        fclose(log_fp);
-    }
-    remove(HUB_PID_FILE);
-    exit(0);
+/* Set by SIGTERM/SIGINT; the main loop exits and main() shuts down in order.
+ * The handler itself does nothing else: stdio, unlink and exit() from a
+ * handler are unsafe (the signal can land inside malloc or hub_log), and an
+ * exit() there skipped the pending config write and the secret wipes. */
+static volatile sig_atomic_t g_hub_stop_signal = 0;
+
+static void handle_signal(int sig) {
+    g_hub_stop_signal = sig;
 }
 
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
@@ -491,9 +559,7 @@ void hub_maintenance(hub_state_t *state) {
                 int purged = hub_execute_purge(state, cutoff, purge_log, sizeof(purge_log));
                 if (purged > 0)
                     hub_log("[HUB] Scheduled purge removed %d tombstones\n", purged);
-                char sched_purge_msg[64];
-                snprintf(sched_purge_msg, sizeof(sched_purge_msg), "PURGE|%ld\n", (long)cutoff);
-                hub_broadcast_sync_to_peers(state, sched_purge_msg, -1);
+                hub_broadcast_purge(state, cutoff);
             } else {
                 hub_log("[HUB] Scheduled purge skipped (not elected leader in mesh)\n");
             }
@@ -949,10 +1015,27 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        printf("Friendly Name: ");
-        fflush(stdout);
-        if (fgets(state.hub_friendly_name, sizeof(state.hub_friendly_name), stdin)) {
-            state.hub_friendly_name[strcspn(state.hub_friendly_name, "\n")] = 0;
+        for (;;) {
+            char name_buf[128];
+            printf("Friendly Name (A-Z a-z 0-9 . _ -, max 63): ");
+            fflush(stdout);
+            if (!fgets(name_buf, sizeof(name_buf), stdin)) {
+                fprintf(stderr, "No hub name given.\n");
+                return 1;
+            }
+            if (!strchr(name_buf, '\n') && strlen(name_buf) == sizeof(name_buf) - 1) {
+                int ch;
+                while ((ch = getchar()) != '\n' && ch != EOF) {}
+                printf("Invalid name: longer than 63 characters.\n");
+                continue;
+            }
+            name_buf[strcspn(name_buf, "\r\n")] = 0;
+            if (hub_name_valid(name_buf)) {
+                memcpy(state.hub_friendly_name, name_buf, strlen(name_buf) + 1);
+                break;
+            }
+            printf("Invalid name: it is written into config lines and peer "
+                   "handshakes, so 1-63 letters, digits, '.', '_' or '-'.\n");
         }
 
         generate_uuid_v4(state.hub_uuid, sizeof(state.hub_uuid));
@@ -1175,8 +1258,15 @@ int main(int argc, char *argv[]) {
     log_fp = hub_log_open(false);
 
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
+    {
+        /* No SA_RESTART: a stop signal interrupts select() at once. */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = handle_signal;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+    }
 
     // Create PID file with exclusive lock
     int pid_fd = open(HUB_PID_FILE, O_CREAT | O_RDWR, 0600);
@@ -1277,7 +1367,7 @@ int main(int argc, char *argv[]) {
     
     listen(state.listen_fd, 10);
 
-    while (state.running) {
+    while (state.running && !g_hub_stop_signal) {
         hub_check_peers(&state);
         hub_maintenance(&state);
 
@@ -1310,6 +1400,14 @@ int main(int argc, char *argv[]) {
          * queues we want to revisit drain opportunities promptly without
          * busy-waiting. */
         struct timeval tv = {0, 250 * 1000};
+        /* Frames already read but not yet handled (the pump's 8-per-call
+         * cap): poll instead of sleeping, so they are handled this pass. */
+        for (int i = 0; i < state.client_count; i++) {
+            if (hub_client_has_buffered_frame(state.clients[i])) {
+                tv.tv_usec = 0;
+                break;
+            }
+        }
         if (select(max_fd + 1, &read_fds, &write_fds, NULL, &tv) < 0) continue;
 
         /* ---- Drain writable peers FIRST.  This keeps URGENT op-flow
@@ -1367,42 +1465,77 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < state.client_count; i++) {
             hub_client_t *c = state.clients[i];
             
-            if (c->fd > 0 && FD_ISSET(c->fd, &read_fds)) {
+            if (c->fd <= 0) continue;
+
+            if (FD_ISSET(c->fd, &read_fds)) {
                 int space = c->recv_cap - c->recv_len;  /* D2: per-client cap */
-                
+
                 if (space > 0) {
                     int n = read(c->fd, c->recv_buf + c->recv_len, space);
-                    
+
                     if (n <= 0) {
                         hub_disconnect_client(&state, c);
                         i--;
-                    } else {
-                        c->last_seen = time(NULL);
-                        c->recv_len += n;
-                        
-                        if (!hub_handle_client_data(&state, c)) {
-                            i--;
-                        }
+                        continue;
                     }
-                } else {
+                    c->last_seen = time(NULL);
+                    c->recv_len += n;
+                } else if (!hub_client_has_buffered_frame(c)) {
+                    /* Full buffer and no whole frame in it: cannot happen
+                     * with a valid length prefix, so the stream is bad. */
                     hub_log("[HUB] Buffer overflow %s\n", c->ip);
                     hub_disconnect_client(&state, c);
+                    i--;
+                    continue;
+                }
+                /* A full buffer that still holds whole frames is not an
+                 * overflow: handle them and read the rest next pass. */
+                if (!hub_handle_client_data(&state, c)) {
+                    i--;
+                }
+            } else if (hub_client_has_buffered_frame(c)) {
+                /* Nothing new on the socket, but frames left over from an
+                 * earlier read: without this they wait for the sender's next
+                 * packet (a burst of peer records took minutes). */
+                if (!hub_handle_client_data(&state, c)) {
                     i--;
                 }
             }
         }
     }
     
-    // Cleanup
-    if (state.pid_fd >= 0) {
-        close(state.pid_fd);
+    /* Shutdown.  The locked pid file is what says "this hub is running" (to
+     * tooling, and to a second copy's single-instance check), so it goes
+     * last: first the port and every link close and acknowledged changes
+     * still inside the write debounce reach the config, then the file is
+     * unlinked while still locked, then the lock is released.  Dropping it
+     * first let an immediate restart find the port still bound. */
+    hub_log("[HUB] Shutting down (signal %d).\n", (int)g_hub_stop_signal);
+    if (state.listen_fd >= 0) {
+        close(state.listen_fd);
+        state.listen_fd = -1;
     }
-    remove(HUB_PID_FILE);
+    while (state.client_count > 0)
+        hub_disconnect_client(&state, state.clients[state.client_count - 1]);
+    if (state.config_dirty) {
+        hub_config_write(&state);
+        state.config_dirty = false;
+    }
 
     secure_wipe(state.hub_ed25519_priv, 32);
     secure_wipe(state.hub_x25519_priv,  32);
     OPENSSL_cleanse(state.config_pass,   sizeof(state.config_pass));
     munlock(state.config_pass, sizeof(state.config_pass));
+
+    unlink(HUB_PID_FILE);
+    if (state.pid_fd >= 0) {
+        close(state.pid_fd);
+        state.pid_fd = -1;
+    }
+    if (log_fp) {
+        fclose(log_fp);
+        log_fp = NULL;
+    }
 
     return 0;
 }

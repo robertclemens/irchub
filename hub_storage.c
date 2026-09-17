@@ -97,17 +97,24 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
     snprintf(combined_value, sizeof(combined_value), "%s|%s", value,
              safe_op);
   } else if (strcmp(key, "o") == 0) {
-    snprintf(combined_value, sizeof(combined_value), "%s|%s|%s", value,
-             extra ? extra : "", safe_op);
+    /* Legacy global oper mask: the password slot is always stored empty.
+     * Oper passwords are retired; one arriving from an old config, an old
+     * peer or an old hub_admin must not be kept, synced or listed. */
+    (void)extra;
+    snprintf(combined_value, sizeof(combined_value), "%s||%s", value, safe_op);
   } else {
     snprintf(combined_value, sizeof(combined_value), "%s", value);
   }
 
   int i = global_entry_find(state, key, value);
   if (i >= 0) {
-    if (ts > state->global_entries[i].timestamp) {
-      hub_log("[STORAGE] Global %s=%s: incoming_ts=%ld > stored_ts=%ld -> UPDATED\n",
-              key, value, (long)ts, (long)state->global_entries[i].timestamp);
+    if (hub_lww_accepts(ts, hub_global_value_active(combined_value),
+                        state->global_entries[i].timestamp,
+                        hub_global_value_active(state->global_entries[i].value))) {
+      hub_log("[STORAGE] Global %s=%s: incoming_ts=%ld %s stored_ts=%ld -> UPDATED\n",
+              key, value, (long)ts,
+              ts > state->global_entries[i].timestamp ? ">" : "== (del beats add)",
+              (long)state->global_entries[i].timestamp);
       size_t len = strlen(combined_value);
       if (len >= sizeof(state->global_entries[i].value))
         len = sizeof(state->global_entries[i].value) - 1;
@@ -265,10 +272,11 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
                        strcmp(key, "d") == 0 || strcmp(key, "pub") == 0 ||
                        strcmp(key, "seen") == 0);
 
-  // Auto-Undelete on check-in
-  if (strcmp(key, "n") == 0 || strcmp(key, "s") == 0) {
-    b->is_active = true;
-  }
+  /* is_active follows the 'd' entry alone.  An 'n' or 's' entry used to set
+   * it back to true ("auto-undelete on check-in"): a peer still holding a
+   * deleted bot's nick, or a config reload that read 'n' after 'd|1',
+   * re-registered the bot.  A deleted bot cannot check in (auth needs
+   * is_active), so nothing legitimate depended on it. */
 
   // Check for existing entry
   for (int i = 0; i < b->entry_count; i++) {
@@ -319,8 +327,12 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
         return true;
       }
 
+      /* Same stamp, different value: the byte-wise greater value wins on
+       * every node.  "Last arrival wins" swapped two nodes' copies with each
+       * other and kept them apart; for 'd' this makes "1" (deleted) beat "0",
+       * the same delete-over-add rule as hub_lww_accepts. */
       if (ts == b->entries[i].timestamp) {
-        if (strcmp(b->entries[i].value, combined_value) != 0) {
+        if (strcmp(combined_value, b->entries[i].value) > 0) {
           size_t len = strlen(combined_value);
           if (len >= sizeof(b->entries[i].value))
             len = sizeof(b->entries[i].value) - 1;
@@ -359,29 +371,36 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
   return false;
 }
 
-bool hub_storage_delete(hub_state_t *state, const char *uuid) {
-  int found_index = -1;
-
+bool hub_storage_delete(hub_state_t *state, const char *uuid, time_t *ts_out) {
+  /* A delete is a d|1 tombstone, the same record every peer stores from the
+   * sync line, and the purge removes it later.  It used to remove the bot
+   * outright here: this hub then held nothing that outranks a peer still
+   * carrying the bot live (a peer that had not yet seen the delete), and
+   * that peer's next full sync registered the bot again. */
+  bot_config_t *b = NULL;
   for (int i = 0; i < state->bot_count; i++) {
     if (strcmp(state->bots[i].uuid, uuid) == 0) {
-      found_index = i;
+      b = &state->bots[i];
       break;
     }
   }
-
-  if (found_index == -1) {
+  if (!b || !b->is_active)
     return false;
+
+  time_t prev = 0;
+  for (int j = 0; j < b->entry_count; j++) {
+    if (strcmp(b->entries[j].key, "d") == 0) {
+      prev = b->entries[j].timestamp;
+      break;
+    }
   }
-
-  // Hard delete: Remove bot from array by shifting remaining bots
-  for (int i = found_index; i < state->bot_count - 1; i++) {
-    memcpy(&state->bots[i], &state->bots[i + 1], sizeof(bot_config_t));
-  }
-
-  // Clear the last slot and decrement count
-  memset(&state->bots[state->bot_count - 1], 0, sizeof(bot_config_t));
-  state->bot_count--;
-
+  time_t ts = hub_lww_next_ts(prev);
+  if (!hub_storage_update_entry(state, uuid, "d", "1", "", "", ts) ||
+      b->is_active)
+    return false;
+  if (ts_out)
+    *ts_out = ts;
+  state->config_dirty = true;
   hub_config_write(state);
   return true;
 }
@@ -582,6 +601,12 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   //    v2:     b|<hostmask>|<uuid>|<pubkey>|<ts>   (pubkey seals ~B2 traffic)
   //    legacy: b|<hostmask>|<uuid>|<ts>
   //    ts = max(hostmask ts, pubkey ts) so a rekey alone is seen as newer.
+  //    v2 payloads end the list with T|<count>: the lines above are the whole
+  //    trusted set, so the bot drops every trusted bot they do not name (a
+  //    deleted or purged bot).  Without it a bot only ever added or updated
+  //    trust and a revoked bot kept ~B2 and op grants forever.  Bots that
+  //    predate the marker ignore the unknown line.
+  int trusted_lines = 0;
   for (int i = 0; i < state->bot_count; i++) {
     if (strcmp(state->bots[i].uuid, uuid) == 0)
       continue; // Skip self
@@ -609,5 +634,12 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
     if (written < 0 || written >= (max_len - offset))
       break;
     offset += written;
+    trusted_lines++;
+  }
+  if (proto_v2) {
+    written = snprintf(buffer + offset, max_len - offset, "T|%d\n",
+                       trusted_lines);
+    if (written > 0 && written < (max_len - offset))
+      offset += written;
   }
 }
