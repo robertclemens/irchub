@@ -6124,6 +6124,360 @@ static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
 
 // ========== End Handlers for Forwarded OP Commands ==========
 
+// ========== Channel-Access Requests (unban / invite / key) ==========
+
+/* Frame `payload` under `cmd` and write it to one authenticated bot. */
+static bool send_cmd_to_bot(hub_client_t *bot, uint8_t cmd,
+                            const char *payload) {
+  int pay_len = payload ? (int)strlen(payload) : 0;
+  if (pay_len + 5 > MAX_BUFFER)
+    return false;
+
+  unsigned char plain[MAX_BUFFER], buf[MAX_BUFFER], tag[GCM_TAG_LEN];
+  plain[0] = cmd;
+  uint32_t net_pay = htonl((uint32_t)pay_len);
+  memcpy(&plain[1], &net_pay, 4);
+  if (pay_len)
+    memcpy(&plain[5], payload, (size_t)pay_len);
+
+  int enc_len = aes_gcm_encrypt(plain, 5 + pay_len, bot->session_key, buf + 4,
+                                tag);
+  if (enc_len <= 0) {
+    secure_wipe(plain, (size_t)(5 + pay_len));
+    return false;
+  }
+  memcpy(buf + 4 + enc_len, tag, GCM_TAG_LEN);
+  uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
+  memcpy(buf, &net_len, 4);
+  bool ok = write(bot->fd, buf, (size_t)(4 + enc_len + GCM_TAG_LEN)) > 0;
+  /* A CHAN_REPLY carries a channel key, so the cleartext frame does not stay
+   * on the stack after it has gone out.  Only the bytes used are touched. */
+  secure_wipe(plain, (size_t)(5 + pay_len));
+  return ok;
+}
+
+static bool chan_kind_valid(const char *kind) {
+  return strcmp(kind, "unban") == 0 || strcmp(kind, "invite") == 0 ||
+         strcmp(kind, "key") == 0;
+}
+
+static int add_pending_chan_request(hub_state_t *state, const char *request_id,
+                                    const char *requester_uuid,
+                                    const char *kind, const char *channel,
+                                    int origin_fd) {
+  time_t now = time(NULL);
+  for (int i = 0; i < MAX_PENDING_CHAN_REQUESTS; i++) {
+    pending_chan_request_t *p = &state->pending_chan_requests[i];
+    /* Reuse a slot whose reply never came rather than filling the table. */
+    if (p->active && now - p->timestamp > CHAN_REQUEST_TIMEOUT)
+      p->active = false;
+    if (!p->active) {
+      snprintf(p->request_id, sizeof(p->request_id), "%s", request_id);
+      snprintf(p->requester_uuid, sizeof(p->requester_uuid), "%s",
+               requester_uuid);
+      snprintf(p->kind, sizeof(p->kind), "%s", kind);
+      snprintf(p->channel, sizeof(p->channel), "%s", channel);
+      p->origin_fd = origin_fd;
+      p->timestamp = now;
+      p->active = true;
+      return i;
+    }
+  }
+  return -1;
+}
+
+static pending_chan_request_t *find_pending_chan_request(hub_state_t *state,
+                                                        const char *request_id) {
+  for (int i = 0; i < MAX_PENDING_CHAN_REQUESTS; i++) {
+    if (state->pending_chan_requests[i].active &&
+        strcmp(state->pending_chan_requests[i].request_id, request_id) == 0)
+      return &state->pending_chan_requests[i];
+  }
+  return NULL;
+}
+
+/* Look up one `key` of a stored bot record (e.g. "h" hostmask, "n" nick).
+ * Returns false when the bot or the key is unknown. */
+static bool hub_bot_entry(hub_state_t *state, const char *uuid, const char *key,
+                          char *out, size_t out_len) {
+  for (int i = 0; i < state->bot_count; i++) {
+    if (strcmp(state->bots[i].uuid, uuid) != 0)
+      continue;
+    for (int j = 0; j < state->bots[i].entry_count; j++) {
+      if (strcmp(state->bots[i].entries[j].key, key) == 0) {
+        snprintf(out, out_len, "%s", state->bots[i].entries[j].value);
+        return out[0] != '\0';
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
+static void forward_chan_request_to_peers(hub_state_t *state,
+                                          const char *request_id,
+                                          const char *requester_uuid,
+                                          const char *kind, const char *channel,
+                                          const char *nick,
+                                          const char *hostmask, int exclude_fd) {
+  /* request_id|requester_uuid|kind|channel|nick|hostmask */
+  char fwd[MAX_MASK_LEN + 256];
+  snprintf(fwd, sizeof(fwd), "%s|%s|%s|%s|%s|%s", request_id, requester_uuid,
+           kind, channel, nick ? nick : "", hostmask ? hostmask : "");
+
+  int queued = 0;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_HUB && c->authenticated && c->fd != exclude_fd) {
+      if (!peer_send_urgent(state, c, CMD_CHAN_FWD_REQUEST, fwd)) {
+        hub_log("[HUB] URGENT queue full forwarding CHAN_REQUEST to peer "
+                "fd=%d — disconnecting\n", c->fd);
+        hub_disconnect_client(state, c);
+        i--;
+        continue;
+      }
+      queued++;
+    }
+  }
+  if (queued > 0)
+    hub_log("[HUB] Forwarded CHAN_FWD_REQUEST (id:%s %s %s) to %d peer(s)\n",
+            request_id, kind, channel, queued);
+}
+
+/* Push the action to every authenticated local bot except the requester and
+ * the peer it arrived from.  Returns how many bots were told. */
+static int broadcast_chan_action(hub_state_t *state, const char *request_id,
+                                 const char *requester_uuid, const char *kind,
+                                 const char *channel, const char *nick,
+                                 const char *hostmask) {
+  char action[MAX_MASK_LEN + 256];
+  snprintf(action, sizeof(action), "%s|%s|%s|%s|%s|%s", request_id, kind,
+           channel, requester_uuid, nick ? nick : "", hostmask ? hostmask : "");
+
+  int sent = 0;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *bc = state->clients[i];
+    if (bc->type != CLIENT_BOT || !bc->authenticated)
+      continue;
+    if (strcmp(bc->id, requester_uuid) == 0)
+      continue; /* never ask the locked-out bot to help itself */
+    if (send_cmd_to_bot(bc, CMD_CHAN_ACTION, action))
+      sent++;
+    else
+      hub_log("[HUB] Failed to send CHAN_ACTION to bot %s\n", bc->id);
+  }
+  return sent;
+}
+
+/* Entry point shared by a local bot's request and a peer-forwarded one.
+ * `origin_fd` is the peer fd to route a reply back to, or -1 when the
+ * requester is one of our own bots. */
+static void chan_request_dispatch(hub_state_t *state, const char *request_id,
+                                  const char *requester_uuid, const char *kind,
+                                  const char *channel, const char *nick,
+                                  const char *hostmask, int origin_fd) {
+  /* Only `key` sends anything back, so only `key` needs a pending slot. */
+  if (strcmp(kind, "key") == 0 &&
+      add_pending_chan_request(state, request_id, requester_uuid, kind, channel,
+                               origin_fd) < 0) {
+    hub_log("[HUB] Pending channel-request table full — dropping %s for %s\n",
+            kind, channel);
+    return;
+  }
+
+  int told = broadcast_chan_action(state, request_id, requester_uuid, kind,
+                                   channel, nick, hostmask);
+  forward_chan_request_to_peers(state, request_id, requester_uuid, kind,
+                                channel, nick, hostmask, origin_fd);
+  hub_log("[HUB] CHAN_REQUEST %s for %s (id:%s) delivered to %d local bot(s)\n",
+          kind, channel, request_id, told);
+}
+
+static void process_chan_request(hub_state_t *state, hub_client_t *client,
+                                 char *payload) {
+  /* Payload from a bot is only `kind|channel`; everything that could be
+   * forged is resolved here from the authenticated bot's own records. */
+  char kind[8], channel[MAX_CHAN];
+  if (sscanf(payload, "%7[^|]|%64s", kind, channel) != 2 ||
+      !chan_kind_valid(kind)) {
+    hub_log("[HUB] Invalid CHAN_REQUEST payload from %s\n", client->id);
+    return;
+  }
+  if (channel[0] != '#' && channel[0] != '&') {
+    hub_log("[HUB] CHAN_REQUEST from %s for non-channel '%s'\n", client->id,
+            channel);
+    return;
+  }
+
+  char nick[MAX_NICK] = "", hostmask[MAX_MASK_LEN] = "";
+  hub_bot_entry(state, client->id, "n", nick, sizeof(nick));
+  hub_bot_entry(state, client->id, "h", hostmask, sizeof(hostmask));
+
+  /* An unban can only be matched against a mask, an invite only sent to a
+   * nick.  Without them the request is unserviceable, so say so rather than
+   * flooding the mesh with something no bot can act on. */
+  if (strcmp(kind, "unban") == 0 && hostmask[0] == '\0') {
+    hub_log("[HUB] No hostmask for %s — cannot service unban for %s\n",
+            client->id, channel);
+    return;
+  }
+  if (strcmp(kind, "invite") == 0 && nick[0] == '\0') {
+    hub_log("[HUB] No nick for %s — cannot service invite for %s\n",
+            client->id, channel);
+    return;
+  }
+
+  hub_log("[HUB] CHAN_REQUEST %s from %s for %s\n", kind, client->id, channel);
+
+  char request_id[64];
+  generate_request_id(request_id, sizeof(request_id));
+  op_forward_seen_check_and_add(state, request_id);
+  chan_request_dispatch(state, request_id, client->id, kind, channel, nick,
+                        hostmask, -1);
+}
+
+/* A bot answering a request (today only `key`).  Route it to the requester if
+ * it is ours, otherwise back down the peer fd the request arrived on. */
+static void process_chan_reply(hub_state_t *state, hub_client_t *client,
+                               char *payload) {
+  char request_id[64], kind[8], channel[MAX_CHAN], status[16];
+  const char *data = "";
+
+  /* Parsed straight out of `payload`: the %[^|] conversions do not write to
+   * their source, so there is no second copy of the key to wipe afterwards. */
+  if (sscanf(payload, "%63[^|]|%7[^|]|%64[^|]|%15[^|]", request_id, kind,
+             channel, status) != 4) {
+    hub_log("[HUB] Invalid CHAN_REPLY payload from %s\n", client->id);
+    return;
+  }
+  /* The data field is the remainder after the 4th '|' — a channel key may
+   * contain anything but whitespace, so it is never re-split. */
+  int bars = 0;
+  for (const char *p = payload; *p; p++) {
+    if (*p == '|' && ++bars == 4) {
+      data = p + 1;
+      break;
+    }
+  }
+
+  pending_chan_request_t *req = find_pending_chan_request(state, request_id);
+  if (!req) {
+    /* Late or duplicate answer — the first one already went home. */
+    hub_log("[HUB] CHAN_REPLY (id:%s) from %s matches no pending request\n",
+            request_id, client->id);
+    return;
+  }
+  /* Bind the answer to what was actually asked: holding a request id must not
+   * let a bot hand the requester a key for some other channel. */
+  if (strcmp(req->kind, kind) != 0 || strcasecmp(req->channel, channel) != 0) {
+    hub_log("[HUB] CHAN_REPLY (id:%s) from %s answers %s/%s but the request "
+            "was %s/%s — dropped\n", request_id, client->id, kind, channel,
+            req->kind, req->channel);
+    return;
+  }
+  /* A bot answering its own request tells us nothing. */
+  if (strcmp(client->id, req->requester_uuid) == 0)
+    return;
+
+  char out[MAX_BUFFER];
+  snprintf(out, sizeof(out), "%s|%s|%s|%s|%s", request_id, kind, channel,
+           status, data);
+
+  if (req->origin_fd == -1) {
+    hub_client_t *target = NULL;
+    for (int i = 0; i < state->client_count; i++) {
+      if (state->clients[i]->type == CLIENT_BOT &&
+          state->clients[i]->authenticated &&
+          strcmp(state->clients[i]->id, req->requester_uuid) == 0) {
+        target = state->clients[i];
+        break;
+      }
+    }
+    if (target && send_cmd_to_bot(target, CMD_CHAN_REPLY, out))
+      hub_log("[HUB] CHAN_REPLY %s for %s delivered to %s\n", kind, channel,
+              req->requester_uuid);
+    else
+      hub_log("[HUB] CHAN_REPLY %s for %s undeliverable to %s\n", kind, channel,
+              req->requester_uuid);
+  } else {
+    for (int i = 0; i < state->client_count; i++) {
+      hub_client_t *c = state->clients[i];
+      if (c->type == CLIENT_HUB && c->authenticated &&
+          c->fd == req->origin_fd) {
+        if (!peer_send_urgent(state, c, CMD_CHAN_FWD_REPLY, out))
+          hub_log("[HUB] URGENT queue full routing CHAN_REPLY to peer fd=%d\n",
+                  c->fd);
+        else
+          hub_log("[HUB] CHAN_REPLY %s for %s sent back as CHAN_FWD_REPLY to "
+                  "peer fd=%d\n", kind, channel, c->fd);
+        break;
+      }
+    }
+  }
+
+  req->active = false;
+  secure_wipe(out, sizeof(out));
+}
+
+static void process_forward_chan_request(hub_state_t *state,
+                                         hub_client_t *client, char *payload) {
+  char request_id[64], requester_uuid[64], kind[8], channel[MAX_CHAN];
+  char nick[MAX_NICK] = "", hostmask[MAX_MASK_LEN] = "";
+
+  int parsed = sscanf(payload, "%63[^|]|%63[^|]|%7[^|]|%64[^|]|%31[^|]|%255[^|]",
+                      request_id, requester_uuid, kind, channel, nick, hostmask);
+  if (parsed < 4 || !chan_kind_valid(kind)) {
+    hub_log("[HUB] Invalid CHAN_FWD_REQUEST from peer fd=%d\n", client->fd);
+    return;
+  }
+  /* Second sighting of this id: another path already delivered it. */
+  if (op_forward_seen_check_and_add(state, request_id))
+    return;
+
+  hub_log("[HUB] CHAN_FWD_REQUEST %s for %s (id:%s) from peer fd=%d\n", kind,
+          channel, request_id, client->fd);
+  chan_request_dispatch(state, request_id, requester_uuid, kind, channel, nick,
+                        hostmask, client->fd);
+}
+
+static void process_forward_chan_reply(hub_state_t *state, hub_client_t *client,
+                                       char *payload) {
+  char request_id[64];
+  if (sscanf(payload, "%63[^|]", request_id) != 1) {
+    hub_log("[HUB] Invalid CHAN_FWD_REPLY from peer fd=%d\n", client->fd);
+    return;
+  }
+  pending_chan_request_t *req = find_pending_chan_request(state, request_id);
+  if (!req)
+    return; /* not ours, or already answered */
+
+  if (req->origin_fd == -1) {
+    for (int i = 0; i < state->client_count; i++) {
+      if (state->clients[i]->type == CLIENT_BOT &&
+          state->clients[i]->authenticated &&
+          strcmp(state->clients[i]->id, req->requester_uuid) == 0) {
+        send_cmd_to_bot(state->clients[i], CMD_CHAN_REPLY, payload);
+        hub_log("[HUB] CHAN_FWD_REPLY (id:%s) from peer fd=%d delivered to %s\n",
+                request_id, client->fd, req->requester_uuid);
+        break;
+      }
+    }
+  } else {
+    for (int i = 0; i < state->client_count; i++) {
+      hub_client_t *c = state->clients[i];
+      if (c->type == CLIENT_HUB && c->authenticated && c->fd == req->origin_fd) {
+        peer_send_urgent(state, c, CMD_CHAN_FWD_REPLY, payload);
+        hub_log("[HUB] CHAN_FWD_REPLY (id:%s) relayed on toward its origin "
+                "(peer fd=%d)\n", request_id, c->fd);
+        break;
+      }
+    }
+  }
+  req->active = false;
+}
+
+// ========== End Channel-Access Requests ==========
+
 static void process_bot_command(hub_state_t *state, hub_client_t *client,
                                 int cmd, char *payload) {
   switch (cmd) {
@@ -6406,6 +6760,14 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
       }
     }
   } break;
+
+  case CMD_CHAN_REQUEST:
+    process_chan_request(state, client, payload);
+    break;
+
+  case CMD_CHAN_REPLY:
+    process_chan_reply(state, client, payload);
+    break;
 
   case CMD_INVITE_REQUEST: {
     /* Payload: nick|#channel — broadcast to all other bots, forward to peers */
@@ -7088,6 +7450,10 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 process_forward_op_grant(state, client, payload_ptr);
               } else if (cmd == CMD_OP_FORWARD_FAILED) {
                 process_forward_op_failed(state, client, payload_ptr);
+              } else if (cmd == CMD_CHAN_FWD_REQUEST) {
+                process_forward_chan_request(state, client, payload_ptr);
+              } else if (cmd == CMD_CHAN_FWD_REPLY) {
+                process_forward_chan_reply(state, client, payload_ptr);
               } else if (cmd == CMD_PEER_REKEY_BOT) {
                 /* v3: per-bot independent keys.  Peer-forwarded bot rekey
                  * is rejected because it would carry a private key. */

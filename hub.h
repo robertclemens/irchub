@@ -243,6 +243,37 @@
 #define CMD_BOT_ROSTER   0x57  // Hub <-> Hub: presence gossip (volatile)
 #define CMD_BOT_TREE     0x58  // Hub -> Bot: rendered tree rows (volatile)
 
+/* ---- Channel-access requests (unban / invite / key) ----------------------
+ * A bot locked out of a managed channel (474 banned, 473 invite-only, 475 bad
+ * key) asks the mesh to let it back in.  Routed exactly like CMD_OP_REQUEST:
+ * stamp a request id, broadcast the action to local bots, forward to peers
+ * under the same id (dropped on the second sighting via the shared
+ * seen_forwards ring), and route any reply back down the fd the request
+ * arrived on.  Only `key` produces a reply.
+ *
+ * The requesting bot supplies only `kind|channel`.  The hub fills in the
+ * requester's nick and hostmask from its own `n`/`h` records for that
+ * authenticated UUID, so a bot can neither request an unban for a mask that
+ * is not its own nor have a third party invited.  Mirrors ircbot/bot.h. */
+#define CMD_CHAN_REQUEST 0x59 // Bot -> Hub: kind|channel
+#define CMD_CHAN_ACTION  0x5A // Hub -> Bot: id|kind|chan|uuid|nick|hostmask
+#define CMD_CHAN_REPLY   0x5B // Bot <-> Hub: id|kind|chan|status|data
+#define CMD_CHAN_FWD_REQUEST 0x5C // Hub -> Hub: forward the action
+#define CMD_CHAN_FWD_REPLY   0x5D // Hub -> Hub: route a reply home
+
+#define MAX_PENDING_CHAN_REQUESTS 200
+#define CHAN_REQUEST_TIMEOUT 45   // Reap a pending request with no reply
+
+typedef struct {
+  char request_id[64];
+  char requester_uuid[64];  // Bot that is locked out
+  char kind[8];             // "unban" | "invite" | "key"
+  char channel[MAX_CHAN];
+  int origin_fd;            // Peer fd the request came from, -1 if local bot
+  time_t timestamp;
+  bool active;
+} pending_chan_request_t;
+
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
 
@@ -635,6 +666,7 @@ typedef struct {
   int pending_count;
 
   pending_op_request_t pending_op_requests[MAX_PENDING_OP_REQUESTS];
+  pending_chan_request_t pending_chan_requests[MAX_PENDING_CHAN_REQUESTS];
 
   ip_rate_limit_t ip_limits[MAX_IP_RATE_LIMITS];
   int ip_limits_count;
