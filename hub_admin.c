@@ -1674,6 +1674,125 @@ void menu_manage_global_peer_config(void) {
     }
 }
 
+/* ---- Network upgrade (hub-orchestrated rolling upgrade) ---- */
+
+/* Start a run.  Everything past the version is optional: an empty variant
+ * keeps each node on the one it is already running, an empty kind lets each
+ * node pick a prebuilt binary or a source build, and an empty base uses the
+ * release URL compiled into the daemons.  Bots and hubs are separate
+ * products on separate version lines, so the hubs get their own target and
+ * base; a blank hub target leaves every hub on the build it runs.  The hub
+ * freezes the config for the
+ * duration and drives the rolling plan itself, so this is fire-and-poll: the
+ * status screen is where the run is watched. */
+void admin_upgrade_network(void) {
+    char response[MAX_BUFFER];
+    char version[64], variant[16], kind[16], min_from[64], base[512];
+    char hub_version[64], hub_base[512];
+
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                 UPGRADE NETWORK\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("  Bots are upgraded in waves, peer hubs afterwards one at a\n");
+    printf("  time, this hub last.  The config is frozen until the run\n");
+    printf("  finishes, and any failure rolls the whole mesh back.\n\n");
+
+    get_input("Bot target version (e.g. 2.4.0, blank to cancel): ", version,
+              sizeof(version));
+    if (strlen(version) == 0) {
+        printf("[*] Cancelled.\n");
+        pause_and_continue();
+        return;
+    }
+    get_input("Variant c/rs (blank = keep each node's own): ", variant,
+              sizeof(variant));
+    get_input("Artifact bin/src (blank = let each node choose): ", kind,
+              sizeof(kind));
+    get_input("Minimum version to upgrade from (blank = any): ", min_from,
+              sizeof(min_from));
+    get_input("Bot release base URL override (blank = built-in): ", base,
+              sizeof(base));
+    get_input("Hub target version (blank = hubs stay on their build): ",
+              hub_version, sizeof(hub_version));
+    hub_base[0] = '\0';
+    if (strlen(hub_version) > 0)
+        get_input("Hub release base URL override (blank = built-in): ",
+                  hub_base, sizeof(hub_base));
+
+    char payload[1400];
+    snprintf(payload, sizeof(payload), "%s|%s|%s|%s|%s|%s|%s", version, variant,
+             kind, min_from, base, hub_version, hub_base);
+
+    printf("\n[*] Asking the hub to upgrade the network to %s...\n", version);
+    send_packet(g_fd, CMD_ADMIN_UPGRADE_NET, payload, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\nHub: %s\n", response);
+    printf("\n[*] Watch it with \"Upgrade status\"; the run continues whether\n");
+    printf("    or not this console stays connected.\n");
+    pause_and_continue();
+}
+
+void admin_upgrade_status(void) {
+    char response[MAX_BUFFER];
+    printf("\n");
+    send_packet(g_fd, CMD_ADMIN_UPGRADE_STATUS, NULL, g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("%s\n", response);
+    pause_and_continue();
+}
+
+/* Stop a run in flight: every node that already moved is told to restore its
+ * retained build, and the config freeze lifts. */
+void admin_upgrade_abort(void) {
+    char response[MAX_BUFFER], confirm[16];
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("                  ABORT UPGRADE\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("  Every node that already upgraded rolls back to its previous\n");
+    printf("  build.  Type 'yes' to confirm.\n\n");
+    get_input("Confirm: ", confirm, sizeof(confirm));
+    if (strcmp(confirm, "yes") != 0) {
+        printf("[*] Cancelled.\n");
+        pause_and_continue();
+        return;
+    }
+    send_packet(g_fd, CMD_ADMIN_UPGRADE_STATUS, "abort", g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\nHub: %s\n", response);
+    pause_and_continue();
+}
+
+void menu_upgrade_network(void) {
+    while (1) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║                UPGRADE NETWORK                   ║\n");
+        printf("╚══════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  1. Upgrade network to a version\n");
+        printf("  2. Upgrade status\n");
+        printf("  3. Abort the running upgrade\n");
+        printf("  4. Back to Main Menu\n");
+        printf("\n");
+        printf("Select: ");
+        fflush(stdout);
+
+        char buf[10];
+        if (!wait_for_input_or_socket(buf, sizeof(buf))) {
+            printf("\n[!] Connection lost.\n");
+            exit(1);
+        }
+
+        switch (atoi(buf)) {
+            case 1: admin_upgrade_network(); break;
+            case 2: admin_upgrade_status();  break;
+            case 3: admin_upgrade_abort();   break;
+            case 4: return;
+            default: printf("Invalid choice.\n"); break;
+        }
+    }
+}
+
 void menu_admin_commands(void) {
     while (1) {
         printf("\n");
@@ -2173,7 +2292,8 @@ int main(int argc, char *argv[]) {
         printf("  3. Manage Local Peer Config\n");
         printf("  4. Manage Global Peer Config\n");
         printf("  5. IRC Admin Commands\n");
-        printf("  6. Exit\n");
+        printf("  6. Upgrade Network\n");
+        printf("  7. Exit\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -2208,6 +2328,10 @@ int main(int argc, char *argv[]) {
                 break;
 
             case 6:
+                menu_upgrade_network();
+                break;
+
+            case 7:
                 printf("\nExiting...\n");
                 secure_wipe(g_key, sizeof(g_key));
                 close(fd);

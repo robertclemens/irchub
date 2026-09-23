@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>   /* PATH_MAX for hub_state_t.executable_path */
 #include <netinet/in.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -29,6 +30,10 @@
  * Each option is a single [a-zA-Z0-9] character; the active set lives in
  * hub_state_t.opt_flags and replicates to bots in CMD_CONFIG_DATA / sync. */
 #define OPT_HUB_ONLY_MUTATIONS 'h'
+/* Set for the duration of a network upgrade window: config mutations (admin
+ * commands + bot deltas) are refused until every node reports success and the
+ * verification pass completes, or the run aborts.  Task 6 (upgrade freeze). */
+#define OPT_CONFIG_FROZEN 'F'
 #define MAX_CHAN 65
 #define MAX_NICK 32
 #define MAX_KEY 31
@@ -100,9 +105,60 @@
  * Mirrors HIDEPINGPONG in ircbot/bot.h. */
 #define HIDEPINGPONG true
 
-/* This hub's version, reported in the bots tree beside each hub node.  Keep in
- * step with VERSION in the Makefile. */
-#define HUB_VERSION "2.0"
+/* This hub's version, reported in the bots tree beside each hub node and the
+ * one every upgrade comparison is made against.  Keep in step with VERSION in
+ * the Makefile; -D-overridable so a release build can stamp its own version
+ * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
+#ifndef HUB_VERSION
+#define HUB_VERSION "2.4.0"
+#endif
+
+/* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
+ * ircbot's BOT_UPDATE_PUBKEY_B64: one key signs both repos.  All of these are
+ * -D-overridable (the testnet injects a throwaway signing key), and at RUNTIME
+ * IRCHUB_UPDATE_BASE repoints the updater at a local irchub-releases tree.
+ * An empty pubkey DISABLES hub updates (fail-closed).
+ *
+ * HUB_UPDATE_BASE is the tree ROOT; one variant subdirectory below it holds
+ * that build's manifest.  Keeping the root separate is what lets a
+ * hub-orchestrated upgrade flip a hub between the C and Rust builds, exactly
+ * as it does for a bot: hub_update_commit() appends the variant it was told
+ * to install.  Mirrors BOT_UPDATE_BASE in ircbot/bot.h. */
+#ifndef HUB_UPDATE_BASE
+#define HUB_UPDATE_BASE                                                        \
+  "https://raw.githubusercontent.com/robertclemens/irchub-releases/main/"      \
+  "irchub"
+#endif
+/* The variant THIS build is.  The Rust hub answers "rs". */
+#ifndef HUB_UPDATE_VARIANT
+#define HUB_UPDATE_VARIANT "c"
+#endif
+#ifndef HUB_UPDATE_URL
+#define HUB_UPDATE_URL HUB_UPDATE_BASE "/" HUB_UPDATE_VARIANT "/releases.txt"
+#endif
+/* Detached Ed25519 signature over releases.txt (raw 64-byte sig, base64). */
+#ifndef HUB_UPDATE_SIG_URL
+#define HUB_UPDATE_SIG_URL HUB_UPDATE_BASE "/" HUB_UPDATE_VARIANT "/releases.sig"
+#endif
+#ifndef HUB_UPDATE_PUBKEY_B64
+#define HUB_UPDATE_PUBKEY_B64 "qkXMh/F8TC+cnKuIwrP5TJIynfrLBD+MDUwvkyh9lBU="
+#endif
+/* Hand-off note written just before a hub-driven upgrade execs the new binary:
+ * the restarted process has no memory of the run that replaced it, so it reads
+ * the upgrade id from here and answers CMD_UPGRADE_RESULT. */
+#define HUB_UPGRADE_MARKER_FILE ".irchub.upgrade"
+/* Retained previous binary/config, kept (not deleted) after an upgrade so
+ * CMD_UPGRADE_ABORT can put this hub back. */
+#define HUB_UPGRADE_PREV_SUFFIX ".prev"
+/* The generated installer, written 0700 and exec'd once the old process has
+ * let go of its pid lock. */
+#define HUB_UPGRADE_SCRIPT "hub_upgrade.sh"
+/* Ceilings on what the updater will pull down.  A manifest is a few KB and an
+ * unbounded realloc loop against a hostile or broken server is a
+ * memory-exhaustion hole; the archive cap is enforced by libcurl itself. */
+#define HUB_UPDATE_MAX_MANIFEST (1024 * 1024)
+#define HUB_UPDATE_MAX_ARCHIVE (256L * 1024 * 1024)
+#define HUB_UPDATE_FETCH_TIMEOUT 300L
 
 // Timeout Settings
 #define PING_INTERVAL 60
@@ -261,8 +317,52 @@
 #define CMD_CHAN_FWD_REQUEST 0x5C // Hub -> Hub: forward the action
 #define CMD_CHAN_FWD_REPLY   0x5D // Hub -> Hub: route a reply home
 
+/* --- Network-wide upgrade coordination (hub_admin-initiated rolling upgrade).
+ * Fan PREPARE out to bots + peer hubs, collect READY/UNABLE acks routed home by
+ * origin_fd (like CMD_OP_*), then COMMIT node-by-node and await RESULT.  Mirror
+ * in ircbot/bot.h, irchub.rs/consts.rs, ircbot.rs/consts.rs and
+ * docs/ARCHITECTURE.md.  Payloads are '|'-delimited text. */
+#define CMD_UPGRADE_PREPARE      0x5E // Hub -> Bot/Hub: id|ver|variant|kind|min_from|base
+#define CMD_UPGRADE_READY        0x5F // Bot/Hub -> Hub: id|uuid|cur|variant|arch|libc|ok|reason
+#define CMD_UPGRADE_COMMIT       0x60 // Hub -> node: id|ver|variant
+#define CMD_UPGRADE_RESULT       0x61 // node -> Hub: id|uuid|status|new_ver|detail
+#define CMD_UPGRADE_ABORT        0x62 // Hub -> all: id|reason
+#define CMD_ADMIN_UPGRADE_NET    0x63 // hub_admin -> Hub: ver|variant|kind|min_from|base
+#define CMD_ADMIN_UPGRADE_STATUS 0x64 // hub_admin -> Hub: ""=poll, "abort"=stop+roll back
+
 #define MAX_PENDING_CHAN_REQUESTS 200
 #define CHAN_REQUEST_TIMEOUT 45   // Reap a pending request with no reply
+
+/* ---- Network upgrade run (CMD_UPGRADE_*, CMD_ADMIN_UPGRADE_NET) ----------
+ * One run at a time per hub: the whole point is that exactly one plan drives
+ * the mesh while the config is frozen. */
+#define MAX_UPGRADE_NODES (MAX_CLIENTS + 1) /* every client, plus this hub */
+/* Downstream routes a follower remembers for a run it is only relaying: one
+ * per node it forwarded an answer for.  See upgrade_route_t. */
+#define MAX_UPGRADE_ROUTES MAX_UPGRADE_NODES
+#define UPGRADE_PREPARE_TIMEOUT 45  /* stop waiting for READY acks          */
+#define UPGRADE_COMMIT_TIMEOUT 420  /* a node must be back, upgraded, by now */
+/* Bots go in waves so a channel never loses every bot at once, and peer hubs
+ * go one at a time so the mesh never fully drops. */
+#define UPGRADE_BOT_WAVE_MAX 4
+#define UPGRADE_BOT_WAVE_DIVISOR 4  /* never commit more than 1/N of the bots */
+/* How long a CMD_UPGRADE_PREPARE this hub acknowledged stays commitable.  A
+ * driver that stalls mid-roll has to ask again rather than commit against a
+ * stale plan.  Mirrors UPGRADE_PREPARE_TTL in ircbot/bot.h. */
+#define UPGRADE_PREPARE_TTL 900
+
+/* ---- Offline roll-up (upgrade plan, Task 7) ----------------------------
+ * A node that was down, or homed elsewhere, when a run went through comes
+ * back on the old build.  The hub brings it up to the last completed run's
+ * target by itself, ONE node at a time and WITHOUT freezing the config: a
+ * single late bot is not a reason to hold the whole network's config still.
+ * Bounded on purpose — a node that keeps failing must not be re-committed on
+ * every reconnect. */
+#define ROLLUP_MAX_TRIES   3    /* per node, per hub lifetime               */
+#define ROLLUP_COOLDOWN    900  /* seconds between attempts on one node     */
+#define ROLLUP_SETTLE      20   /* seconds after a node appears before we try */
+#define ROLLUP_TIMEOUT     300  /* give up on one attempt after this        */
+#define MAX_ROLLUP_TRIES   64   /* nodes remembered in the attempt ledger   */
 
 typedef struct {
   char request_id[64];
@@ -325,8 +425,11 @@ typedef struct {
  * per-bot term scaled by the bots actually present.  A config that does not
  * fit is NOT written (the old file is kept) — never a truncated one.
  * hub_tool.h's HUB_TOOL_MAX_CONFIG is this at MAX_BOTS; keep them in step. */
+/* The persisted roll-up plan (see pending_rollup_t): rollup| + target,
+ * variant, kind, min_from, hub_target, plan_set and both 512-byte bases. */
+#define ROLLUP_LINE_MAX 1536
 #define HUB_CONFIG_FIXED_MAX \
-  ( (size_t)8192 + \
+  ( (size_t)8192 + (size_t)ROLLUP_LINE_MAX + \
     (size_t)MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
     (size_t)MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
     (size_t)MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
@@ -444,6 +547,117 @@ typedef struct {
   time_t timestamp;        // When request was created
   bool active;             // Whether this slot is in use
 } pending_op_request_t;
+
+/* ---- Network upgrade orchestration --------------------------------------
+ * Modeled on pending_op_request_t: a run carries its own id, routes its
+ * status back down origin_fd, and every node it touches gets a row here.
+ * Volatile on purpose — a hub that restarts mid-run has no business resuming
+ * someone else's plan; it comes back with the freeze flag still set in the
+ * replicated opt record and an admin clears it explicitly. */
+typedef enum {
+  UPG_NODE_PENDING = 0, /* PREPARE sent, no answer yet                   */
+  UPG_NODE_READY,       /* answered ready; waiting for its turn          */
+  UPG_NODE_UNABLE,      /* answered not-ready (reason says why)          */
+  UPG_NODE_COMMITTED,   /* COMMIT sent; waiting for the restart          */
+  UPG_NODE_DONE,        /* back on the target version                    */
+  UPG_NODE_FAILED       /* said fail, or never came back in time         */
+} upgrade_node_state_t;
+
+typedef struct {
+  char uuid[64];        /* bot uuid, or a peer hub's OWN hub uuid         */
+  /* Display label: a peer hub is known to the mesh by its friendly name,
+   * while every upgrade frame it sends is keyed by its uuid, so the table is
+   * keyed by uuid and prints this.  "" for a bot (its uuid is its name). */
+  char name[64];
+  char kind;            /* 'b' bot, 'h' peer hub, 's' this hub           */
+  char via[64];         /* peer hub a remote bot is reached through, else "" */
+  int  fd;              /* the connection it was reached on, -1 if gone  */
+  char cur_version[ROSTER_VERSION_MAX + 1];
+  char variant[8];      /* "c" / "rs"                                    */
+  char arch[32];
+  char libc[16];
+  upgrade_node_state_t state;
+  char reason[128];
+  time_t committed_at;
+} upgrade_node_t;
+
+/* One downstream node a FOLLOWER relays for.  A run reaches every hub in the
+ * mesh, whatever shape it is wired in: each follower re-broadcasts PREPARE to
+ * its own peers and forwards the answers back toward the driver, so a node
+ * several hops away is still a node of the run.  COMMIT and ABORT travel the
+ * same path in reverse, hop by hop, and this is the hop: "the peer I heard
+ * <uuid> from is where a frame for <uuid> goes next". */
+typedef struct {
+  char uuid[64];  /* the node the driver is addressing                     */
+  char via[64];   /* hub uuid of the peer it was learned from (next hop)   */
+} upgrade_route_t;
+
+typedef enum {
+  UPG_IDLE = 0,
+  UPG_PREPARE,  /* PREPARE fanned out, collecting READY/UNABLE           */
+  UPG_ROLLING,  /* committing nodes wave by wave                         */
+  UPG_DONE,
+  UPG_FAILED,
+  UPG_ABORTED
+} upgrade_phase_t;
+
+typedef struct {
+  bool   active;
+  char   id[64];              /* generate_request_id()                   */
+  char   target_ver[64];
+  char   variant[8];          /* "" = keep each node's own variant       */
+  char   kind[8];             /* "" = let each node pick bin/src         */
+  char   min_from[64];        /* "*" = any                               */
+  char   base[512];           /* release base override, "" = compiled-in */
+  /* The hubs' own target.  ircbot and irchub are separate products with
+   * separate version lines and separate release trees, so a hub node is
+   * never checked against `target_ver`/`base` — those are the bots'.  An
+   * empty hub_ver leaves every hub on the build it runs. */
+  char   hub_ver[64];
+  char   hub_base[512];       /* irchub-releases override, "" = compiled-in */
+  int    origin_fd;           /* admin connection that started it, or -1 */
+  time_t started;
+  time_t phase_started;
+  upgrade_phase_t phase;
+  upgrade_node_t nodes[MAX_UPGRADE_NODES];
+  int    node_count;
+  char   summary[192];        /* why it ended, shown by UPGRADE_STATUS   */
+} pending_upgrade_t;
+
+/* The plan a completed run left behind, and the one node being walked up to
+ * it right now.  The plan is persisted in this hub's own .irchub.cnf (a
+ * `rollup|` line, hub-local and never replicated — its base may be a test
+ * hook's file:// URL) so a restart does not forget what the network is
+ * supposed to be running; the attempt in flight and the retry ledger stay
+ * volatile.  The roll-up is a convenience, never the record of what the
+ * network runs (that is each node's own presence), and it only ever chases a
+ * target some other bot is demonstrably running (hub_rollup_target_proven). */
+typedef struct {
+  bool   have_plan;
+  char   target[64];
+  char   variant[8];
+  char   kind[8];
+  char   min_from[64];
+  char   base[512];
+  char   hub_target[64];  /* the run's hub target, "" = hubs were not moved */
+  char   hub_base[512];
+  time_t plan_set;
+
+  /* The attempt in flight, if any. */
+  bool   active;
+  char   id[64];          /* its own run id, distinct from any real run  */
+  char   uuid[64];        /* the node being rolled up                    */
+  char   node_kind;       /* 'b' bot — the only kind rolled up           */
+  char   step[64];        /* the version THIS attempt installs           */
+  time_t started;
+  bool   committed;
+} pending_rollup_t;
+
+typedef struct {
+  char   uuid[64];
+  time_t last_try;
+  int    tries;
+} rollup_try_t;
 
 typedef struct {
   char ip[64];
@@ -625,6 +839,9 @@ typedef struct {
   char bind_ip[64];          // IP this hub advertises itself as in mesh
   char hub_uuid[64];         // This hub's UUID
   char hub_friendly_name[64]; // This hub's friendly name
+  /* realpath(argv[0]) — the binary an upgrade replaces, and the one
+   * <exe>.prev sits beside.  Resolved once in main(); see hub_update.c. */
+  char executable_path[PATH_MAX];
   /* config_pass holds the plaintext AES-GCM config-file password for the
    * lifetime of the process (needed on every config write).  It is mlock'd
    * so the OS cannot page it to swap, and OPENSSL_cleanse'd at shutdown.
@@ -667,6 +884,36 @@ typedef struct {
 
   pending_op_request_t pending_op_requests[MAX_PENDING_OP_REQUESTS];
   pending_chan_request_t pending_chan_requests[MAX_PENDING_CHAN_REQUESTS];
+
+  /* The network upgrade this hub is driving, if any (one at a time). */
+  pending_upgrade_t upgrade;
+
+  /* The upgrade this hub has agreed to take from ANOTHER hub, if any.  The
+   * mesh is flat, so a hub is a follower and a driver at the same time and the
+   * two must not share state: `upgrade` above is the run this hub drives,
+   * these fields are a run someone else drives.  CMD_UPGRADE_COMMIT carries
+   * only the id and the version, so the release base the driver named at
+   * PREPARE time is remembered here; an id that never went through PREPARE, or
+   * one older than UPGRADE_PREPARE_TTL, is refused.  Volatile — the upgrade
+   * itself hands over through HUB_UPGRADE_MARKER_FILE because exec() takes all
+   * of this with it. */
+  char   follow_id[64];
+  char   follow_origin[64];  /* uuid of the hub driving the followed run  */
+  char   follow_target[64];     /* the bots' target (relayed COMMITs)    */
+  char   follow_hub_target[64]; /* this hub's own target, "" = stay put  */
+  char   follow_variant[8];
+  char   follow_hub_base[512];  /* irchub-releases base for this hub     */
+  bool   follow_self_ready;  /* this hub itself can take the followed run */
+  time_t follow_prepared;
+  /* Nodes below this hub in the followed run's fan-out tree (its own peers'
+   * subtrees).  Rebuilt for every run; see upgrade_route_t. */
+  upgrade_route_t follow_routes[MAX_UPGRADE_ROUTES];
+  int    follow_route_count;
+
+  /* Offline roll-up (see pending_rollup_t). */
+  pending_rollup_t rollup;
+  rollup_try_t     rollup_tries[MAX_ROLLUP_TRIES];
+  int              rollup_try_count;
 
   ip_rate_limit_t ip_limits[MAX_IP_RATE_LIMITS];
   int ip_limits_count;
@@ -934,6 +1181,58 @@ void hub_broadcast_mesh_state(hub_state_t *state);
  * BOT_TREE_REFRESH regardless).  hub_roster_expire drops entries past the
  * TTL; hub_roster_mark_dirty asks for a push on the next tick. */
 void hub_presence_tick(hub_state_t *state, time_t now);
+/* One step of the rolling network upgrade per maintenance tick: collect
+ * READY acks, commit the next wave, time out a node that never came back.
+ * A no-op unless a run is active. */
+void hub_upgrade_tick(hub_state_t *state, time_t now);
+/* Report the outcome of an upgrade another hub drove, once there is a peer to
+ * tell.  A no-op unless HUB_UPGRADE_MARKER_FILE says this process is that
+ * upgrade's restart; the marker is read and removed exactly once, so whichever
+ * peer link comes up first carries the answer. */
+void hub_upgrade_report_pending(hub_state_t *state, hub_client_t *peer);
+
+/* ---- The hub's own self-update (hub_update.c) ---------------------------
+ * The hub side of the network upgrade: what a node needs in order to *be*
+ * upgraded, as opposed to the orchestration that drives other nodes.  Built
+ * with HAVE_CURL; without it every entry point reports the feature
+ * unavailable rather than falling back to anything. */
+/* Could this hub move to `target_ver`?  Answered at PREPARE time, before
+ * anything is downloaded.  `min_from` is what the driving hub sent ("" or "*"
+ * = let the manifest decide); `reason` explains a false. */
+bool hub_update_can_take(const char *target_ver, const char *min_from,
+                         const char *base, char *reason, size_t reason_size);
+/* CMD_UPGRADE_COMMIT.  Returns false with *err set and nothing touched; on
+ * success it does not return -- the process is replaced and reports the
+ * outcome after the restart. */
+/* Highest version `cur_ver` may take right now on the way to `target_ver`,
+ * read from the release tree at <base>/<variant>.  Walks a node that sits
+ * below a target's min_from_version there one release at a time. */
+bool hub_update_next_step(const char *base, const char *variant,
+                          const char *cur_ver, const char *target_ver,
+                          char *out, size_t out_size, char *reason,
+                          size_t reason_size);
+
+bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
+                       const char *target_ver, const char *variant,
+                       const char *base, const char **err);
+/* CMD_UPGRADE_ABORT: restore <exe>.prev / .irchub.cnf.prev and restart onto
+ * them.  False when there is nothing retained to go back to. */
+bool hub_update_rollback(hub_state_t *state, const char *reason);
+bool hub_upgrade_marker_write(const char *upgrade_id, const char *target_ver);
+/* True when `s` may be one field of an upgrade plan: no '|', no line break,
+ * no shell metacharacter or blank, and short enough for any plan field.  The
+ * same rule gates what a follower accepts at PREPARE and what the rollup|
+ * config line carries, so a peer can never split or inject a config line. */
+bool hub_upgrade_plan_field_ok(const char *s);
+/* Reads and removes the hand-off marker hub_update_commit() left behind. */
+bool hub_update_take_pending(char *id_out, size_t id_size, char *ver_out,
+                             size_t ver_size);
+/* Compare two version strings, tolerating a leading 'v' on either side. */
+int hub_update_version_cmp(const char *a, const char *b);
+/* Host capability probe answered in CMD_UPGRADE_READY. */
+void hub_update_host_arch(char *out, size_t out_size);
+void hub_update_host_libc(char *out, size_t out_size);
+const char *hub_update_host_variant(void);
 void hub_roster_expire(hub_state_t *state, time_t now);
 void hub_roster_mark_dirty(hub_state_t *state);
 

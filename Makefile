@@ -17,7 +17,7 @@ $(info [build] using CC=$(CC))
 PROJECT = irchub
 
 # Version
-VERSION = 2.0
+VERSION = 2.4.0
 
 # Directories
 SRC_DIR = .
@@ -26,7 +26,7 @@ BIN_DIR = bin
 OBJ_DIR = $(BUILD_DIR)/obj
 
 # Source files
-HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c
+HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_update.c
 ADMIN_SOURCES = hub_admin.c hub_crypto.c
 DECRYPT_SOURCES = hub_decrypt.c
 ENCRYPT_SOURCES = hub_encrypt.c
@@ -56,17 +56,26 @@ CFLAGS = -Wall -Wextra -Wpedantic -std=c11
 
 ifeq ($(UNAME_S),Linux)
 # glibc + -std=c11 defines __STRICT_ANSI__ and hides POSIX symbols unless we
-# explicitly request a POSIX environment.
-CFLAGS += -D_POSIX_C_SOURCE=200809L
+# explicitly request a POSIX environment.  _XOPEN_SOURCE adds the XSI part
+# (realpath): glibc declares it without, musl does not (as in ircbot).
+CFLAGS += -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
 endif
 # FreeBSD/other BSD: leaving _POSIX_C_SOURCE unset keeps __BSD_VISIBLE on, which
 # is required for MSG_DONTWAIT and flock/LOCK_* used by the hub.
+
+# The hub's self-update transport.  Drop this (and -lcurl below) to build a hub
+# without the upgrade feature: every entry point in hub_update.c then reports it
+# unavailable instead of falling back to anything.
+CFLAGS += -DHAVE_CURL
 
 # OpenSSL includes (adjust if needed)
 INCLUDES = -I/usr/include -I/usr/local/include
 
 # Libraries
-LIBS = -lssl -lcrypto -lpthread
+# -lcurl is the hub's self-update transport (hub_update.c), guarded by
+# HAVE_CURL exactly as ircbot guards its own updater: a hub built without it
+# still builds and runs, and reports the upgrade feature unavailable.
+LIBS = -lssl -lcrypto -lpthread -lcurl
 
 # Linker flags
 LDFLAGS =

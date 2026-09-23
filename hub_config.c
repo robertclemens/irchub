@@ -189,6 +189,26 @@ void hub_config_write(hub_state_t *state) {
                (long long)state->opt_flags_ts);
   }
 
+  /* The roll-up plan (upgrade plan, Task 13): hub-local, never replicated.
+   * rollup|target|variant|kind|min_from|hub_target|plan_set|base|hub_base —
+   * every field was checked free of '|' and line breaks before it was
+   * accepted (hub_upgrade_plan_field_ok), and is checked again here, so the
+   * line can never split or inject another. */
+  {
+    const pending_rollup_t *r = &state->rollup;
+    if (r->have_plan && hub_upgrade_plan_field_ok(r->target) &&
+        hub_upgrade_plan_field_ok(r->variant) &&
+        hub_upgrade_plan_field_ok(r->kind) &&
+        hub_upgrade_plan_field_ok(r->min_from) &&
+        hub_upgrade_plan_field_ok(r->hub_target) &&
+        hub_upgrade_plan_field_ok(r->base) &&
+        hub_upgrade_plan_field_ok(r->hub_base)) {
+      SAFE_WRITE("rollup|%s|%s|%s|%s|%s|%lld|%s|%s\n", r->target, r->variant,
+                 r->kind, r->min_from, r->hub_target, (long long)r->plan_set,
+                 r->base, r->hub_base);
+    }
+  }
+
   for (int i = 0; i < state->peer_count; i++) {
     /* Serialize the per-peer Curve25519 pubkey (88 chars base64 of 64-byte
      * combined Ed25519+X25519) as the 5th field. Empty string means "no
@@ -605,6 +625,37 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         if (hub_parse_opt_value(v, flags, &ts)) {
           memcpy(state->opt_flags, flags, sizeof(flags));
           state->opt_flags_ts = ts;
+        }
+      } else if (strcmp(k, "rollup") == 0) {
+        /* rollup|target|variant|kind|min_from|hub_target|plan_set|base|hub_base
+         * — see hub_config_write.  A line that does not parse cleanly is
+         * dropped whole: no plan is better than half of one. */
+        const char *f[9];
+        size_t fl[9];
+        int n = split_fields(v, f, fl, 9);
+        pending_rollup_t *r = &state->rollup;
+        struct { char *dst; size_t cap; } out[8] = {
+            {r->target, sizeof(r->target)},     {r->variant, sizeof(r->variant)},
+            {r->kind, sizeof(r->kind)},         {r->min_from, sizeof(r->min_from)},
+            {r->hub_target, sizeof(r->hub_target)}, {NULL, 0},
+            {r->base, sizeof(r->base)},         {r->hub_base, sizeof(r->hub_base)}};
+        bool ok = (n == 8 && fl[0] > 0);
+        for (int i = 0; ok && i < 8; i++) {
+          if (!out[i].dst) continue;
+          if (fl[i] >= out[i].cap) ok = false;
+          else {
+            memcpy(out[i].dst, f[i], fl[i]);
+            out[i].dst[fl[i]] = '\0';
+            ok = hub_upgrade_plan_field_ok(out[i].dst);
+          }
+        }
+        long long ts = ok ? strtoll(f[5], NULL, 10) : 0;
+        if (ok && ts > 0) {
+          r->plan_set = (time_t)ts;
+          r->have_plan = true;
+        } else {
+          memset(r, 0, sizeof(*r));
+          hub_log("[CONFIG] Ignoring a malformed rollup| line\n");
         }
       } else if (strcmp(k, "lamport_seq") == 0) {
         unsigned long long loaded_seq = 0;

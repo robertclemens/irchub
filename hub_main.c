@@ -416,6 +416,9 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
         return;
     }
     hub_log("[PEER] Handshake complete with %s\n", c->ip);
+    /* If this process is the product of an upgrade a peer drove, close that
+     * run out now that there is a peer to tell (no-op otherwise). */
+    hub_upgrade_report_pending(state, c);
     /* Send a full config sync immediately via the BULK queue.  The queue
      * enforces a per-peer byte budget (BULK_SOFT_BUDGET_BPS = 32 KB/s) so
      * simultaneous startup of all 10 hubs no longer creates a cascade that
@@ -423,8 +426,14 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
      * by the select() cycle time.  This replaces the old approach of deferring
      * the first sync to anti-entropy (up to 90 s wait). */
     {
-        char full_sync[MAX_BUFFER];
-        hub_generate_sync_packet(state, full_sync, MAX_BUFFER - 100);
+        /* Heap, sized to the sync ceiling like the accepting side: a 16 KB
+         * stack buffer cut the dialing side's startup sync short. */
+        char *full_sync = malloc(MAX_SYNC_PAYLOAD);
+        if (!full_sync) {
+            hub_log("[PEER] OOM building initial sync for %s\n", c->ip);
+            return;
+        }
+        hub_generate_sync_packet(state, full_sync, MAX_SYNC_PAYLOAD);
         int sync_len = strlen(full_sync);
         if (sync_len > 0) {
             queued_msg_t *sync_msg = queued_msg_new(CMD_PEER_SYNC, LANE_BULK,
@@ -439,6 +448,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
                 }
             }
         }
+        free(full_sync);
     }
 }
 
@@ -488,6 +498,9 @@ void hub_maintenance(hub_state_t *state) {
      * see the CMD_BOT_PRESENCE block in hub.h. */
     hub_presence_tick(state, now);
 
+    /* Rolling network upgrade: one step per tick (no-op unless running). */
+    hub_upgrade_tick(state, now);
+
     /* Mesh state gossip: every 5 min as heartbeat, or immediately when peer
      * topology changes (connect/disconnect sets mesh_state_dirty). */
     if (state->mesh_state_dirty || (now - last_mesh_gossip > 300)) {
@@ -509,9 +522,16 @@ void hub_maintenance(hub_state_t *state) {
         if (state->peer_count > 0) {
             hub_log("[MESH] Running %santi-entropy sync...\n",
                     forced_ae ? "forced " : "periodic ");
-            char full_sync[MAX_BUFFER];
-            hub_generate_sync_packet(state, full_sync, MAX_BUFFER - 100);
-            hub_broadcast_sync_to_peers(state, full_sync, -1);
+            /* Heap, sized to the sync ceiling: a 16 KB buffer truncated
+             * anti-entropy the same way it truncated the startup sync. */
+            char *full_sync = malloc(MAX_SYNC_PAYLOAD);
+            if (full_sync) {
+                hub_generate_sync_packet(state, full_sync, MAX_SYNC_PAYLOAD);
+                hub_broadcast_sync_to_peers(state, full_sync, -1);
+                free(full_sync);
+            } else {
+                hub_log("[MESH] OOM building anti-entropy sync\n");
+            }
         }
     }
 
@@ -1266,6 +1286,15 @@ int main(int argc, char *argv[]) {
         sigemptyset(&sa.sa_mask);
         sigaction(SIGINT, &sa, NULL);
         sigaction(SIGTERM, &sa, NULL);
+    }
+
+    /* The binary an upgrade replaces, and the one <exe>.prev sits beside.
+     * Resolved once, here, because exec() through the upgrade script needs an
+     * absolute path and argv[0] alone may be relative.  A hub that cannot
+     * resolve it still runs; hub_update_commit() refuses instead. */
+    if (!realpath(argv[0], state.executable_path)) {
+        state.executable_path[0] = '\0';
+        hub_log_warning("Could not resolve my own path; self-upgrade disabled\n");
     }
 
     // Create PID file with exclusive lock
