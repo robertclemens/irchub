@@ -1627,6 +1627,7 @@ static void roster_upsert(hub_state_t *state, const bot_roster_t *in) {
      * re-rendering every bot's tree for. */
     bool changed = strcmp(e->nick, in->nick) != 0 ||
                    strcmp(e->version, in->version) != 0 ||
+                   strcmp(e->variant, in->variant) != 0 ||
                    strcmp(e->server, in->server) != 0 ||
                    e->connected_at != in->connected_at;
     *e = *in;
@@ -1647,12 +1648,15 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
                                  const char *payload) {
   char version[ROSTER_VERSION_MAX + 1] = "";
   char server[ROSTER_SERVER_MAX + 1] = "";
+  char variant[ROSTER_VARIANT_MAX + 1] = "";
   long long started = 0;
 
-  /* "<version>|<server>|<started>" — a short, fixed shape.  Anything longer
-   * than the field caps is truncated by roster_clean, never rejected, so a
-   * newer bot advertising more never drops off the tree entirely. */
-  char work[ROSTER_VERSION_MAX + ROSTER_SERVER_MAX + 64];
+  /* "<version>|<server>|<started>|<variant>" — a short, fixed shape.  The
+   * variant (code base, c / rs) is the newest field; a bot that predates it
+   * sends three and simply shows no code base.  Anything longer than the
+   * field caps is truncated by roster_clean, never rejected, so a newer bot
+   * advertising more never drops off the tree entirely. */
+  char work[ROSTER_VERSION_MAX + ROSTER_SERVER_MAX + ROSTER_VARIANT_MAX + 64];
   snprintf(work, sizeof(work), "%s", payload ? payload : "");
   char *p1 = strchr(work, '|');
   if (p1) {
@@ -1660,6 +1664,13 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
     char *p2 = strchr(p1 + 1, '|');
     if (p2) {
       *p2 = '\0';
+      char *p3 = strchr(p2 + 1, '|');
+      if (p3) {
+        *p3 = '\0';
+        char *p4 = strchr(p3 + 1, '|'); /* room for fields after it */
+        if (p4) *p4 = '\0';
+        roster_clean(variant, sizeof(variant), p3 + 1);
+      }
       started = atoll(p2 + 1);
     }
     roster_clean(server, sizeof(server), p1 + 1);
@@ -1673,14 +1684,17 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
 
   bool changed = strcmp(client->bot_version, version) != 0 ||
                  strcmp(client->bot_server, server) != 0 ||
+                 strcmp(client->bot_variant, variant) != 0 ||
                  client->bot_started != (time_t)started;
   snprintf(client->bot_version, sizeof(client->bot_version), "%s", version);
   snprintf(client->bot_server, sizeof(client->bot_server), "%s", server);
+  snprintf(client->bot_variant, sizeof(client->bot_variant), "%s", variant);
   client->bot_started = (time_t)started;
 
   if (changed) {
-    hub_log("[PRESENCE] Bot %s: version %s on %s\n", client->id,
-            version[0] ? version : "?", server[0] ? server : "(no server)");
+    hub_log("[PRESENCE] Bot %s: version %s (%s) on %s\n", client->id,
+            version[0] ? version : "?", variant[0] ? variant : "?",
+            server[0] ? server : "(no server)");
     state->tree_dirty = true;
     state->last_presence_gossip = 0; /* gossip the change on the next tick */
   }
@@ -1741,17 +1755,29 @@ static void roster_send_to_peers(hub_state_t *state, const char *frame,
 
 /* Gossip the bots connected to THIS hub out to the peers.  Chunked to a byte
  * budget: each frame repeats the h| header and carries whole rows only, so a
- * receiver can apply any frame on its own without waiting for the rest. */
+ * receiver can apply any frame on its own without waiting for the rest.
+ *
+ * Frame shape:
+ *   h|<hub_uuid>|<name>|<started>|<hub_version>
+ *   v|<hub_variant>                          (this hub's code base: c / rs)
+ *   b|<bot_uuid>|<nick>|<version>|<server>|<started>|<variant>
+ * The hub's variant is a line of its own, not a sixth h| field: a hub that
+ * predates it reads everything after the version's '|' into the version
+ * (roster_clean drops the '|'), which would read as "2.4.0c" and stall any
+ * upgrade run waiting on "2.4.0".  Older hubs skip an unknown line.  The b|
+ * variant can ride last because older hubs split five fields and atoll() the
+ * start time, which stops at the '|'. */
 static void hub_gossip_bot_roster(hub_state_t *state) {
   if (state->peer_count == 0) return;
 
   char frame[ROSTER_FRAME_BUDGET];
   time_t now = time(NULL);
-  int header_len = snprintf(frame, sizeof(frame), "h|%s|%s|%lld|%s\n",
+  int header_len = snprintf(frame, sizeof(frame), "h|%s|%s|%lld|%s\nv|%s\n",
                             state->hub_uuid[0] ? state->hub_uuid : "-",
                             state->hub_friendly_name[0]
                                 ? state->hub_friendly_name : "-",
-                            (long long)state->hub_started, HUB_VERSION);
+                            (long long)state->hub_started, HUB_VERSION,
+                            HUB_UPDATE_VARIANT);
   if (header_len <= 0 || header_len >= (int)sizeof(frame)) return;
   int offset = header_len, rows = 0, frames = 0;
 
@@ -1762,11 +1788,12 @@ static void hub_gossip_bot_roster(hub_state_t *state) {
     char nick[MAX_NICK];
     bot_nick_from_config(state, c->id, nick, sizeof(nick));
     char row[TREE_ROW_MAX];
-    int rl = snprintf(row, sizeof(row), "b|%s|%s|%s|%s|%lld\n", c->id,
+    int rl = snprintf(row, sizeof(row), "b|%s|%s|%s|%s|%lld|%s\n", c->id,
                       nick[0] ? nick : "-",
                       c->bot_version[0] ? c->bot_version : "-",
                       c->bot_server[0] ? c->bot_server : "-",
-                      (long long)c->bot_started);
+                      (long long)c->bot_started,
+                      c->bot_variant[0] ? c->bot_variant : "-");
     if (rl <= 0 || rl >= (int)sizeof(row)) continue; /* unrepresentable row */
 
     if (offset + rl >= (int)sizeof(frame)) { /* full: flush, restart */
@@ -1846,6 +1873,24 @@ static void process_bot_roster(hub_state_t *state, char *payload) {
       }
       continue;
     }
+    if (strncmp(line, "v|", 2) == 0) {
+      /* The code base of the hub whose h| header this frame opened with. */
+      if (!hub_uuid[0] || strcmp(hub_uuid, "-") == 0) continue;
+      char hv[ROSTER_VARIANT_MAX + 1];
+      roster_clean(hv, sizeof(hv), line + 2);
+      for (int p = 0; p < state->peer_count; p++) {
+        if (!state->peers[p].uuid[0] ||
+            strcmp(state->peers[p].uuid, hub_uuid) != 0)
+          continue;
+        if (strcmp(state->peers[p].remote_variant, hv) != 0) {
+          snprintf(state->peers[p].remote_variant,
+                   sizeof(state->peers[p].remote_variant), "%s", hv);
+          state->tree_dirty = true;
+        }
+        break;
+      }
+      continue;
+    }
     if (strncmp(line, "b|", 2) != 0) continue;
     /* A row before its header has no hub to hang off — ignore it rather than
      * guess, so a malformed frame cannot graft bots onto the wrong branch. */
@@ -1854,10 +1899,12 @@ static void process_bot_roster(hub_state_t *state, char *payload) {
      * built from our live client list and nothing else. */
     if (state->hub_uuid[0] && strcmp(hub_uuid, state->hub_uuid) == 0) continue;
 
-    char *fields[5] = {NULL, NULL, NULL, NULL, NULL};
+    /* Five fields from any hub; a sixth (the bot's code base) from one that
+     * knows it. */
+    char *fields[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
     char *cur = line + 2;
     int n = 0;
-    while (n < 5) {
+    while (n < 6) {
       fields[n++] = cur;
       char *sep = strchr(cur, '|');
       if (!sep) break;
@@ -1876,6 +1923,8 @@ static void process_bot_roster(hub_state_t *state, char *payload) {
     if (strcmp(fields[1], "-") != 0) roster_clean(e.nick, sizeof(e.nick), fields[1]);
     if (strcmp(fields[2], "-") != 0) roster_clean(e.version, sizeof(e.version), fields[2]);
     if (strcmp(fields[3], "-") != 0) roster_clean(e.server, sizeof(e.server), fields[3]);
+    if (n >= 6 && strcmp(fields[5], "-") != 0)
+      roster_clean(e.variant, sizeof(e.variant), fields[5]);
     long long started = atoll(fields[4]);
     /* Clamp a peer's clock skew rather than trusting it: a future start time
      * would render as a negative uptime. */
@@ -1885,9 +1934,42 @@ static void process_bot_roster(hub_state_t *state, char *payload) {
   }
 }
 
+/* "<version> (<code base>)" for a bot that is on the mesh right now, e.g.
+ * "2.4.0 (rs)": our own live client first, else the freshest peer report.
+ * The bare version when the reporter did not say which code base, "-" when
+ * nobody reports the bot at all.  For hub_admin's bot list. */
+static void bot_version_label(const hub_state_t *state, const char *uuid,
+                              char *out, size_t cap) {
+  const char *ver = "", *var = "";
+  bool found = false;
+  for (int i = 0; i < state->client_count && !found; i++) {
+    const hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_BOT || !c->authenticated ||
+        strcmp(c->id, uuid) != 0)
+      continue;
+    ver = c->bot_version;
+    var = c->bot_variant;
+    found = true;
+  }
+  time_t freshest = 0;
+  for (int r = 0; r < state->roster_count && !found; r++) {
+    const bot_roster_t *e = &state->roster[r];
+    if (strcmp(e->bot_uuid, uuid) != 0 || e->reported_at < freshest) continue;
+    freshest = e->reported_at;
+    ver = e->version;
+    var = e->variant;
+  }
+  if (!ver[0])
+    snprintf(out, cap, "-");
+  else if (var[0])
+    snprintf(out, cap, "%s (%s)", ver, var);
+  else
+    snprintf(out, cap, "%s", ver);
+}
+
 /* Build the tree for the bots on THIS hub, in DFS pre-order.  Row shapes:
- *   H|<depth>|<name>|<uuid>|<online>|<uptime>
- *   B|<depth>|<nick>|<uuid>|<version>|<server>|<uptime>
+ *   H|<depth>|<name>|<uuid>|<online>|<uptime>|<version>|<variant>
+ *   B|<depth>|<nick>|<uuid>|<version>|<server>|<uptime>|<variant>
  *   D|<nick>|<uuid>|<last_seen>            (offline; always the tail)
  * Depth plus pre-order is all a renderer needs to draw the connectors: a node
  * is the last child at its level when no later row shares its depth before a
@@ -1902,13 +1984,16 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
   time_t now = time(NULL);
   buf[0] = '\0';
 
-  written = snprintf(buf, max_len, "H|0|%s|%s|1|%lld|%s\n",
+  /* <variant> is the code base (c / rs), always the last field: a bot that
+   * predates it splits a fixed field count and never looks past uptime or
+   * version, so the extra field is invisible to it. */
+  written = snprintf(buf, max_len, "H|0|%s|%s|1|%lld|%s|%s\n",
                      state->hub_friendly_name[0] ? state->hub_friendly_name
                                                  : "hub",
                      state->hub_uuid[0] ? state->hub_uuid : "-",
                      (long long)(state->hub_started
                                      ? now - state->hub_started : 0),
-                     HUB_VERSION);
+                     HUB_VERSION, HUB_UPDATE_VARIANT);
   if (written < 0 || written >= max_len) return 0;
   offset += written;
 
@@ -1919,11 +2004,13 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
     if (max_len - offset <= TREE_ROW_MAX) break;
     char nick[MAX_NICK];
     bot_nick_from_config(state, c->id, nick, sizeof(nick));
-    written = snprintf(buf + offset, max_len - offset, "B|1|%s|%s|%s|%s|%lld\n",
+    written = snprintf(buf + offset, max_len - offset,
+                       "B|1|%s|%s|%s|%s|%lld|%s\n",
                        nick[0] ? nick : "-", c->id,
                        c->bot_version[0] ? c->bot_version : "-",
                        c->bot_server[0] ? c->bot_server : "-",
-                       (long long)(c->bot_started ? now - c->bot_started : 0));
+                       (long long)(c->bot_started ? now - c->bot_started : 0),
+                       c->bot_variant[0] ? c->bot_variant : "-");
     if (written < 0 || written >= max_len - offset) break;
     offset += written;
   }
@@ -1944,12 +2031,14 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
     char pname[64];
     roster_clean(pname, sizeof(pname),
                  peer->friendly_name[0] ? peer->friendly_name : peer->ip);
-    written = snprintf(buf + offset, max_len - offset, "H|1|%s|%s|%d|%lld|%s\n",
+    written = snprintf(buf + offset, max_len - offset,
+                       "H|1|%s|%s|%d|%lld|%s|%s\n",
                        pname[0] ? pname : "peer", puuid[0] ? puuid : "-",
                        online ? 1 : 0,
                        (long long)(peer->remote_started
                                        ? now - peer->remote_started : 0),
-                       peer->remote_version[0] ? peer->remote_version : "-");
+                       peer->remote_version[0] ? peer->remote_version : "-",
+                       peer->remote_variant[0] ? peer->remote_variant : "-");
     if (written < 0 || written >= max_len - offset) break;
     offset += written;
 
@@ -1959,12 +2048,13 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
       if (strcmp(e->hub_uuid, puuid) != 0) continue;
       if (max_len - offset <= TREE_ROW_MAX) break;
       written = snprintf(buf + offset, max_len - offset,
-                         "B|2|%s|%s|%s|%s|%lld\n",
+                         "B|2|%s|%s|%s|%s|%lld|%s\n",
                          e->nick[0] ? e->nick : "-", e->bot_uuid,
                          e->version[0] ? e->version : "-",
                          e->server[0] ? e->server : "-",
                          (long long)(e->connected_at ? now - e->connected_at
-                                                     : 0));
+                                                     : 0),
+                         e->variant[0] ? e->variant : "-");
       if (written < 0 || written >= max_len - offset) break;
       offset += written;
     }
@@ -3762,6 +3852,29 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         }
       }
 
+      /* Still not found: the live presence roster (CMD_BOT_ROSTER) knows
+       * every bot a peer hub has right now, TTL'd, whatever the legacy
+       * gossip above carries. */
+      if (!is_connected) {
+        const bot_roster_t *best = NULL;
+        for (int r = 0; r < state->roster_count; r++)
+          if (strcmp(state->roster[r].bot_uuid, b->uuid) == 0 &&
+              (!best || state->roster[r].reported_at >= best->reported_at))
+            best = &state->roster[r];
+        if (best) {
+          is_connected = true;
+          snprintf(connected_to, sizeof(connected_to), "PEER (%.100s)",
+                   best->hub_name);
+          for (int p = 0; p < state->peer_count; p++)
+            if (state->peers[p].uuid[0] &&
+                strcmp(state->peers[p].uuid, best->hub_uuid) == 0) {
+              snprintf(connected_to, sizeof(connected_to), "PEER (%.64s:%d)",
+                       state->peers[p].ip, state->peers[p].port);
+              break;
+            }
+        }
+      }
+
       // Format last seen time
       char time_buf[64];
       if (last_seen == 0) {
@@ -3781,12 +3894,17 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
           break;
         }
 
+      /* Version and code base, e.g. "2.4.0 (rs)", from the volatile presence
+       * data — known only while the bot is on the mesh. */
+      char ver[ROSTER_VERSION_MAX + ROSTER_VARIANT_MAX + 4] = "-";
+      if (is_connected) bot_version_label(state, b->uuid, ver, sizeof(ver));
+
       // Build output line
       written =
           snprintf(response + offset, LIST_FULL_SZ - offset,
-                   "[%s] %-15s | Status: %-10s | Peer: %-20s | Key: %s | Last: %s\n",
+                   "[%s] %-15s | Status: %-10s | Peer: %-20s | Version: %-12s | Key: %s | Last: %s\n",
                    b->uuid, nick, is_connected ? "CONNECTED" : "OFFLINE",
-                   is_connected ? connected_to : "N/A", bfp, time_buf);
+                   is_connected ? connected_to : "N/A", ver, bfp, time_buf);
 
       if (written >= LIST_FULL_SZ - offset)
         break;
@@ -4400,8 +4518,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     }
     offset += written;
 
-    // Add 25 for the IP:Port column (21 chars + " | " = 24)
-    int line_len = peer_col_width + 3 + 24 + (count * 5) + 15 + 10;
+    // Add 25 for the IP:Port column (21 chars + " | " = 24); 7 for Code
+    int line_len = peer_col_width + 3 + 24 + (count * 5) + 15 + 10 + 7;
 
     for (int k = 0; k < line_len && offset < 65534; k++)
       response_ptr[offset++] = '-';
@@ -4431,7 +4549,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
     // CRITICAL FIX: Add overflow check
     written = snprintf(response_ptr + offset, 65536 - offset,
-                       " Mesh State    | Bots |\n");
+                       " Mesh State    | Bots | Code |\n");
     if (written < 0 || written >= (int)(65536 - offset)) {
       free(response_ptr);
       return send_response(state, client, "ERROR: Response buffer overflow");
@@ -4737,10 +4855,32 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       }
       offset += written;
 
+      /* Code base (c / rs): ours is compiled in; a peer's comes from the v|
+       * line of its roster gossip, so only hubs we peer with directly (and
+       * that send one) are known — anything else shows "?". */
+      const char *code = "?";
+      if (all_peers[row].is_me) {
+        code = HUB_UPDATE_VARIANT;
+      } else {
+        for (int p = 0; p < state->peer_count; p++) {
+          bool peer_matches;
+          if (all_peers[row].uuid[0] && state->peers[p].uuid[0])
+            peer_matches = strcmp(state->peers[p].uuid, all_peers[row].uuid) == 0;
+          else
+            peer_matches = state->peers[p].port == all_peers[row].port &&
+                           strcmp(state->peers[p].ip, all_peers[row].ip) == 0;
+          if (peer_matches) {
+            if (state->peers[p].remote_variant[0])
+              code = state->peers[p].remote_variant;
+            break;
+          }
+        }
+      }
+
       if (is_offline) {
         // CRITICAL FIX: Add overflow check
-        written =
-            snprintf(response_ptr + offset, 65536 - offset, " ??   |\n");
+        written = snprintf(response_ptr + offset, 65536 - offset,
+                           " ??   | %-4s |\n", code);
       } else {
         int bot_cnt = 0;
         if (all_peers[row].is_me) {
@@ -4764,7 +4904,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
           }
         }
         written = snprintf(response_ptr + offset, 65536 - offset,
-                           " %-4d |\n", bot_cnt);
+                           " %-4d | %-4s |\n", bot_cnt, code);
       }
 
       if (written < 0 || written >= (int)(65536 - offset)) {

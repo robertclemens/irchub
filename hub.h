@@ -110,7 +110,7 @@
  * the Makefile; -D-overridable so a release build can stamp its own version
  * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
 #ifndef HUB_VERSION
-#define HUB_VERSION "2.4.0"
+#define HUB_VERSION "2.4.1"
 #endif
 
 /* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
@@ -295,7 +295,7 @@
  * nothing to purge, and a hub that dies ages out of the tree on its own.
  * Identity (nick, last-seen) still comes from the persisted config -- read
  * only -- so disconnected bots can still be listed with a real timestamp. */
-#define CMD_BOT_PRESENCE 0x56  // Bot -> Hub: version|server|started (volatile)
+#define CMD_BOT_PRESENCE 0x56  // Bot -> Hub: version|server|started|variant (volatile)
 #define CMD_BOT_ROSTER   0x57  // Hub <-> Hub: presence gossip (volatile)
 #define CMD_BOT_TREE     0x58  // Hub -> Bot: rendered tree rows (volatile)
 
@@ -452,6 +452,7 @@ typedef struct {
 #define BOT_TREE_REFRESH      300  /* unconditional re-push to bots          */
 #define BOT_ROSTER_TTL        240  /* entry nobody refreshed since -> dropped */
 #define ROSTER_VERSION_MAX    15   /* "2.3.0", with room to grow             */
+#define ROSTER_VARIANT_MAX    7    /* code base: "c" / "rs"                  */
 #define ROSTER_SERVER_MAX     63   /* host:port of the bot's IRC link        */
 #define ROSTER_FRAME_BUDGET   8192 /* chunk gossip well under MAX_BUFFER     */
 #define TREE_ROW_MAX          256  /* one tree row at its field caps         */
@@ -700,6 +701,9 @@ typedef struct {
    * never serialized: these only feed the bots tree's uptime/version columns. */
   time_t remote_started;
   char   remote_version[ROSTER_VERSION_MAX + 1];
+  /* Its code base ("c" / "rs"), from the roster's v| line; "" until a hub
+   * that sends one reports in. */
+  char   remote_variant[ROSTER_VARIANT_MAX + 1];
   char last_gossip[MAX_BUFFER];
 
   /* Peer auth (HUBv3): per-peer Curve25519 public keys. has_pubkey is
@@ -794,6 +798,7 @@ typedef struct {
    * never reports simply shows blank fields in the tree.  Never persisted. */
   char   bot_version[ROSTER_VERSION_MAX + 1];
   char   bot_server[ROSTER_SERVER_MAX + 1];
+  char   bot_variant[ROSTER_VARIANT_MAX + 1]; /* "c" / "rs", "" = unreported */
   time_t bot_started;              /* bot's own start time, 0 = unreported  */
 } hub_client_t;
 
@@ -820,6 +825,7 @@ typedef struct {
   char   bot_uuid[64];
   char   nick[MAX_NICK];
   char   version[ROSTER_VERSION_MAX + 1];
+  char   variant[ROSTER_VARIANT_MAX + 1]; /* code base: "c" / "rs" / ""  */
   char   server[ROSTER_SERVER_MAX + 1];   /* the bot's IRC link           */
   time_t connected_at;                    /* bot -> hub, for uptime       */
   time_t reported_at;                     /* local clock: drives the TTL  */
