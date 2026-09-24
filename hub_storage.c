@@ -111,7 +111,7 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
     if (hub_lww_accepts(ts, hub_global_value_active(combined_value),
                         state->global_entries[i].timestamp,
                         hub_global_value_active(state->global_entries[i].value))) {
-      hub_log("[STORAGE] Global %s=%s: incoming_ts=%ld %s stored_ts=%ld -> UPDATED\n",
+      hub_log_debug("[STORAGE] Global %s=%s: incoming_ts=%ld %s stored_ts=%ld -> UPDATED\n",
               key, value, (long)ts,
               ts > state->global_entries[i].timestamp ? ">" : "== (del beats add)",
               (long)state->global_entries[i].timestamp);
@@ -123,13 +123,13 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
       state->global_entries[i].timestamp = ts;
       return true;
     }
-    hub_log("[STORAGE] Global %s=%s: incoming_ts=%ld <= stored_ts=%ld -> REJECTED\n",
+    hub_log_debug("[STORAGE] Global %s=%s: incoming_ts=%ld <= stored_ts=%ld -> REJECTED\n",
             key, value, (long)ts, (long)state->global_entries[i].timestamp);
     return false;
   }
 
   if (state->global_entry_count < MAX_BOT_ENTRIES) {
-    hub_log("[STORAGE] Global %s=%s: NEW entry ts=%ld\n", key, value, (long)ts);
+    hub_log_debug("[STORAGE] Global %s=%s: NEW entry ts=%ld\n", key, value, (long)ts);
     config_entry_t *e = &state->global_entries[state->global_entry_count++];
     snprintf(e->key, sizeof(e->key), "%s", key);
     size_t len = strlen(combined_value);
@@ -140,7 +140,7 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
     e->timestamp = ts;
     return true;
   }
-  hub_log("[STORAGE] Global %s=%s: REJECTED (max entries reached)\n", key, value);
+  hub_log_warning("[STORAGE] Global %s=%s: REJECTED (max entries reached)\n", key, value);
   return false;
 }
 
@@ -153,7 +153,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
    * password 'p' and the legacy global admin password 'a' are never stored
    * again, whichever path (delta, push, sync, load) offers them. */
   if (strcmp(key, "p") == 0 || strcmp(key, "a") == 0) {
-    hub_log("[STORAGE] REJECTED retired key '%s' (passwordless)\n", key);
+    hub_log_warning("[STORAGE] REJECTED retired key '%s' (passwordless)\n", key);
     return false;
   }
 
@@ -167,7 +167,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
   if (strcmp(uuid, "n") == 0 || strcmp(uuid, "h") == 0 ||
       strcmp(uuid, "seen") == 0 || strcmp(uuid, "pub") == 0 ||
       strcmp(uuid, "d") == 0 || strcmp(uuid, "t") == 0) {
-    hub_log("[STORAGE] REJECTED: Invalid UUID '%s' (bot-specific key used as UUID)\n", uuid);
+    hub_log_warning("[STORAGE] REJECTED: Invalid UUID '%s' (bot-specific key used as UUID)\n", uuid);
     return false;
   }
 
@@ -185,7 +185,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
   if (strcmp(key, "t") != 0 && strcmp(key, "n") != 0 &&
       strcmp(key, "h") != 0 && strcmp(key, "pub") != 0 &&
       strcmp(key, "seen") != 0 && strcmp(key, "d") != 0) {
-    hub_log("[STORAGE] REJECTED per-bot key '%s' for %s (not in whitelist)\n",
+    hub_log_warning("[STORAGE] REJECTED per-bot key '%s' for %s (not in whitelist)\n",
             key, uuid);
     return false;
   }
@@ -197,7 +197,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
     else if (strcmp(key, "pub") == 0) cap = COMBINED_KEY_B64;
     else                              cap = 31; /* seen/d/t: short numerics */
     if (vlen > cap) {
-      hub_log("[STORAGE] REJECTED per-bot '%s' for %s: value too long "
+      hub_log_warning("[STORAGE] REJECTED per-bot '%s' for %s: value too long "
               "(%zu > %zu)\n", key, uuid, vlen, cap);
       return false;
     }
@@ -367,7 +367,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
     return true;
   }
 
-  hub_log("Warning: Bot %s has reached MAX_BOT_ENTRIES\n", uuid);
+  hub_log_warning("[STORAGE] Bot %s has reached MAX_BOT_ENTRIES\n", uuid);
   return false;
 }
 

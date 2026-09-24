@@ -58,7 +58,10 @@
 #define HUB_PASS_FILE ".irchub.pass"
 #define HUB_CONFIG_PURGE_DAYS_KEY "purge_days"
 #define HUB_LOG_FILE ".irchub.log"
-#define HUB_LOG_FILE_SIZE (10 * 1024 * 1024)  // 10MB
+#define HUB_LOG_FILE_SIZE (10 * 1024 * 1024)  // 10MB default; log_size| overrides
+/* CMD_ADMIN_SET_LOG_SIZE / log_size| bounds (ircbot's L| takes the same). */
+#define HUB_LOG_SIZE_MIN 1024
+#define HUB_LOG_SIZE_MAX (1024 * 1024 * 1024)
 
 // Curve25519 key constants
 #define ED25519_KEY_LEN    32
@@ -90,8 +93,21 @@
 #define CHURN_WINDOW_SEC 10
 #define CHURN_MAX_CONNS  30
 #define CHURN_BLOCK_SEC  30
-#define MAX_RECENT_PURGES 5             // Track recent PURGE cutoffs to prevent loops
-#define PURGE_DEDUP_WINDOW 60            // Seconds to remember PURGE (prevents loops)
+/* PURGE loop suppression.  A purge is flooded to every peer and forwarded on,
+ * so on a big mesh each hub sees many copies, some of them minutes late when
+ * peer queues back up.  An id is random and never reused, so it is remembered
+ * long and in quantity: with 5 ids for 60 s, a late copy or one pushed out by
+ * newer purges was taken as new, re-applied and re-flooded, and a 10-hub
+ * mesh kept a dozen purges circulating for good.  An id-less purge (a hub
+ * that predates the id) can only be told apart by time, so it keeps the short
+ * window — a longer one would swallow a second, deliberate purge now. */
+/* The full config push to bots is coalesced: however many updates land in a
+ * burst (a mass reconnect sends two per bot, and each reaches every hub), the
+ * bots get one push per this many seconds, carrying the latest state. */
+#define BOT_CONFIG_PUSH_COALESCE 1
+#define MAX_RECENT_PURGES 64
+#define PURGE_DEDUP_WINDOW 3600          // seconds an id'd purge is remembered
+#define PURGE_DEDUP_WINDOW_LEGACY 60     // seconds an id-less purge is remembered
 #define PURGE_ID_HEX 16                  // PURGE|<cutoff>|<id>: 8 random bytes, hex
 
 // OP_FORWARD_REQUEST deduplication — prevents packet storms
@@ -330,6 +346,60 @@
 #define CMD_ADMIN_UPGRADE_NET    0x63 // hub_admin -> Hub: ver|variant|kind|min_from|base
 #define CMD_ADMIN_UPGRADE_STATUS 0x64 // hub_admin -> Hub: ""=poll, "abort"=stop+roll back
 
+/* Sealed bot-to-bot relay across hubs.  CMD_BOT_RELAY names its target by
+ * uuid only; when that bot is not connected here the hub stamps the frame
+ * with a request id and floods it to its peers, each of which delivers it
+ * (as CMD_BOT_MSG) if the target is one of its own bots and otherwise passes
+ * it on minus the link it came in on.  The id goes through the shared
+ * seen_forwards ring, so a cycle in the peer graph cannot keep it moving,
+ * and a frame older than BOT_RELAY_FWD_TTL is dropped.  The sender uuid is
+ * the one the ORIGIN hub authenticated; the target bot still checks the
+ * sealed payload against that sender's key (AAD binding), so a peer cannot
+ * forge a command.  Hub <-> hub only: bots never see this opcode.
+ * Payload: id|origin_ts|sender_uuid|target_uuid|cipher:tag */
+#define CMD_BOT_RELAY_FWD 0x65
+#define BOT_RELAY_FWD_TTL 30 /* seconds a forwarded relay stays deliverable */
+
+/* Drop the roll-up plan mesh-wide.  Every hub that followed a run keeps that
+ * run's plan in its own .irchub.cnf (a hub-local `rollup|` line) and walks any
+ * bot that comes back behind it up to the target; an admin's
+ * CMD_ADMIN_UPGRADE_STATUS "forget" drops it on the hub it is logged into and
+ * floods this frame so every other hub drops its copy too.  Loop-suppressed
+ * by the seen_forwards ring like CMD_BOT_RELAY_FWD, refused while the config
+ * freeze (a run in flight) is up.  Hub <-> hub only.
+ * Payload: id|origin_ts */
+#define CMD_UPGRADE_FORGET 0x66
+#define UPGRADE_FORGET_TTL 60 /* seconds a forwarded forget stays valid */
+
+/* A config broadcast: the payload of CMD_PEER_SYNC, sent by a hub to EVERY
+ * peer it is linked to (minus the one it forwards for).  What it adds is that
+ * fact, which the receiver may rely on when it forwards what it accepted: a
+ * peer the sender is linked to right now already has the frame first hand,
+ * so the forwarder skips it (hub_broadcast_sync_to_peers' split horizon).  On
+ * a full mesh that turns one copy of every accepted update from every hub
+ * into none.  Point-to-point syncs (the reply to CMD_SYNC_REQUEST, the sync a
+ * new link opens with) stay CMD_PEER_SYNC: a forwarder must reach everyone
+ * with those.  Sent only to a peer whose roster gossip carries l| lines, i.e.
+ * one that knows this opcode; an older peer gets CMD_PEER_SYNC as before. */
+#define CMD_PEER_BCAST 0x67
+/* After a peer link drops, ask the remaining peers for a full sync this many
+ * seconds later: a forwarder may have skipped us on the strength of that
+ * link in the moment before the drop reached its gossip. */
+#define SYNC_RESYNC_AFTER_LINK_LOSS 5
+
+/* Admin -> Hub: this hub's traffic counters since it started (read-only,
+ * empty payload).  Reply lines, zero rows left out:
+ *   stats|up=<s>
+ *   cfg|sent=<n>|same=<n>|lost=<n>        full config pushes to bots
+ *   sync|frames=<n>|noop=<n>|records=<n>|applied=<n>   PEER_SYNC/BCAST in
+ *   op|0x<cc>|rx=<frames>/<bytes>|tx=<frames>/<bytes>
+ * "same" = a push skipped because that bot was already sent the identical
+ * config; "lost" = a queued push dropped on overflow (that bot is re-sent the
+ * next one in full).  rx counts every authenticated frame this hub decrypted,
+ * tx every frame it sent from its outbound queues (the ping/pong keepalive and
+ * direct admin/bot replies are not queued and not counted). */
+#define CMD_ADMIN_STATS 0x68
+
 #define MAX_PENDING_CHAN_REQUESTS 200
 #define CHAN_REQUEST_TIMEOUT 45   // Reap a pending request with no reply
 
@@ -341,6 +411,9 @@
  * per node it forwarded an answer for.  See upgrade_route_t. */
 #define MAX_UPGRADE_ROUTES MAX_UPGRADE_NODES
 #define UPGRADE_PREPARE_TIMEOUT 45  /* stop waiting for READY acks          */
+/* PREPARE also stays open this long after the node table last grew: a hub
+ * several hops out is unknown to the driver until its first READY arrives. */
+#define UPGRADE_PREPARE_SETTLE 3
 #define UPGRADE_COMMIT_TIMEOUT 420  /* a node must be back, upgraded, by now */
 /* Bots go in waves so a channel never loses every bot at once, and peer hubs
  * go one at a time so the mesh never fully drops. */
@@ -459,9 +532,21 @@ typedef struct {
 /* One entry per (reporting hub, bot).  A hub only ever reports bots connected
  * to itself, so the mesh-wide worst case is every hub carrying MAX_BOTS. */
 #define MAX_BOT_ROSTER        ((MAX_PEERS + 1) * MAX_BOTS)
+/* Hubs the tree can know mesh-wide, direct peers or not.  Each hub's roster
+ * gossip is relayed hop by hop (see CMD_BOT_ROSTER), so a chain or a star
+ * still draws every hub; this bounds the per-origin relay bookkeeping. */
+#define MAX_MESH_HUBS         64
+/* Hops a relayed roster frame may still travel when its origin sends it. */
+#define ROSTER_RELAY_HOPS     16
+/* Hub rows are hung no deeper than this; the bots render up to depth 32. */
+#define MAX_TREE_DEPTH        30
+/* A forwarder trusts a sender's reported links (for the sync split horizon)
+ * only while the report is this fresh: past one missed gossip round it
+ * forwards to everyone, as a hub that never reported links is. */
+#define SYNC_SPLIT_HORIZON_FRESH (2 * BOT_PRESENCE_INTERVAL + 10)
 /* Tree rows: every hub node, every bot beneath one, plus the disconnected
  * tail (bounded by the bots the config knows about). */
-#define MAX_TREE_ROWS         (MAX_PEERS + 1 + MAX_BOT_ROSTER + MAX_BOTS)
+#define MAX_TREE_ROWS         (MAX_MESH_HUBS + MAX_PEERS + 1 + MAX_BOT_ROSTER + MAX_BOTS)
 #define MAX_TREE_PAYLOAD      ((MAX_TREE_ROWS) * TREE_ROW_MAX + PAYLOAD_SLACK)
 
 /* ==========================================================================
@@ -580,6 +665,16 @@ typedef struct {
   upgrade_node_state_t state;
   char reason[128];
   time_t committed_at;
+  /* A hub node's READY says how many of ITS local bots it relayed PREPARE
+   * to; the driver holds PREPARE open until that many relayed READYs are in,
+   * so a peer's bots are never missed for answering a moment after it. */
+  int relayed;
+  /* Order its READY reached the driver in (1, 2, ...; 0 = none yet).  A
+   * follower answers before it relays anything from below it, and every
+   * answer travels the same FIFO peer links up, so a hub's READY always
+   * lands ahead of any hub it routes for: descending ready_seq is
+   * deepest-first along the COMMIT routes (see hub_upgrade_tick). */
+  int ready_seq;
 } upgrade_node_t;
 
 /* One downstream node a FOLLOWER relays for.  A run reaches every hub in the
@@ -622,6 +717,8 @@ typedef struct {
   upgrade_phase_t phase;
   upgrade_node_t nodes[MAX_UPGRADE_NODES];
   int    node_count;
+  time_t last_added;          /* when the node table last grew           */
+  int    ready_seq_next;      /* last upgrade_node_t.ready_seq handed out */
   char   summary[192];        /* why it ended, shown by UPGRADE_STATUS   */
 } pending_upgrade_t;
 
@@ -800,6 +897,13 @@ typedef struct {
   char   bot_server[ROSTER_SERVER_MAX + 1];
   char   bot_variant[ROSTER_VARIANT_MAX + 1]; /* "c" / "rs", "" = unreported */
   time_t bot_started;              /* bot's own start time, 0 = unreported  */
+
+  /* SHA-256 of the last full config queued to this bot (CMD_CONFIG_DATA), so
+   * a broadcast push that would repeat it is skipped.  Only valid while that
+   * push is known to be on its way: cleared when a queued config is dropped
+   * on overflow and whenever the bot sends a config push of its own. */
+  unsigned char cfg_sent_hash[32];
+  bool          cfg_sent_valid;
 } hub_client_t;
 
 // Track recently processed PURGE messages to prevent feedback loops
@@ -831,6 +935,33 @@ typedef struct {
   time_t reported_at;                     /* local clock: drives the TTL  */
 } bot_roster_t;
 
+/* One peer link a hub reports in its roster gossip (an l| line): a peer it is
+ * configured with and whether that link is up right now. */
+typedef struct {
+  char uuid[64];
+  char name[64];
+  bool online;
+} mesh_link_t;
+
+/* What this hub knows about another hub anywhere in the mesh, from that
+ * hub's own roster gossip — direct or relayed.  Volatile like the roster:
+ * dropped once nothing refreshed it within BOT_ROSTER_TTL.  `gen` and
+ * `chunks_seen` suppress relay loops: a hub applies and passes on a given
+ * frame (origin, generation, chunk) exactly once. */
+typedef struct {
+  char        uuid[64];
+  char        name[64];
+  time_t      started;
+  char        version[ROSTER_VERSION_MAX + 1];
+  char        variant[ROSTER_VARIANT_MAX + 1];
+  mesh_link_t links[MAX_PEERS];
+  int         link_count;
+  bool        have_links;   /* it has sent an l| list (a hub that relays) */
+  long long   gen;          /* newest gossip generation seen from it      */
+  uint64_t    chunks_seen;  /* chunks of `gen` already applied (bit n)    */
+  time_t      reported_at;  /* local clock: drives the TTL                */
+} mesh_hub_t;
+
 /* Loop-prevention seen-set: highest lamport_seq observed per (origin, bot). */
 typedef struct {
   char     origin_hub_uuid[64];
@@ -838,6 +969,22 @@ typedef struct {
   uint64_t max_seq_seen;
   time_t   last_seen_at;
 } delta_seen_t;
+
+/* Traffic counters since start, answered by CMD_ADMIN_STATS.  Monotonic:
+ * whoever reads them diffs two snapshots. */
+typedef struct {
+  uint64_t rx_frames[256], rx_bytes[256];  /* by opcode, decrypted frames   */
+  uint64_t tx_frames[256], tx_bytes[256];  /* by opcode, queued frames sent */
+  uint64_t cfg_sent;      /* full configs queued to a bot                  */
+  uint64_t cfg_same;      /* skipped: that bot already has this exact one  */
+  uint64_t cfg_lost;      /* queued config dropped on lane overflow        */
+  uint64_t sync_frames;   /* PEER_SYNC / PEER_BCAST frames processed       */
+  uint64_t sync_noop;     /* ... of which changed nothing                  */
+  uint64_t sync_records;  /* record lines in them                          */
+  uint64_t sync_applied;  /* ... of which were new and applied             */
+} hub_stats_t;
+/* One per process (the daemon is single-threaded); defined in hub_logic.c. */
+extern hub_stats_t g_hub_stats;
 
 typedef struct {
   int listen_fd;
@@ -959,6 +1106,11 @@ typedef struct {
    * hub_maintenance flushes at most once every CONFIG_WRITE_DEBOUNCE_S seconds.
    * This prevents N PBKDF2(100K) calls when N peer syncs arrive in a burst. */
   bool config_dirty;
+  /* A full config push to every local bot is owed (see
+   * hub_flush_bot_config): set by every change bots must see, sent at most
+   * once per BOT_CONFIG_PUSH_COALESCE by the maintenance loop. */
+  bool bot_config_pending;
+  time_t last_bot_config_push;
   time_t last_config_write;
   bool mesh_state_dirty;    /* set on peer connect/disconnect; clears after gossip */
   bool anti_entropy_due;    /* set to force anti-entropy on next hub_maintenance tick */
@@ -981,12 +1133,22 @@ typedef struct {
   time_t       last_presence_gossip;
   time_t       last_tree_push;
   bool         tree_dirty;         /* roster changed: push to bots next tick */
+  mesh_hub_t   mesh_hubs[MAX_MESH_HUBS]; /* every hub heard from, any hop  */
+  int          mesh_hub_count;
+  long long    roster_gen;         /* last generation this hub gossiped     */
+  uint32_t     gossip_link_mask;   /* peers linked at the last gossip (bit p) */
+  time_t       resync_due_at;      /* ask peers for a sync then (0 = none)  */
 } hub_state_t;
 
 #define CONFIG_WRITE_DEBOUNCE_S 5
 
 // --- Prototypes ---
 void hub_log(const char *format, ...);
+/* Send the owed full config push to every local bot (maintenance loop). */
+void hub_flush_bot_config(hub_state_t *state, time_t now);
+/* The running hub's state (hub_main.c): the level macros below read
+ * g_state->log_level, and stay silent while it is NULL. */
+extern hub_state_t *g_state;
 
 // Log level filtering macros - these check the log level before calling hub_log.
 // The tag is glued to the caller's format by string-literal concatenation, so a
@@ -1239,6 +1401,8 @@ int hub_update_version_cmp(const char *a, const char *b);
 void hub_update_host_arch(char *out, size_t out_size);
 void hub_update_host_libc(char *out, size_t out_size);
 const char *hub_update_host_variant(void);
+/* irchub -checkupdate [variant]: verify the release channel, print, exit. */
+int hub_update_check_cli(const char *variant);
 void hub_roster_expire(hub_state_t *state, time_t now);
 void hub_roster_mark_dirty(hub_state_t *state);
 

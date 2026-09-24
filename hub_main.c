@@ -152,10 +152,12 @@ void hub_log(const char *format, ...) {
         }
         fprintf(log_fp, "[%s] Log file truncated (size limit reached)\n", time_buf);
         fflush(log_fp);
-        return;
+        /* fall through: the line that tripped the cap is kept, after it */
     }
 
-    // Write log entry (log level filtering would be done by caller in Task 5)
+    /* Write the entry.  Level filtering is the caller's: the hub_log_error /
+     * _warning / _info / _debug macros test g_state->log_level first; a bare
+     * hub_log() is written at every level but LOG_NONE. */
     char stack_msg[2048];
     char *msg = stack_msg;
     va_start(args, format);
@@ -224,7 +226,7 @@ static void handle_signal(int sig) {
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
     if (!c) return;
 
-    hub_log("[HUB] Disconnecting client %s (FD: %d)\n", c->ip, c->fd);
+    hub_log_info("[HUB] Disconnecting client %s (FD: %d)\n", c->ip, c->fd);
 
     decrement_active_connections(state, c->ip);
 
@@ -318,13 +320,13 @@ static int hub_seal_send(const unsigned char hub_x25519_pub[32],
 void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
                          const hub_peer_config_t *peer) {
     if (!state->hub_keys_loaded) {
-        hub_log("[PEER] No Curve25519 keys loaded; cannot handshake\n");
+        hub_log_error("[PEER] No Curve25519 keys loaded; cannot handshake\n");
         hub_disconnect_client(state, c);
         return;
     }
 
     if (!peer || !peer->has_pubkey) {
-        hub_log("[PEER] Peer has no registered pubkey — refusing to connect. "
+        hub_log_warning("[PEER] Peer has no registered pubkey — refusing to connect. "
                 "Re-add this peer with its Curve25519 pubkey (HUBv3 auth needs it).\n");
         hub_disconnect_client(state, c);
         return;
@@ -347,7 +349,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
                             state->hub_uuid, ts_str, state->port,
                             state->hub_friendly_name, state->bind_ip);
         if (tlen < 0 || tlen >= (int)sizeof(transcript)) {
-            hub_log("[PEER] v3 transcript too long\n");
+            hub_log_error("[PEER] v3 transcript too long\n");
             hub_disconnect_client(state, c);
             return;
         }
@@ -356,14 +358,14 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
         if (!hub_crypto_ed25519_sign(state->hub_ed25519_priv,
                                      (unsigned char *)transcript, (size_t)tlen,
                                      sig)) {
-            hub_log("[PEER] v3 Ed25519 sign failed\n");
+            hub_log_error("[PEER] v3 Ed25519 sign failed\n");
             hub_disconnect_client(state, c);
             return;
         }
 
         char *sig_b64 = base64_encode(sig, ED25519_SIG_LEN);
         if (!sig_b64) {
-            hub_log("[PEER] v3 signature base64 encode failed\n");
+            hub_log_error("[PEER] v3 signature base64 encode failed\n");
             hub_disconnect_client(state, c);
             return;
         }
@@ -377,7 +379,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
         free(sig_b64);
 
         if (msg_len < 0 || msg_len >= (int)sizeof(pack)) {
-            hub_log("[PEER] v3 packet too long\n");
+            hub_log_error("[PEER] v3 packet too long\n");
             hub_disconnect_client(state, c);
             return;
         }
@@ -393,7 +395,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
     secure_wipe(pack, sizeof(pack));
 
     if (enc_len <= 0) {
-        hub_log("[PEER] Sealed-box encryption failed\n");
+        hub_log_error("[PEER] Sealed-box encryption failed\n");
         hub_disconnect_client(state, c);
         return;
     }
@@ -401,7 +403,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
     uint32_t net_len = htonl(enc_len);
     if (write(c->fd, &net_len, 4) != (ssize_t)4 ||
         write(c->fd, enc, enc_len) != (ssize_t)enc_len) {
-        hub_log("[PEER] Handshake write failed\n");
+        hub_log_warning("[PEER] Handshake write failed\n");
         hub_disconnect_client(state, c);
         return;
     }
@@ -411,11 +413,11 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
      * authenticated (c->type == CLIENT_HUB → MAX_SYNC_PAYLOAD) — the full sync
      * below rides these.  Runs before any bulk frame is queued. */
     if (!hub_client_promote_buffers(c)) {
-        hub_log("[PEER] Buffer promotion OOM for %s — disconnecting\n", c->ip);
+        hub_log_error("[PEER] Buffer promotion OOM for %s — disconnecting\n", c->ip);
         hub_disconnect_client(state, c);
         return;
     }
-    hub_log("[PEER] Handshake complete with %s\n", c->ip);
+    hub_log_info("[PEER] Handshake complete with %s\n", c->ip);
     /* If this process is the product of an upgrade a peer drove, close that
      * run out now that there is a peer to tell (no-op otherwise). */
     hub_upgrade_report_pending(state, c);
@@ -430,7 +432,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
          * stack buffer cut the dialing side's startup sync short. */
         char *full_sync = malloc(MAX_SYNC_PAYLOAD);
         if (!full_sync) {
-            hub_log("[PEER] OOM building initial sync for %s\n", c->ip);
+            hub_log_error("[PEER] OOM building initial sync for %s\n", c->ip);
             return;
         }
         hub_generate_sync_packet(state, full_sync, MAX_SYNC_PAYLOAD);
@@ -444,7 +446,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
                                         hub_next_lamport_seq(state),
                                         "handshake_sync");
                 if (!peer_enqueue(c, sync_msg)) {
-                    hub_log("[PEER] Could not queue initial sync to %s\n", c->ip);
+                    hub_log_warning("[PEER] Could not queue initial sync to %s\n", c->ip);
                 }
             }
         }
@@ -501,6 +503,9 @@ void hub_maintenance(hub_state_t *state) {
     /* Rolling network upgrade: one step per tick (no-op unless running). */
     hub_upgrade_tick(state, now);
 
+    /* The full config push owed to the bots, coalesced across a burst. */
+    hub_flush_bot_config(state, now);
+
     /* Mesh state gossip: every 5 min as heartbeat, or immediately when peer
      * topology changes (connect/disconnect sets mesh_state_dirty). */
     if (state->mesh_state_dirty || (now - last_mesh_gossip > 300)) {
@@ -520,7 +525,7 @@ void hub_maintenance(hub_state_t *state) {
         last_anti_entropy = now;
         state->anti_entropy_due = false;
         if (state->peer_count > 0) {
-            hub_log("[MESH] Running %santi-entropy sync...\n",
+            hub_log_debug("[MESH] Running %santi-entropy sync...\n",
                     forced_ae ? "forced " : "periodic ");
             /* Heap, sized to the sync ceiling: a 16 KB buffer truncated
              * anti-entropy the same way it truncated the startup sync. */
@@ -530,7 +535,7 @@ void hub_maintenance(hub_state_t *state) {
                 hub_broadcast_sync_to_peers(state, full_sync, -1);
                 free(full_sync);
             } else {
-                hub_log("[MESH] OOM building anti-entropy sync\n");
+                hub_log_error("[MESH] OOM building anti-entropy sync\n");
             }
         }
     }
@@ -552,7 +557,7 @@ void hub_maintenance(hub_state_t *state) {
         for (int i = 0; i < state->client_count; i++) {
             hub_client_t *c = state->clients[i];
             if (c->inbound && !hub_ip_acl_permits(state, c->ip)) {
-                hub_log("[ACCESS_CONTROL] Closing %s: no longer permitted by "
+                hub_log_warning("[ACCESS_CONTROL] Closing %s: no longer permitted by "
                         "the allow/deny lists\n", c->ip);
                 hub_disconnect_client(state, c);
                 i--;
@@ -572,16 +577,16 @@ void hub_maintenance(hub_state_t *state) {
         if (now - last_purge > 86400) {
             last_purge = now;
             if (hub_should_initiate_scheduled_purge(state)) {
-                hub_log("[HUB] Running scheduled purge (older than %d days)\n",
+                hub_log_info("[HUB] Running scheduled purge (older than %d days)\n",
                         state->purge_days_setting);
                 char purge_log[MAX_BUFFER];
                 time_t cutoff = now - ((time_t)state->purge_days_setting * 86400);
                 int purged = hub_execute_purge(state, cutoff, purge_log, sizeof(purge_log));
                 if (purged > 0)
-                    hub_log("[HUB] Scheduled purge removed %d tombstones\n", purged);
+                    hub_log_info("[HUB] Scheduled purge removed %d tombstones\n", purged);
                 hub_broadcast_purge(state, cutoff);
             } else {
-                hub_log("[HUB] Scheduled purge skipped (not elected leader in mesh)\n");
+                hub_log_info("[HUB] Scheduled purge skipped (not elected leader in mesh)\n");
             }
         }
     }
@@ -593,7 +598,7 @@ void hub_maintenance(hub_state_t *state) {
         for (int i = 0; i < state->client_count; i++) {
             hub_client_t *c = state->clients[i];
             if ((now - c->last_seen) > CLIENT_TIMEOUT) {
-                hub_log("[HUB] Client %s timed out.\n", c->ip);
+                hub_log_warning("[HUB] Client %s timed out.\n", c->ip);
                 hub_disconnect_client(state, c);
                 i--;
                 continue;
@@ -610,7 +615,7 @@ void hub_maintenance(hub_state_t *state) {
                                                         : PREAUTH_TIMEOUT_SEC;
             if (!c->authenticated && c->type != CLIENT_HUB &&
                 (now - c->connected_at) > preauth_window) {
-                hub_log("[HUB] Pre-auth timeout for %s (%lds, no handshake%s) — "
+                hub_log_warning("[HUB] Pre-auth timeout for %s (%lds, no handshake%s) — "
                         "dropping\n", c->ip, (long)(now - c->connected_at),
                         c->admin_hello_seen ? ", admin" : "");
                 hub_disconnect_client(state, c);
@@ -619,7 +624,7 @@ void hub_maintenance(hub_state_t *state) {
             }
             if (c->authenticated && (now - c->last_seen) > PING_INTERVAL) {
                 if (!send_ping(c)) {
-                    hub_log("[WARN] Ping failed to %s. Disconnecting.\n", c->ip);
+                    hub_log_warning("[HUB] Ping failed to %s. Disconnecting.\n", c->ip);
                     hub_disconnect_client(state, c);
                     i--;
                     continue;
@@ -686,7 +691,7 @@ void hub_check_peers(hub_state_t *state) {
 
     for (int i = 0; i < state->peer_count; i++) {
         if (!state->peers[i].connected) {
-            hub_log("[PEER] Attempting to connect to %s:%d...\n", 
+            hub_log_debug("[PEER] Attempting to connect to %s:%d...\n", 
                    state->peers[i].ip, state->peers[i].port);
             
             int sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -698,7 +703,7 @@ void hub_check_peers(hub_state_t *state) {
             
             if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
                           sizeof(timeout)) < 0) {
-                hub_log("setsockopt failed\n");
+                hub_log_error("[HUB] setsockopt failed\n");
             }
 
             struct sockaddr_in peer_addr;
@@ -731,10 +736,10 @@ void hub_check_peers(hub_state_t *state) {
                     hub_peer_handshake(state, c, &state->peers[i]);
                 } else {
                     close(sockfd);
-                    hub_log("[PEER] Client limit reached.\n");
+                    hub_log_warning("[PEER] Client limit reached.\n");
                 }
             } else {
-                hub_log("[PEER] Failed to connect to %s:%d\n", 
+                hub_log_warning("[PEER] Failed to connect to %s:%d\n", 
                        state->peers[i].ip, state->peers[i].port);
                 close(sockfd);
             }
@@ -981,6 +986,10 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-setup") == 0) setup_mode = true;
         if (strcmp(argv[i], "-p")     == 0) passfile_mode = true;
+        /* -checkupdate [variant]: verify the release channel and exit; needs
+         * no config, no password and no PID lock. */
+        if (strcmp(argv[i], "-checkupdate") == 0)
+            return hub_update_check_cli(i + 1 < argc ? argv[i + 1] : NULL);
     }
 
     static hub_state_t state;
@@ -1346,7 +1355,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (!state.hub_keys_loaded) {
-        hub_log("[ERROR] No Curve25519 keypair in config. Re-run -setup.\n");
+        hub_log_error("[HUB] No Curve25519 keypair in config. Re-run -setup.\n");
         return 1;
     }
 
@@ -1358,14 +1367,14 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < state.peer_count; i++)
             if (!state.peers[i].has_pubkey) peerless++;
         if (peerless > 0) {
-            hub_log("[HUB] WARNING: %d peer(s) lack a Curve25519 pubkey and "
+            hub_log_warning("[HUB] %d peer(s) lack a Curve25519 pubkey and "
                     "will be refused on connect. Re-add them with their "
                     "hub_public.b64 via hub_admin (Add Peer / Set Peer Pubkey).\n",
                     peerless);
         }
     }
 
-    hub_log("[HUB] Started on port %d (PID: %d)\n", state.port, getpid());
+    hub_log_info("[HUB] Started on port %d (PID: %d)\n", state.port, getpid());
 
     state.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr;
@@ -1376,21 +1385,21 @@ int main(int argc, char *argv[]) {
     // Use bind_ip if set, otherwise default to 0.0.0.0
     if (state.bind_ip[0] && strcmp(state.bind_ip, "0.0.0.0") != 0) {
         if (inet_pton(AF_INET, state.bind_ip, &addr.sin_addr) != 1) {
-            hub_log("[ERROR] Invalid bind_ip: %s, using 0.0.0.0\n", state.bind_ip);
+            hub_log_warning("[HUB] Invalid bind_ip: %s, using 0.0.0.0\n", state.bind_ip);
             addr.sin_addr.s_addr = INADDR_ANY;
         } else {
-            hub_log("[HUB] Binding to %s:%d\n", state.bind_ip, state.port);
+            hub_log_info("[HUB] Binding to %s:%d\n", state.bind_ip, state.port);
         }
     } else {
         addr.sin_addr.s_addr = INADDR_ANY;
-        hub_log("[HUB] Binding to 0.0.0.0:%d (all interfaces)\n", state.port);
+        hub_log_info("[HUB] Binding to 0.0.0.0:%d (all interfaces)\n", state.port);
     }
     
     int opt = 1;
     setsockopt(state.listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     
     if (bind(state.listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        hub_log("[ERROR] Bind failed\n");
+        hub_log_error("[HUB] Bind failed\n");
         return 1;
     }
     
@@ -1460,10 +1469,10 @@ int main(int argc, char *argv[]) {
 
                 // Check access lists first
                 if (!check_ip_access_lists(&state, incoming_ip)) {
-                    hub_log("[HUB] Connection from %s rejected (access control)\n", incoming_ip);
+                    hub_log_warning("[HUB] Connection from %s rejected (access control)\n", incoming_ip);
                     close(new_fd);
                 } else if (!is_ip_allowed(&state, incoming_ip)) {
-                    hub_log("[HUB] Connection from %s rejected (rate limit)\n", incoming_ip);
+                    hub_log_warning("[HUB] Connection from %s rejected (rate limit)\n", incoming_ip);
                     close(new_fd);
                 } else if (state.client_count < MAX_CLIENTS) {
                     hub_client_t *c = calloc(1, sizeof(hub_client_t));
@@ -1480,7 +1489,7 @@ int main(int argc, char *argv[]) {
 
                         increment_active_connections(&state, c->ip);
 
-                        hub_log("[HUB] Incoming connect: %s\n", c->ip);
+                        hub_log_info("[HUB] Incoming connect: %s\n", c->ip);
                     } else {
                         free(c);
                         close(new_fd);
@@ -1512,7 +1521,7 @@ int main(int argc, char *argv[]) {
                 } else if (!hub_client_has_buffered_frame(c)) {
                     /* Full buffer and no whole frame in it: cannot happen
                      * with a valid length prefix, so the stream is bad. */
-                    hub_log("[HUB] Buffer overflow %s\n", c->ip);
+                    hub_log_warning("[HUB] Buffer overflow %s\n", c->ip);
                     hub_disconnect_client(&state, c);
                     i--;
                     continue;
@@ -1539,7 +1548,7 @@ int main(int argc, char *argv[]) {
      * still inside the write debounce reach the config, then the file is
      * unlinked while still locked, then the lock is released.  Dropping it
      * first let an immediate restart find the port still bound. */
-    hub_log("[HUB] Shutting down (signal %d).\n", (int)g_hub_stop_signal);
+    hub_log_info("[HUB] Shutting down (signal %d).\n", (int)g_hub_stop_signal);
     if (state.listen_fd >= 0) {
         close(state.listen_fd);
         state.listen_fd = -1;

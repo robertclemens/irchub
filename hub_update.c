@@ -176,20 +176,20 @@ bool hub_update_rollback(hub_state_t *state, const char *reason) {
                HUB_UPGRADE_PREV_SUFFIX) >= (int)sizeof(prev_cfg))
     return false;
   if (access(prev_exe, X_OK) != 0) {
-    hub_log("[UPGRADE] Rollback requested (%s) but no retained binary\n",
+    hub_log_error("[UPGRADE] Rollback requested (%s) but no retained binary\n",
             reason ? reason : "no reason given");
     return false;
   }
 
-  hub_log("[UPGRADE] Rolling back to the retained build: %s\n",
+  hub_log_warning("[UPGRADE] Rolling back to the retained build: %s\n",
           reason ? reason : "the upgrade was aborted");
   /* Config first: if the restart races us, the old binary must not come up
    * against a config only the newer build understands. */
   if (access(prev_cfg, R_OK) == 0 && rename(prev_cfg, HUB_CONFIG_FILE) != 0)
-    hub_log("[UPGRADE] Could not restore %s; keeping the current one\n",
+    hub_log_error("[UPGRADE] Could not restore %s; keeping the current one\n",
             prev_cfg);
   if (rename(prev_exe, state->executable_path) != 0) {
-    hub_log("[UPGRADE] Could not restore %s\n", prev_exe);
+    hub_log_error("[UPGRADE] Could not restore %s\n", prev_exe);
     return false;
   }
   remove(HUB_UPGRADE_MARKER_FILE);
@@ -774,7 +774,7 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
    * accepts artifact URLs under it and a local tree needs nothing else. */
   if (base && base[0]) setenv("IRCHUB_UPDATE_BASE", base, 1);
 
-  hub_log("[UPGRADE] Commit %s: %s -> %s (variant %s)\n", upgrade_id,
+  hub_log_info("[UPGRADE] Commit %s: %s -> %s (variant %s)\n", upgrade_id,
           HUB_VERSION, target_ver, want_variant);
 
   const char *verr = NULL;
@@ -812,7 +812,7 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
     return false;
   }
 
-  hub_log("[UPGRADE] Fetching %s artifact %s\n", row.kind, archive);
+  hub_log_info("[UPGRADE] Fetching %s artifact %s\n", row.kind, archive);
   if (!download_file(row.url, archive)) {
     *err = "artifact download failed";
     return false;
@@ -860,7 +860,7 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
     return false;
   }
 
-  hub_log("[UPGRADE] Installing %s and restarting\n", target_ver);
+  hub_log_info("[UPGRADE] Installing %s and restarting\n", target_ver);
   if (state->pid_fd >= 0) close(state->pid_fd);
   sleep(1);
   hub_update_close_fds_for_exec();
@@ -938,7 +938,57 @@ bool hub_update_next_step(const char *base, const char *variant,
   return true;
 }
 
+/* irchub -checkupdate [variant]: fetch the irchub release manifest and its
+ * signature exactly as a hub self-upgrade does — <root>/<variant>, the
+ * compiled-in root and pinned key unless IRCHUB_UPDATE_BASE says otherwise —
+ * verify one against the other, and report.  Nothing past the manifest is
+ * downloaded and nothing is installed, so an operator (or the testnet) can
+ * prove a host reaches and trusts the real release channel — TLS, CA store,
+ * pinned key — without upgrading anything.  0 = verified. */
+int hub_update_check_cli(const char *variant) {
+  const char *want = (variant && variant[0]) ? variant : hub_update_host_variant();
+  if (strpbrk(want, "/;|&`$ \t\r\n") || strlen(want) > 7) {
+    printf("checkupdate: FAIL malformed variant\n");
+    return 1;
+  }
+  char tree[600];
+  if (snprintf(tree, sizeof(tree), "%s/%s", effective_root(NULL), want) >=
+      (int)sizeof(tree)) {
+    printf("checkupdate: FAIL release base URL too long\n");
+    return 1;
+  }
+  const char *verr = NULL;
+  char *manifest = fetch_verified_manifest(tree, &verr);
+  if (!manifest) {
+    printf("checkupdate: FAIL %s (%s)\n", verr ? verr : "manifest fetch failed",
+           tree);
+    return 1;
+  }
+  int rows = 0;
+  char newest[64] = "";
+  char *saveptr = NULL;
+  for (char *line = strtok_r(manifest, "\n", &saveptr); line;
+       line = strtok_r(NULL, "\n", &saveptr)) {
+    char version[64];
+    if (line[0] == '#' || sscanf(line, "%63s", version) != 1) continue;
+    rows++;
+    if (!newest[0] || hub_update_version_cmp(version, newest) > 0)
+      snprintf(newest, sizeof(newest), "%s", version);
+  }
+  free(manifest);
+  printf("checkupdate: OK %s manifest verified: %d release row(s), newest %s, "
+         "running %s\n",
+         want, rows, newest[0] ? newest : "-", HUB_VERSION);
+  return 0;
+}
+
 #else /* !HAVE_CURL */
+
+int hub_update_check_cli(const char *variant) {
+  (void)variant;
+  printf("checkupdate: FAIL hub built without curl support\n");
+  return 1;
+}
 
 bool hub_update_next_step(const char *base, const char *variant,
                           const char *cur_ver, const char *target_ver,

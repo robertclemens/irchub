@@ -172,6 +172,13 @@ void hub_config_write(hub_state_t *state) {
   /* Persist Lamport seq so it survives restart and stays monotonic. */
   SAFE_WRITE("lamport_seq|%llu\n", (unsigned long long)state->next_lamport_seq);
 
+  /* Log settings set over CMD_ADMIN_SET_LOG_LEVEL / _SIZE: written only when
+   * they differ from the defaults, so an untouched hub's file is unchanged. */
+  if (state->log_level != HUB_DEFAULT_LOG_LEVEL)
+    SAFE_WRITE("log_level|%d\n", state->log_level);
+  if (state->log_max_size > 0 && state->log_max_size != HUB_LOG_FILE_SIZE)
+    SAFE_WRITE("log_size|%d\n", state->log_max_size);
+
   // Write purge_days setting (only if enabled)
   if (state->purge_days_setting > 0) {
     SAFE_WRITE("purge_days|%d\n", state->purge_days_setting);
@@ -341,7 +348,7 @@ void hub_config_write(hub_state_t *state) {
 #undef SAFE_WRITE
 
   if (overflow) {
-    hub_log("[CONFIG][ERROR] config exceeds its %d-byte bound; NOT written "
+    hub_log_error("[CONFIG] config exceeds its %d-byte bound; NOT written "
             "(previous file kept)\n", estimated_size);
     secure_wipe(buffer, (size_t)estimated_size);
     free(buffer);
@@ -354,7 +361,7 @@ void hub_config_write(hub_state_t *state) {
    * with a predictable IV/salt if the RNG is unavailable. */
   if (RAND_bytes(salt, sizeof(salt)) != 1 ||
       RAND_bytes(iv,   sizeof(iv))   != 1) {
-    hub_log("RAND_bytes failed; aborting config write\n");
+    hub_log_error("[HUB] RAND_bytes failed; aborting config write\n");
     secure_wipe(buffer, offset);
     free(buffer);
     return;
@@ -369,7 +376,7 @@ void hub_config_write(hub_state_t *state) {
                                       32, key);
   secure_wipe(plain_pass, sizeof(plain_pass));
   if (!pbkdf2_ok) {
-    hub_log("PBKDF2 failed\n");
+    hub_log_error("[HUB] PBKDF2 failed\n");
     secure_wipe(buffer, offset);
     free(buffer);
     return;
@@ -396,7 +403,7 @@ void hub_config_write(hub_state_t *state) {
                         offset) != 1 ||
       EVP_EncryptFinal_ex(ctx, ciphertext + cipher_len, &len) != 1 ||
       EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag) != 1) {
-    hub_log("EVP encryption failed; aborting config write\n");
+    hub_log_error("[HUB] EVP encryption failed; aborting config write\n");
     EVP_CIPHER_CTX_free(ctx);
     secure_wipe(key, sizeof(key));
     secure_wipe(ciphertext, (size_t)offset + 16);
@@ -442,7 +449,7 @@ static bool load_ip_acl_line(hub_state_t *state, char list, char *v) {
   const char *name = list == 'w' ? "allowlist" : "denylist";
   char *s_ts = strrchr(v, '|');
   if (!s_ts) {
-    hub_log("[CONFIG] Dropping %s line without a timestamp\n", name);
+    hub_log_warning("[CONFIG] Dropping %s line without a timestamp\n", name);
     return false;
   }
   *s_ts = 0;
@@ -450,20 +457,20 @@ static bool load_ip_acl_line(hub_state_t *state, char list, char *v) {
   if (op) {
     *op++ = 0;
     if (strcmp(op, "add") != 0) {
-      hub_log("[CONFIG] Dropping %s entry '%.40s' (op '%.8s')\n", name, v, op);
+      hub_log_warning("[CONFIG] Dropping %s entry '%.40s' (op '%.8s')\n", name, v, op);
       return false;
     }
   }
   hub_ip_acl_t e;
   if (!hub_ip_acl_parse(v, &e)) {
-    hub_log("[CONFIG] Dropping invalid %s entry '%.40s' (not an IPv4 address "
+    hub_log_warning("[CONFIG] Dropping invalid %s entry '%.40s' (not an IPv4 address "
             "or CIDR)\n", name, v);
     return false;
   }
   e.added = (time_t)atoll(s_ts + 1);
   ip_acl_add_t r = hub_ip_acl_add(state, list, &e);
   if (r == IP_ACL_FULL)
-    hub_log("[CONFIG] %s full (%d); dropping %s\n", name, MAX_IP_ACL_ENTRIES,
+    hub_log_warning("[CONFIG] %s full (%d); dropping %s\n", name, MAX_IP_ACL_ENTRIES,
             e.pattern);
   return r == IP_ACL_ADDED && !op && strcmp(v, e.pattern) == 0;
 }
@@ -475,29 +482,29 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   struct stat cfg_st;
   if (stat(HUB_CONFIG_FILE, &cfg_st) == 0) {
     if ((cfg_st.st_mode & 0177) != 0)
-      hub_log("[WARN] %s has insecure permissions %04o — should be 0600\n",
+      hub_log_warning("[HUB] %s has insecure permissions %04o — should be 0600\n",
               HUB_CONFIG_FILE, (unsigned)(cfg_st.st_mode & 0777));
   }
   FILE *fp = fopen(HUB_CONFIG_FILE, "rb");
   if (!fp) {
-    hub_log("Config file not found\n");
+    hub_log_error("[HUB] Config file not found\n");
     return false;
   }
 
   unsigned char salt[SALT_SIZE], iv[GCM_IV_LEN], tag[GCM_TAG_LEN];
 
   if (fread(salt, 1, SALT_SIZE, fp) != SALT_SIZE) {
-    hub_log("Failed to read salt\n");
+    hub_log_error("[HUB] Failed to read salt\n");
     fclose(fp);
     return false;
   }
   if (fread(iv, 1, GCM_IV_LEN, fp) != GCM_IV_LEN) {
-    hub_log("Failed to read IV\n");
+    hub_log_error("[HUB] Failed to read IV\n");
     fclose(fp);
     return false;
   }
   if (fread(tag, 1, GCM_TAG_LEN, fp) != GCM_TAG_LEN) {
-    hub_log("Failed to read tag\n");
+    hub_log_error("[HUB] Failed to read tag\n");
     fclose(fp);
     return false;
   }
@@ -507,7 +514,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   long cipher_len = fsize - SALT_SIZE - GCM_IV_LEN - GCM_TAG_LEN;
 
   if (cipher_len <= 0) {
-    hub_log("Invalid config file size\n");
+    hub_log_error("[HUB] Invalid config file size\n");
     fclose(fp);
     return false;
   }
@@ -520,7 +527,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   }
 
   if (fread(ciphertext, 1, cipher_len, fp) != (size_t)cipher_len) {
-    hub_log("Failed to read ciphertext\n");
+    hub_log_error("[HUB] Failed to read ciphertext\n");
     free(ciphertext);
     fclose(fp);
     return false;
@@ -531,7 +538,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   unsigned char key[32];
   if (PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_SIZE,
                         PBKDF2_ITERATIONS, EVP_sha256(), 32, key) != 1) {
-    hub_log("PBKDF2 failed\n");
+    hub_log_error("[HUB] PBKDF2 failed\n");
     free(ciphertext);
     return false;
   }
@@ -556,7 +563,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       EVP_DecryptUpdate(ctx, plaintext, &plain_len, ciphertext, cipher_len) != 1 ||
       EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag) != 1 ||
       EVP_DecryptFinal_ex(ctx, plaintext + plain_len, &len) <= 0) {
-    hub_log("Config decryption failed (wrong password or corrupted file)\n");
+    hub_log_error("[HUB] Config decryption failed (wrong password or corrupted file)\n");
     EVP_CIPHER_CTX_free(ctx);
     secure_wipe(key, sizeof(key));
     /* Partial plaintext may have been written by EVP_DecryptUpdate before the
@@ -609,6 +616,15 @@ bool hub_config_load(hub_state_t *state, const char *password) {
          * favour of per-admin records). Old configs simply lose this field
          * on the next save; admins must already exist as a| records. */
         (void)v;
+      } else if (strcmp(k, "log_level") == 0) {
+        long lv = strtol(v, NULL, 10);
+        state->log_level = (int)(lv < LOG_NONE ? LOG_NONE
+                                 : lv > LOG_DEBUG ? LOG_DEBUG : lv);
+      } else if (strcmp(k, "log_size") == 0) {
+        long sz = strtol(v, NULL, 10);
+        state->log_max_size = (int)(sz < HUB_LOG_SIZE_MIN ? HUB_LOG_SIZE_MIN
+                                    : sz > HUB_LOG_SIZE_MAX ? HUB_LOG_SIZE_MAX
+                                                            : sz);
       } else if (strcmp(k, "purge_days") == 0) {
         state->purge_days_setting = atoi(v);
         if (state->purge_days_setting < 0) state->purge_days_setting = 0;
@@ -655,7 +671,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           r->have_plan = true;
         } else {
           memset(r, 0, sizeof(*r));
-          hub_log("[CONFIG] Ignoring a malformed rollup| line\n");
+          hub_log_warning("[CONFIG] Ignoring a malformed rollup| line\n");
         }
       } else if (strcmp(k, "lamport_seq") == 0) {
         unsigned long long loaded_seq = 0;
@@ -673,7 +689,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           memcpy(state->hub_x25519_priv,  d + 32, 32);
           state->hub_keys_loaded = true;
         } else if (d) {
-          hub_log("[HUB] Hub private key in config is not 64 bytes "
+          hub_log_error("[HUB] Hub private key in config is not 64 bytes "
                   "(legacy RSA?). Re-run -setup with a Curve25519 key.\n");
         }
         if (d) { secure_wipe(d, out); free(d); }
@@ -730,7 +746,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
                 memcpy(p->x25519_pub, dec + ED25519_KEY_LEN, X25519_KEY_LEN);
                 p->has_pubkey = true;
               } else {
-                hub_log("[PEER] peer %s pubkey wrong length (%d, need %d) — "
+                hub_log_warning("[PEER] peer %s pubkey wrong length (%d, need %d) — "
                         "ignoring; v2 auth disabled for this peer\n",
                         p->uuid, dec_len, COMBINED_KEY_LEN);
               }
@@ -986,7 +1002,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         }
         (void)loser;
         if (remap_count > 0) {
-          hub_log("[HUB] Dedup: merged duplicate '%s' %c record\n", u->name, u->type);
+          hub_log_debug("[HUB] Dedup: merged duplicate '%s' %c record\n", u->name, u->type);
         }
       }
     }
@@ -1010,7 +1026,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         }
       }
       if (!has_owner) {
-        hub_log("[HUB] Dedup: dropped orphaned mask '%s' (UUID %s)\n",
+        hub_log_debug("[HUB] Dedup: dropped orphaned mask '%s' (UUID %s)\n",
                 m->mask, m->uuid);
         continue;
       }
@@ -1031,7 +1047,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
 
     if (dedup_user_count != state->user_record_count ||
         dedup_mask_count  != state->mask_record_count) {
-      hub_log("[HUB] Config dedup: users %d->%d, masks %d->%d\n",
+      hub_log_info("[HUB] Config dedup: users %d->%d, masks %d->%d\n",
               state->user_record_count, dedup_user_count,
               state->mask_record_count, dedup_mask_count);
       memcpy(state->user_records, dedup_users,
@@ -1048,12 +1064,12 @@ bool hub_config_load(hub_state_t *state, const char *password) {
     }
   }
   if (cfg_legacy_users > 0)
-    hub_log("[HUB] Config migrated to passwordless records (%d legacy "
+    hub_log_info("[HUB] Config migrated to passwordless records (%d legacy "
             "line(s)); passwords dropped\n", cfg_legacy_users);
   for (int i = 0; i < state->user_record_count; i++) {
     const hub_user_record_t *u = &state->user_records[i];
     if (u->is_active && !u->has_pubkey)
-      hub_log("[HUB] %s '%s' has no public key and cannot authenticate until "
+      hub_log_warning("[HUB] %s '%s' has no public key and cannot authenticate until "
               "given one (hub_admin: Change user public key)\n",
               u->type == 'a' ? "Admin" : "Oper", u->name);
   }

@@ -1615,6 +1615,18 @@ void menu_manage_channels(void) {
     }
 }
 
+static void admin_show_stats(void) {
+    char *response = malloc(MAX_BUFFER);
+    if (!response) return;
+    send_packet(g_fd, CMD_ADMIN_STATS, NULL, g_key);
+    read_response(g_fd, g_key, response, MAX_BUFFER);
+    printf("\nTraffic since this hub started (cfg: full config pushes to bots,\n"
+           "same = skipped as identical; sync: peer sync frames/records in;\n"
+           "op: frames/bytes by opcode):\n%s\n", response);
+    free(response);
+    pause_and_continue();
+}
+
 static void admin_show_opt_flags(void) {
     char response[256];
     send_packet(g_fd, CMD_ADMIN_GET_OPT_FLAGS, NULL, g_key);
@@ -1762,6 +1774,29 @@ void admin_upgrade_abort(void) {
     pause_and_continue();
 }
 
+/* Drop the roll-up plan the last finished run left behind, on every hub:
+ * until then, any bot that comes back on an older build is walked up to the
+ * plan's target by its hub. */
+void admin_upgrade_forget(void) {
+    char response[MAX_BUFFER], confirm[16];
+    printf("\n═══════════════════════════════════════════════════\n");
+    printf("               FORGET ROLL-UP PLAN\n");
+    printf("═══════════════════════════════════════════════════\n\n");
+    printf("  Every hub stops walking returning bots up to the last\n");
+    printf("  run's target.  Nothing already upgraded is touched.\n");
+    printf("  Type 'yes' to confirm.\n\n");
+    get_input("Confirm: ", confirm, sizeof(confirm));
+    if (strcmp(confirm, "yes") != 0) {
+        printf("[*] Cancelled.\n");
+        pause_and_continue();
+        return;
+    }
+    send_packet(g_fd, CMD_ADMIN_UPGRADE_STATUS, "forget", g_key);
+    read_response(g_fd, g_key, response, sizeof(response));
+    printf("\nHub: %s\n", response);
+    pause_and_continue();
+}
+
 void menu_upgrade_network(void) {
     while (1) {
         printf("\n");
@@ -1772,7 +1807,8 @@ void menu_upgrade_network(void) {
         printf("  1. Upgrade network to a version\n");
         printf("  2. Upgrade status\n");
         printf("  3. Abort the running upgrade\n");
-        printf("  4. Back to Main Menu\n");
+        printf("  4. Forget the roll-up plan\n");
+        printf("  5. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -1787,7 +1823,8 @@ void menu_upgrade_network(void) {
             case 1: admin_upgrade_network(); break;
             case 2: admin_upgrade_status();  break;
             case 3: admin_upgrade_abort();   break;
-            case 4: return;
+            case 4: admin_upgrade_forget();  break;
+            case 5: return;
             default: printf("Invalid choice.\n"); break;
         }
     }
@@ -1961,7 +1998,8 @@ void menu_manage_peer_config(void) {
         printf("  9. Export Public Key\n");
         printf(" 10. Set Log Level\n");
         printf(" 11. Set Log Size Limit\n");
-        printf(" 12. Back to Main Menu\n");
+        printf(" 12. Show Traffic Stats\n");
+        printf(" 13. Back to Main Menu\n");
         printf("\n");
         printf("Select: ");
         fflush(stdout);
@@ -2009,6 +2047,9 @@ void menu_manage_peer_config(void) {
                 admin_set_log_size_limit();
                 break;
             case 12:
+                admin_show_stats();
+                break;
+            case 13:
                 return;  // Back to main menu
             default:
                 printf("Invalid choice.\n");
