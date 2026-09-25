@@ -30,9 +30,19 @@ hub_stats_t g_hub_stats;
 /* A config push that never reaches its bot must not stand as "sent", or the
  * next identical broadcast would be skipped and the bot left behind. */
 static void cfg_push_lost(hub_client_t *c, const queued_msg_t *m) {
+  if (m->cmd == CMD_BOT_TREE) c->tree_sent_valid = false; /* same for a tree */
   if (m->cmd != CMD_CONFIG_DATA) return;
   c->cfg_sent_valid = false;
   g_hub_stats.cfg_lost++;
+}
+
+/* Max-merge one activity time (last_seen / last_used) outside LWW.  A rise
+ * is persisted but is never a config update: nothing forwarded or pushed. */
+static bool activity_raise(hub_state_t *state, time_t *slot, time_t ts) {
+  if (ts <= *slot || ts > time(NULL) + ACTIVITY_MAX_FUTURE) return false;
+  *slot = ts;
+  state->config_dirty = true;
+  return true;
 }
 
 static bool wire_field(const char *s, int idx, char *dst, size_t cap) {
@@ -269,7 +279,8 @@ static int peer_encrypt_into_writing(hub_client_t *peer, queued_msg_t *m) {
    * keep host order for wire compatibility.  CMD_BOT_TREE joined that list;
    * without it the bot computed a garbage length, failed its bounds check and
    * silently dropped every tree push. */
-  if (m->cmd == CMD_CONFIG_DATA || m->cmd == CMD_BOT_TREE) {
+  if (m->cmd == CMD_CONFIG_DATA || m->cmd == CMD_BOT_TREE ||
+      m->cmd == CMD_ACTIVITY_REPLY) {
     inner_len_field = htonl((uint32_t)m->payload_len);
   } else {
     inner_len_field = (uint32_t)m->payload_len;
@@ -1673,6 +1684,18 @@ static mesh_hub_t *mesh_hub_get(hub_state_t *state, const char *uuid) {
   return h;
 }
 
+/* Same links, same order: what a hub's l| lines render in the tree.
+ * old_n < 0 is "no list before", which is always a change. */
+static bool mesh_links_equal(const mesh_link_t *a, int old_n,
+                             const mesh_link_t *b, int new_n) {
+  if (old_n != new_n) return false;
+  for (int i = 0; i < new_n; i++)
+    if (a[i].online != b[i].online || strcmp(a[i].uuid, b[i].uuid) != 0 ||
+        strcmp(a[i].name, b[i].name) != 0)
+      return false;
+  return true;
+}
+
 /* True when our link to configured peer `p` is up right now. */
 static bool peer_is_linked(const hub_state_t *state, const hub_peer_config_t *p) {
   if (p->fd <= 0) return false;
@@ -2037,6 +2060,10 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
                                      gen, chunk, ttl - 1);
   }
   bool links_reset = false;
+  /* The link list this frame replaces: re-rendering every bot's tree is only
+   * worth it when the list really changed, not on every gossip round. */
+  mesh_link_t old_links[MAX_PEERS];
+  int old_link_count = -1;
 
   for (char *line = strtok_r(payload, "\n", &saveptr); line;
        line = strtok_r(NULL, "\n", &saveptr)) {
@@ -2127,10 +2154,12 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
       if (!relayable || chunk != 0 || !mh || strcmp(mh->uuid, hub_uuid) != 0)
         continue;
       if (!links_reset) {
+        old_link_count = mh->have_links ? mh->link_count : -1;
+        if (old_link_count > 0)
+          memcpy(old_links, mh->links, sizeof(mesh_link_t) * (size_t)old_link_count);
         mh->link_count = 0;
         mh->have_links = true;
         links_reset = true;
-        state->tree_dirty = true; /* cheap: pushes are coalesced per bot */
       }
       char lu[64] = "", ln[64] = "", lo[4] = "";
       if (!wire_field(line + 2, 0, lu, sizeof(lu)) ||
@@ -2187,6 +2216,10 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
     e.reported_at = now;
     roster_upsert(state, &e);
   }
+
+  if (links_reset && !mesh_links_equal(old_links, old_link_count, mh->links,
+                                        mh->link_count))
+    state->tree_dirty = true;
 
   /* Pass it on after applying it, so the split horizon uses the links this
    * very frame just reported. */
@@ -2261,19 +2294,20 @@ static bool tree_hub_placed(const hub_state_t *state, const tree_hub_t *th,
  * network legitimately renders differently depending on which bot you ask. */
 static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
   int offset = 0, written;
-  time_t now = time(NULL);
   buf[0] = '\0';
 
-  /* <variant> is the code base (c / rs), always the last field: a bot that
-   * predates it splits a fixed field count and never looks past uptime or
-   * version, so the extra field is invisible to it. */
-  written = snprintf(buf, max_len, "H|0|%s|%s|1|%lld|%s|%s\n",
+  /* <variant> is the code base (c / rs); after it comes <started>, the
+   * node's absolute start time (0 = unknown), from which the bot works out
+   * the uptime itself.  A bot that predates a field splits a fixed field
+   * count and never looks past it.  The old uptime field is always 0: a tree
+   * that says the same thing is then the same bytes, and an unchanged tree is
+   * not pushed again (hub_push_tree_to_bots). */
+  written = snprintf(buf, max_len, "H|0|%s|%s|1|0|%s|%s|%lld\n",
                      state->hub_friendly_name[0] ? state->hub_friendly_name
                                                  : "hub",
                      state->hub_uuid[0] ? state->hub_uuid : "-",
-                     (long long)(state->hub_started
-                                     ? now - state->hub_started : 0),
-                     HUB_VERSION, HUB_UPDATE_VARIANT);
+                     HUB_VERSION, HUB_UPDATE_VARIANT,
+                     (long long)state->hub_started);
   if (written < 0 || written >= max_len) return 0;
   offset += written;
 
@@ -2285,12 +2319,12 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
     char nick[MAX_NICK];
     bot_nick_from_config(state, c->id, nick, sizeof(nick));
     written = snprintf(buf + offset, max_len - offset,
-                       "B|1|%s|%s|%s|%s|%lld|%s\n",
+                       "B|1|%s|%s|%s|%s|0|%s|%lld\n",
                        nick[0] ? nick : "-", c->id,
                        c->bot_version[0] ? c->bot_version : "-",
                        c->bot_server[0] ? c->bot_server : "-",
-                       (long long)(c->bot_started ? now - c->bot_started : 0),
-                       c->bot_variant[0] ? c->bot_variant : "-");
+                       c->bot_variant[0] ? c->bot_variant : "-",
+                       (long long)c->bot_started);
     if (written < 0 || written >= max_len - offset) break;
     offset += written;
   }
@@ -2365,11 +2399,11 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
       if (!var[0]) var = mh->variant;
     }
     written = snprintf(buf + offset, max_len - offset,
-                       "H|%d|%s|%s|%d|%lld|%s|%s\n", th[i].depth,
+                       "H|%d|%s|%s|%d|0|%s|%s|%lld\n", th[i].depth,
                        th[i].name[0] ? th[i].name : "peer",
                        puuid[0] ? puuid : "-", th[i].online ? 1 : 0,
-                       (long long)(started ? now - started : 0),
-                       ver[0] ? ver : "-", var[0] ? var : "-");
+                       ver[0] ? ver : "-", var[0] ? var : "-",
+                       (long long)started);
     if (written < 0 || written >= max_len - offset) break;
     offset += written;
 
@@ -2379,13 +2413,12 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
         if (strcmp(e->hub_uuid, puuid) != 0) continue;
         if (max_len - offset <= TREE_ROW_MAX) break;
         written = snprintf(buf + offset, max_len - offset,
-                           "B|%d|%s|%s|%s|%s|%lld|%s\n", th[i].depth + 1,
+                           "B|%d|%s|%s|%s|%s|0|%s|%lld\n", th[i].depth + 1,
                            e->nick[0] ? e->nick : "-", e->bot_uuid,
                            e->version[0] ? e->version : "-",
                            e->server[0] ? e->server : "-",
-                           (long long)(e->connected_at ? now - e->connected_at
-                                                       : 0),
-                           e->variant[0] ? e->variant : "-");
+                           e->variant[0] ? e->variant : "-",
+                           (long long)e->connected_at);
         if (written < 0 || written >= max_len - offset) break;
         offset += written;
       }
@@ -2431,8 +2464,11 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
 }
 
 /* Push the assembled tree to every connected bot.  Coalesced per bot so a
- * burst of roster changes collapses to one send per drain cycle. */
-static void hub_push_tree_to_bots(hub_state_t *state) {
+ * burst of roster changes collapses to one send per drain cycle.  force=false
+ * (a change) skips a bot that was already sent this exact tree; the
+ * BOT_TREE_REFRESH push is forced, which is what keeps a bot's tree from
+ * looking stale (BOT_TREE_STALE_AFTER) on a quiet mesh. */
+static void hub_push_tree_to_bots(hub_state_t *state, bool force) {
   int bots = 0;
   for (int i = 0; i < state->client_count; i++)
     if (state->clients[i]->type == CLIENT_BOT && state->clients[i]->authenticated)
@@ -2447,18 +2483,27 @@ static void hub_push_tree_to_bots(hub_state_t *state) {
   int len = hub_build_tree(state, payload, MAX_TREE_PAYLOAD);
   if (len <= 0) { free(payload); return; }
 
+  unsigned char hash[32];
+  unsigned int hlen = 0;
+  bool hashed = EVP_Digest(payload, (size_t)len, hash, &hlen, EVP_sha256(),
+                           NULL) == 1 && hlen == sizeof(hash);
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
     if (c->type != CLIENT_BOT || !c->authenticated) continue;
+    if (!force && hashed && c->tree_sent_valid &&
+        memcmp(hash, c->tree_sent_hash, sizeof(hash)) == 0)
+      continue;
     queued_msg_t *m = queued_msg_new(CMD_BOT_TREE, LANE_BULK,
                                      (const unsigned char *)payload, len);
     if (!m) continue;
+    c->tree_sent_valid = hashed;
+    if (hashed) memcpy(c->tree_sent_hash, hash, sizeof(hash));
     char coalesce[160];
     snprintf(coalesce, sizeof(coalesce), "%s|bot_tree|%s", state->hub_uuid,
              c->id);
     queued_msg_set_coalesce(m, state->hub_uuid, hub_next_lamport_seq(state),
                             coalesce);
-    peer_enqueue(c, m);
+    if (!peer_enqueue(c, m)) c->tree_sent_valid = false;
   }
   free(payload);
 }
@@ -2490,12 +2535,15 @@ void hub_presence_tick(hub_state_t *state, time_t now) {
   if (now - state->last_presence_gossip >= BOT_PRESENCE_INTERVAL)
     hub_gossip_bot_roster(state);
 
-  /* Push on change, with an unconditional refresh so a bot that missed a
-   * frame — or connected between changes — still converges. */
-  if (state->tree_dirty || now - state->last_tree_push >= BOT_TREE_REFRESH) {
+  /* Push on change (only to bots whose tree it changes), with an
+   * unconditional refresh so a bot that missed a frame — or connected between
+   * changes — still converges.  Only the refresh restarts the refresh clock:
+   * a change push may reach no bot at all. */
+  bool refresh = now - state->last_tree_push >= BOT_TREE_REFRESH;
+  if (state->tree_dirty || refresh) {
     state->tree_dirty = false;
-    state->last_tree_push = now;
-    hub_push_tree_to_bots(state);
+    if (refresh) state->last_tree_push = now;
+    hub_push_tree_to_bots(state, refresh);
   }
 }
 
@@ -2829,6 +2877,9 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
             int w = snprintf(sync_buffer+sync_offset, sizeof(sync_buffer)-sync_offset,
                              "m|%s|%s|%s|%lld|%lld\n", uuid, mask_s, act, last_used, ts);
             if (w>0) sync_offset += w;
+          } else if (found_m) {
+            /* Activity repair, outside LWW: not an update. */
+            activity_raise(state, &found_m->last_used, (time_t)last_used);
           }
         }
       }
@@ -2872,6 +2923,8 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
             sync_offset += w;
             sync_buffer[sync_offset] = '\0';
           }
+        } else if (found_u) {
+          activity_raise(state, &found_u->last_seen, in.last_seen);
         }
       }
     } else if (type == 'h') {
@@ -3435,6 +3488,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                       fwd_offset += ul;
                       forward_buf[fwd_offset] = '\0';
                     }
+                  } else if (!discard_incoming && found_u) {
+                    /* Activity repair, outside LWW: not an update. */
+                    activity_raise(state, &found_u->last_seen, (time_t)last_seen);
                   }
                 }
                 line = strtok_r(NULL, "\n", &saveptr);
@@ -3487,6 +3543,8 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                                        "%s\n", line);
                       if (w>0) fwd_offset += w;
                     }
+                  } else if (found_m) {
+                    activity_raise(state, &found_m->last_used, (time_t)last_used);
                   }
                 }
                 line = strtok_r(NULL, "\n", &saveptr);
@@ -8878,6 +8936,213 @@ static void process_peer_bot_relay(hub_state_t *state, hub_client_t *peer,
           target, sent);
 }
 
+/* ---- Activity (CMD_ACTIVITY / CMD_ACTIVITY_QUERY) ----------------------- */
+
+/* A user uuid as the config stores it: 36 chars, hex and dashes. */
+static bool activity_uuid_ok(const char *s) {
+  if (!s || strlen(s) != 36) return false;
+  for (int i = 0; i < 36; i++) {
+    bool dash = (i == 8 || i == 13 || i == 18 || i == 23);
+    if (dash ? s[i] != '-' : !isxdigit((unsigned char)s[i])) return false;
+  }
+  return true;
+}
+
+static hub_user_record_t *activity_user(hub_state_t *state, const char *uuid) {
+  for (int i = 0; i < state->user_record_count; i++)
+    if (strcmp(state->user_records[i].uuid, uuid) == 0)
+      return &state->user_records[i];
+  return NULL;
+}
+
+static hub_mask_record_t *activity_mask(hub_state_t *state, const char *uuid,
+                                        const char *mask) {
+  for (int i = 0; i < state->mask_record_count; i++)
+    if (strcmp(state->mask_records[i].uuid, uuid) == 0 &&
+        strcasecmp(state->mask_records[i].mask, mask) == 0)
+      return &state->mask_records[i];
+  return NULL;
+}
+
+/* Send CMD_ACTIVITY lines to every authenticated peer except exclude_fd. */
+static void activity_flood(hub_state_t *state, const char *lines, int len,
+                           int exclude_fd) {
+  if (len <= 0) return;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_HUB || !c->authenticated || c->fd == exclude_fd)
+      continue;
+    queued_msg_t *m = queued_msg_new(CMD_ACTIVITY, LANE_DELTA,
+                                     (const unsigned char *)lines, len);
+    if (!m) continue;
+    if (!peer_enqueue(c, m))
+      hub_log_warning("[ACTIVITY] enqueue failed for peer %s\n", c->ip);
+  }
+}
+
+/* hub_admin login: stamp the admin's exact time; the first login in an
+ * ACTIVITY_BUCKET is flooded to the peers.  Never a config change. */
+static void hub_activity_stamp_user(hub_state_t *state, hub_user_record_t *u,
+                                    time_t now) {
+  if (!u || now <= u->last_seen) return;
+  bool new_bucket = u->last_seen / ACTIVITY_BUCKET < now / ACTIVITY_BUCKET;
+  u->last_seen = now;
+  state->config_dirty = true;
+  hub_log_debug("[ACTIVITY] %s last seen %lld%s\n", u->name, (long long)now,
+                new_bucket ? " (first this hour: flooded to peers)" : "");
+  if (!new_bucket) return;
+  char line[80];
+  int len = snprintf(line, sizeof(line), "a|%s|%lld\n", u->uuid,
+                     (long long)now);
+  if (len > 0 && len < (int)sizeof(line))
+    activity_flood(state, line, len, -1);
+}
+
+/* CMD_ACTIVITY from a bot (from = the bot) or a peer (from = the peer).
+ * Every line is validated on its own; a bad or unknown one is dropped.
+ * Lines that raised our value go on to the other peers. */
+static void process_activity(hub_state_t *state, hub_client_t *from,
+                             const char *payload) {
+  char *fwd = malloc(MAX_BUFFER);
+  char *buf = strdup(payload ? payload : "");
+  if (!fwd || !buf) {
+    free(fwd);
+    free(buf);
+    return;
+  }
+  int fwd_len = 0, raised = 0, lines = 0;
+  long long now = (long long)time(NULL);
+  char *save = NULL;
+  for (char *line = strtok_r(buf, "\n", &save); line;
+       line = strtok_r(NULL, "\n", &save)) {
+    if (++lines > MAX_HUB_USER_RECORDS + MAX_HUB_USER_MASKS) break;
+    /* a|uuid|ts or m|uuid|mask|ts.  The time is always the last field, so
+     * a mask may hold a '|' of its own. */
+    char uuid[40] = "", mask[MAX_MASK_LEN] = "";
+    bool is_mask = line[0] == 'm';
+    const char *last = strrchr(line, '|');
+    size_t mask_len = 0;
+    bool ok = (line[0] == 'a' || is_mask) && line[1] == '|' &&
+              wire_field(line, 1, uuid, sizeof(uuid)) && activity_uuid_ok(uuid);
+    if (ok && is_mask) {
+      const char *mstart = line + 2 + 36 + 1;
+      ok = last > mstart && mstart[-1] == '|';
+      mask_len = ok ? (size_t)(last - mstart) : 0;
+      if (ok && mask_len < sizeof(mask)) {
+        memcpy(mask, mstart, mask_len);
+        mask[mask_len] = '\0';
+      } else {
+        ok = false;
+      }
+    } else if (ok) {
+      ok = last == line + 2 + 36;
+    }
+    if (!ok) {
+      hub_log_debug("[ACTIVITY] malformed line from %s\n", from->id);
+      continue;
+    }
+    char *end = NULL;
+    long long ts = strtoll(last + 1, &end, 10);
+    if (!end || *end != '\0' || ts <= 0 || ts > now + ACTIVITY_MAX_FUTURE) {
+      hub_log_debug("[ACTIVITY] bad time from %s\n", from->id);
+      continue;
+    }
+    time_t *slot = NULL;
+    if (is_mask) {
+      hub_mask_record_t *m = activity_mask(state, uuid, mask);
+      if (m) slot = &m->last_used;
+    } else {
+      hub_user_record_t *u = activity_user(state, uuid);
+      if (u) slot = &u->last_seen;
+    }
+    if (!slot || (long long)*slot >= ts) continue; /* unknown or not newer */
+    *slot = (time_t)ts;
+    raised++;
+    int w = is_mask
+                ? snprintf(fwd + fwd_len, MAX_BUFFER - fwd_len,
+                           "m|%s|%s|%lld\n", uuid, mask, ts)
+                : snprintf(fwd + fwd_len, MAX_BUFFER - fwd_len, "a|%s|%lld\n",
+                           uuid, ts);
+    if (w > 0 && w < MAX_BUFFER - fwd_len - 5) fwd_len += w;
+  }
+  if (raised) {
+    state->config_dirty = true;
+    hub_log_debug("[ACTIVITY] %d record(s) raised by %s\n", raised, from->id);
+    activity_flood(state, fwd, fwd_len,
+                   from->type == CLIENT_HUB ? from->fd : -1);
+  }
+  free(buf);
+  free(fwd);
+}
+
+/* Queue one CMD_ACTIVITY_REPLY chunk to a bot. */
+static void activity_reply_send(hub_client_t *bot, const char *frame, int len) {
+  queued_msg_t *m = queued_msg_new(CMD_ACTIVITY_REPLY, LANE_DELTA,
+                                   (const unsigned char *)frame, len);
+  if (!m) return;
+  if (!peer_enqueue(bot, m))
+    hub_log_warning("[ACTIVITY] reply enqueue failed for %s\n", bot->id);
+}
+
+/* CMD_ACTIVITY_QUERY from a bot: <req_id>|users or <req_id>|masks|<uuid|*>.
+ * Answers every known time (records at 0 are left out), chunked. */
+static void process_activity_query(hub_state_t *state, hub_client_t *bot,
+                                   const char *payload) {
+  char req[ACTIVITY_REQ_ID_MAX + 1] = "", kind[8] = "", who[40] = "";
+  if (!wire_field(payload, 0, req, sizeof(req)) || !bot_relay_id_ok(req) ||
+      !wire_field(payload, 1, kind, sizeof(kind))) {
+    hub_log_warning("[ACTIVITY] invalid query from %s\n", bot->id);
+    return;
+  }
+  bool masks = strcmp(kind, "masks") == 0;
+  if (!masks && strcmp(kind, "users") != 0) {
+    hub_log_warning("[ACTIVITY] unknown query kind from %s\n", bot->id);
+    return;
+  }
+  if (masks && (!wire_field(payload, 2, who, sizeof(who)) ||
+                (strcmp(who, "*") != 0 && !activity_uuid_ok(who)))) {
+    hub_log_warning("[ACTIVITY] invalid masks query from %s\n", bot->id);
+    return;
+  }
+  bool all = !masks || strcmp(who, "*") == 0;
+
+  /* Frame budget: header + the longest line must always fit. */
+  const int cap = MAX_BUFFER - 64;
+  char *frame = malloc((size_t)cap);
+  if (!frame) return;
+  int hdr = snprintf(frame, (size_t)cap, "%s|1\n", req);
+  int len = hdr;
+  for (int pass = 0; pass < (masks ? 2 : 1); pass++) {
+    int n = pass == 0 ? state->user_record_count : state->mask_record_count;
+    for (int i = 0; i < n; i++) {
+      char line[MAX_MASK_LEN + 96];
+      int w = 0;
+      if (pass == 0) {
+        const hub_user_record_t *u = &state->user_records[i];
+        if (u->last_seen <= 0 || (!all && strcmp(u->uuid, who) != 0)) continue;
+        w = snprintf(line, sizeof(line), "a|%s|%lld\n", u->uuid,
+                     (long long)u->last_seen);
+      } else {
+        const hub_mask_record_t *m = &state->mask_records[i];
+        if (m->last_used <= 0 || (!all && strcmp(m->uuid, who) != 0)) continue;
+        w = snprintf(line, sizeof(line), "m|%s|%s|%lld\n", m->uuid, m->mask,
+                     (long long)m->last_used);
+      }
+      if (w <= 0 || w >= (int)sizeof(line)) continue;
+      if (len + w > cap) {
+        activity_reply_send(bot, frame, len);
+        len = hdr;
+      }
+      memcpy(frame + len, line, (size_t)w);
+      len += w;
+    }
+  }
+  /* Last chunk: more=0. */
+  frame[hdr - 2] = '0';
+  activity_reply_send(bot, frame, len);
+  free(frame);
+}
+
 static void process_bot_command(hub_state_t *state, hub_client_t *client,
                                 int cmd, char *payload) {
   switch (cmd) {
@@ -8888,6 +9153,14 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
 
   case CMD_BOT_PRESENCE:
     process_bot_presence(state, client, payload);
+    break;
+
+  case CMD_ACTIVITY:
+    process_activity(state, client, payload);
+    break;
+
+  case CMD_ACTIVITY_QUERY:
+    process_activity_query(state, client, payload);
     break;
 
   case CMD_UPGRADE_READY:
@@ -9620,8 +9893,9 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 client->admin_connect_port = 0;
               }
 
-              admin_u->last_seen = time(NULL);
-              state->config_dirty = true;
+              /* Activity, not a config change: no peer sync, no bot push.
+               * The first login in a clock hour is flooded to the peers. */
+              hub_activity_stamp_user(state, admin_u, time(NULL));
               char afp[KEY_FP_LEN + 1];
               hub_crypto_key_fingerprint(admin_pub, afp);
               hub_log_info("[HUB] Admin Login (key %s): %s as '%s'\n",
@@ -9634,10 +9908,6 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 secure_wipe(plain, sizeof(plain));
                 return false;  /* send_response already disconnected */
               }
-
-              state->anti_entropy_due = true;
-              hub_request_sync_from_peers(state);
-              broadcast_full_config_to_all_bots(state);
             } else {
               hub_log_warning("[HUB] Failed admin auth from %s: %s\n", client->ip, why);
               record_failed_auth(state, client->ip);
@@ -9907,6 +10177,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 process_peer_upgrade_forget(state, client, payload_ptr);
               } else if (cmd == CMD_BOT_RELAY_FWD) {
                 process_peer_bot_relay(state, client, payload_ptr);
+              } else if (cmd == CMD_ACTIVITY) {
+                process_activity(state, client, payload_ptr);
               } else if (cmd == CMD_CHAN_FWD_REQUEST) {
                 process_forward_chan_request(state, client, payload_ptr);
               } else if (cmd == CMD_CHAN_FWD_REPLY) {

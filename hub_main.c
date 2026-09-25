@@ -520,13 +520,10 @@ void hub_maintenance(hub_state_t *state) {
         unsigned int jitter = 30 + (unsigned int)(rand() % 61);
         last_anti_entropy = now - (time_t)(MESH_ANTI_ENTROPY_INTERVAL - jitter);
     }
-    bool forced_ae = state->anti_entropy_due;
-    if (forced_ae || now - last_anti_entropy > MESH_ANTI_ENTROPY_INTERVAL) {
+    if (now - last_anti_entropy > MESH_ANTI_ENTROPY_INTERVAL) {
         last_anti_entropy = now;
-        state->anti_entropy_due = false;
         if (state->peer_count > 0) {
-            hub_log_debug("[MESH] Running %santi-entropy sync...\n",
-                    forced_ae ? "forced " : "periodic ");
+            hub_log_debug("[MESH] Running periodic anti-entropy sync...\n");
             /* Heap, sized to the sync ceiling: a 16 KB buffer truncated
              * anti-entropy the same way it truncated the startup sync. */
             char *full_sync = malloc(MAX_SYNC_PAYLOAD);

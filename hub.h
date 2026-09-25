@@ -400,6 +400,35 @@
  * direct admin/bot replies are not queued and not counted). */
 #define CMD_ADMIN_STATS 0x68
 
+/* ---- Activity (last seen / last used) -----------------------------------
+ * An admin/oper's last_seen and a usermask's last_used are max-merged values
+ * OUTSIDE the LWW config: they only ever rise, a rise is never a config
+ * change (no record forward, no bot push), and every hub converges on the
+ * latest time any node saw.  A node reports a record only on its first use
+ * within an ACTIVITY_BUCKET (a clock hour), with that use's exact time; later
+ * uses in the same bucket stay local.  A hub that receives CMD_ACTIVITY keeps
+ * max(stored, ts) and forwards to its other peers only the lines that raised
+ * its value, so a flood dies out without a seen-set.  PEER_SYNC / CONFIG_PUSH
+ * max-merge the same fields as a repair path (anti-entropy).
+ * Mirrors ircbot/bot.h, irchub.rs + ircbot.rs consts.rs.
+ *
+ *   CMD_ACTIVITY        bot -> hub, hub <-> hub.  Lines:
+ *                         a|<user_uuid>|<ts>          (admin or oper)
+ *                         m|<user_uuid>|<mask>|<ts>
+ *   CMD_ACTIVITY_QUERY  bot -> hub: <req_id>|users   or
+ *                                   <req_id>|masks|<user_uuid or *>
+ *                       ("masks" answers that user's a| line too)
+ *   CMD_ACTIVITY_REPLY  hub -> bot: first line <req_id>|<more>, then a|/m|
+ *                       lines; chunked under MAX_BUFFER, more=0 on the last. */
+#define CMD_ACTIVITY       0x69
+#define CMD_ACTIVITY_QUERY 0x6A
+#define CMD_ACTIVITY_REPLY 0x6B
+#define ACTIVITY_BUCKET    3600 /* report the first use per this many seconds */
+/* A reported time this far ahead of our clock is refused: activity only
+ * rises, so one bogus future stamp would stick for good. */
+#define ACTIVITY_MAX_FUTURE 300
+#define ACTIVITY_REQ_ID_MAX 32
+
 #define MAX_PENDING_CHAN_REQUESTS 200
 #define CHAN_REQUEST_TIMEOUT 45   // Reap a pending request with no reply
 
@@ -904,6 +933,12 @@ typedef struct {
    * on overflow and whenever the bot sends a config push of its own. */
   unsigned char cfg_sent_hash[32];
   bool          cfg_sent_valid;
+
+  /* SHA-256 of the last bot tree queued to this bot (CMD_BOT_TREE): a change
+   * push that would repeat it is skipped (the BOT_TREE_REFRESH one never is).
+   * Cleared when a queued tree is dropped on overflow. */
+  unsigned char tree_sent_hash[32];
+  bool          tree_sent_valid;
 } hub_client_t;
 
 // Track recently processed PURGE messages to prevent feedback loops
@@ -1113,7 +1148,6 @@ typedef struct {
   time_t last_bot_config_push;
   time_t last_config_write;
   bool mesh_state_dirty;    /* set on peer connect/disconnect; clears after gossip */
-  bool anti_entropy_due;    /* set to force anti-entropy on next hub_maintenance tick */
 
   /* Mesh transport: monotonic Lamport sequence stamped onto outgoing deltas
    * (carried as the trailing field of the wire format). On load from disk we
