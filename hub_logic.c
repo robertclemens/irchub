@@ -548,6 +548,27 @@ static void remove_pending_op_request(hub_state_t *state,
                                        const char *request_id);
 static bool op_forward_seen_check_and_add(hub_state_t *state,
                                            const char *request_id);
+/* The peer link to the hub the roster places bot `target_uuid` on, or NULL
+ * (flood) when it is on no direct peer, on more than one hub (mid-move), or
+ * unknown.  Never the peer on `exclude_fd`: that is where it came from. */
+static hub_client_t *op_route_peer(hub_state_t *state, const char *target_uuid,
+                                   int exclude_fd) {
+  const char *home = NULL;
+  for (int r = 0; r < state->roster_count; r++) {
+    if (strcmp(state->roster[r].bot_uuid, target_uuid) != 0) continue;
+    if (home && strcmp(home, state->roster[r].hub_uuid) != 0) return NULL;
+    home = state->roster[r].hub_uuid;
+  }
+  if (!home) return NULL;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_HUB && c->authenticated && c->fd != exclude_fd &&
+        strcmp(upgrade_peer_uuid(state, c), home) == 0)
+      return c;
+  }
+  return NULL;
+}
+
 static void forward_op_request_to_peers(hub_state_t *state,
                                          const char *request_id,
                                          const char *requester_uuid,
@@ -555,7 +576,7 @@ static void forward_op_request_to_peers(hub_state_t *state,
                                          const char *channel,
                                          const char *requester_hostmask,
                                          int exclude_fd,
-                                         time_t origin_ts);
+                                         time_t origin_ts, bool split);
 static void process_forward_op_request(hub_state_t *state,
                                         hub_client_t *client, char *payload);
 static void process_forward_op_grant(hub_state_t *state, hub_client_t *client,
@@ -1243,7 +1264,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
 
     /* A new bot joins the tree: gossip and push on the next tick instead of
      * leaving it invisible to the mesh until the periodic refresh. */
-    hub_roster_mark_dirty(state);
+    hub_roster_mark_dirty(state, true);
     state->last_presence_gossip = 0;
 
     hub_log_info("[HUB] Bot %s authenticated (Curve25519)\n", client->id);
@@ -1631,7 +1652,10 @@ static void roster_clean(char *dst, size_t cap, const char *src) {
   dst[o] = '\0';
 }
 
-void hub_roster_mark_dirty(hub_state_t *state) { state->tree_dirty = true; }
+void hub_roster_mark_dirty(hub_state_t *state, bool local) {
+  state->tree_dirty = true;
+  if (local) state->tree_dirty_local = true;
+}
 
 void hub_roster_expire(hub_state_t *state, time_t now) {
   for (int i = 0; i < state->roster_count;) {
@@ -1787,7 +1811,7 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
     hub_log_info("[PRESENCE] Bot %s: version %s (%s) on %s\n", client->id,
             version[0] ? version : "?", variant[0] ? variant : "?",
             server[0] ? server : "(no server)");
-    state->tree_dirty = true;
+    hub_roster_mark_dirty(state, true);
     state->last_presence_gossip = 0; /* gossip the change on the next tick */
   }
 
@@ -2538,10 +2562,16 @@ void hub_presence_tick(hub_state_t *state, time_t now) {
   /* Push on change (only to bots whose tree it changes), with an
    * unconditional refresh so a bot that missed a frame — or connected between
    * changes — still converges.  Only the refresh restarts the refresh clock:
-   * a change push may reach no bot at all. */
+   * a change push may reach no bot at all.  Changes are coalesced (see
+   * BOT_TREE_COALESCE): under churn every peer's gossip round re-rendered the
+   * tree for every bot, O(hubs x bots) 10 KB frames a minute. */
   bool refresh = now - state->last_tree_push >= BOT_TREE_REFRESH;
-  if (state->tree_dirty || refresh) {
+  int gap = state->tree_dirty_local ? BOT_TREE_COALESCE_LOCAL : BOT_TREE_COALESCE;
+  bool due = state->tree_dirty && now - state->last_tree_change_push >= gap;
+  if (due || refresh) {
     state->tree_dirty = false;
+    state->tree_dirty_local = false;
+    state->last_tree_change_push = now;
     if (refresh) state->last_tree_push = now;
     hub_push_tree_to_bots(state, refresh);
   }
@@ -2554,6 +2584,35 @@ static uint8_t sync_bcast_opcode(hub_state_t *state, const hub_client_t *c) {
   const char *cu = upgrade_peer_uuid(state, c);
   const mesh_hub_t *mh = cu[0] ? mesh_hub_find(state, cu) : NULL;
   return (mh && mh->have_links) ? CMD_PEER_BCAST : CMD_PEER_SYNC;
+}
+
+/* The mesh-map record of the peer on `from_fd`, if its link report is fresh
+ * enough to trust for a split horizon (sent the moment a link changes,
+ * refreshed every BOT_PRESENCE_INTERVAL), else NULL. */
+static const mesh_hub_t *split_horizon_sender(hub_state_t *state, int from_fd) {
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_HUB || !c->authenticated || c->fd != from_fd)
+      continue;
+    const char *su = upgrade_peer_uuid(state, c);
+    const mesh_hub_t *mh = su[0] ? mesh_hub_find(state, su) : NULL;
+    if (mh && mh->have_links &&
+        time(NULL) - mh->reported_at <= SYNC_SPLIT_HORIZON_FRESH)
+      return mh;
+    return NULL;
+  }
+  return NULL;
+}
+
+/* True when `sender` is linked to peer `c` right now: it sent `c` its flood
+ * directly, so we need not. */
+static bool split_horizon_has(hub_state_t *state, const mesh_hub_t *sender,
+                              const hub_client_t *c) {
+  const char *cu = upgrade_peer_uuid(state, c);
+  for (int l = 0; l < sender->link_count && cu[0]; l++)
+    if (sender->links[l].online && strcmp(sender->links[l].uuid, cu) == 0)
+      return true;
+  return false;
 }
 
 /* One config payload to every authenticated peer except `exclude_fd`.
@@ -2575,33 +2634,17 @@ static void sync_send_to_peers(hub_state_t *state, const char *payload,
    * link that dropped in the moment before its gossip said so is what the
    * resync after a link loss (SYNC_RESYNC_AFTER_LINK_LOSS) and the periodic
    * anti-entropy exist to repair. */
-  const mesh_hub_t *sender = NULL;
-  for (int i = 0; split && i < state->client_count && !sender; i++) {
-    hub_client_t *c = state->clients[i];
-    if (c->type != CLIENT_HUB || !c->authenticated || c->fd != exclude_fd)
-      continue;
-    const char *su = upgrade_peer_uuid(state, c);
-    const mesh_hub_t *mh = su[0] ? mesh_hub_find(state, su) : NULL;
-    if (mh && mh->have_links &&
-        time(NULL) - mh->reported_at <= SYNC_SPLIT_HORIZON_FRESH)
-      sender = mh;
-  }
+  const mesh_hub_t *sender = split ? split_horizon_sender(state, exclude_fd)
+                                   : NULL;
 
   int skipped = 0;
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
     if (c->type != CLIENT_HUB || !c->authenticated || c->fd == exclude_fd)
       continue;
-    if (sender) {
-      const char *cu = upgrade_peer_uuid(state, c);
-      bool has_it = false;
-      for (int l = 0; l < sender->link_count && cu[0] && !has_it; l++)
-        has_it = sender->links[l].online &&
-                 strcmp(sender->links[l].uuid, cu) == 0;
-      if (has_it) {
-        skipped++;
-        continue;
-      }
+    if (sender && split_horizon_has(state, sender, c)) {
+      skipped++;
+      continue;
     }
     queued_msg_t *m = queued_msg_new(sync_bcast_opcode(state, c), lane,
                                      (const unsigned char *)payload,
@@ -5863,7 +5906,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         /* Stamp origin_ts now and mark seen locally so any loop-back is dropped. */
         time_t admin_origin_ts = time(NULL);
         op_forward_seen_check_and_add(state, request_id);
-        forward_op_request_to_peers(state, request_id, "ADMIN", "ANY", admin_payload, "", -1, admin_origin_ts);
+        forward_op_request_to_peers(state, request_id, "ADMIN", "ANY", admin_payload, "", -1, admin_origin_ts, false);
 
         if (sent_count > 0) {
           snprintf(response, sizeof(response),
@@ -6675,22 +6718,51 @@ static void forward_op_request_to_peers(hub_state_t *state,
                                          const char *channel,
                                          const char *requester_hostmask,
                                          int exclude_fd,
-                                         time_t origin_ts) {
-  /* Payload format (6 fields):
-   *   request_id|requester_uuid|target_uuid|channel|requester_hostmask|origin_ts
-   * The trailing origin_ts field is new; old hub peers parse sscanf with a
-   * fixed count and will simply ignore it — wire-backwards-compatible. */
+                                         time_t origin_ts, bool split) {
+  /* Payload format (7 fields):
+   *   request_id|requester_uuid|target_uuid|channel|requester_hostmask|origin_ts|how
+   * `how` is newest: "F" = flooded to every peer the sender is linked to (a
+   * receiver may apply the split horizon), "D" = sent to one peer only.  Old
+   * hubs read a fixed field count and ignore it; a frame without it is
+   * treated as "D" (no split horizon) — the old behaviour. */
+  hub_client_t *route = strcmp(target_uuid, "ANY") != 0
+                            ? op_route_peer(state, target_uuid, exclude_fd)
+                            : NULL;
   char forward_payload[680];
-  snprintf(forward_payload, sizeof(forward_payload), "%s|%s|%s|%s|%s|%ld",
+  snprintf(forward_payload, sizeof(forward_payload), "%s|%s|%s|%s|%s|%ld|%s",
            request_id, requester_uuid, target_uuid, channel,
            requester_hostmask ? requester_hostmask : "",
-           (long)(origin_ts > 0 ? origin_ts : time(NULL)));
+           (long)(origin_ts > 0 ? origin_ts : time(NULL)), route ? "D" : "F");
 
-  int queued_count = 0;
+  if (route) {
+    /* Directed: the roster says which hub holds the target and it is one of
+     * ours.  Flooding put ~hubs^2 copies on the mesh for one grant.  If the
+     * roster was stale, that hub routes it on the same way (it excludes us),
+     * so the request is still delivered, one hop later. */
+    if (!peer_send_urgent(state, route, CMD_OP_FORWARD_REQUEST, forward_payload)) {
+      hub_log_warning("[HUB] URGENT queue full forwarding OP_REQUEST to peer fd=%d — disconnecting\n",
+              route->fd);
+      hub_disconnect_client(state, route);
+      return;
+    }
+    hub_log_debug("[HUB] Routed OP_FORWARD_REQUEST (id:%s) to peer fd=%d, the hub of %s\n",
+            request_id, route->fd, target_uuid);
+    return;
+  }
+
+  /* Flood, with the split horizon when the sender flooded too: a peer the
+   * sender is linked to got its copy straight from the sender. */
+  const mesh_hub_t *sender = split ? split_horizon_sender(state, exclude_fd)
+                                   : NULL;
+  int queued_count = 0, skipped = 0;
   /* Route through URGENT lane — op grants must not be delayed by BULK sync. */
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
     if (c->type == CLIENT_HUB && c->authenticated && c->fd != exclude_fd) {
+      if (sender && split_horizon_has(state, sender, c)) {
+        skipped++;
+        continue;
+      }
       if (!peer_send_urgent(state, c, CMD_OP_FORWARD_REQUEST, forward_payload)) {
         hub_log_warning("[HUB] URGENT queue full forwarding OP_REQUEST to peer fd=%d — disconnecting\n",
                 c->fd);
@@ -6704,9 +6776,9 @@ static void forward_op_request_to_peers(hub_state_t *state,
               request_id, c->fd);
     }
   }
-  if (queued_count > 0)
-    hub_log_debug("[HUB] Forwarded OP_FORWARD_REQUEST (id:%s) to %d peer(s)\n",
-            request_id, queued_count);
+  if (queued_count > 0 || skipped > 0)
+    hub_log_debug("[HUB] Forwarded OP_FORWARD_REQUEST (id:%s) to %d peer(s), %d skipped (split horizon)\n",
+            request_id, queued_count, skipped);
 }
 
 // ========== End OP Request Forwarding Helper Functions ==========
@@ -6716,7 +6788,7 @@ static void forward_op_request_to_peers(hub_state_t *state,
 static void process_forward_op_request(hub_state_t *state,
                                         hub_client_t *client, char *payload) {
   /* Payload format (6 fields, 6th is new and optional for old senders):
-   *   request_id|requester_uuid|target_uuid|channel|requester_hostmask|origin_ts */
+   *   request_id|requester_uuid|target_uuid|channel|requester_hostmask|origin_ts|how */
   char request_id[64], requester_uuid[64], target_uuid[64], channel[MAX_CHAN];
   char carried_hostmask[MAX_MASK_LEN] = "";
   long long origin_ts = 0;
@@ -6730,6 +6802,10 @@ static void process_forward_op_request(hub_state_t *state,
             client->fd);
     return;
   }
+  /* The trailing "F": the sender flooded it (see forward_op_request_to_peers).
+   * Read from the end: an empty hostmask field stops the sscanf above early. */
+  const char *how = strrchr(payload, '|');
+  bool flooded = how && strcmp(how + 1, "F") == 0;
 
   /* ================================================================
    * DUPLICATE / STORM GUARD
@@ -6804,7 +6880,8 @@ static void process_forward_op_request(hub_state_t *state,
        * The seen-set on each receiving hub ensures they process it only once
        * even if multiple peers forward copies. */
       forward_op_request_to_peers(state, request_id, requester_uuid, target_uuid,
-                                  channel, "", client->fd, (time_t)origin_ts);
+                                  channel, "", client->fd, (time_t)origin_ts,
+                                  flooded);
       hub_log_info("[HUB] Admin OP_REQUEST delivered to %d local bot(s), forwarding to peers\n",
               sent_count);
     }
@@ -6887,7 +6964,8 @@ static void process_forward_op_request(hub_state_t *state,
     hub_log_debug("[HUB] Target bot %s not found locally, forwarding to %d peer(s)\n",
             target_uuid, state->client_count);
     forward_op_request_to_peers(state, request_id, requester_uuid, target_uuid,
-                                 channel, carried_hostmask, client->fd, (time_t)origin_ts);
+                                 channel, carried_hostmask, client->fd, (time_t)origin_ts,
+                                 flooded);
   }
 }
 
@@ -9338,7 +9416,8 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
           time_t op_origin_ts = time(NULL);
           op_forward_seen_check_and_add(state, request_id);
           forward_op_request_to_peers(state, request_id, client->id,
-                                       target_uuid, channel, req_hostmask, -1, op_origin_ts);
+                                       target_uuid, channel, req_hostmask, -1, op_origin_ts,
+                                       false);
           hub_log_info("[HUB] Forwarded OP_REQUEST (id:%s) to %d peer hub(s)\n",
                   request_id, peer_count);
         } else {

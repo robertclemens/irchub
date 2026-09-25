@@ -552,6 +552,13 @@ typedef struct {
  * ========================================================================== */
 #define BOT_PRESENCE_INTERVAL 60   /* how often a hub gossips its own bots   */
 #define BOT_TREE_REFRESH      300  /* unconditional re-push to bots          */
+/* Change pushes are coalesced: news from the mesh (peer gossip, links, TTL
+ * expiry) reaches bots at most once per BOT_TREE_COALESCE — it is already up
+ * to a gossip interval old — while a change to this hub's own bots goes out
+ * within BOT_TREE_COALESCE_LOCAL.  A quiet mesh pushes at once (leading edge);
+ * the flag is held until the push, so the latest tree always lands. */
+#define BOT_TREE_COALESCE       30
+#define BOT_TREE_COALESCE_LOCAL 2
 #define BOT_ROSTER_TTL        240  /* entry nobody refreshed since -> dropped */
 #define ROSTER_VERSION_MAX    15   /* "2.3.0", with room to grow             */
 #define ROSTER_VARIANT_MAX    7    /* code base: "c" / "rs"                  */
@@ -1167,6 +1174,8 @@ typedef struct {
   time_t       last_presence_gossip;
   time_t       last_tree_push;
   bool         tree_dirty;         /* roster changed: push to bots next tick */
+  bool         tree_dirty_local;   /* ...by one of our own bots (short gap)  */
+  time_t       last_tree_change_push; /* coalescing clock (BOT_TREE_COALESCE) */
   mesh_hub_t   mesh_hubs[MAX_MESH_HUBS]; /* every hub heard from, any hop  */
   int          mesh_hub_count;
   long long    roster_gen;         /* last generation this hub gossiped     */
@@ -1381,7 +1390,8 @@ void hub_broadcast_mesh_state(hub_state_t *state);
  * this hub's own connected bots to the peers every BOT_PRESENCE_INTERVAL and
  * pushes a refreshed tree down to the bots when the roster changed (or every
  * BOT_TREE_REFRESH regardless).  hub_roster_expire drops entries past the
- * TTL; hub_roster_mark_dirty asks for a push on the next tick. */
+ * TTL; hub_roster_mark_dirty asks for a push (`local`: one of our own bots
+ * changed, pushed within BOT_TREE_COALESCE_LOCAL). */
 void hub_presence_tick(hub_state_t *state, time_t now);
 /* One step of the rolling network upgrade per maintenance tick: collect
  * READY acks, commit the next wave, time out a node that never came back.
@@ -1438,7 +1448,7 @@ const char *hub_update_host_variant(void);
 /* irchub -checkupdate [variant]: verify the release channel, print, exit. */
 int hub_update_check_cli(const char *variant);
 void hub_roster_expire(hub_state_t *state, time_t now);
-void hub_roster_mark_dirty(hub_state_t *state);
+void hub_roster_mark_dirty(hub_state_t *state, bool local);
 
 /* ---- Mesh transport: per-peer outbound queue (see docs/mesh.md) ---- */
 

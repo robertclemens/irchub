@@ -239,13 +239,13 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
             /* Its uptime stops being a fact the moment the link drops; the
              * bots beneath it age out of the roster on the TTL. */
             state->peers[p].remote_started = 0;
-            hub_roster_mark_dirty(state);   /* a whole branch just went away */
+            hub_roster_mark_dirty(state, false); /* a whole branch just went away */
         }
     }
     /* A bot leaving changes the tree; gossip it on the next tick rather than
      * waiting for its roster entry to time out on the peers. */
     if (c->type == CLIENT_BOT && c->authenticated) {
-        hub_roster_mark_dirty(state);
+        hub_roster_mark_dirty(state, true);
         state->last_presence_gossip = 0;
     }
 
