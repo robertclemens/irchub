@@ -980,6 +980,7 @@ int main(int argc, char *argv[]) {
 
     bool setup_mode = false;
     bool passfile_mode = false;
+    bool selftest_mode = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-setup") == 0) setup_mode = true;
         if (strcmp(argv[i], "-p")     == 0) passfile_mode = true;
@@ -987,6 +988,10 @@ int main(int argc, char *argv[]) {
          * no config, no password and no PID lock. */
         if (strcmp(argv[i], "-checkupdate") == 0)
             return hub_update_check_cli(i + 1 < argc ? argv[i + 1] : NULL);
+        /* -selftest: could this binary run here, on this config?  No daemon,
+         * no PID lock, no network, no config rewrite — run on a STAGED build
+         * by the updater before anything is swapped. */
+        if (strcmp(argv[i], "-selftest") == 0) selftest_mode = true;
     }
 
     static hub_state_t state;
@@ -1015,6 +1020,34 @@ int main(int argc, char *argv[]) {
     g_state = &state;
     state.log_level = HUB_DEFAULT_LOG_LEVEL;
     state.log_max_size = HUB_LOG_FILE_SIZE;
+
+    if (selftest_mode) {
+        if (access(HUB_CONFIG_FILE, R_OK) != 0) {
+            printf("selftest: FAIL no readable %s\n", HUB_CONFIG_FILE);
+            return 1;
+        }
+        char pw[MAX_PASS];
+        memset(pw, 0, sizeof(pw));
+        if (!passfile_load(HUB_PASS_FILE, pw, sizeof(pw)) || !pw[0]) {
+            secure_wipe(pw, sizeof(pw));
+            printf("selftest: FAIL cannot read %s\n", HUB_PASS_FILE);
+            return 1;
+        }
+        g_hub_config_readonly = true;
+        hub_set_config_pass(&state, pw);
+        bool ok = hub_config_load(&state, pw);
+        secure_wipe(pw, sizeof(pw));
+        OPENSSL_cleanse(state.config_pass, sizeof(state.config_pass));
+        OPENSSL_cleanse(state.hub_ed25519_priv, sizeof(state.hub_ed25519_priv));
+        OPENSSL_cleanse(state.hub_x25519_priv, sizeof(state.hub_x25519_priv));
+        if (!ok) {
+            printf("selftest: FAIL cannot load %s\n", HUB_CONFIG_FILE);
+            return 1;
+        }
+        printf("selftest: OK irchub %s %s\n", HUB_VERSION,
+               hub_update_host_variant());
+        return 0;
+    }
 
     if (setup_mode) {
         int ch;

@@ -1,4 +1,5 @@
 #include "hub.h"
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -1688,60 +1689,236 @@ void menu_manage_global_peer_config(void) {
 
 /* ---- Network upgrade (hub-orchestrated rolling upgrade) ---- */
 
-/* Start a run.  Everything past the version is optional: an empty variant
- * keeps each node on the one it is already running, an empty kind lets each
- * node pick a prebuilt binary or a source build, and an empty base uses the
- * release URL compiled into the daemons.  Bots and hubs are separate
- * products on separate version lines, so the hubs get their own target and
- * base; a blank hub target leaves every hub on the build it runs.  The hub
- * freezes the config for the
- * duration and drives the rolling plan itself, so this is fire-and-poll: the
- * status screen is where the run is watched. */
+/* ---- Upgrade network: pick, don't type ------------------------------------
+ * The hub reads and signature-verifies both products' release manifests and
+ * lists the nodes it knows ("releases" query), so the admin picks versions
+ * and nodes from numbered lists.  No URLs, no artifact kinds, no min_from:
+ * each node answers those questions itself from the verified manifest.
+ * IRCBOT_UPDATE_BASE / IRCHUB_UPDATE_BASE in this tool's environment still
+ * point a run at another release tree (the testnet's local one). */
+
+#define UPG_MAX_LIST 64
+
+typedef struct {
+  char version[64];
+  char date[16];
+  char variants[16];
+} upg_release_t;
+
+typedef struct {
+  char kind; /* b h s */
+  char uuid[64];
+  char name[64];
+  char version[32];
+  char variant[8];
+} upg_node_t;
+
+static const char *upg_env(const char *name) {
+  const char *v = getenv(name);
+  return (v && v[0] && !strpbrk(v, "|;&`$ \t\r\n") && strlen(v) < 500) ? v : "";
+}
+
+/* Split one "a|b|c|..." response line into at most `max` fields in place. */
+static int upg_split(char *line, char **f, int max) {
+  int n = 0;
+  char *p = line;
+  while (n < max) {
+    f[n++] = p;
+    char *bar = strchr(p, '|');
+    if (!bar) break;
+    *bar = '\0';
+    p = bar + 1;
+  }
+  return n;
+}
+
+/* Pick from a numbered list: Enter = `dflt` (1-based, 0 = none allowed).
+ * Returns the 1-based choice, 0 for "none", -1 to cancel. */
+static int upg_pick(const char *prompt, int count, int dflt, bool allow_none) {
+  char buf[16];
+  for (;;) {
+    get_input(prompt, buf, sizeof(buf));
+    if (!buf[0]) return dflt;
+    if (buf[0] == 'q' || buf[0] == 'Q') return -1;
+    char *end = NULL;
+    long v = strtol(buf, &end, 10);
+    if (end && *end == '\0') {
+      if (v == 0 && allow_none) return 0;
+      if (v >= 1 && v <= count) return (int)v;
+    }
+    printf("  Enter a number from the list%s, or q to cancel.\n",
+           allow_none ? " (0 = none)" : "");
+  }
+}
+
 void admin_upgrade_network(void) {
-    char response[MAX_BUFFER];
-    char version[64], variant[16], kind[16], min_from[64], base[512];
-    char hub_version[64], hub_base[512];
+  char response[MAX_BUFFER];
 
-    printf("\n═══════════════════════════════════════════════════\n");
-    printf("                 UPGRADE NETWORK\n");
-    printf("═══════════════════════════════════════════════════\n\n");
-    printf("  Bots are upgraded in waves, peer hubs afterwards one at a\n");
-    printf("  time, this hub last.  The config is frozen until the run\n");
-    printf("  finishes, and any failure rolls the whole mesh back.\n\n");
+  printf("\n═══════════════════════════════════════════════════\n");
+  printf("                 UPGRADE NETWORK\n");
+  printf("═══════════════════════════════════════════════════\n\n");
+  printf("  Bots go in waves, then peer hubs one at a time, this hub\n");
+  printf("  last.  The config is frozen until the run finishes.  A node\n");
+  printf("  that cannot take the build is left where it is; a node that\n");
+  printf("  takes it and does not come back up aborts the run.\n\n");
+  printf("[*] Reading the release manifests...\n");
 
-    get_input("Bot target version (e.g. 2.4.0, blank to cancel): ", version,
-              sizeof(version));
-    if (strlen(version) == 0) {
-        printf("[*] Cancelled.\n");
+  const char *bot_base = upg_env("IRCBOT_UPDATE_BASE");
+  const char *hub_base = upg_env("IRCHUB_UPDATE_BASE");
+  char query[1100];
+  if (bot_base[0] || hub_base[0])
+    snprintf(query, sizeof(query), "releases|%s|%s", bot_base, hub_base);
+  else
+    snprintf(query, sizeof(query), "releases");
+  send_packet(g_fd, CMD_ADMIN_UPGRADE_STATUS, query, g_key);
+  read_response(g_fd, g_key, response, sizeof(response));
+  if (strncmp(response, "OK:releases", 11) != 0) {
+    printf("\nHub: %s\n", response);
+    printf("[!] This hub cannot list releases (older than 2.4.3?).\n");
+    pause_and_continue();
+    return;
+  }
+
+  static upg_release_t bots[UPG_MAX_LIST], hubs[UPG_MAX_LIST];
+  static upg_node_t nodes[256];
+  int nb = 0, nh = 0, nn = 0;
+  char *save = NULL;
+  for (char *line = strtok_r(response, "\n", &save); line;
+       line = strtok_r(NULL, "\n", &save)) {
+    char *f[7];
+    int n = upg_split(line, f, 7);
+    if (n >= 4 && (!strcmp(f[0], "bot") || !strcmp(f[0], "hub"))) {
+      upg_release_t *r = !strcmp(f[0], "bot") ? (nb < UPG_MAX_LIST ? &bots[nb++] : NULL)
+                                              : (nh < UPG_MAX_LIST ? &hubs[nh++] : NULL);
+      if (!r) continue;
+      /* Manifests write "v2.4.4"; nodes announce "2.4.4". */
+      const char *ver = (f[1][0] == 'v' && isdigit((unsigned char)f[1][1])) ? f[1] + 1 : f[1];
+      snprintf(r->version, sizeof(r->version), "%s", ver);
+      snprintf(r->date, sizeof(r->date), "%s", f[2]);
+      snprintf(r->variants, sizeof(r->variants), "%s", f[3]);
+    } else if (n >= 3 && !strcmp(f[0], "err")) {
+      printf("[!] Could not read %s: %s\n", f[1], f[2]);
+    } else if (n >= 6 && !strcmp(f[0], "node") && nn < 256) {
+      upg_node_t *d = &nodes[nn++];
+      d->kind = f[1][0];
+      snprintf(d->uuid, sizeof(d->uuid), "%s", f[2]);
+      snprintf(d->name, sizeof(d->name), "%s", f[3]);
+      snprintf(d->version, sizeof(d->version), "%s", f[4]);
+      snprintf(d->variant, sizeof(d->variant), "%s", f[5]);
+    }
+  }
+  if (nb == 0) {
+    printf("[!] No bot releases could be read — nothing to upgrade to.\n");
+    pause_and_continue();
+    return;
+  }
+
+  /* What the network runs now, so "newest" is read against something. */
+  printf("\n  Nodes:\n");
+  for (int i = 0; i < nn; i++)
+    printf("   %3d. %-4s %-20.20s %-8s %-3s %s\n", i + 1,
+           nodes[i].kind == 'b' ? "bot" : nodes[i].kind == 'h' ? "hub" : "self",
+           nodes[i].name[0] ? nodes[i].name : "-", nodes[i].version,
+           nodes[i].variant, nodes[i].uuid);
+
+  printf("\n  Bot releases:\n");
+  for (int i = 0; i < nb; i++)
+    printf("   %3d. %-10s %-10s %s%s\n", i + 1, bots[i].version, bots[i].date,
+           bots[i].variants, i == 0 ? "   (newest)" : "");
+  int bi = upg_pick("Bot version [Enter = newest, q = cancel]: ", nb, 1, false);
+  if (bi < 0) {
+    printf("[*] Cancelled.\n");
+    pause_and_continue();
+    return;
+  }
+
+  int hi = 0;
+  if (nh > 0) {
+    printf("\n  Hub releases:\n");
+    for (int i = 0; i < nh; i++)
+      printf("   %3d. %-10s %-10s %s%s\n", i + 1, hubs[i].version, hubs[i].date,
+             hubs[i].variants, i == 0 ? "   (newest)" : "");
+    hi = upg_pick("Hub version [Enter = newest, 0 = leave hubs, q = cancel]: ",
+                  nh, 1, true);
+    if (hi < 0) {
+      printf("[*] Cancelled.\n");
+      pause_and_continue();
+      return;
+    }
+  } else {
+    printf("\n[!] No hub releases could be read; hubs stay on their build.\n");
+  }
+
+  printf("\n  Which nodes?  Enter = the whole network.  Or list them by\n");
+  printf("  number or name, comma-separated; add =c or =rs to move a node\n");
+  printf("  onto that build (e.g.  3,optiplex=c).\n");
+  char scope[1024], sel[MAX_UPGRADE_SELECT * 80] = "";
+  get_input("Nodes: ", scope, sizeof(scope));
+  if (scope[0]) {
+    int so = 0, count = 0;
+    char *sv = NULL;
+    for (char *tok = strtok_r(scope, ", ", &sv); tok;
+         tok = strtok_r(NULL, ", ", &sv)) {
+      char name[128];
+      snprintf(name, sizeof(name), "%s", tok);
+      char *eq = strchr(name, '=');
+      char suffix[8] = "";
+      if (eq) {
+        snprintf(suffix, sizeof(suffix), "%.7s", eq);
+        *eq = '\0';
+      }
+      /* A bare number picks from the node list above; anything else is
+       * passed on for the hub to resolve (name, uuid or uuid prefix). */
+      char *end = NULL;
+      long v = strtol(name, &end, 10);
+      const char *tokname = name;
+      if (end && *end == '\0' && v >= 1 && v <= nn) tokname = nodes[v - 1].uuid;
+      if (strpbrk(tokname, "|;&`$\t\r\n") || strpbrk(suffix, "|;&`$\t\r\n")) {
+        printf("[!] Bad node token '%s'.\n", tok);
         pause_and_continue();
         return;
+      }
+      int w = snprintf(sel + so, sizeof(sel) - (size_t)so, "%s%s%s",
+                       count ? "," : "", tokname, suffix);
+      if (w <= 0 || w >= (int)sizeof(sel) - so) {
+        printf("[!] Too many nodes named.\n");
+        pause_and_continue();
+        return;
+      }
+      so += w;
+      count++;
     }
-    get_input("Variant c/rs (blank = keep each node's own): ", variant,
-              sizeof(variant));
-    get_input("Artifact bin/src (blank = let each node choose): ", kind,
-              sizeof(kind));
-    get_input("Minimum version to upgrade from (blank = any): ", min_from,
-              sizeof(min_from));
-    get_input("Bot release base URL override (blank = built-in): ", base,
-              sizeof(base));
-    get_input("Hub target version (blank = hubs stay on their build): ",
-              hub_version, sizeof(hub_version));
-    hub_base[0] = '\0';
-    if (strlen(hub_version) > 0)
-        get_input("Hub release base URL override (blank = built-in): ",
-                  hub_base, sizeof(hub_base));
+  }
 
-    char payload[1400];
-    snprintf(payload, sizeof(payload), "%s|%s|%s|%s|%s|%s|%s", version, variant,
-             kind, min_from, base, hub_version, hub_base);
-
-    printf("\n[*] Asking the hub to upgrade the network to %s...\n", version);
-    send_packet(g_fd, CMD_ADMIN_UPGRADE_NET, payload, g_key);
-    read_response(g_fd, g_key, response, sizeof(response));
-    printf("\nHub: %s\n", response);
-    printf("\n[*] Watch it with \"Upgrade status\"; the run continues whether\n");
-    printf("    or not this console stays connected.\n");
+  printf("\n  Summary\n");
+  printf("   bots  -> %s\n", bots[bi - 1].version);
+  printf("   hubs  -> %s\n", hi > 0 ? hubs[hi - 1].version : "(stay on their build)");
+  printf("   nodes : %s\n", sel[0] ? sel : "whole network");
+  if (bot_base[0] || hub_base[0])
+    printf("   bases : %s | %s (from the environment)\n",
+           bot_base[0] ? bot_base : "built-in", hub_base[0] ? hub_base : "built-in");
+  char confirm[16];
+  get_input("\nType 'yes' to start: ", confirm, sizeof(confirm));
+  if (strcmp(confirm, "yes") != 0) {
+    printf("[*] Cancelled.\n");
     pause_and_continue();
+    return;
+  }
+
+  /* ver|variant|kind|min_from|base|hub_ver|hub_base|sel — variant, kind and
+   * min_from are left to each node. */
+  char payload[MAX_BUFFER];
+  snprintf(payload, sizeof(payload), "%s||||%s|%s|%s|%s", bots[bi - 1].version,
+           bot_base, hi > 0 ? hubs[hi - 1].version : "",
+           hi > 0 ? hub_base : "", sel);
+
+  printf("\n[*] Starting the upgrade...\n");
+  send_packet(g_fd, CMD_ADMIN_UPGRADE_NET, payload, g_key);
+  read_response(g_fd, g_key, response, sizeof(response));
+  printf("\nHub: %s\n", response);
+  printf("\n[*] Watch it with \"Upgrade status\"; the run continues whether\n");
+  printf("    or not this console stays connected.\n");
+  pause_and_continue();
 }
 
 void admin_upgrade_status(void) {

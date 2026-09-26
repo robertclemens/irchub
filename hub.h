@@ -126,7 +126,7 @@
  * the Makefile; -D-overridable so a release build can stamp its own version
  * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
 #ifndef HUB_VERSION
-#define HUB_VERSION "2.4.2"
+#define HUB_VERSION "2.4.3"
 #endif
 
 /* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
@@ -146,6 +146,14 @@
   "irchub"
 #endif
 /* The variant THIS build is.  The Rust hub answers "rs". */
+/* The bots' release tree ROOT (ircbot-releases), for the hub_admin release
+ * list and for walking a bot up via the roll-up.  Mirrors BOT_UPDATE_BASE in
+ * ircbot/bot.h; a run's own bot base, when an admin names one, wins. */
+#ifndef HUB_BOT_RELEASE_BASE
+#define HUB_BOT_RELEASE_BASE                                                   \
+  "https://raw.githubusercontent.com/robertclemens/ircbot-releases/main/"      \
+  "ircbot"
+#endif
 #ifndef HUB_UPDATE_VARIANT
 #define HUB_UPDATE_VARIANT "c"
 #endif
@@ -166,6 +174,9 @@
 /* Retained previous binary/config, kept (not deleted) after an upgrade so
  * CMD_UPGRADE_ABORT can put this hub back. */
 #define HUB_UPGRADE_PREV_SUFFIX ".prev"
+/* The upgrade script's startup watchdog: how long the new build's daemon has
+ * to be up and alive before the script keeps it (see write_upgrade_script). */
+#define UPGRADE_WATCH_SECS 20
 /* The generated installer, written 0700 and exec'd once the old process has
  * let go of its pid lock. */
 #define HUB_UPGRADE_SCRIPT "hub_upgrade.sh"
@@ -175,6 +186,9 @@
 #define HUB_UPDATE_MAX_MANIFEST (1024 * 1024)
 #define HUB_UPDATE_MAX_ARCHIVE (256L * 1024 * 1024)
 #define HUB_UPDATE_FETCH_TIMEOUT 300L
+/* Per-transfer budget for manifest reads made from the event loop (PREPARE
+ * answers, the hub_admin release list): the hub serves nothing meanwhile. */
+#define HUB_UPDATE_QUICK_TIMEOUT 8L
 
 // Timeout Settings
 #define PING_INTERVAL 60
@@ -452,6 +466,27 @@
  * driver that stalls mid-roll has to ask again rather than commit against a
  * stale plan.  Mirrors UPGRADE_PREPARE_TTL in ircbot/bot.h. */
 #define UPGRADE_PREPARE_TTL 900
+/* A selective run (CMD_ADMIN_UPGRADE_NET's 8th field) names at most this many
+ * nodes; an empty selection is the whole network. */
+#define MAX_UPGRADE_SELECT 16
+/* Selective runs need every hub they cross to understand the peer PREPARE's
+ * `sel` field: an older follower would PREPARE all its bots and adopt the
+ * run's target as its roll-up plan, walking bots nobody selected up to it. */
+#define UPGRADE_SELECT_MIN_HUB "2.4.3"
+/* Releases listed by the hub_admin "releases" query, per product. */
+#define MAX_UPGRADE_RELEASES 24
+/* ircbot builds from this version on hold their "ok" RESULT until they are
+ * back on IRC and re-opped where they were, so the driver waits for it
+ * instead of taking a presence on the target as done (the next wave would
+ * otherwise leave a channel before this bot holds ops in it again). */
+#define UPGRADE_OPS_GATE_MIN_BOT "2.4.5"
+/* A bot back on the target that never sends its ready report is taken as
+ * done after this long (it runs; its channels are its own business). */
+#define UPGRADE_OPS_GRACE 240
+/* The staged new binary's -selftest must finish within this many seconds,
+ * and irchub knows -selftest from this version on. */
+#define UPGRADE_SELFTEST_SECS 15
+#define UPGRADE_SELFTEST_MIN_HUB "2.4.3"
 
 /* ---- Offline roll-up (upgrade plan, Task 7) ----------------------------
  * A node that was down, or homed elsewhere, when a run went through comes
@@ -696,6 +731,15 @@ typedef struct {
   int  fd;              /* the connection it was reached on, -1 if gone  */
   char cur_version[ROSTER_VERSION_MAX + 1];
   char variant[8];      /* "c" / "rs"                                    */
+  /* The variant a selective run asked for THIS node ("name=c"), "" = the
+   * run's own.  Sent in its PREPARE and COMMIT. */
+  char want_variant[8];
+  bool not_selected;    /* a selective run left it out: not a failure    */
+  /* When a committed bot was first seen back on the target (its presence,
+   * or a follower's "back").  From ircbot UPGRADE_OPS_GATE_MIN_BOT on, that
+   * is not "done": the bot reports ok itself once it is re-opped where it
+   * was.  0 = not seen back yet. */
+  time_t back_at;
   char arch[32];
   char libc[16];
   upgrade_node_state_t state;
@@ -756,6 +800,14 @@ typedef struct {
   time_t last_added;          /* when the node table last grew           */
   int    ready_seq_next;      /* last upgrade_node_t.ready_seq handed out */
   char   summary[192];        /* why it ended, shown by UPGRADE_STATUS   */
+  /* Selective run: only these nodes move; every other node answers into
+   * "not selected".  select_count == 0 is the whole network. */
+  struct {
+    char uuid[64];
+    char variant[8];          /* "" = the run's variant                  */
+  } select[MAX_UPGRADE_SELECT];
+  int    select_count;
+  char   sel_wire[MAX_UPGRADE_SELECT * 72]; /* uuid[=v],... for peers    */
 } pending_upgrade_t;
 
 /* The plan a completed run left behind, and the one node being walked up to
@@ -1098,6 +1150,13 @@ typedef struct {
   char   follow_hub_target[64]; /* this hub's own target, "" = stay put  */
   char   follow_variant[8];
   char   follow_hub_base[512];  /* irchub-releases base for this hub     */
+  /* What the followed run asked of this hub's BOTS: the run's own variant
+   * ("" = each keeps its own) and a selective run's uuid[=v],... list.  A
+   * local bot's presence is only reported up as that bot's success when it
+   * is on the build it was asked for — a same-version C<->Rust switch is
+   * otherwise "done" the moment the OLD process re-announces itself. */
+  char   follow_bot_variant[8];
+  char   follow_sel[MAX_UPGRADE_SELECT * 72];
   bool   follow_self_ready;  /* this hub itself can take the followed run */
   time_t follow_prepared;
   /* Nodes below this hub in the followed run's fan-out tree (its own peers'
@@ -1212,6 +1271,8 @@ extern hub_state_t *g_state;
 
 bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);
+/* hub_config_write() is a no-op while this is set (-selftest). */
+extern bool g_hub_config_readonly;
 
 /* a|/o| record codec (docs/passwordless.md §3.1), shared by config load,
  * peer sync and bot pushes.  Field 3 decides: a valid key = new format;
@@ -1411,8 +1472,18 @@ void hub_upgrade_report_pending(hub_state_t *state, hub_client_t *peer);
 /* Could this hub move to `target_ver`?  Answered at PREPARE time, before
  * anything is downloaded.  `min_from` is what the driving hub sent ("" or "*"
  * = let the manifest decide); `reason` explains a false. */
-bool hub_update_can_take(const char *target_ver, const char *min_from,
-                         const char *base, char *reason, size_t reason_size);
+bool hub_update_can_take(const char *target_ver, const char *variant,
+                         const char *min_from, const char *base, char *reason,
+                         size_t reason_size);
+/* One release a manifest lists: its version and date. */
+typedef struct {
+  char version[64];
+  char date[16];
+} hub_release_t;
+/* Fetch and verify the manifest at <root>/<variant> and list its distinct
+ * versions, newest first.  Returns the count, or -1 with *err set. */
+int hub_update_list_releases(const char *root, const char *variant,
+                             hub_release_t *out, int max, const char **err);
 /* CMD_UPGRADE_COMMIT.  Returns false with *err set and nothing touched; on
  * success it does not return -- the process is replaced and reports the
  * outcome after the restart. */
@@ -1430,7 +1501,8 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
 /* CMD_UPGRADE_ABORT: restore <exe>.prev / .irchub.cnf.prev and restart onto
  * them.  False when there is nothing retained to go back to. */
 bool hub_update_rollback(hub_state_t *state, const char *reason);
-bool hub_upgrade_marker_write(const char *upgrade_id, const char *target_ver);
+bool hub_upgrade_marker_write(const char *upgrade_id, const char *target_ver,
+                              const char *variant);
 /* True when `s` may be one field of an upgrade plan: no '|', no line break,
  * no shell metacharacter or blank, and short enough for any plan field.  The
  * same rule gates what a follower accepts at PREPARE and what the rollup|
@@ -1438,7 +1510,8 @@ bool hub_upgrade_marker_write(const char *upgrade_id, const char *target_ver);
 bool hub_upgrade_plan_field_ok(const char *s);
 /* Reads and removes the hand-off marker hub_update_commit() left behind. */
 bool hub_update_take_pending(char *id_out, size_t id_size, char *ver_out,
-                             size_t ver_size);
+                             size_t ver_size, char *variant_out,
+                             size_t variant_size);
 /* Compare two version strings, tolerating a leading 'v' on either side. */
 int hub_update_version_cmp(const char *a, const char *b);
 /* Host capability probe answered in CMD_UPGRADE_READY. */

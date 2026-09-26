@@ -504,9 +504,15 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
                               const char *target_ver, const char *variant,
                               const char *kind, const char *min_from,
                               const char *base, const char *hub_ver,
-                              const char *hub_base, char *msg,
-                              size_t msg_size);
+                              const char *hub_base, const char *sel,
+                              char *msg, size_t msg_size);
 static void hub_upgrade_status(hub_state_t *state, char *out, size_t out_size);
+static bool upgrade_sel_lookup(const char *sel, const char *uuid, char *variant,
+                               size_t variant_size);
+static bool upgrade_peer_takes_sel(const hub_state_t *state,
+                                   const hub_client_t *c);
+static void hub_upgrade_releases(hub_state_t *state, const char *payload,
+                                 char *out, size_t out_size);
 static void hub_upgrade_note_ready(hub_state_t *state, const char *payload,
                                    hub_client_t *from_peer);
 static hub_client_t *upgrade_find_client(hub_state_t *state, const char *uuid,
@@ -524,7 +530,8 @@ static void process_peer_upgrade_commit(hub_state_t *state, hub_client_t *peer,
 static void process_peer_upgrade_abort(hub_state_t *state, hub_client_t *peer,
                                        const char *payload);
 static void hub_upgrade_note_presence(hub_state_t *state, const char *uuid,
-                                      const char *version);
+                                      const char *version,
+                                      const char *variant);
 static void hub_rollup_note_presence(hub_state_t *state, const char *uuid,
                                      char node_kind, const char *version);
 static bool hub_rollup_note_ready(hub_state_t *state, const char *payload);
@@ -1818,19 +1825,29 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
   /* A committed node coming back on the target version is the authoritative
    * success signal for a rolling upgrade — CMD_UPGRADE_RESULT can be lost,
    * but without this frame the bot is not on the mesh at all. */
-  hub_upgrade_note_presence(state, client->id, version);
+  hub_upgrade_note_presence(state, client->id, version, variant);
   hub_rollup_note_presence(state, client->id, 'b', version);
 
   /* If this hub is following a run another hub drives, a local bot reappearing
    * on the followed target is that bot's authoritative success: synthesize a
    * RESULT up to the driver so a lost bot RESULT does not stall the run. */
+  char want[8] = "";
+  if (state->follow_id[0] &&
+      !upgrade_sel_lookup(state->follow_sel, client->id, want, sizeof(want)))
+    snprintf(want, sizeof(want), "%s", state->follow_bot_variant);
   if (state->follow_id[0] && version[0] &&
-      strcmp(version, state->follow_target) == 0) {
+      hub_update_version_cmp(version, state->follow_target) == 0 &&
+      (!want[0] || strcmp(variant, want) == 0)) {
     hub_client_t *origin = upgrade_find_peer(state, state->follow_origin);
     if (origin) {
+      /* A bot that reports ready itself is only "back" — unless the driver
+       * is too old to know that status (it would read it as a failure). */
+      bool gated =
+          hub_update_version_cmp(version, UPGRADE_OPS_GATE_MIN_BOT) >= 0 &&
+          upgrade_peer_takes_sel(state, origin);
       char p[192];
-      snprintf(p, sizeof(p), "%s|%s|ok|%s|", state->follow_id, client->id,
-               version);
+      snprintf(p, sizeof(p), "%s|%s|%s|%s|", state->follow_id, client->id,
+               gated ? "back" : "ok", version);
       peer_send_urgent(state, origin, CMD_UPGRADE_RESULT, p);
     }
   }
@@ -2147,7 +2164,9 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
        * run's, so it would fan the frame out to the whole mesh — and every
        * hub holding the plan would do the same to every other, which is the
        * storm a hub-and-bot net produced. */
-      hub_upgrade_note_presence(state, hub_uuid, hub_ver);
+      /* No variant here: it follows on the v| line, so a hub asked to switch
+       * build at the same version is proven by its RESULT alone. */
+      hub_upgrade_note_presence(state, hub_uuid, hub_ver, "");
       continue;
     }
     if (strncmp(line, "v|", 2) == 0) {
@@ -4134,6 +4153,9 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
      * one), so only the last field is a tail. */
     char ver[64] = "", variant[8] = "", kind[8] = "", min_from[64] = "";
     char base[512] = "", hub_ver[64] = "", hub_base[512] = "";
+    /* 8th field: the selection ("" = whole network), comma-separated
+     * name-or-uuid[=c|rs] tokens.  Only it may be the tail now. */
+    char sel[MAX_UPGRADE_SELECT * 80] = "";
     if (payload) {
       wire_field(payload, 0, ver, sizeof(ver));
       wire_field(payload, 1, variant, sizeof(variant));
@@ -4141,15 +4163,24 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       wire_field(payload, 3, min_from, sizeof(min_from));
       wire_field(payload, 4, base, sizeof(base));
       wire_field(payload, 5, hub_ver, sizeof(hub_ver));
-      wire_tail(payload, 6, hub_base, sizeof(hub_base));
+      wire_field(payload, 6, hub_base, sizeof(hub_base));
+      wire_tail(payload, 7, sel, sizeof(sel));
     }
-    char msg[320];
+    char msg[640];
     hub_upgrade_start(state, client, ver, variant, kind, min_from, base,
-                      hub_ver, hub_base, msg, sizeof(msg));
+                      hub_ver, hub_base, sel, msg, sizeof(msg));
     return send_response(state, client, msg);
   }
 
   case CMD_ADMIN_UPGRADE_STATUS: {
+    /* "releases[|bot_base|hub_base]": what hub_admin offers to pick from —
+     * the verified release manifests of both products and the nodes a
+     * selective run could name.  Read-only; allowed during a run. */
+    if (payload && strncasecmp(payload, "releases", 8) == 0 &&
+        (payload[8] == '\0' || payload[8] == '|')) {
+      hub_upgrade_releases(state, payload, response, sizeof(response));
+      return send_response(state, client, response);
+    }
     /* A payload of "abort" stops a run in flight and rolls the mesh back. */
     if (payload && strcasecmp(payload, "abort") == 0) {
       if (!state->upgrade.active)
@@ -7644,8 +7675,17 @@ static void upgrade_finish(hub_state_t *state, upgrade_phase_t phase,
   /* Keep the plan of a run that actually got somewhere: a node that was down
    * or homed elsewhere while it went through is walked up to this target when
    * it comes back (see hub_rollup_*).  An aborted run left the mesh where it
-   * was, so there is nothing to catch up to. */
-  if (phase == UPG_DONE) {
+   * was, so there is nothing to catch up to.  A selective run leaves the
+   * plan alone either way: moving three named bots says nothing about what
+   * every other bot should run. */
+  if (u->select_count > 0) {
+    /* no roll-up plan change */
+  } else if (phase == UPG_DONE &&
+             (upgrade_count(u, UPG_NODE_DONE, 0) > 0 ||
+              upgrade_count(u, UPG_NODE_COMMITTED, 's') > 0)) {
+    /* Only a run that moved something (a node done, or this hub committing
+     * itself last): one where every node declined must not replace the plan
+     * an earlier, real run left. */
     pending_rollup_t *r = &state->rollup;
     r->have_plan = true;
     snprintf(r->target, sizeof(r->target), "%s", u->target_ver);
@@ -7716,14 +7756,216 @@ static const char *upgrade_node_target(const pending_upgrade_t *u,
   return n->kind == 'b' ? u->target_ver : u->hub_ver;
 }
 
+/* ---- Selective runs ------------------------------------------------------
+ * An admin may move a handful of nodes instead of the whole network, each
+ * optionally onto the other build ("optiplex=c").  Names are resolved here,
+ * once, against everything this hub knows a node by — the stored bot records
+ * (so an offline bot can still be named and ends "no answer to PREPARE"),
+ * the live roster, and every hub heard from — and the run itself only ever
+ * carries uuids. */
+typedef struct {
+  char uuid[64];
+  char name[64];
+  char kind; /* 'b' bot, 'h' hub, 's' this hub */
+} upgrade_cand_t;
+
+static void upgrade_cand_add(upgrade_cand_t *c, int *n, int max,
+                             const char *uuid, const char *name, char kind) {
+  if (!uuid || !uuid[0] || strcmp(uuid, "-") == 0) return;
+  for (int i = 0; i < *n; i++) {
+    if (strcmp(c[i].uuid, uuid) != 0) continue;
+    if (!c[i].name[0] && name && name[0])
+      snprintf(c[i].name, sizeof(c[i].name), "%s", name);
+    return;
+  }
+  if (*n >= max) return;
+  snprintf(c[*n].uuid, sizeof(c[*n].uuid), "%s", uuid);
+  snprintf(c[*n].name, sizeof(c[*n].name), "%s", name ? name : "");
+  c[*n].kind = kind;
+  (*n)++;
+}
+
+#define UPGRADE_CAND_MAX                                                       \
+  (1 + MAX_MESH_HUBS + MAX_PEERS + MAX_BOTS + MAX_BOT_ROSTER + MAX_CLIENTS)
+
+/* Every node this hub could name.  Caller frees. */
+static upgrade_cand_t *upgrade_candidates(hub_state_t *state, int *count) {
+  upgrade_cand_t *c = calloc(UPGRADE_CAND_MAX, sizeof(*c));
+  *count = 0;
+  if (!c) return NULL;
+  int n = 0;
+  upgrade_cand_add(c, &n, UPGRADE_CAND_MAX, state->hub_uuid,
+                   state->hub_friendly_name, 's');
+  for (int i = 0; i < state->peer_count; i++)
+    upgrade_cand_add(c, &n, UPGRADE_CAND_MAX, state->peers[i].uuid,
+                     state->peers[i].friendly_name, 'h');
+  for (int i = 0; i < state->mesh_hub_count; i++)
+    upgrade_cand_add(c, &n, UPGRADE_CAND_MAX, state->mesh_hubs[i].uuid,
+                     state->mesh_hubs[i].name, 'h');
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *cl = state->clients[i];
+    if (cl->type != CLIENT_BOT || !cl->authenticated) continue;
+    char nick[64] = "";
+    hub_bot_entry(state, cl->id, "n", nick, sizeof(nick));
+    upgrade_cand_add(c, &n, UPGRADE_CAND_MAX, cl->id, nick, 'b');
+  }
+  for (int i = 0; i < state->roster_count; i++)
+    upgrade_cand_add(c, &n, UPGRADE_CAND_MAX, state->roster[i].bot_uuid,
+                     state->roster[i].nick, 'b');
+  for (int i = 0; i < state->bot_count; i++) {
+    if (!state->bots[i].is_active) continue;
+    char nick[64] = "";
+    hub_bot_entry(state, state->bots[i].uuid, "n", nick, sizeof(nick));
+    upgrade_cand_add(c, &n, UPGRADE_CAND_MAX, state->bots[i].uuid, nick, 'b');
+  }
+  *count = n;
+  return c;
+}
+
+/* One token: a full uuid, else an exact name (case-insensitive), else a uuid
+ * prefix of at least 4 characters.  Anything matching two different nodes is
+ * refused rather than guessed. */
+static const upgrade_cand_t *upgrade_resolve(const upgrade_cand_t *c, int n,
+                                             const char *tok, char *err,
+                                             size_t err_size) {
+  for (int i = 0; i < n; i++)
+    if (strcasecmp(c[i].uuid, tok) == 0) return &c[i];
+  const upgrade_cand_t *hit = NULL;
+  for (int i = 0; i < n; i++) {
+    if (!c[i].name[0] || strcasecmp(c[i].name, tok) != 0) continue;
+    if (hit) {
+      snprintf(err, err_size, "'%s' names more than one node (%s, %s) — use a uuid",
+               tok, hit->uuid, c[i].uuid);
+      return NULL;
+    }
+    hit = &c[i];
+  }
+  if (hit) return hit;
+  size_t tl = strlen(tok);
+  if (tl >= 4) {
+    for (int i = 0; i < n; i++) {
+      if (strncasecmp(c[i].uuid, tok, tl) != 0) continue;
+      if (hit) {
+        snprintf(err, err_size, "uuid prefix '%s' is ambiguous (%s, %s)", tok,
+                 hit->uuid, c[i].uuid);
+        return NULL;
+      }
+      hit = &c[i];
+    }
+    if (hit) return hit;
+  }
+  snprintf(err, err_size, "no node known as '%s'", tok);
+  return NULL;
+}
+
+/* Is `uuid` in this run's selection?  Always true for a whole-network run. */
+static bool upgrade_selected(const pending_upgrade_t *u, const char *uuid,
+                             const char **variant) {
+  if (variant) *variant = "";
+  if (u->select_count == 0) return true;
+  for (int i = 0; i < u->select_count; i++) {
+    if (strcmp(u->select[i].uuid, uuid) != 0) continue;
+    if (variant) *variant = u->select[i].variant;
+    return true;
+  }
+  return false;
+}
+
+/* Look `uuid` up in a peer PREPARE's resolved selection ("uuid[=v],...").
+ * Returns false when it is not listed; `variant` gets its "=v" or "". */
+static bool upgrade_sel_lookup(const char *sel, const char *uuid, char *variant,
+                               size_t variant_size) {
+  if (variant && variant_size) variant[0] = '\0';
+  size_t ul = strlen(uuid);
+  if (!ul) return false;
+  for (const char *p = sel; p && *p;) {
+    const char *end = strchr(p, ',');
+    size_t len = end ? (size_t)(end - p) : strlen(p);
+    if (len >= ul && strncmp(p, uuid, ul) == 0 &&
+        (len == ul || p[ul] == '=')) {
+      if (len > ul + 1 && variant && variant_size)
+        snprintf(variant, variant_size, "%.*s", (int)(len - ul - 1), p + ul + 1);
+      return true;
+    }
+    p = end ? end + 1 : NULL;
+  }
+  return false;
+}
+
+/* The variant a node is being moved onto: its own override in a selective
+ * run, else the run's ("" = keep its own). */
+static const char *upgrade_node_variant(const pending_upgrade_t *u,
+                                        const upgrade_node_t *n) {
+  return n->want_variant[0] ? n->want_variant : u->variant;
+}
+
+/* Every hub a selective run could cross must understand the `sel` field of a
+ * peer PREPARE (see UPGRADE_SELECT_MIN_HUB).  Names the first one that does
+ * not, or returns false. */
+static bool upgrade_old_hub(const hub_state_t *state, char *who,
+                            size_t who_size) {
+  for (int i = 0; i < state->peer_count; i++) {
+    const hub_peer_config_t *p = &state->peers[i];
+    if (!p->connected) continue;
+    if (!p->remote_version[0] ||
+        hub_update_version_cmp(p->remote_version, UPGRADE_SELECT_MIN_HUB) < 0) {
+      snprintf(who, who_size, "%s (%s)",
+               p->friendly_name[0] ? p->friendly_name : p->uuid,
+               p->remote_version[0] ? p->remote_version : "version unknown");
+      return true;
+    }
+  }
+  for (int i = 0; i < state->mesh_hub_count; i++) {
+    const mesh_hub_t *m = &state->mesh_hubs[i];
+    if (strcmp(m->uuid, state->hub_uuid) == 0 || !m->version[0]) continue;
+    if (hub_update_version_cmp(m->version, UPGRADE_SELECT_MIN_HUB) < 0) {
+      snprintf(who, who_size, "%s (%s)", m->name[0] ? m->name : m->uuid,
+               m->version);
+      return true;
+    }
+  }
+  return false;
+}
+
+/* Is the peer connection `c` known to run a hub new enough for `sel`? */
+static bool upgrade_peer_takes_sel(const hub_state_t *state,
+                                   const hub_client_t *c) {
+  for (int i = 0; i < state->peer_count; i++) {
+    const hub_peer_config_t *p = &state->peers[i];
+    if (!p->connected || p->fd != c->fd) continue;
+    return p->remote_version[0] &&
+           hub_update_version_cmp(p->remote_version, UPGRADE_SELECT_MIN_HUB) >= 0;
+  }
+  return false;
+}
+
 /* Send one node its CMD_UPGRADE_COMMIT.  A node that dropped off in the
  * meantime is marked unable rather than failing the run — Task 7 rolls it up
  * when it reconnects. */
 static bool upgrade_commit_node(hub_state_t *state, upgrade_node_t *n) {
   pending_upgrade_t *u = &state->upgrade;
   const char *ver = upgrade_node_target(u, n);
+  const char *variant = upgrade_node_variant(u, n);
   char payload[192];
-  snprintf(payload, sizeof(payload), "%s|%s|%s", u->id, ver, u->variant);
+  snprintf(payload, sizeof(payload), "%s|%s|%s", u->id, ver, variant);
+
+  /* Never through a hub that has already restarted: its run state (follow_id
+   * and the COMMIT routes) went with the old process, so the frame could only
+   * come back as a failure — and one a pre-2.4.3 follower files under its own
+   * uuid.  Hubs go after bots, so this only catches a straggler; it stays out
+   * of the run, unharmed. */
+  if (n->via[0]) {
+    const upgrade_node_t *hop = upgrade_find_node(u, n->via);
+    if (hop && (hop->state == UPG_NODE_COMMITTED ||
+                hop->state == UPG_NODE_DONE || hop->state == UPG_NODE_FAILED)) {
+      n->state = UPG_NODE_UNABLE;
+      snprintf(n->reason, sizeof(n->reason),
+               "its hub restarted before it could be committed");
+      hub_log_warning("[UPGRADE] Not committing %s: hub %s already restarted\n",
+                      n->uuid, n->via);
+      return false;
+    }
+  }
 
   if (n->kind == 's') {
     /* This hub is the last node of its own run, so there is no frame and no
@@ -7743,8 +7985,7 @@ static bool upgrade_commit_node(hub_state_t *state, upgrade_node_t *n) {
     upgrade_finish(state, UPG_DONE, done_msg);
 
     const char *err = NULL;
-    if (!hub_update_commit(state, u->id, ver, u->variant, u->hub_base,
-                           &err)) {
+    if (!hub_update_commit(state, u->id, ver, variant, u->hub_base, &err)) {
       /* The other nodes are already on the target and the freeze is lifted;
        * only this hub stayed behind.  Say so in the summary rather than
        * leaving the run reading "done" with no explanation. */
@@ -7795,21 +8036,49 @@ static bool upgrade_commit_node(hub_state_t *state, upgrade_node_t *n) {
 
 /* hub_admin asked for a network upgrade.  Freeze the config, enumerate the
  * nodes and fan PREPARE out; the rolling plan itself runs on the maintenance
- * tick.  Returns false with `msg` filled in when the run could not start. */
+ * tick.  Returns false with `msg` filled in when the run could not start.
+ * `sel` is the admin's selection ("" = whole network): comma-separated
+ * name-or-uuid tokens, each optionally "=c" / "=rs" to switch that node's
+ * build.  It is resolved to uuids here, before anything is frozen or sent,
+ * so a typo refuses the run instead of quietly moving nothing. */
 static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
                               const char *target_ver, const char *variant,
                               const char *kind, const char *min_from,
                               const char *base, const char *hub_ver,
-                              const char *hub_base, char *msg,
-                              size_t msg_size) {
+                              const char *hub_base, const char *sel,
+                              char *msg, size_t msg_size) {
   pending_upgrade_t *u = &state->upgrade;
   if (u->active) {
     snprintf(msg, msg_size, "ERROR: upgrade %s already running (%s)", u->id,
              upgrade_phase_name(u->phase));
     return false;
   }
-  if (!target_ver || !target_ver[0] || strlen(target_ver) >= 64) {
+  /* The freeze replicates, so it is how this hub knows a run driven from
+   * anywhere else in the mesh is still in flight.  Two plans moving the same
+   * nodes is what the one-run-at-a-time rule exists to prevent. */
+  if (hub_config_frozen(state)) {
+    snprintf(msg, msg_size,
+             "ERROR: config is frozen — an upgrade is already in flight "
+             "somewhere in the mesh (if none is, clear opt flag 'F')");
+    return false;
+  }
+  if (!target_ver || !target_ver[0] || !hub_upgrade_plan_field_ok(target_ver) ||
+      strlen(target_ver) >= sizeof(u->target_ver)) {
     snprintf(msg, msg_size, "ERROR: bad target version");
+    return false;
+  }
+  if (variant && variant[0] && strcmp(variant, "c") != 0 &&
+      strcmp(variant, "rs") != 0) {
+    snprintf(msg, msg_size, "ERROR: variant must be c or rs");
+    return false;
+  }
+  if (kind && kind[0] && strcmp(kind, "bin") != 0 && strcmp(kind, "src") != 0) {
+    snprintf(msg, msg_size, "ERROR: kind must be bin or src");
+    return false;
+  }
+  if (min_from && min_from[0] && (!hub_upgrade_plan_field_ok(min_from) ||
+                                  strlen(min_from) >= sizeof(u->min_from))) {
+    snprintf(msg, msg_size, "ERROR: bad min_from version");
     return false;
   }
   /* The base travels to every node and ends up in a shell-free download path
@@ -7831,6 +8100,87 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
     return false;
   }
 
+  /* Resolve the selection into a scratch copy first: an error must leave the
+   * last run's table (and its status) untouched. */
+  struct {
+    char uuid[64];
+    char variant[8];
+    char kind;
+  } pick[MAX_UPGRADE_SELECT];
+  int picks = 0;
+  if (sel && sel[0]) {
+    int nc = 0;
+    upgrade_cand_t *cands = upgrade_candidates(state, &nc);
+    if (!cands) {
+      snprintf(msg, msg_size, "ERROR: out of memory");
+      return false;
+    }
+    char work[MAX_UPGRADE_SELECT * 80];
+    snprintf(work, sizeof(work), "%s", sel);
+    char *save = NULL;
+    for (char *tok = strtok_r(work, ", ", &save); tok;
+         tok = strtok_r(NULL, ", ", &save)) {
+      char *eq = strchr(tok, '=');
+      const char *want = "";
+      if (eq) {
+        *eq = '\0';
+        want = eq + 1;
+        if (strcmp(want, "c") != 0 && strcmp(want, "rs") != 0) {
+          snprintf(msg, msg_size, "ERROR: '%s=%s': the build must be c or rs",
+                   tok, want);
+          free(cands);
+          return false;
+        }
+      }
+      char err[256];
+      const upgrade_cand_t *c = upgrade_resolve(cands, nc, tok, err, sizeof(err));
+      if (!c) {
+        snprintf(msg, msg_size, "ERROR: %s", err);
+        free(cands);
+        return false;
+      }
+      bool dup = false;
+      for (int k = 0; k < picks && !dup; k++) dup = !strcmp(pick[k].uuid, c->uuid);
+      if (dup) continue;
+      if (picks >= MAX_UPGRADE_SELECT) {
+        snprintf(msg, msg_size,
+                 "ERROR: at most %d nodes per selective run — run the whole "
+                 "network instead",
+                 MAX_UPGRADE_SELECT);
+        free(cands);
+        return false;
+      }
+      if (c->kind != 'b' && (!hub_ver || !hub_ver[0])) {
+        snprintf(msg, msg_size,
+                 "ERROR: '%s' is a hub, and this run has no hub target", tok);
+        free(cands);
+        return false;
+      }
+      snprintf(pick[picks].uuid, sizeof(pick[picks].uuid), "%s", c->uuid);
+      snprintf(pick[picks].variant, sizeof(pick[picks].variant), "%s", want);
+      pick[picks].kind = c->kind;
+      picks++;
+    }
+    free(cands);
+    if (picks == 0) {
+      snprintf(msg, msg_size, "ERROR: the selection names no node");
+      return false;
+    }
+    char who[160];
+    if (upgrade_old_hub(state, who, sizeof(who))) {
+      snprintf(msg, msg_size,
+               "ERROR: hub %s is older than %s and cannot take a selective "
+               "run — upgrade the hubs first with a whole-network run",
+               who, UPGRADE_SELECT_MIN_HUB);
+      return false;
+    }
+  }
+
+  /* One spelling of a version everywhere a run compares it with strcmp —
+   * what nodes announce ("2.4.4"), not what manifests write ("v2.4.4"). */
+  if (target_ver[0] == 'v' && isdigit((unsigned char)target_ver[1])) target_ver++;
+  if (hub_ver && hub_ver[0] == 'v' && isdigit((unsigned char)hub_ver[1])) hub_ver++;
+
   memset(u, 0, sizeof(*u));
   generate_request_id(u->id, sizeof(u->id));
   /* Seed the PREPARE seen-ring: our own PREPARE coming back to us around a
@@ -7844,6 +8194,17 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
   snprintf(u->base, sizeof(u->base), "%s", base ? base : "");
   snprintf(u->hub_ver, sizeof(u->hub_ver), "%s", hub_ver ? hub_ver : "");
   snprintf(u->hub_base, sizeof(u->hub_base), "%s", hub_base ? hub_base : "");
+  u->select_count = picks;
+  int sw = 0;
+  for (int k = 0; k < picks; k++) {
+    snprintf(u->select[k].uuid, sizeof(u->select[k].uuid), "%s", pick[k].uuid);
+    snprintf(u->select[k].variant, sizeof(u->select[k].variant), "%s",
+             pick[k].variant);
+    int w = snprintf(u->sel_wire + sw, sizeof(u->sel_wire) - (size_t)sw,
+                     "%s%s%s%s", k ? "," : "", pick[k].uuid,
+                     pick[k].variant[0] ? "=" : "", pick[k].variant);
+    if (w > 0 && w < (int)sizeof(u->sel_wire) - sw) sw += w;
+  }
   u->origin_fd = admin ? admin->fd : -1;
   u->started = u->phase_started = time(NULL);
   u->phase = UPG_PREPARE;
@@ -7855,21 +8216,31 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
 
   /* Two shapes of the same PREPARE.  A bot gets the six fields it has always
    * read; a peer hub also needs the hubs' own target and base, appended so
-   * the bot prefix stays byte-identical and a follower can relay it on. */
-  char prepare[1024], prepare_peer[1600];
-  snprintf(prepare, sizeof(prepare), "%s|%s|%s|%s|%s|%s", u->id, u->target_ver,
-           u->variant, u->kind, u->min_from, u->base);
-  snprintf(prepare_peer, sizeof(prepare_peer), "%s|%s|%s", prepare, u->hub_ver,
-           u->hub_base);
+   * the bot prefix stays byte-identical and a follower can relay it on, and
+   * — in a selective run — the resolved selection, which tells it which of
+   * its own bots to ask and whether it is itself part of the run. */
+  char prepare_peer[1600 + sizeof(u->sel_wire)];
+  snprintf(prepare_peer, sizeof(prepare_peer), "%s|%s|%s|%s|%s|%s|%s|%s%s%s",
+           u->id, u->target_ver, u->variant, u->kind, u->min_from, u->base,
+           u->hub_ver, u->hub_base, u->sel_wire[0] ? "|" : "", u->sel_wire);
 
   int bots = 0, peers = 0;
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
     if (!c->authenticated) continue;
     if (c->type == CLIENT_BOT) {
+      const char *want = "";
+      if (!upgrade_selected(u, c->id, &want)) continue;
       upgrade_node_t *n =
           upgrade_add_node(u, c->id, 'b', c->fd, c->bot_version);
       if (!n) break;
+      snprintf(n->want_variant, sizeof(n->want_variant), "%s", want);
+      /* The variant this bot is asked about is ITS target build, so a bot
+       * told "=c" checks the C manifest at PREPARE, not its own. */
+      char prepare[1024];
+      snprintf(prepare, sizeof(prepare), "%s|%s|%s|%s|%s|%s", u->id,
+               u->target_ver, upgrade_node_variant(u, n), u->kind, u->min_from,
+               u->base);
       if (send_cmd_to_bot(c, CMD_UPGRADE_PREPARE, prepare)) {
         bots++;
       } else {
@@ -7891,6 +8262,9 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
       upgrade_node_t *n = upgrade_add_node(u, puuid, 'h', c->fd, NULL);
       if (!n) break;
       snprintf(n->name, sizeof(n->name), "%s", c->id);
+      const char *want = "";
+      if (upgrade_selected(u, puuid, &want))
+        snprintf(n->want_variant, sizeof(n->want_variant), "%s", want);
       if (peer_send_urgent(state, c, CMD_UPGRADE_PREPARE, prepare_peer)) {
         peers++;
       } else {
@@ -7903,12 +8277,20 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
   upgrade_node_t *self =
       upgrade_add_node(u, state->hub_uuid, 's', -1, HUB_VERSION);
   if (self) {
+    snprintf(self->name, sizeof(self->name), "%s", state->hub_friendly_name);
     char why[192] = "";
-    bool can = u->hub_ver[0]
-                   ? hub_update_can_take(u->hub_ver, u->min_from, u->hub_base,
-                                         why, sizeof(why))
-                   : (snprintf(why, sizeof(why), "no hub target in this run"),
-                      false);
+    const char *want = "";
+    bool picked = upgrade_selected(u, state->hub_uuid, &want);
+    snprintf(self->want_variant, sizeof(self->want_variant), "%s", want);
+    bool can = false;
+    if (!picked)
+      snprintf(why, sizeof(why), "not selected");
+    else if (!u->hub_ver[0])
+      snprintf(why, sizeof(why), "no hub target in this run");
+    else
+      can = hub_update_can_take(u->hub_ver, upgrade_node_variant(u, self),
+                                u->min_from, u->hub_base, why, sizeof(why));
+    self->not_selected = !picked;
     self->state = can ? UPG_NODE_READY : UPG_NODE_UNABLE;
     /* Explicit precision: a long reason is truncated on purpose. */
     snprintf(self->reason, sizeof(self->reason), "%.*s",
@@ -7918,14 +8300,34 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
     hub_update_host_arch(self->arch, sizeof(self->arch));
     hub_update_host_libc(self->libc, sizeof(self->libc));
   }
+  /* A selected node this hub did not just ask directly is somewhere below a
+   * peer (or offline).  Seed it as pending: its READY fills it in, and one
+   * that never answers ends "no answer to PREPARE" instead of vanishing from
+   * the status an admin is watching. */
+  for (int k = 0; k < u->select_count; k++) {
+    if (upgrade_find_node(u, u->select[k].uuid)) continue;
+    upgrade_node_t *n = upgrade_add_node(u, u->select[k].uuid,
+                                         pick[k].kind == 'b' ? 'b' : 'h', -1,
+                                         NULL);
+    if (!n) break;
+    snprintf(n->want_variant, sizeof(n->want_variant), "%s",
+             u->select[k].variant);
+  }
 
-  hub_log_info("[UPGRADE] Run %s -> %s: PREPARE to %d bot(s) and %d peer hub(s); "
+  hub_log_info("[UPGRADE] Run %s -> %s: PREPARE to %d bot(s) and %d peer hub(s)%s%s; "
           "this hub is %s\n", u->id, u->target_ver, bots, peers,
+          u->select_count ? "; selection " : "", u->sel_wire,
           self ? upgrade_node_state_name(self->state) : "not in the run");
-  snprintf(msg, msg_size,
-           "OK:upgrade %s started for %s — %d bot(s) and %d peer hub(s) asked "
-           "to prepare, this hub last; config frozen until it finishes", u->id,
-           u->target_ver, bots, peers);
+  if (u->select_count)
+    snprintf(msg, msg_size,
+             "OK:upgrade %s started for %d selected node(s) -> %s%s%s; config "
+             "frozen until it finishes", u->id, u->select_count, u->target_ver,
+             u->hub_ver[0] ? ", hubs -> " : "", u->hub_ver);
+  else
+    snprintf(msg, msg_size,
+             "OK:upgrade %s started for %s — %d bot(s) and %d peer hub(s) asked "
+             "to prepare, this hub last; config frozen until it finishes", u->id,
+             u->target_ver, bots, peers);
   return true;
 }
 
@@ -7982,6 +8384,14 @@ static void hub_upgrade_note_ready(hub_state_t *state, const char *payload,
     snprintf(node->via, sizeof(node->via), "%s",
              upgrade_peer_uuid(state, from_peer));
   }
+  /* A READY answers PREPARE, once.  A second copy (a relay loop, a bot that
+   * reconnected and was re-asked by a follower) must not move a node that is
+   * already committed or finished back to "ready" — that re-commits it. */
+  if (node->state != UPG_NODE_PENDING) {
+    hub_log_debug("[UPGRADE] Duplicate READY from %s (%s) — ignored\n", uuid,
+                  upgrade_node_state_name(node->state));
+    return;
+  }
   /* Explicit precision: a version longer than the roster field is truncated
    * on purpose, exactly as roster_clean does it for the tree. */
   snprintf(node->cur_version, sizeof(node->cur_version), "%.*s",
@@ -7992,6 +8402,23 @@ static void hub_upgrade_note_ready(hub_state_t *state, const char *payload,
   upgrade_clean(node->reason, sizeof(node->reason), reason);
   node->state = (okbuf[0] == '1') ? UPG_NODE_READY : UPG_NODE_UNABLE;
   if (node->ready_seq == 0) node->ready_seq = ++u->ready_seq_next;
+  /* The plan is fixed when PREPARE closes.  An answer that arrives later —
+   * a bot a follower relayed to, whose READY lost the race — is recorded but
+   * never committed: by then the hub it sits behind may already be
+   * restarting, and a COMMIT sent through it would come back as a failure
+   * that aborts a healthy run (run 83aac614). */
+  if (node->state == UPG_NODE_READY && u->phase != UPG_PREPARE) {
+    node->state = UPG_NODE_UNABLE;
+    snprintf(node->reason, sizeof(node->reason),
+             "answered after the plan was fixed — run again to include it");
+  }
+  /* A whole-network follower (or an older one) asks every bot it has; a
+   * selective run only moves what the admin named. */
+  if (!upgrade_selected(u, uuid, NULL)) {
+    node->state = UPG_NODE_UNABLE;
+    node->not_selected = true;
+    snprintf(node->reason, sizeof(node->reason), "not selected");
+  }
   if (node->kind == 'h' && relbuf[0]) {
     long rel = strtol(relbuf, NULL, 10);
     node->relayed = (rel > 0 && rel <= MAX_UPGRADE_NODES) ? (int)rel : 0;
@@ -8020,20 +8447,43 @@ static void hub_upgrade_note_result(hub_state_t *state, const char *payload) {
   upgrade_node_t *node = upgrade_find_node(u, uuid);
   if (!node) return;
 
+  /* A RESULT answers a COMMIT.  Anything for a node that is not committed —
+   * a duplicate, a late reply from a hub that restarted, the answer to our
+   * own ABORT — is logged and dropped: a finished node must never be turned
+   * back into a failure by noise (run 83aac614's eb04). */
+  if (node->state != UPG_NODE_COMMITTED) {
+    hub_log_info("[UPGRADE] %s reports %s (%s) while %s — ignored%s%s\n", uuid,
+                 status, ver, upgrade_node_state_name(node->state),
+                 detail[0] ? ": " : "", detail);
+    return;
+  }
+  /* "back": a follower saw this bot return on the target; it is not done
+   * until it reports ready itself (or UPGRADE_OPS_GRACE runs out). */
+  if (strcmp(status, "back") == 0) {
+    snprintf(node->cur_version, sizeof(node->cur_version), "%.*s",
+             (int)sizeof(node->cur_version) - 1, ver);
+    if (!node->back_at) node->back_at = time(NULL);
+    hub_log_info("[UPGRADE] %s is back (%s); waiting for it to report ready\n",
+                 uuid, ver);
+    return;
+  }
   snprintf(node->cur_version, sizeof(node->cur_version), "%.*s",
            (int)sizeof(node->cur_version) - 1, ver);
   upgrade_clean(node->reason, sizeof(node->reason), detail);
   if (strcmp(status, "ok") == 0) {
     node->state = UPG_NODE_DONE;
-  } else if (strcmp(status, "aborted") == 0) {
-    /* Answer to our own ABORT; the run is already over. */
-    node->state = UPG_NODE_FAILED;
+  } else if (strcmp(status, "skip") == 0) {
+    /* Nothing on that node changed and it is healthy on its current build:
+     * it leaves the run, the run goes on.  Abort is for harm, not noise. */
+    node->state = UPG_NODE_UNABLE;
+    if (!node->reason[0])
+      snprintf(node->reason, sizeof(node->reason), "skipped");
   } else {
     node->state = UPG_NODE_FAILED;
     if (!node->reason[0])
       snprintf(node->reason, sizeof(node->reason), "%s", status);
   }
-  hub_log_debug("[UPGRADE] %s reports %s (%s)%s%s\n", uuid, status, ver,
+  hub_log_info("[UPGRADE] %s reports %s (%s)%s%s\n", uuid, status, ver,
           node->reason[0] ? ": " : "", node->reason);
 }
 
@@ -8042,17 +8492,54 @@ static void hub_upgrade_note_result(hub_state_t *state, const char *payload) {
  * (the RESULT can be lost, the presence cannot: without it the bot is not on
  * the mesh at all). */
 static void hub_upgrade_note_presence(hub_state_t *state, const char *uuid,
-                                      const char *version) {
+                                      const char *version,
+                                      const char *variant) {
   pending_upgrade_t *u = &state->upgrade;
-  if (!u->active || u->phase != UPG_ROLLING) return;
+  if (!u->active || u->phase != UPG_ROLLING || !version) return;
   upgrade_node_t *node = upgrade_find_node(u, uuid);
-  if (!node || node->state != UPG_NODE_COMMITTED) return;
-  snprintf(node->cur_version, sizeof(node->cur_version), "%.*s",
-           (int)sizeof(node->cur_version) - 1, version ? version : "");
-  if (version && strcmp(version, upgrade_node_target(u, node)) == 0) {
-    node->state = UPG_NODE_DONE;
-    hub_log_info("[UPGRADE] %s is back on %s\n", uuid, version);
+  if (!node) return;
+  const char *target = upgrade_node_target(u, node);
+  bool on_target = hub_update_version_cmp(version, target) == 0;
+
+  /* A node that reported done and then shows up on another build fell back:
+   * its upgrade script's watchdog put the old binary back because the new
+   * one would not stay up.  That is the one signal a bad build gives.
+   * Bots only: their presence comes straight off their own connection,
+   * while a hub's header may be a relayed copy older than its restart. */
+  if (node->state == UPG_NODE_DONE) {
+    if (!on_target && node->kind == 'b') {
+      node->state = UPG_NODE_FAILED;
+      snprintf(node->reason, sizeof(node->reason),
+               "came back on %.40s after reporting done", version);
+      hub_log_warning("[UPGRADE] %s fell back to %s after reporting done\n",
+                      uuid, version);
+    }
+    return;
   }
+  if (node->state != UPG_NODE_COMMITTED) return;
+  snprintf(node->cur_version, sizeof(node->cur_version), "%.*s",
+           (int)sizeof(node->cur_version) - 1, version);
+  if (!on_target) return;
+  /* A build switch at the same version is only proven by the variant: the
+   * old process announced this very version before it restarted.  Without
+   * a variant to compare (a hub's header line), wait for the RESULT. */
+  const char *want = upgrade_node_variant(u, node);
+  if (want[0] && strcmp(want, node->variant) != 0 &&
+      (!variant || strcmp(variant, want) != 0))
+    return;
+  /* A bot that reports ready itself (once re-opped where it was) is only
+   * "back" here: the next wave waits for its ok, or UPGRADE_OPS_GRACE. */
+  if (node->kind == 'b' &&
+      hub_update_version_cmp(target, UPGRADE_OPS_GATE_MIN_BOT) >= 0) {
+    if (!node->back_at) {
+      node->back_at = time(NULL);
+      hub_log_info("[UPGRADE] %s is back on %s; waiting for it to report ready\n",
+                   uuid, version);
+    }
+    return;
+  }
+  node->state = UPG_NODE_DONE;
+  hub_log_info("[UPGRADE] %s is back on %s\n", uuid, version);
 }
 
 bool hub_upgrade_plan_field_ok(const char *s) {
@@ -8203,8 +8690,16 @@ static void hub_rollup_consider(hub_state_t *state, const char *uuid,
    * from where it is.  A manifest this hub cannot read (no curl, no key, no
    * network) is not fatal — aim straight at the target and let the node's own
    * updater refuse if it must. */
+  /* Read the BOT's release tree for its own build: the hub's tree and the
+   * hub's variant say nothing about which ircbot releases exist. */
   char step[64], why[192] = "";
-  if (!hub_update_next_step(r->base, r->variant, version, r->target, step,
+  hub_client_t *bc =
+      node_kind == 'b' ? upgrade_find_client(state, uuid, CLIENT_BOT) : NULL;
+  const char *step_variant = r->variant[0]           ? r->variant
+                             : (bc && bc->bot_variant[0]) ? bc->bot_variant
+                                                          : "c";
+  if (!hub_update_next_step(r->base[0] ? r->base : HUB_BOT_RELEASE_BASE,
+                            step_variant, version, r->target, step,
                             sizeof(step), why, sizeof(why))) {
     snprintf(step, sizeof(step), "%s", r->target);
     if (why[0])
@@ -8339,11 +8834,25 @@ void hub_upgrade_tick(hub_state_t *state, time_t now) {
 
   if (u->phase != UPG_ROLLING) return;
 
+  /* A bot back on the target that never reports ready: it runs, and it came
+   * back — done, with a note.  Only its channels' ops are unconfirmed. */
+  for (int i = 0; i < u->node_count; i++) {
+    upgrade_node_t *n = &u->nodes[i];
+    if (n->state != UPG_NODE_COMMITTED || !n->back_at) continue;
+    if (now - n->back_at <= UPGRADE_OPS_GRACE) continue;
+    n->state = UPG_NODE_DONE;
+    snprintf(n->reason, sizeof(n->reason), "back on target; no ready report");
+    hub_log_info("[UPGRADE] %s: back %ld s without a ready report; done\n",
+                 n->uuid, (long)(now - n->back_at));
+  }
   /* A committed node that never came back fails the whole run: the rest of
    * the mesh must not keep marching onto a build that does not come up. */
   for (int i = 0; i < u->node_count; i++) {
     upgrade_node_t *n = &u->nodes[i];
     if (n->state != UPG_NODE_COMMITTED) continue;
+    /* Already seen back on the target: it came up, so only the ops grace
+     * above applies — a bot back at 400 s must not fail at 420 s. */
+    if (n->back_at) continue;
     if (now - n->committed_at <= UPGRADE_COMMIT_TIMEOUT) continue;
     n->state = UPG_NODE_FAILED;
     snprintf(n->reason, sizeof(n->reason), "did not return on %s in time",
@@ -8404,11 +8913,14 @@ void hub_upgrade_tick(hub_state_t *state, time_t now) {
     return;
   }
 
+  int unable = 0;
+  for (int i = 0; i < u->node_count; i++)
+    if (u->nodes[i].state == UPG_NODE_UNABLE && !u->nodes[i].not_selected)
+      unable++;
   char done_msg[192];
   snprintf(done_msg, sizeof(done_msg),
-           "%d node(s) now on %s, %d could not take it",
-           upgrade_count(u, UPG_NODE_DONE, 0), u->target_ver,
-           upgrade_count(u, UPG_NODE_UNABLE, 0));
+           "%d node(s) now on the target, %d could not take it",
+           upgrade_count(u, UPG_NODE_DONE, 0), unable);
   upgrade_finish(state, UPG_DONE, done_msg);
 }
 
@@ -8529,7 +9041,18 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
   wire_field(payload, 4, min_from, sizeof(min_from));
   wire_field(payload, 5, base, sizeof(base));
   wire_field(payload, 6, hub_ver, sizeof(hub_ver));
-  wire_tail(payload, 7, hub_base, sizeof(hub_base));
+  wire_field(payload, 7, hub_base, sizeof(hub_base));
+  /* 9th field (2.4.3+): a selective run's resolved selection, uuid[=v],... */
+  char sel[MAX_UPGRADE_SELECT * 72] = "";
+  wire_tail(payload, 8, sel, sizeof(sel));
+  for (const char *p = sel; *p; p++) {
+    if (!isalnum((unsigned char)*p) && *p != '-' && *p != '=' && *p != ',') {
+      hub_log_warning("[UPGRADE] Malformed selection in PREPARE from peer %s\n",
+                      peer->ip);
+      return;
+    }
+  }
+  bool selective = sel[0] != '\0';
   /* Every field lands in this hub's config (the persisted roll-up plan) and
    * in a download path, so a peer's PREPARE is held to the same shape the
    * driver enforced on its admin: nothing that could split a line. */
@@ -8571,8 +9094,16 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
    * `follow_self_ready` records only whether the hub itself may commit. */
   char why[192] = "";
   bool ready = false;
-  if (hub_ver[0])
-    ready = hub_update_can_take(hub_ver, min_from, hub_base, why, sizeof(why));
+  char self_variant[8] = "";
+  bool self_picked =
+      !selective || upgrade_sel_lookup(sel, state->hub_uuid, self_variant,
+                                       sizeof(self_variant));
+  if (!self_variant[0]) snprintf(self_variant, sizeof(self_variant), "%s", variant);
+  if (!self_picked)
+    snprintf(why, sizeof(why), "not selected");
+  else if (hub_ver[0])
+    ready = hub_update_can_take(hub_ver, self_variant, min_from, hub_base, why,
+                                sizeof(why));
   else
     snprintf(why, sizeof(why), "no hub target in this run");
   snprintf(state->follow_id, sizeof(state->follow_id), "%s", id);
@@ -8583,11 +9114,14 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
   }
   snprintf(state->follow_target, sizeof(state->follow_target), "%s", ver);
   snprintf(state->follow_variant, sizeof(state->follow_variant), "%s",
-           variant[0] ? variant : hub_update_host_variant());
+           self_variant[0] ? self_variant : hub_update_host_variant());
   snprintf(state->follow_hub_target, sizeof(state->follow_hub_target), "%s",
            hub_ver);
   snprintf(state->follow_hub_base, sizeof(state->follow_hub_base), "%s",
            hub_base);
+  snprintf(state->follow_bot_variant, sizeof(state->follow_bot_variant), "%s",
+           variant);
+  snprintf(state->follow_sel, sizeof(state->follow_sel), "%s", sel);
   state->follow_self_ready = ready;
   state->follow_prepared = time(NULL);
   upgrade_routes_clear(state);
@@ -8596,8 +9130,9 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
    * down while the run went through reconnects to whichever hub it likes, so
    * every hub has to know what the network is supposed to be running; the
    * replicated config freeze is what keeps any of them from acting on it
-   * before the run is over (see hub_rollup_may_try). */
-  {
+   * before the run is over (see hub_rollup_may_try).  Not for a selective
+   * run: a few named nodes moving is no statement about the rest. */
+  if (!selective) {
     pending_rollup_t *r = &state->rollup;
     r->have_plan = true;
     snprintf(r->target, sizeof(r->target), "%s", ver);
@@ -8617,16 +9152,20 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
    * (its hub); we forward that up to the origin, which records it as a remote
    * node reached through this hub.  That is what makes one run reach a bot no
    * matter which hub it is homed on. */
-  /* Bots get the six fields they read, not the hubs' two on the end. */
-  char bot_prepare[1024];
-  snprintf(bot_prepare, sizeof(bot_prepare), "%s|%s|%s|%s|%s|%s", id, ver,
-           variant, kind, min_from, base);
+  /* Bots get the six fields they read, not the hubs' on the end — and in a
+   * selective run only the bots it names, each asked about its own build. */
   int relayed = 0;
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
-    if (c->type == CLIENT_BOT && c->authenticated &&
-        send_cmd_to_bot(c, CMD_UPGRADE_PREPARE, bot_prepare))
-      relayed++;
+    if (c->type != CLIENT_BOT || !c->authenticated) continue;
+    char bot_variant[8] = "";
+    if (selective &&
+        !upgrade_sel_lookup(sel, c->id, bot_variant, sizeof(bot_variant)))
+      continue;
+    char bot_prepare[1024];
+    snprintf(bot_prepare, sizeof(bot_prepare), "%s|%s|%s|%s|%s|%s", id, ver,
+             bot_variant[0] ? bot_variant : variant, kind, min_from, base);
+    if (send_cmd_to_bot(c, CMD_UPGRADE_PREPARE, bot_prepare)) relayed++;
   }
   if (relayed)
     hub_log_info("[UPGRADE] Relayed PREPARE %s to %d local bot(s)\n", id, relayed);
@@ -8640,12 +9179,35 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
     if (c->type != CLIENT_HUB || !c->authenticated || c == peer) continue;
+    /* A hub too old to read the selection would ask all of its bots and
+     * adopt the target as its roll-up plan; the driver refuses a selective
+     * run it can see such a hub in, and this catches one it could not. */
+    if (selective && !upgrade_peer_takes_sel(state, c)) {
+      hub_log_warning("[UPGRADE] Not relaying selective run %s to %s: it is "
+                      "older than %s\n", id, c->id, UPGRADE_SELECT_MIN_HUB);
+      continue;
+    }
     if (peer_send_urgent(state, c, CMD_UPGRADE_PREPARE, payload)) fanned++;
   }
   if (fanned)
     hub_log_info("[UPGRADE] Re-broadcast PREPARE %s to %d peer hub(s)\n", id, fanned);
 
   hub_upgrade_answer_ready(state, peer, id, ready, why, relayed);
+}
+
+/* A COMMIT refused because the RELEASE is bad — tampered, corrupt, or the
+ * wrong product — is still answered "fail" although nothing on this node
+ * changed: every other node would hit the same artifact, and the run must
+ * stop rather than retry it across the mesh in waves.  Any other refusal is
+ * this node's own business and answered "skip". */
+static bool upgrade_err_is_integrity(const char *err) {
+  static const char *const marks[] = {
+      "SHA-256 mismatch", "signature INVALID", "is not a irchub release",
+      "is not a ircbot release", "untrusted artifact URL"};
+  if (!err) return false;
+  for (size_t i = 0; i < sizeof(marks) / sizeof(marks[0]); i++)
+    if (strstr(err, marks[i])) return true;
+  return false;
 }
 
 /* A frame this hub is only relaying: an answer from somewhere below it in the
@@ -8693,24 +9255,38 @@ static void process_peer_upgrade_commit(hub_state_t *state, hub_client_t *peer,
   }
   wire_field(payload, 2, variant, sizeof(variant));
   wire_field(payload, 3, target_uuid, sizeof(target_uuid));
+  bool for_self = !target_uuid[0] || strcmp(target_uuid, state->hub_uuid) == 0;
+  /* Every refusal below touched nothing, so it is answered "skip" — the
+   * node stays healthy where it is and leaves the run — and always under the
+   * uuid of the node the driver addressed.  Answering a relayed bot's COMMIT
+   * under this hub's own uuid is what turned a done hub into a failed one
+   * and aborted run 83aac614. */
+  const char *who = for_self ? state->hub_uuid : target_uuid;
+
   if (!state->follow_id[0] || strcmp(state->follow_id, id) != 0) {
-    hub_upgrade_answer_result(state, peer, id, "fail",
-                              "no matching UPGRADE_PREPARE");
+    /* No run state: this hub restarted (or never saw the PREPARE).  If it
+     * is itself the target and already on that build, the COMMIT's work is
+     * done — say so rather than fail a node that succeeded. */
+    bool there = for_self && hub_update_version_cmp(HUB_VERSION, ver) == 0 &&
+                 (!variant[0] || strcmp(variant, hub_update_host_variant()) == 0);
+    hub_upgrade_answer_result_uuid(state, peer, id, who, there ? "ok" : "skip",
+                                   there ? "" : "this hub holds no such run "
+                                                "(restarted since PREPARE?)");
     return;
   }
   /* The version must be one this run named: the bots' target for a frame
    * on its way to a bot, the hubs' own for this hub (checked again below). */
-  bool for_self = !target_uuid[0] || strcmp(target_uuid, state->hub_uuid) == 0;
   if (strcmp(state->follow_target, ver) != 0 &&
       !(state->follow_hub_target[0] &&
         strcmp(state->follow_hub_target, ver) == 0)) {
-    hub_upgrade_answer_result(state, peer, id, "fail",
-                              "commit version differs from prepare");
+    hub_upgrade_answer_result_uuid(state, peer, id, who, "skip",
+                                   "commit version differs from prepare");
     return;
   }
   if (time(NULL) - state->follow_prepared > UPGRADE_PREPARE_TTL) {
     state->follow_id[0] = '\0';
-    hub_upgrade_answer_result(state, peer, id, "fail", "prepare expired");
+    hub_upgrade_answer_result_uuid(state, peer, id, who, "skip",
+                                   "prepare expired");
     return;
   }
 
@@ -8724,26 +9300,26 @@ static void process_peer_upgrade_commit(hub_state_t *state, hub_client_t *peer,
       char relay[192];
       snprintf(relay, sizeof(relay), "%s|%s|%s", id, ver, variant);
       if (!send_cmd_to_bot(bot, CMD_UPGRADE_COMMIT, relay))
-        hub_upgrade_answer_result_uuid(state, peer, id, target_uuid, "fail",
+        hub_upgrade_answer_result_uuid(state, peer, id, target_uuid, "skip",
                                        "bot not reachable through this hub");
       return;
     }
     const char *via = upgrade_route_via(state, target_uuid);
     hub_client_t *next = via ? upgrade_find_peer(state, via) : NULL;
     if (!next || !peer_send_urgent(state, next, CMD_UPGRADE_COMMIT, payload))
-      hub_upgrade_answer_result_uuid(state, peer, id, target_uuid, "fail",
+      hub_upgrade_answer_result_uuid(state, peer, id, target_uuid, "skip",
                                      "no route to that node from this hub");
     return;
   }
 
   /* No target uuid: this hub is the node being committed. */
   if (!state->follow_self_ready) {
-    hub_upgrade_answer_result(state, peer, id, "fail",
+    hub_upgrade_answer_result(state, peer, id, "skip",
                               "this hub cannot take the upgrade");
     return;
   }
   if (strcmp(state->follow_hub_target, ver) != 0) {
-    hub_upgrade_answer_result(state, peer, id, "fail",
+    hub_upgrade_answer_result(state, peer, id, "skip",
                               "commit version differs from prepare");
     return;
   }
@@ -8755,7 +9331,9 @@ static void process_peer_upgrade_commit(hub_state_t *state, hub_client_t *peer,
     /* Nothing was changed on disk; stay on this build and say why. */
     hub_log_warning("[UPGRADE] Commit %s refused: %s\n", id,
             err ? err : "unknown error");
-    hub_upgrade_answer_result(state, peer, id, "fail", err ? err : "failed");
+    hub_upgrade_answer_result(state, peer, id,
+                              upgrade_err_is_integrity(err) ? "fail" : "skip",
+                              err ? err : "failed");
     state->follow_id[0] = '\0';
   }
   /* On success hub_update_commit() does not return: the process is replaced
@@ -8809,13 +9387,21 @@ static void process_peer_upgrade_abort(hub_state_t *state, hub_client_t *peer,
  * run was aiming at.  The driver also infers success from the roster gossip,
  * so a lost RESULT costs nothing. */
 void hub_upgrade_report_pending(hub_state_t *state, hub_client_t *peer) {
-  char id[64], want[64];
-  if (!hub_update_take_pending(id, sizeof(id), want, sizeof(want))) return;
-  bool ok = (hub_update_version_cmp(HUB_VERSION, want) == 0);
-  hub_log_warning("[UPGRADE] Restarted after %s: running %s (wanted %s)\n", id,
-          HUB_VERSION, want);
+  char id[64], want[64], want_variant[16];
+  if (!hub_update_take_pending(id, sizeof(id), want, sizeof(want), want_variant,
+                               sizeof(want_variant)))
+    return;
+  bool ok = hub_update_version_cmp(HUB_VERSION, want) == 0 &&
+            (!want_variant[0] ||
+             strcmp(want_variant, hub_update_host_variant()) == 0);
+  hub_log_warning("[UPGRADE] Restarted after %s: running %s/%s (wanted %s%s%s)\n",
+                  id, HUB_VERSION, hub_update_host_variant(), want,
+                  want_variant[0] ? "/" : "", want_variant);
+  char detail[96];
+  snprintf(detail, sizeof(detail), "wanted %s%s%s", want,
+           want_variant[0] ? "/" : "", want_variant);
   hub_upgrade_answer_result(state, peer, id, ok ? "ok" : "version-mismatch",
-                            ok ? "" : want);
+                            ok ? "" : detail);
 }
 
 /* CMD_ADMIN_UPGRADE_STATUS: one line per node, for hub_admin to print. */
@@ -8844,6 +9430,12 @@ static void hub_upgrade_status(hub_state_t *state, char *out, size_t out_size) {
                      (long)(time(NULL) - u->started),
                      u->summary[0] ? "; " : "", u->summary);
   if (off < 0 || off >= (int)out_size) return;
+  if (u->select_count) {
+    int w = snprintf(out + off, out_size - (size_t)off,
+                     "selective: %d node(s) named\n", u->select_count);
+    if (w <= 0 || w >= (int)out_size - off) return;
+    off += w;
+  }
   if (u->hub_ver[0]) {
     int w = snprintf(out + off, out_size - (size_t)off, "hubs -> %s\n",
                      u->hub_ver);
@@ -8859,14 +9451,139 @@ static void hub_upgrade_status(hub_state_t *state, char *out, size_t out_size) {
   for (int i = 0; i < u->node_count && off < (int)out_size - 1; i++) {
     const upgrade_node_t *n = &u->nodes[i];
     const char *kind = (n->kind == 'b') ? "bot" : (n->kind == 'h') ? "hub" : "self";
+    /* "rs->c" when the node is being moved onto the other build. */
+    const char *want = upgrade_node_variant(u, n);
+    char var[24];
+    if (want[0] && strcmp(want, n->variant) != 0)
+      snprintf(var, sizeof(var), "%s->%s", n->variant[0] ? n->variant : "?", want);
+    else
+      snprintf(var, sizeof(var), "%s", n->variant);
     int w = snprintf(out + off, out_size - (size_t)off,
                      "%-4s %-36s %-10s %-8s %s%s%s\n", kind,
                      n->name[0] ? n->name : n->uuid,
                      upgrade_node_state_name(n->state),
-                     n->cur_version[0] ? n->cur_version : "-",
-                     n->variant[0] ? n->variant : "", n->reason[0] ? " " : "",
-                     n->reason);
+                     n->cur_version[0] ? n->cur_version : "-", var,
+                     n->reason[0] ? " " : "", n->reason);
     if (w <= 0 || w >= (int)out_size - off) break;
+    off += w;
+  }
+}
+
+/* CMD_ADMIN_UPGRADE_STATUS "releases[|bot_base|hub_base]": everything
+ * hub_admin needs to offer choices instead of free text.  Lines:
+ *   bot|<version>|<date>|<variants>     newest first, per product
+ *   hub|<version>|<date>|<variants>
+ *   err|<product>/<variant>|<reason>    a tree that could not be read
+ *   node|<b|h|s>|<uuid>|<name>|<version>|<variant>
+ * Manifests are signature-verified exactly as an upgrade would read them;
+ * an unverifiable tree lists nothing. */
+static void hub_upgrade_releases(hub_state_t *state, const char *payload,
+                                 char *out, size_t out_size) {
+  char bot_base[512] = "", hub_base[512] = "";
+  if (payload[8] == '|') {
+    wire_field(payload, 1, bot_base, sizeof(bot_base));
+    wire_field(payload, 2, hub_base, sizeof(hub_base));
+  }
+  if ((bot_base[0] && !hub_upgrade_plan_field_ok(bot_base)) ||
+      (hub_base[0] && !hub_upgrade_plan_field_ok(hub_base))) {
+    snprintf(out, out_size, "ERROR: bad release base");
+    return;
+  }
+  int off = snprintf(out, out_size, "OK:releases\n");
+  static const char *variants[] = {"c", "rs"};
+  for (int prod = 0; prod < 2; prod++) {
+    const char *pname = prod == 0 ? "bot" : "hub";
+    const char *root = prod == 0 ? (bot_base[0] ? bot_base : HUB_BOT_RELEASE_BASE)
+                                 : hub_base; /* "" = this hub's own root */
+    hub_release_t merged[MAX_UPGRADE_RELEASES];
+    char have[MAX_UPGRADE_RELEASES][8];
+    int nm = 0;
+    for (int v = 0; v < 2; v++) {
+      hub_release_t rel[MAX_UPGRADE_RELEASES];
+      const char *err = NULL;
+      int n = hub_update_list_releases(root, variants[v], rel,
+                                       MAX_UPGRADE_RELEASES, &err);
+      if (n < 0) {
+        int w = snprintf(out + off, out_size - (size_t)off, "err|%s/%s|%s\n",
+                         pname, variants[v], err ? err : "unreadable");
+        if (w > 0 && w < (int)out_size - off) off += w;
+        continue;
+      }
+      for (int k = 0; k < n; k++) {
+        int at = -1;
+        for (int m = 0; m < nm && at < 0; m++)
+          if (hub_update_version_cmp(merged[m].version, rel[k].version) == 0) at = m;
+        if (at < 0) {
+          if (nm >= MAX_UPGRADE_RELEASES) continue;
+          at = nm++;
+          merged[at] = rel[k];
+          have[at][0] = '\0';
+        }
+        size_t hl = strlen(have[at]);
+        snprintf(have[at] + hl, sizeof(have[at]) - hl, "%s%s", hl ? "," : "",
+                 variants[v]);
+      }
+    }
+    /* Newest first across both trees. */
+    for (int a = 1; a < nm; a++) {
+      hub_release_t t = merged[a];
+      char th[8];
+      memcpy(th, have[a], sizeof(th));
+      int b = a - 1;
+      while (b >= 0 && hub_update_version_cmp(merged[b].version, t.version) < 0) {
+        merged[b + 1] = merged[b];
+        memcpy(have[b + 1], have[b], sizeof(th));
+        b--;
+      }
+      merged[b + 1] = t;
+      memcpy(have[b + 1], th, sizeof(th));
+    }
+    for (int m = 0; m < nm; m++) {
+      int w = snprintf(out + off, out_size - (size_t)off, "%s|%s|%s|%s\n", pname,
+                       merged[m].version, merged[m].date, have[m]);
+      if (w <= 0 || w >= (int)out_size - off) return;
+      off += w;
+    }
+  }
+
+  /* The nodes a selective run could name, as this hub sees them now. */
+  int w = snprintf(out + off, out_size - (size_t)off, "node|s|%s|%s|%s|%s\n",
+                   state->hub_uuid, state->hub_friendly_name, HUB_VERSION,
+                   hub_update_host_variant());
+  if (w <= 0 || w >= (int)out_size - off) return;
+  off += w;
+  for (int i = 0; i < state->mesh_hub_count; i++) {
+    const mesh_hub_t *m = &state->mesh_hubs[i];
+    if (!m->uuid[0] || strcmp(m->uuid, state->hub_uuid) == 0) continue;
+    w = snprintf(out + off, out_size - (size_t)off, "node|h|%s|%s|%s|%s\n",
+                 m->uuid, m->name, m->version[0] ? m->version : "-",
+                 m->variant[0] ? m->variant : "-");
+    if (w <= 0 || w >= (int)out_size - off) return;
+    off += w;
+  }
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_BOT || !c->authenticated) continue;
+    char nick[64] = "";
+    hub_bot_entry(state, c->id, "n", nick, sizeof(nick));
+    w = snprintf(out + off, out_size - (size_t)off, "node|b|%s|%s|%s|%s\n",
+                 c->id, nick, c->bot_version[0] ? c->bot_version : "-",
+                 c->bot_variant[0] ? c->bot_variant : "-");
+    if (w <= 0 || w >= (int)out_size - off) return;
+    off += w;
+  }
+  for (int i = 0; i < state->roster_count; i++) {
+    const bot_roster_t *e = &state->roster[i];
+    if (strcmp(e->hub_uuid, state->hub_uuid) == 0) continue;
+    if (upgrade_find_client(state, e->bot_uuid, CLIENT_BOT)) continue;
+    bool dup = false;
+    for (int k = 0; k < i && !dup; k++)
+      dup = strcmp(state->roster[k].bot_uuid, e->bot_uuid) == 0;
+    if (dup) continue;
+    w = snprintf(out + off, out_size - (size_t)off, "node|b|%s|%s|%s|%s\n",
+                 e->bot_uuid, e->nick, e->version[0] ? e->version : "-",
+                 e->variant[0] ? e->variant : "-");
+    if (w <= 0 || w >= (int)out_size - off) return;
     off += w;
   }
 }

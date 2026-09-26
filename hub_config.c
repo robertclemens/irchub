@@ -139,7 +139,12 @@ int hub_format_user_record(const hub_user_record_t *u, bool legacy_v1,
 }
 
 // FIXED: Replaced EVP_BytesToKey with PKCS5_PBKDF2_HMAC
+/* Set by -selftest: a staged build loads and validates the live config but
+ * must never rewrite (migrate) it under the build that is still running. */
+bool g_hub_config_readonly = false;
+
 void hub_config_write(hub_state_t *state) {
+  if (g_hub_config_readonly) return;
   int estimated_size = (int)(HUB_CONFIG_FIXED_MAX +
                              (size_t)state->bot_count * HUB_CONFIG_PER_BOT_MAX);
   char *buffer = malloc(estimated_size);
