@@ -17,7 +17,7 @@ $(info [build] using CC=$(CC))
 PROJECT = irchub
 
 # Version
-VERSION = 2.4.1
+VERSION = 2.4.2
 
 # Directories
 SRC_DIR = .

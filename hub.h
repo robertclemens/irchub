@@ -126,7 +126,7 @@
  * the Makefile; -D-overridable so a release build can stamp its own version
  * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
 #ifndef HUB_VERSION
-#define HUB_VERSION "2.4.1"
+#define HUB_VERSION "2.4.2"
 #endif
 
 /* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
