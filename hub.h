@@ -77,7 +77,11 @@
 #define LOG_INFO    3
 #define LOG_DEBUG   4
 
-#define HUB_DEFAULT_LOG_LEVEL LOG_DEBUG
+/* The log FILE is off by default: a production hub writes nothing to disk
+ * until log_level| (or the console's "loglevel file") turns it on.  The
+ * in-memory ring the SSH consoles read has its own level. */
+#define HUB_DEFAULT_LOG_LEVEL         LOG_NONE
+#define HUB_DEFAULT_CONSOLE_LOG_LEVEL LOG_DEBUG
 
 // Rate Limiting Settings
 #define MAX_IP_RATE_LIMITS 500
@@ -146,7 +150,7 @@
   "irchub"
 #endif
 /* The variant THIS build is.  The Rust hub answers "rs". */
-/* The bots' release tree ROOT (ircbot-releases), for the hub_admin release
+/* The bots' release tree ROOT (ircbot-releases), for the admin console release
  * list and for walking a bot up via the roll-up.  Mirrors BOT_UPDATE_BASE in
  * ircbot/bot.h; a run's own bot base, when an admin names one, wins. */
 #ifndef HUB_BOT_RELEASE_BASE
@@ -187,7 +191,7 @@
 #define HUB_UPDATE_MAX_ARCHIVE (256L * 1024 * 1024)
 #define HUB_UPDATE_FETCH_TIMEOUT 300L
 /* Per-transfer budget for manifest reads made from the event loop (PREPARE
- * answers, the hub_admin release list): the hub serves nothing meanwhile. */
+ * answers, the admin console release list): the hub serves nothing meanwhile. */
 #define HUB_UPDATE_QUICK_TIMEOUT 8L
 
 // Timeout Settings
@@ -200,16 +204,6 @@
  * slot far sooner than CLIENT_TIMEOUT (180s). Outbound CLIENT_HUB peers are
  * exempt (they are trusted, operator-configured endpoints). */
 #define PREAUTH_TIMEOUT_SEC 10
-
-/* D4b — extended pre-auth grace for interactive admin logins. A connection
- * that has spoken the ADMIN-HELLO discovery probe has positively identified
- * itself as hub_admin, but the sealed-box ADMIN auth that follows is gated on
- * a human typing an admin name + password at the prompt. 10s is too tight for
- * manual entry, so a HELLO-marked connection gets this longer window instead.
- * Bots, peers, and unidentified slowloris connections keep PREAUTH_TIMEOUT_SEC.
- * Still bounded (and < CLIENT_TIMEOUT) so an idle admin slot is not held open
- * indefinitely; the connection also remains subject to churn/concurrency caps. */
-#define PREAUTH_ADMIN_TIMEOUT_SEC 120
 
 /* D2 — two-tier client buffers. Unauthenticated clients get a small buffer
  * (enough for the handshake); it is grown to MAX_BUFFER on successful auth.
@@ -240,8 +234,10 @@
 #define CMD_ADMIN_LIST_PEERS 0x19
 #define CMD_ADMIN_DEL_PEER 0x1A
 #define CMD_ADMIN_GET_PUBKEY 0x1B
-#define CMD_ADMIN_SET_PRIVKEY 0x1C
-#define CMD_ADMIN_GET_PRIVKEY 0x1D
+/* 0x1C / 0x1D (SET/GET_PRIVKEY) are retired with hub_admin: the hub key never
+ * leaves the hub, a backup is a copy of .irchub.cnf.  Never reuse the values. */
+#define CMD_ADMIN_SET_PRIVKEY 0x1C // RETIRED
+#define CMD_ADMIN_GET_PRIVKEY 0x1D // RETIRED
 #define CMD_ADMIN_SET_PUBKEY 0x1E
 #define CMD_ADMIN_SYNC_MESH 0x1F
 #define CMD_ADMIN_CREATE_BOT 0x32     // 50 decimal
@@ -347,7 +343,7 @@
 #define CMD_CHAN_FWD_REQUEST 0x5C // Hub -> Hub: forward the action
 #define CMD_CHAN_FWD_REPLY   0x5D // Hub -> Hub: route a reply home
 
-/* --- Network-wide upgrade coordination (hub_admin-initiated rolling upgrade).
+/* --- Network-wide upgrade coordination (console-initiated rolling upgrade).
  * Fan PREPARE out to bots + peer hubs, collect READY/UNABLE acks routed home by
  * origin_fd (like CMD_OP_*), then COMMIT node-by-node and await RESULT.  Mirror
  * in ircbot/bot.h, irchub.rs/consts.rs, ircbot.rs/consts.rs and
@@ -357,8 +353,8 @@
 #define CMD_UPGRADE_COMMIT       0x60 // Hub -> node: id|ver|variant
 #define CMD_UPGRADE_RESULT       0x61 // node -> Hub: id|uuid|status|new_ver|detail
 #define CMD_UPGRADE_ABORT        0x62 // Hub -> all: id|reason
-#define CMD_ADMIN_UPGRADE_NET    0x63 // hub_admin -> Hub: ver|variant|kind|min_from|base
-#define CMD_ADMIN_UPGRADE_STATUS 0x64 // hub_admin -> Hub: ""=poll, "abort"=stop+roll back
+#define CMD_ADMIN_UPGRADE_NET    0x63 // console -> Hub: ver|variant|kind|min_from|base
+#define CMD_ADMIN_UPGRADE_STATUS 0x64 // console -> Hub: ""=poll, "abort"=stop+roll back
 
 /* Sealed bot-to-bot relay across hubs.  CMD_BOT_RELAY names its target by
  * uuid only; when that bot is not connected here the hub stamps the frame
@@ -443,6 +439,38 @@
 #define ACTIVITY_MAX_FUTURE 300
 #define ACTIVITY_REQ_ID_MAX 32
 
+/* ---- SSH admin console (docs/console.md) --------------------------------
+ * The hub's only admin interface: an SSH server on the hub's own port, run on
+ * a console thread (hub_console.c) that never touches hub_state_t.  Each
+ * logged-in console reaches the core over its own socketpair, as an admin
+ * connection that is already authenticated (hub_client_t.internal): plaintext
+ * frames len(4, big-endian) || op(1) || payload.  CMD_CONSOLE is the one
+ * opcode that exists only there -- console -> core "sub|<topics>" /
+ * "get|tree" / "get|status", core -> console "<topic>|<data>" events.  It
+ * never appears on the network; a bot or peer sending it is ignored like any
+ * other opcode it has no business sending.  Mirrors irchub.rs consts.rs. */
+#define CMD_CONSOLE        0x6C
+#define CONSOLE_REPLY      0x00  /* core -> console: reply to the request   */
+#define CONSOLE_MAX_PREAUTH   8     /* SSH connections not yet logged in    */
+#define CONSOLE_MAX_SESSIONS  8     /* open consoles                        */
+#define CONSOLE_LOGIN_GRACE   20    /* connect -> running shell, seconds    */
+#define CONSOLE_IDLE_TIMEOUT  1800  /* seconds without a keystroke          */
+#define CONSOLE_MAX_AUTH_TRIES 3    /* refused keys before the drop         */
+/* The first bytes of an accepted connection decide console vs. bot/peer.  A
+ * sender that has not produced 4 bytes within this window is treated as the
+ * bot/peer protocol (whose own pre-auth timeout then applies). */
+#define CONSOLE_SNIFF_MS      2000
+/* Core-side queue towards one console.  A reply that does not fit closes the
+ * console (fail-secure); an event or log line that does not fit is dropped
+ * and counted ("drop|<n>"). */
+#define CONSOLE_CORE_OUTQ_MAX (1024 * 1024)
+/* In-memory ring of recent log lines the log view and "log on" replay. */
+#define CONSOLE_LOG_RING      1024
+#define CONSOLE_LOG_LINE_MAX  512
+/* Coalescing of pushed events. */
+#define CONSOLE_TREE_MIN_GAP  1     /* seconds between two tree events      */
+#define CONSOLE_NAME_MAX      64
+
 #define MAX_PENDING_CHAN_REQUESTS 200
 #define CHAN_REQUEST_TIMEOUT 45   // Reap a pending request with no reply
 
@@ -473,7 +501,7 @@
  * `sel` field: an older follower would PREPARE all its bots and adopt the
  * run's target as its roll-up plan, walking bots nobody selected up to it. */
 #define UPGRADE_SELECT_MIN_HUB "2.4.3"
-/* Releases listed by the hub_admin "releases" query, per product. */
+/* Releases listed by the admin console "releases" query, per product. */
 #define MAX_UPGRADE_RELEASES 24
 /* ircbot builds from this version on hold their "ok" RESULT until they are
  * back on IRC and re-opped where they were, so the driver waits for it
@@ -561,7 +589,8 @@ typedef struct {
 /* hub_config_write() buffer: every serialized section at its bound, with the
  * per-bot term scaled by the bots actually present.  A config that does not
  * fit is NOT written (the old file is kept) — never a truncated one.
- * hub_tool.h's HUB_TOOL_MAX_CONFIG is this at MAX_BOTS; keep them in step. */
+ * ircbot-testnet's tools/c/hub_tool.h derives HUB_TOOL_MAX_CONFIG from this at
+ * MAX_BOTS. */
 /* The persisted roll-up plan (see pending_rollup_t): rollup| + target,
  * variant, kind, min_from, hub_target, plan_set and both 512-byte bases. */
 #define ROLLUP_LINE_MAX 1536
@@ -660,7 +689,7 @@ typedef struct {
   char   uuid[37];
   char   name[64];
   /* Per-user Curve25519 combined pubkey (Ed25519 + X25519), base64-encoded
-   * (88 chars + NUL) — the user's only credential: hub_admin logins and bot
+   * (88 chars + NUL) — the user's only credential: SSH console logins and bot
    * ~A2 commands verify against it.  Empty (has_pubkey false) for a legacy
    * record not yet given a key; such a user can authenticate nowhere.  The
    * matching private key lives only on the user's machine. */
@@ -856,7 +885,7 @@ typedef struct {
   int    churn_count;        // D1: new connections counted in current window
 } ip_rate_limit_t;
 
-/* IP allow/deny list entry (hub_admin 0x38-0x3D).  The lists are local to
+/* IP allow/deny list entry (the admin console 0x38-0x3D).  The lists are local to
  * this hub: never replicated to peers, never pushed to bots; config lines
  * w|<pattern>|<ts> (allow) and x|<pattern>|<ts> (deny).  IPv4 only (the hub
  * listens on AF_INET).  pattern is canonical: a bare address, or network/N
@@ -900,6 +929,10 @@ typedef struct {
 
 typedef enum { CLIENT_BOT, CLIENT_ADMIN, CLIENT_HUB } client_type_t;
 
+/* Core-side state of one SSH console (hub_console_core.c).  Allocated only
+ * for an internal admin connection; NULL on every network client. */
+struct hub_console_link;
+
 /* Queued outbound message — pre-encryption.  payload is malloc'd. */
 typedef struct queued_msg {
   uint8_t            cmd;                /* protocol opcode (CMD_*) */
@@ -940,11 +973,16 @@ typedef struct {
   time_t last_pong_sent;
   time_t connected_at;             // D4: when the socket was accepted/created
   bool inbound;                    // accepted on the listener (subject to the IP lists)
-  bool admin_hello_seen;           // D4b: sent ADMIN-HELLO → longer pre-auth grace
-  /* Admin login v2: the one-time challenge handed out in HUB-PUBKEY2.  Set on
-   * ADMIN-HELLO, consumed (wiped) by the first ADMIN2 attempt either way. */
-  unsigned char admin_nonce[32];
-  bool admin_nonce_set;
+  /* An SSH console's socketpair end (docs/console.md): an admin connection
+   * the console thread already authenticated.  Plaintext frames, no pings,
+   * no CLIENT_TIMEOUT (the console has its own idle timeout). */
+  bool internal;
+  struct hub_console_link *console;
+  /* First-bytes sniff of an accepted connection: until 4 bytes are there (or
+   * CONSOLE_SNIFF_MS passed) it is not read, so an "SSH-" stream can be
+   * handed to the console thread untouched. */
+  bool sniff_pending;
+  long long sniff_deadline_ms;
   /* Protocol version this bot connection advertised ("v|N" in its config
    * push): 0 = not known yet, 1 = its push carried no v| (a pre-passwordless
    * build; it was sent the legacy-shaped config at once), >= 2 = advertised.
@@ -959,8 +997,6 @@ typedef struct {
   unsigned char bot_eph_x25519_pub[32];
   bool bot_eph_priv_set;
   int recv_len;
-  char admin_connect_ip[64];   // IP that hub_admin used to connect
-  int admin_connect_port;      // Port that hub_admin used to connect
 
   /* ---- Outbound queue (per-lane FIFOs, drained on POLLOUT) ---- */
   queue_lane_t out_lanes[LANE_COUNT];
@@ -1086,8 +1122,9 @@ typedef struct {
   char bind_ip[64];          // IP this hub advertises itself as in mesh
   char hub_uuid[64];         // This hub's UUID
   char hub_friendly_name[64]; // This hub's friendly name
-  /* realpath(argv[0]) — the binary an upgrade replaces, and the one
-   * <exe>.prev sits beside.  Resolved once in main(); see hub_update.c. */
+  /* /proc/self/exe — the binary an upgrade replaces, and the one
+   * <exe>.prev sits beside; its directory is the cwd (instance_dir_enter).
+   * Resolved once in main(); see hub_update.c. */
   char executable_path[PATH_MAX];
   /* config_pass holds the plaintext AES-GCM config-file password for the
    * lifetime of the process (needed on every config write).  It is mlock'd
@@ -1195,7 +1232,8 @@ typedef struct {
   seen_forward_t seen_forwards[MAX_SEEN_FORWARD_IDS];
   int seen_forward_head;  // Next slot to write (ring index)
 
-  int log_level;       // Current log level (LOG_NONE, LOG_ERROR, etc.)
+  int log_level;       // Log FILE level (LOG_NONE, LOG_ERROR, etc.)
+  int console_log_level; // Console log ring level (console_log_level|)
   int log_max_size;    // Max log file size in bytes (default 10MB)
 
   /* Network options pushed to bots/peers via the 'opt|' record. Each letter
@@ -1240,6 +1278,10 @@ typedef struct {
   long long    roster_gen;         /* last generation this hub gossiped     */
   uint32_t     gossip_link_mask;   /* peers linked at the last gossip (bit p) */
   time_t       resync_due_at;      /* ask peers for a sync then (0 = none)  */
+
+  /* SSH console (hub_console_core.c): the core's end of the control
+   * socketpair to the console thread, -1 when the console is not running. */
+  int          console_ctl_fd;
 } hub_state_t;
 
 #define CONFIG_WRITE_DEBOUNCE_S 5
@@ -1249,25 +1291,34 @@ void hub_log(const char *format, ...);
 /* Send the owed full config push to every local bot (maintenance loop). */
 void hub_flush_bot_config(hub_state_t *state, time_t now);
 /* The running hub's state (hub_main.c): the level macros below read
- * g_state->log_level, and stay silent while it is NULL. */
+ * g_state->log_level / console_log_level, and stay silent while it is NULL. */
 extern hub_state_t *g_state;
+
+/* One log line goes to two sinks, each with its own level: the log file
+ * (log_level) and the SSH consoles' in-memory ring (console_log_level).  A
+ * line is formatted when either wants it; hub_log_at() then writes it to
+ * each sink whose level is at least `level`.  A bare hub_log() counts as
+ * LOG_ERROR: written at every level but LOG_NONE. */
+void hub_log_at(int level, const char *format, ...);
+#define hub_log_on(lvl) \
+    (g_state && (g_state->log_level >= (lvl) || g_state->console_log_level >= (lvl)))
 
 // Log level filtering macros - these check the log level before calling hub_log.
 // The tag is glued to the caller's format by string-literal concatenation, so a
 // message with no varargs stays warning-free under -Wpedantic (an empty
 // __VA_ARGS__ after a named parameter is not valid C11).
 #define hub_log_error(...) \
-    do { if (g_state && g_state->log_level >= LOG_ERROR) hub_log("[ERROR] " __VA_ARGS__); } while(0)
+    do { if (hub_log_on(LOG_ERROR)) hub_log_at(LOG_ERROR, "[ERROR] " __VA_ARGS__); } while(0)
 #define hub_log_warning(...) \
-    do { if (g_state && g_state->log_level >= LOG_WARNING) hub_log("[WARNING] " __VA_ARGS__); } while(0)
+    do { if (hub_log_on(LOG_WARNING)) hub_log_at(LOG_WARNING, "[WARNING] " __VA_ARGS__); } while(0)
 #define hub_log_info(...) \
-    do { if (g_state && g_state->log_level >= LOG_INFO) hub_log("[INFO] " __VA_ARGS__); } while(0)
+    do { if (hub_log_on(LOG_INFO)) hub_log_at(LOG_INFO, "[INFO] " __VA_ARGS__); } while(0)
 #define hub_log_debug(...) \
-    do { if (g_state && g_state->log_level >= LOG_DEBUG) hub_log("[DEBUG] " __VA_ARGS__); } while(0)
+    do { if (hub_log_on(LOG_DEBUG)) hub_log_at(LOG_DEBUG, "[DEBUG] " __VA_ARGS__); } while(0)
 /* Periodic runtime counters. Carries its own [STATUS] tag but is gated at the
  * LOG_INFO level, so it disappears together with the rest of the INFO traffic. */
 #define hub_log_status(...) \
-    do { if (g_state && g_state->log_level >= LOG_INFO) hub_log("[STATUS] " __VA_ARGS__); } while(0)
+    do { if (hub_log_on(LOG_INFO)) hub_log_at(LOG_INFO, "[STATUS] " __VA_ARGS__); } while(0)
 
 bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);
@@ -1567,6 +1618,37 @@ bool hub_delta_seen_check_and_update(hub_state_t *state,
                                      const char *origin_hub_uuid,
                                      const char *bot_uuid,
                                      uint64_t seq);
+
+/* ---- SSH admin console, core side (hub_console_core.c) -------------------
+ * Everything here runs on the main thread.  hub_console_start spawns the
+ * console thread (hub_console.c) and publishes the host key and the admin
+ * credentials to it; hub_console_stop joins it at shutdown. */
+bool hub_console_start(hub_state_t *state);
+void hub_console_stop(hub_state_t *state);
+/* Re-publish the host key after the hub key changed (REGEN_KEYS etc.). */
+void hub_console_hostkey_changed(hub_state_t *state);
+/* The accepted connection's first bytes are "SSH-": give its socket to the
+ * console thread and drop the client from the core (the fd stays open). */
+void hub_console_handoff(hub_state_t *state, hub_client_t *c);
+/* The control socketpair is readable: logins, refusals, audit lines. */
+void hub_console_ctl_read(hub_state_t *state);
+/* One pass of the main loop: publish changed credentials, push events and
+ * log lines to the consoles that asked for them. */
+void hub_console_tick(hub_state_t *state);
+/* A plaintext frame on an internal connection (hub_handle_client_data). */
+bool hub_console_frame(hub_state_t *state, hub_client_t *c, uint8_t op,
+                       const char *payload, int payload_len);
+/* Queue one frame to a console.  op CONSOLE_REPLY never drops: false = the
+ * queue is over its cap and the console must be closed.  Events are dropped
+ * (and counted) instead. */
+bool hub_console_send(hub_client_t *c, uint8_t op, const void *data, size_t len);
+bool hub_console_has_pending(const hub_client_t *c);
+void hub_console_drain(hub_state_t *state, hub_client_t *c);
+void hub_console_link_free(hub_client_t *c);
+/* Allocate the log ring (mmap'd, mlock'd, MADV_DONTDUMP); false = no ring. */
+bool hub_console_log_ring_init(void);
+/* hub_log_at feeds every line at or under console_log_level in here. */
+void hub_console_log_append(int level, const char *line, size_t len);
 
 void hub_set_config_pass(hub_state_t *s, const char *pass);
 void hub_get_config_pass(const hub_state_t *s, char *out, size_t len);

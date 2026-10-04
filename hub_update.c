@@ -298,7 +298,7 @@ static void hub_update_set_ca(CURL *h) {
 #endif
 }
 
-/* Manifest reads made from the event loop (a PREPARE answer, the hub_admin
+/* Manifest reads made from the event loop (a PREPARE answer, the admin console
  * release list) run on a short budget: the hub serves nothing while curl
  * blocks, and a peer link that misses its pings is a worse outcome than a
  * node answering "unable: manifest fetch failed".  0 = the full budget, for
@@ -796,7 +796,7 @@ bool hub_update_can_take(const char *target_ver, const char *variant,
 }
 
 /* List the distinct versions a release tree offers, newest first — what
- * hub_admin shows so an admin picks a version instead of typing one.  The
+ * the admin console shows so an admin picks a version instead of typing one.  The
  * manifest is signature-verified like any other read of it; an unverifiable
  * one lists nothing. */
 int hub_update_list_releases(const char *root, const char *variant,
@@ -1086,9 +1086,13 @@ static bool write_upgrade_script(const hub_state_t *state, const char *kind,
   fprintf(f, "sleep %d\n", UPGRADE_WATCH_SECS);
   fprintf(f, "P=$(cat \"%s\" 2>/dev/null | tr -dc 0-9)\n", HUB_PID_FILE);
   fprintf(f, "if [ -z \"$P\" ] || ! kill -0 \"$P\" 2>/dev/null; then\n");
+  /* Nothing retained (an admin put a build back by hand): the binary in
+   * place is the only one there is, so it is never moved aside. */
+  fprintf(f, "  [ -f \"%s\" ] || exit 1\n", prev_path);
   fprintf(f, "  echo \"[UPGRADE] new build did not stay up — restoring previous build\"\n");
   fprintf(f, "  mv -f \"%s\" \"%s.failed\" 2>/dev/null\n", exe, exe);
-  fprintf(f, "  mv -f \"%s\" \"%s\" || exit 1\n", prev_path, exe);
+  fprintf(f, "  mv -f \"%s\" \"%s\" || { mv -f \"%s.failed\" \"%s\"; exit 1; }\n",
+          prev_path, exe, exe, exe);
   fprintf(f, "  [ -f \"%s%s\" ] && cp -f \"%s%s\" \"%s\"\n", HUB_CONFIG_FILE,
           HUB_UPGRADE_PREV_SUFFIX, HUB_CONFIG_FILE, HUB_UPGRADE_PREV_SUFFIX,
           HUB_CONFIG_FILE);

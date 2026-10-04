@@ -99,7 +99,7 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
   } else if (strcmp(key, "o") == 0) {
     /* Legacy global oper mask: the password slot is always stored empty.
      * Oper passwords are retired; one arriving from an old config, an old
-     * peer or an old hub_admin must not be kept, synced or listed. */
+     * peer or an old admin client must not be kept, synced or listed. */
     (void)extra;
     snprintf(combined_value, sizeof(combined_value), "%s||%s", value, safe_op);
   } else {

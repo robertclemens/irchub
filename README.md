@@ -11,7 +11,7 @@ There are no admin, oper or bot passwords: every hub, bot, admin and oper has it
 irchub sits between your IRC bots and your admin console. Each [ircbot](https://github.com/robertclemens/ircbot/) instance authenticates to the hub using its own Curve25519 keypair. The hub distributes encrypted configuration (channels, admins and opers with their public keys and usermasks, the other bots' public keys) to all connected bots and keeps everything synchronized across multiple hub instances via a peer mesh.
 
 ```
-hub_admin ──► irchub ──► ircbot A
+ssh (admin) ──► irchub ──► ircbot A
                     └──► ircbot B
                     └──► irchub (peer) ──► ircbot C
 ```
@@ -21,7 +21,7 @@ hub_admin ──► irchub ──► ircbot A
 - **Bot registration** — each bot makes its own keypair; you register its UUID and public key
 - **Encrypted config sync** — AES-256-GCM encrypted configuration pushed to all bots on connect and periodically
 - **Peer mesh** — multiple hub instances synchronize state; leader election prevents duplicate operations
-- **Admin console** — interactive TUI (`hub_admin`) for managing bots, channels, masks, and opers
+- **Admin console** — an SSH server built into the hub, on its own port: log in with any SSH client (OpenSSH, PuTTY, phone apps) using your admin key, and manage bots, peers, channels, masks, opers and upgrades from a full-screen console or a scriptable line mode
 - **IP access control** — IPv4 allowlist/denylist with CIDR support, local to each hub; changes apply to existing connections too, and a change that would lock out your own admin session is refused
 - **Rate limiting** — per-IP connection limits and failed-auth blocking
 - **Tombstone purging** — automatic cleanup of deleted config entries with configurable retention
@@ -31,10 +31,7 @@ hub_admin ──► irchub ──► ircbot A
 | Binary | Purpose |
 |--------|---------|
 | `irchub` | Hub server |
-| `hub_admin` | Interactive admin console |
-| `keygen` | Makes an admin/oper keypair (`<ts>_<name>.private.b64` / `.public.b64`) |
-| `hub_decrypt` | Decrypt and inspect config file |
-| `hub_encrypt` | Re-encrypt a config file |
+| `keygen` | Makes an admin/oper's IRC keypair (`<ts>_<name>.private.b64` / `.public.b64`) and SSH key (`<ts>_<name>_ed25519` / `.pub`) in one run, optionally under one passphrase (`-d <dir>`, `--passwd` to add/change/remove it later); `--ssh-fingerprint` prints a hub's SSH host key fingerprint |
 
 Built binaries are placed in `bin/`. Install them wherever suits your setup — the examples below assume the binaries are on your `PATH` or you are running from the directory containing them.
 
@@ -47,7 +44,7 @@ irchub is the hub — [ircbot](https://github.com/robertclemens/ircbot/) is the 
 - Bots request op grants through the hub, which coordinates across the mesh so any bot can grant ops to any other bot regardless of which hub they are connected to. With no hub reachable, bots ask each other directly with PRIVMSGs sealed to each other's keys.
 - Admins and opers command a bot over IRC with their own key: a signed auth request, a lockbox reply carrying the bot's public key, then commands sealed to the bot. The hub only distributes public keys — it never holds a user's or a bot's private key.
 
-You provision bots and manage the network entirely through `hub_admin` — you never need to manually edit bot config files.
+You provision bots and manage the network entirely through the hub's SSH console — you never need to manually edit bot config files, and there is no separate admin program to install.
 
 ## Dependencies
 
@@ -57,6 +54,10 @@ You provision bots and manage the network entirely through `hub_admin` — you n
 | OpenSSL | 1.1.1+ | `libssl`, `libcrypto` — EVP API required |
 | POSIX | — | Linux, FreeBSD, and other POSIX systems (uses `termios`, `flock`, POSIX sockets) |
 | GNU Make | 3.81+ | Build system |
+| CMake | 3.14+ | Builds the bundled libssh (below) |
+| libcurl | — | Release downloads for hub-driven upgrades |
+
+**libssh.** The SSH console uses [libssh](https://www.libssh.org/) **0.12.2** (LGPL-2.1), built from the verified source tarball in `third_party/` and linked statically — server side only, no SFTP/GSSAPI/zlib/pcap. The tarball and its upstream GPG signature ship in this repository and the Makefile checks the tarball's SHA-256 before building; the upstream source is at https://www.libssh.org/files/0.12/ .
 
 ### Debian / Ubuntu
 
@@ -107,7 +108,7 @@ First make the first admin's keypair, on that admin's own machine:
 ./keygen robert        # or run ./keygen and type the name
 ```
 
-This writes `YYYYMMDDHHMMSS_robert.private.b64` (mode 0600 — it stays on that machine; `hub_admin` and the IRC scripts use it) and `YYYYMMDDHHMMSS_robert.public.b64`, and prints the public key and its fingerprint. The private key is never printed. (`keygen.c` is byte-identical to `ircbot/utils/keygen.c`; `ircbot/utils/README.txt` has an equivalent openssl recipe.)
+This asks for an optional passphrase (twice, echo off; empty = none) and writes `YYYYMMDDHHMMSS_robert.private.b64` (0600 — it stays on that machine; the IRC scripts and `bot-auth` use it), `YYYYMMDDHHMMSS_robert.public.b64`, and the SSH key for the hub console, `YYYYMMDDHHMMSS_robert_ed25519` (0600) + `.pub`, both private files under the same passphrase. It prints the public key, its fingerprint and a `~/.ssh/config` block; the private key is never printed. `-d <dir>` writes the files elsewhere, `--passwd <file>` adds/changes/removes the passphrase later. (`keygen.c` and `bcrypt_pbkdf.[ch]` are byte-identical to their `ircbot/utils` copies; `docs/console.md` §9 has the formats.)
 
 Then run setup from the directory where irchub will store its files (config, PID, log, and password files are all created relative to the working directory):
 
@@ -169,59 +170,51 @@ crontab -e
 */5 * * * * /full/path/to/irchub
 ```
 
-Replace `/full/path/to/irchub` with the absolute path to the binary. Note that cron executes from your home directory by default — if your irchub files live in a subdirectory, place the binary there or ensure the config files (`.irchub.cnf`, `.irchub.pass`) exist in the directory cron will use as the working directory.
+Replace `/full/path/to/irchub` with the absolute path to the binary. irchub always works in its own directory, whatever directory it is started from: `.irchub.cnf`, `.irchub.pass`, `.irchub.pid`, `.irchub.log` and `hub_upgrade.sh` live beside the binary, so no `cd` is needed. Run one binary per hub, in a directory owned by you and not writable by group or others — irchub refuses to start otherwise.
 
 ## Admin Console
 
-`hub_admin` logs in with an admin's **private key file** — there is no username or password:
+The hub serves an SSH console on its **own listening port** (the first bytes of a connection tell SSH apart from bots and peers). There is no system `sshd`, no OS account and no password: you log in with the admin record's **name** and its **key**.
 
-```bash
-./hub_admin <hub-ip> <hub-port> <YYYYMMDDHHMMSS_name.private.b64>
-```
+1. `keygen robert` (on your own machine) already wrote your SSH key next to the IRC key: `20260914120000_robert_ed25519` (0600) and `…_ed25519.pub`, protected by the same passphrase if you gave one. It also printed a `~/.ssh/config` block (`IdentitiesOnly yes`); `ssh-add -t 1h …_ed25519` keeps it unlocked for an hour. PuTTY users load `…_ed25519` into PuTTYgen and save it as a `.ppk`. For a key made before keygen v2, `./keygen --passwd 20260914120000_robert.private.b64` writes the SSH pair (and adds a passphrase). Details: `docs/console.md` §9.
+2. Check the hub's identity on the first login: the hub logs `[CONSOLE] SSH host key ssh-ed25519 SHA256:…` at startup, and `./keygen --ssh-fingerprint hub_public.b64` prints the same line from the hub's public key. Compare it with what `ssh` shows before you accept it.
+3. Log in:
+   ```bash
+   ssh -i 20260914120000_robert_ed25519 -o IdentitiesOnly=yes -p <hub-port> robert@<hub-host>
+   ```
 
-The hub finds the admin record by the key and the admin proves it holds the key by signing a one-time challenge (a fresh ephemeral session key per login, so a captured login cannot be replayed). Keys an older hub created (`admin_<name>.b64`) are the same format and keep working. Keep the file `chmod 600`; `hub_admin` warns if it is not. Admins created on IRC with `+admin` can log in too — run production networks with opt `h` (below) if you want only hub admins to create users.
+Only admin records log in; opers, unknown names and wrong keys are refused alike, and three refused keys end the connection. Admins created on IRC with `+admin` can log in too — run production networks with opt `h` (below) if you want only hub admins to create users.
 
-### Admin Menu
-
-```
-IRC HUB ADMIN CONSOLE
-
-  1. Manage Bots
-  2. Manage Peer Connections
-  3. Manage Local Peer Config
-  4. Manage Global Peer Config      (opt flags)
-  5. IRC Admin Commands             (admins, opers, usermasks, channels, op)
-  6. Exit
-```
+The console has an output pane, a live network tree, a status bar and an input line; `Alt+1`…`Alt+5` switch between the console, raw log, network, upgrades and stats views. Type `help` for the command list, `help <command>` for one command. With `TERM=dumb` (e.g. `TERM=dumb ssh -tt …` from a script, or a serial terminal) it switches to **line mode**: plain lines, a `> ` prompt and one `[ok #N]` / `[err #N]` marker per command — the interface the test suite drives. Commands and their line-mode output grammar: `docs/console.md`.
 
 ### Adding a Bot
 
 1. On the bot's machine run `./ircbot -setup`; the bot generates its own keypair and prints its UUID, public key and key fingerprint.
-2. **Manage Bots → Add Bot**, then enter the bot's nickname, UUID and 88-character public key.
+2. In the console: `bot add <nick> <uuid> <88-char-pubkey>`.
 
 The hub never sees a bot's private key. Every bot receives the other bots' public keys (`b|` lines), which it uses to seal bot-to-bot requests (OPME, INVITE, SETNICK) when no hub is reachable.
 
 ### Rekeying a Bot
 
-Rekeying is bot-local: only the bot holds its private key. **Manage Bots → Rekey Bot** shows the instructions — an admin runs the bot's own `rekey` command, the bot makes a new keypair, pushes the new public key to the hub and reconnects.
+Rekeying is bot-local: only the bot holds its private key. `bot rekey <uuid>` shows the instructions — an admin runs the bot's own `rekey` command, the bot makes a new keypair, pushes the new public key to the hub and reconnects.
 
 ### Admins and Opers
 
-**IRC Admin Commands → Manage Admins / Manage Opers**:
-
-- **Add Admin / Add Oper** — name, the user's **public key** (they run `keygen <name>` and send you the `.public.b64`; paste it or give its path; a `.private.b64` is refused), confirm the fingerprint, then a usermask. Each key may belong to one user only.
-- **Change User Public Key** — replaces a key (rotation, a lost key, or a legacy user with no key). UUID and usermasks are kept; the old key stops working on the hub and on every bot as soon as it syncs.
-- **List Admins / Opers**, **Match User** — show each key's fingerprint.
-
-Only admins can log into `hub_admin`; an oper's key is refused.
+- `admin add <name> <pubkey> <mask>` / `oper add <name> <pubkey> <mask>` — the user runs `keygen <name>` and sends you the `.public.b64`; each key may belong to one user only.
+- `userkey <name> <pubkey>` — replaces a key (rotation, a lost key, or a legacy user with no key). UUID and usermasks are kept; the old key stops working on the hub and on every bot as soon as it syncs.
+- `admin list`, `oper list`, `match <name|*>` — show each key's fingerprint; `mask add|del <name> <mask>` manages usermasks.
 
 ### Opt flags
 
-**Manage Global Peer Config → Set Opt Flags**. Flag `h` (hub-only mutations) makes every bot refuse local `+admin`/`-admin`, `+oper`/`-oper`, `+usermask`/`-usermask`, `+bot`/`-bot`, `join`/`part` and `chkey`, so users, masks, keys and channels change only through `hub_admin`. Set an empty string to clear it.
+`opt set h` (hub-only mutations) makes every bot refuse local `+admin`/`-admin`, `+oper`/`-oper`, `+usermask`/`-usermask`, `+bot`/`-bot`, `join`/`part` and `chkey`, so users, masks, keys and channels change only through the hub console. `opt set -` clears it.
+
+### The hub's own key
+
+The hub's private key lives only inside the encrypted `.irchub.cnf`; no command shows or imports it. A copy of `.irchub.cnf` (with its password) is the backup, and moving a hub to a new machine is copying that file. `hub rekey` makes a new key — peers and bots must then re-pin it: see `docs/console.md` §7.
 
 ## Peer Mesh
 
-Multiple hub instances can be linked to share configuration and bot state. Add a peer from **Manage Peer Connections → Add Peer**. Provide the peer's IP, port, UUID, friendly name and public key (its `hub_public.b64`). Peers authenticate each other with Ed25519 signatures (`HUBv3`); a pre-passwordless hub (`HUBv2`) is refused, so upgrade all hubs together.
+Multiple hub instances can be linked to share configuration and bot state. Add a peer with `peer add <ip> <port> <uuid> <name> <pubkey>` (the pubkey is the peer's `hub_public.b64`). Peers authenticate each other with Ed25519 signatures (`HUBv3`); a pre-passwordless hub (`HUBv2`) is refused, so upgrade all hubs together.
 
 Connected peers:
 - Synchronize bot config and global config entries
@@ -233,42 +226,22 @@ Connected peers:
 
 The config file (`.irchub.cnf`) is AES-256-GCM encrypted with a key derived from your config password via PBKDF2-SHA256 (100,000 iterations). It is never stored in plaintext.
 
-**Global settings managed via `hub_admin`:**
+**Settings managed from the console:**
 
 | Setting | Command |
 |---------|---------|
-| Bind IP | Manage Local Peer Config → Set Bind IP |
-| Bind Port | Manage Local Peer Config → Set Bind Port |
-| Hub Name | Manage Local Peer Config → Set Hub Name |
-| Log Level | Manage Local Peer Config → Set Log Level (0–4) |
-| Log Size Limit | Manage Local Peer Config → Set Log Size Limit |
-| IP Allowlist | Manage Local Peer Config → Manage IP Allowlist |
-| IP Denylist | Manage Local Peer Config → Manage IP Denylist |
-| Tombstone Purge | Manage Local Peer Config → Purge Tombstones |
-| Auto Purge Schedule | Manage Local Peer Config → Configure Automatic Purge |
-| Admins (keys, masks) | IRC Admin Commands → Manage Admins |
-| Opers (keys, masks) | IRC Admin Commands → Manage Opers |
-| Channels | IRC Admin Commands → Manage Channels |
-| Opt flags (`h`) | Manage Global Peer Config → Set Opt Flags |
+| Bind IP / port | `hub bindip <ip>` / `hub port <port>` (restart to apply) |
+| Hub name | `hub name <name>` |
+| Log level | `loglevel [file|console] <none|error|warning|info|debug>` |
+| Log size limit | `hub logsize <MB>` |
+| IP allowlist / denylist | `allow list|add|del`, `deny list|add|del` (CIDR) |
+| Tombstone purge | `hub purge now` / `hub autopurge <days>` |
+| Admins, opers (keys, masks) | `admin …`, `oper …`, `mask …`, `userkey …` |
+| Channels | `chan list|add|del` |
+| Opt flags (`h`) | `opt` / `opt set <flags|->` |
+| Network upgrade | `upgrade status|releases|start|abort|forget` |
 
 ## Utilities
-
-### Decrypt config (inspection / debugging)
-
-```bash
-./hub_decrypt [config-file]                # defaults to .irchub.cnf
-./hub_decrypt .irchub.cnf > config.txt     # raw plaintext, nothing else
-```
-
-Prompts for the config password (no echo) and writes the raw plaintext config to stdout — no banner or framing, so it can be redirected or piped. The prompt goes to the terminal and errors to stderr. When stdin is not a terminal, the first line of stdin is taken as the password (`echo "$PW" | ./hub_decrypt`); the password is never passed as an argument.
-
-### Encrypt config
-
-```bash
-./hub_encrypt [plaintext-file] [output-file]   # defaults: config.txt, .irchub.cnf
-```
-
-Re-encrypts a plaintext config file. Useful for migrating or restoring configs. Prompts for the password twice (or reads one line from a non-terminal stdin), then writes the output mode 0600 via a temp file and rename, so a failed run never leaves a truncated config. Input that does not look like a plaintext config (e.g. an already-encrypted file) is refused.
 
 ### Make an admin/oper keypair
 
@@ -283,10 +256,10 @@ Writes `YYYYMMDDHHMMSS_<name>.private.b64` (mode 0600) and `YYYYMMDDHHMMSS_<name
 - The config password is never passed on the command line or stored in an environment variable. It is read from `.irchub.pass` (if present) or prompted on stdin at startup.
 - `.irchub.pass` is AES-256-GCM encrypted and machine-bound — it cannot be decrypted on a different host. The file must be owned by the current user with permissions `0600`; any deviation is rejected and irchub falls back to the stdin prompt.
 - All bot-to-hub communication is encrypted with AES-256-GCM using per-session keys negotiated via Curve25519 (sealed-box).
-- Failed authentication attempts are tracked per IP. After 3 failures the IP is blocked for 5 minutes; the failure counter resets after 1 hour. These thresholds are compile-time constants (`MAX_FAILED_AUTH_ATTEMPTS`, `FAILED_AUTH_BLOCK_DURATION`, `FAILED_AUTH_RESET_TIME` in `hub.h`) — adjust and rebuild to change them. Specific IPs and ranges can be permanently allowed or blocked at runtime via **Manage Peer Config → Manage IP Allowlist / Manage IP Denylist** in `hub_admin` (supports CIDR notation).
+- Failed authentication attempts are tracked per IP. After 3 failures the IP is blocked for 5 minutes; the failure counter resets after 1 hour. These thresholds are compile-time constants (`MAX_FAILED_AUTH_ATTEMPTS`, `FAILED_AUTH_BLOCK_DURATION`, `FAILED_AUTH_RESET_TIME` in `hub.h`) — adjust and rebuild to change them. Specific IPs and ranges can be permanently allowed or blocked at runtime with the console's `allow` / `deny` commands (CIDR notation supported).
 - Each IP is limited to 5 simultaneous connections (`MAX_CONNECTIONS_PER_IP` in `hub.h` — compile-time constant).
 - Private key material is wiped from memory (`secure_wipe`) as soon as it is no longer needed.
-- No private key ever crosses the network: bots, admins and opers make their own keypairs and only public keys are registered and synced. `hub_admin` logins sign a one-time challenge; captured logins cannot be replayed.
+- No private key ever crosses the network: bots, admins and opers make their own keypairs and only public keys are registered and synced. Admins reach the hub only through its SSH console (public-key auth against the admin record; the host key is the hub's own key, so `known_hosts` pins the hub).
 - Mixed-version rollout is fail-closed: bots that have not advertised protocol `v|2` get records with an empty password slot, and pre-passwordless hubs are refused as peers (`docs/passwordless.md` §9).
 
 ## Files
@@ -302,15 +275,27 @@ All files are created relative to the working directory at the time irchub is in
 
 ## Log Levels
 
-Logging is disabled by default. Set the level at runtime via **Manage Peer Config → Set Log Level** in `hub_admin`:
+A hub has two log sinks, each with its own level:
+
+* **The log file** (`.irchub.log`) is **off by default** (`NONE`,
+  `HUB_DEFAULT_LOG_LEVEL` in `hub.h`): a production hub writes nothing to disk
+  until you turn it on with `loglevel file <level>` (or plain `loglevel <level>`).
+* **The console log** — the in-memory ring the SSH consoles' log view and
+  `log on` read — defaults to `DEBUG` (`HUB_DEFAULT_CONSOLE_LOG_LEVEL`), and is
+  fed even when the file is off or cannot be opened.  Set it with
+  `loglevel console <level>`.  The ring is not encrypted: it is `mlock`'d (no
+  swap) and `MADV_DONTDUMP` (no core dump).
+
+Both levels persist in the config (`log_level|`, `console_log_level|`, written
+only when not the default) and show in the console's status bar and `status`.
 
 | Level | Name | Output |
 |-------|------|--------|
-| 0 | NONE | No logging (default) |
+| 0 | NONE | No logging (file default) |
 | 1 | ERROR | Errors only |
-| 2 | WARNING | Errors and warnings |
+| 2 | WARNING | Errors and warnings (includes `[AUDIT]` lines for key-material changes) |
 | 3 | INFO | Errors, warnings, and info |
-| 4 | DEBUG | Everything |
+| 4 | DEBUG | Everything (console default) |
 
 ## Quick Reference
 
@@ -333,16 +318,16 @@ kill $(cat .irchub.pid)
 # (Optional) Auto-start via crontab — check every 5 minutes
 # */5 * * * * /full/path/to/irchub
 
-# Make an admin keypair (on the admin's machine)
+# Make an admin's IRC + SSH keypairs (on the admin's machine; asks for an
+# optional passphrase; -d <dir> picks where the files go)
 ./keygen robert
 
-# Connect admin console (with the admin's PRIVATE key file)
-#./hub_admin <hub ip> <hub port> <private key file>
-./hub_admin 127.0.0.1 6697 20260914120000_robert.private.b64
+# Add / change / remove the passphrase later (rewrites the SSH pair too)
+./keygen --passwd 20260914120000_robert.private.b64
+
+# Admin console
+ssh -i 20260914120000_robert_ed25519 -o IdentitiesOnly=yes -p 6697 robert@127.0.0.1
 
 # View logs (if logging has been turned on)
 tail -f .irchub.log
-
-# Inspect config (debug)
-./hub_decrypt
 ```

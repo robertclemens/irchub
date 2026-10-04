@@ -181,6 +181,8 @@ void hub_config_write(hub_state_t *state) {
    * they differ from the defaults, so an untouched hub's file is unchanged. */
   if (state->log_level != HUB_DEFAULT_LOG_LEVEL)
     SAFE_WRITE("log_level|%d\n", state->log_level);
+  if (state->console_log_level != HUB_DEFAULT_CONSOLE_LOG_LEVEL)
+    SAFE_WRITE("console_log_level|%d\n", state->console_log_level);
   if (state->log_max_size > 0 && state->log_max_size != HUB_LOG_FILE_SIZE)
     SAFE_WRITE("log_size|%d\n", state->log_max_size);
 
@@ -625,6 +627,10 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         long lv = strtol(v, NULL, 10);
         state->log_level = (int)(lv < LOG_NONE ? LOG_NONE
                                  : lv > LOG_DEBUG ? LOG_DEBUG : lv);
+      } else if (strcmp(k, "console_log_level") == 0) {
+        long lv = strtol(v, NULL, 10);
+        state->console_log_level = (int)(lv < LOG_NONE ? LOG_NONE
+                                         : lv > LOG_DEBUG ? LOG_DEBUG : lv);
       } else if (strcmp(k, "log_size") == 0) {
         long sz = strtol(v, NULL, 10);
         state->log_max_size = (int)(sz < HUB_LOG_SIZE_MIN ? HUB_LOG_SIZE_MIN
@@ -1075,7 +1081,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
     const hub_user_record_t *u = &state->user_records[i];
     if (u->is_active && !u->has_pubkey)
       hub_log_warning("[HUB] %s '%s' has no public key and cannot authenticate until "
-              "given one (hub_admin: Change user public key)\n",
+              "given one (admin console: userkey)\n",
               u->type == 'a' ? "Admin" : "Oper", u->name);
   }
 

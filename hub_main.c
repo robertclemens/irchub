@@ -1,4 +1,5 @@
 #include "hub.h"
+#include "hub_console.h"
 #if defined(__GLIBC__)
 #include <malloc.h>   /* for mallopt(); glibc-only, guarded like its use in main() */
 #endif
@@ -31,7 +32,7 @@ hub_state_t *g_state = NULL;  // Global state pointer for use in hub_log() and o
  * fopen("a") so the mode never depends on the caller's umask, and the fchmod
  * tightens a log that already exists with looser permissions — mode= only
  * applies on creation, so an inherited 0644 file would otherwise stay 0644.
- * Same guard the codebase documents in keygen.c and hub_admin.c. */
+ * Same guard the codebase documents in keygen.c. */
 static FILE *hub_log_open(bool truncate) {
     int flags = O_CREAT | O_WRONLY | (truncate ? O_TRUNC : O_APPEND);
     int fd = open(HUB_LOG_FILE, flags, 0600);
@@ -93,20 +94,10 @@ static void hub_log_write_sanitized(FILE *fp, const char *msg, size_t n) {
     }
 }
 
-void hub_log(const char *format, ...) {
-    va_list args;
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    char time_buf[32];
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", t);
-
-    // Check if logging disabled
-    if (g_state && g_state->log_level == LOG_NONE) {
-        return;
-    }
-
+/* The file sink: the size-capped, inode-checked HUB_LOG_FILE.  Returns
+ * without writing when the file cannot be opened. */
+static void hub_log_file_write(const char *time_buf, const char *msg, size_t len) {
     if (!log_fp) {
-        // Try to open log file first
         log_fp = hub_log_open(false);
         if (!log_fp) {
             return;  // Silent fail if can't open
@@ -155,34 +146,78 @@ void hub_log(const char *format, ...) {
         /* fall through: the line that tripped the cap is kept, after it */
     }
 
-    /* Write the entry.  Level filtering is the caller's: the hub_log_error /
-     * _warning / _info / _debug macros test g_state->log_level first; a bare
-     * hub_log() is written at every level but LOG_NONE. */
+    fprintf(log_fp, "[%s] ", time_buf);
+    hub_log_write_sanitized(log_fp, msg, len);
+    fflush(log_fp);
+}
+
+static void hub_log_v(int level, const char *format, va_list ap) {
+    /* Which sinks take a line at this level.  Before g_state exists (early
+     * startup) only the file does, as it always did. */
+    bool to_file = !g_state || g_state->log_level >= level;
+    bool to_ring = g_state && g_state->console_log_level >= level;
+    if (!to_file && !to_ring) return;
+
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char time_buf[32];
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", t);
+
     char stack_msg[2048];
     char *msg = stack_msg;
-    va_start(args, format);
-    int need = vsnprintf(stack_msg, sizeof(stack_msg), format, args);
-    va_end(args);
-    if (need < 0) return;
+    va_list ap2;
+    va_copy(ap2, ap);
+    int need = vsnprintf(stack_msg, sizeof(stack_msg), format, ap);
+    if (need < 0) {
+        va_end(ap2);
+        return;
+    }
     if ((size_t)need >= sizeof(stack_msg)) {
         msg = malloc((size_t)need + 1);
         if (!msg) {
             msg = stack_msg;  /* keep the (cut) message rather than nothing */
             need = (int)sizeof(stack_msg) - 1;
         } else {
-            va_start(args, format);
-            vsnprintf(msg, (size_t)need + 1, format, args);
-            va_end(args);
+            vsnprintf(msg, (size_t)need + 1, format, ap2);
         }
     }
-    fprintf(log_fp, "[%s] ", time_buf);
-    hub_log_write_sanitized(log_fp, msg, (size_t)need);
-    fflush(log_fp);
+    va_end(ap2);
+
+    if (to_file) hub_log_file_write(time_buf, msg, (size_t)need);
+    if (to_ring) {
+        /* The SSH consoles' log view reads the same lines from memory; the
+         * ring is fed whether or not the file could be written. */
+        char ring_line[CONSOLE_LOG_LINE_MAX];
+        int rl = snprintf(ring_line, sizeof(ring_line), "[%s] %.*s", time_buf,
+                          need, msg);
+        if (rl > 0)
+            hub_console_log_append(level, ring_line,
+                                   rl < (int)sizeof(ring_line)
+                                       ? (size_t)rl
+                                       : sizeof(ring_line) - 1);
+        secure_wipe(ring_line, sizeof(ring_line));
+    }
     if (msg != stack_msg) {
         secure_wipe(msg, (size_t)need);  /* log args can hold key material */
         free(msg);
     }
     secure_wipe(stack_msg, sizeof(stack_msg));
+}
+
+/* Level filtering is the caller's (the hub_log_error / _warning / _info /
+ * _debug macros test hub_log_on() first); this only picks the sinks. */
+void hub_log_at(int level, const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    hub_log_v(level, format, ap);
+    va_end(ap);
+}
+
+void hub_log(const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    hub_log_v(LOG_ERROR, format, ap);
+    va_end(ap);
 }
 
 static void daemonize(void) {
@@ -226,7 +261,9 @@ static void handle_signal(int sig) {
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
     if (!c) return;
 
-    hub_log_info("[HUB] Disconnecting client %s (FD: %d)\n", c->ip, c->fd);
+    /* fd -1: a socket handed to the SSH console, not a disconnect */
+    if (c->fd >= 0)
+        hub_log_info("[HUB] Disconnecting client %s (FD: %d)\n", c->ip, c->fd);
 
     decrement_active_connections(state, c->ip);
 
@@ -262,6 +299,7 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
     }
 
     // 4. Wipe sensitive data and free memory
+    if (c->internal) hub_console_link_free(c);
     secure_wipe(c->session_key, sizeof(c->session_key));
     secure_wipe(c->bot_eph_x25519_priv, sizeof(c->bot_eph_x25519_priv));
     c->bot_eph_priv_set = false;
@@ -594,6 +632,9 @@ void hub_maintenance(hub_state_t *state) {
         last_client_scan = now;
         for (int i = 0; i < state->client_count; i++) {
             hub_client_t *c = state->clients[i];
+            /* An SSH console has no pings: the console thread owns its idle
+             * timeout, and the socketpair closes when the session does. */
+            if (c->internal) continue;
             if ((now - c->last_seen) > CLIENT_TIMEOUT) {
                 hub_log_warning("[HUB] Client %s timed out.\n", c->ip);
                 hub_disconnect_client(state, c);
@@ -605,16 +646,10 @@ void hub_maintenance(hub_state_t *state) {
              * dribbles bytes to keep last_seen fresh is still dropped. Outbound
              * CLIENT_HUB peers are trusted, operator-configured endpoints and
              * are exempt. */
-            /* D4b: a connection that spoke ADMIN-HELLO is an interactive admin
-             * login gated on manual name/password entry — give it a longer
-             * grace window. Everything else keeps the strict pre-auth window. */
-            time_t preauth_window = c->admin_hello_seen ? PREAUTH_ADMIN_TIMEOUT_SEC
-                                                        : PREAUTH_TIMEOUT_SEC;
             if (!c->authenticated && c->type != CLIENT_HUB &&
-                (now - c->connected_at) > preauth_window) {
-                hub_log_warning("[HUB] Pre-auth timeout for %s (%lds, no handshake%s) — "
-                        "dropping\n", c->ip, (long)(now - c->connected_at),
-                        c->admin_hello_seen ? ", admin" : "");
+                (now - c->connected_at) > PREAUTH_TIMEOUT_SEC) {
+                hub_log_warning("[HUB] Pre-auth timeout for %s (%lds, no handshake) — "
+                        "dropping\n", c->ip, (long)(now - c->connected_at));
                 hub_disconnect_client(state, c);
                 i--;
                 continue;
@@ -910,6 +945,47 @@ static void harden_process(void) {
 #endif
 }
 
+/* Instance directory: .irchub.cnf/.pass/.pid/.log/.upgrade and hub_upgrade.sh
+ * all live beside the binary, so the hub behaves the same whatever the
+ * caller's cwd -- cron starts jobs in $HOME.  One binary per hub.  Our own
+ * path comes from /proc/self/exe (argv[0] has no directory when launched
+ * through PATH); fills `exe` with it and chdir()s to its directory.  That
+ * directory holds the binary an upgrade replaces, its .prev and the upgrade
+ * script, so refuse one another user owns or group/other can write -- they
+ * could swap any of them. */
+static bool instance_dir_enter(char *exe, size_t exe_len) {
+    ssize_t n = readlink("/proc/self/exe", exe, exe_len - 1);
+    if (n <= 0 || (size_t)n >= exe_len - 1) {
+        fprintf(stderr, "Cannot resolve my own path (/proc/self/exe)\n");
+        return false;
+    }
+    exe[n] = '\0';
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", exe);
+    char *slash = strrchr(dir, '/');
+    if (!slash) {
+        fprintf(stderr, "Cannot resolve my own directory from %s\n", exe);
+        return false;
+    }
+    slash[slash == dir ? 1 : 0] = '\0';
+    struct stat st;
+    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "Cannot stat my own directory %s\n", dir);
+        return false;
+    }
+    if (st.st_uid != geteuid() || (st.st_mode & (S_IWGRP | S_IWOTH))) {
+        fprintf(stderr, "Refusing to run from %s: it must be owned by this "
+                        "user and not writable by group or others "
+                        "(chmod go-w)\n", dir);
+        return false;
+    }
+    if (chdir(dir) != 0) {
+        fprintf(stderr, "Cannot change to my own directory %s\n", dir);
+        return false;
+    }
+    return true;
+}
+
 /* -setup: read a user's public key — the pasted 88-char key, or a path to
  * their .public.b64 — show its fingerprint and confirm.  False on EOF. */
 static bool setup_read_pubkey(const char *who, char out[COMBINED_KEY_B64 + 1]) {
@@ -994,8 +1070,15 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "-selftest") == 0) selftest_mode = true;
     }
 
+    /* -selftest stays in the caller's directory: the updater runs a staged
+     * build from a scratch subdirectory, against this hub's config. */
+    static char self_exe[PATH_MAX];
+    if (!selftest_mode && !instance_dir_enter(self_exe, sizeof(self_exe)))
+        return 1;
+
     static hub_state_t state;
     memset(&state, 0, sizeof(state));
+    state.console_ctl_fd = -1;
 
     /* Lock the secret-bearing fields into RAM so they cannot reach swap or a
      * hibernation image.  hub_state_t is ~8.1 MB -- bots[] alone is 6.8 MB of
@@ -1016,9 +1099,13 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Warning: mlock(%s) failed - "
                                 "secrets may reach swap.\n", locks[i].what);
     }
+    /* The console log ring lives in its own mlock'd, MADV_DONTDUMP mapping
+     * (hub_console_core.c); allocated before the first line is logged. */
+    (void)hub_console_log_ring_init();
     state.running = true;
     g_state = &state;
     state.log_level = HUB_DEFAULT_LOG_LEVEL;
+    state.console_log_level = HUB_DEFAULT_CONSOLE_LOG_LEVEL;
     state.log_max_size = HUB_LOG_FILE_SIZE;
 
     if (selftest_mode) {
@@ -1152,13 +1239,21 @@ int main(int argc, char *argv[]) {
                 printf("    │   - Bots adding this hub will need both         │\n");
                 printf("    │     (ircbot -setup prompts for UUID + pubkey).  │\n");
                 printf("    │   - Peer hubs adding this hub will need the     │\n");
-                printf("    │     UUID + ip:port + pubkey via hub_admin.      │\n");
+                printf("    │     UUID + ip:port + pubkey (console: peer add).│\n");
                 printf("    │ The hub's PRIVATE key never leaves this machine │\n");
                 printf("    │ (stored encrypted inside .irchub.cnf).          │\n");
                 printf("    └─────────────────────────────────────────────────┘\n");
                 free(pub_b64);
             }
             printf("[+] Curve25519 keypair generated.\n");
+            {
+                /* What ssh shows admins on their first login to the console. */
+                char sshfp[80];
+                console_ssh_fingerprint(state.hub_ed25519_pub, sshfp, sizeof(sshfp));
+                printf("[+] SSH console host key: ssh-ed25519 %s\n", sshfp);
+                printf("    Admins check it on first connect (keygen --ssh-fingerprint\n");
+                printf("    hub_public.b64 prints the same line).\n");
+            }
         }
         (void)ch;
 
@@ -1167,8 +1262,8 @@ int main(int argc, char *argv[]) {
          * admin's own machine (keygen <name>) and imports only the PUBLIC key
          * here.  The hub never sees or prints a user's private key. */
         printf("\n--- First Admin Setup ---\n");
-        printf("This creates the first named admin, who can log into hub_admin\n");
-        printf("and command bots over IRC. Admins sign in with a Curve25519 key,\n");
+        printf("This creates the first named admin, who can log into the hub's SSH\n");
+        printf("console and command bots over IRC. Admins sign in with a Curve25519 key,\n");
         printf("not a password: on the admin's own machine run\n");
         printf("    ./keygen <name>      (irchub/bin/keygen or ircbot/utils/keygen)\n");
         printf("keep the <ts>_<name>.private.b64 there (chmod 600), and give this\n");
@@ -1246,7 +1341,10 @@ int main(int argc, char *argv[]) {
 
             printf("[+] Admin '%s' created with %d usermask(s), UUID %s\n",
                    bot_admin_name, masks_added, new_uuid);
-            printf("    Log in with:  ./hub_admin <ip> <port> <its .private.b64>\n");
+            printf("    Their SSH key:     <ts>_%s_ed25519 (keygen writes it with the IRC key)\n",
+                   bot_admin_name);
+            printf("    then log in with:  ssh -i <ts>_%s_ed25519 -p <hub port> %s@<hub>\n",
+                   bot_admin_name, bot_admin_name);
         }
 
         hub_config_write(&state);
@@ -1327,14 +1425,9 @@ int main(int argc, char *argv[]) {
         sigaction(SIGTERM, &sa, NULL);
     }
 
-    /* The binary an upgrade replaces, and the one <exe>.prev sits beside.
-     * Resolved once, here, because exec() through the upgrade script needs an
-     * absolute path and argv[0] alone may be relative.  A hub that cannot
-     * resolve it still runs; hub_update_commit() refuses instead. */
-    if (!realpath(argv[0], state.executable_path)) {
-        state.executable_path[0] = '\0';
-        hub_log_warning("Could not resolve my own path; self-upgrade disabled\n");
-    }
+    /* The binary an upgrade replaces, and the one <exe>.prev sits beside
+     * (resolved by instance_dir_enter() at startup). */
+    snprintf(state.executable_path, sizeof(state.executable_path), "%s", self_exe);
 
     // Create PID file with exclusive lock
     int pid_fd = open(HUB_PID_FILE, O_CREAT | O_RDWR, 0600);
@@ -1391,7 +1484,7 @@ int main(int argc, char *argv[]) {
 
     /* Per-hub independent keypairs (no shared-keypair mesh).
      * Peers without a registered pubkey are refused at handshake time —
-     * the operator must add each peer with its own pubkey via hub_admin. */
+     * the operator must add each peer with its own pubkey via the console. */
     {
         int peerless = 0;
         for (int i = 0; i < state.peer_count; i++)
@@ -1399,7 +1492,7 @@ int main(int argc, char *argv[]) {
         if (peerless > 0) {
             hub_log_warning("[HUB] %d peer(s) lack a Curve25519 pubkey and "
                     "will be refused on connect. Re-add them with their "
-                    "hub_public.b64 via hub_admin (Add Peer / Set Peer Pubkey).\n",
+                    "hub_public.b64 in the admin console (peer add / peer setkey).\n",
                     peerless);
         }
     }
@@ -1435,6 +1528,13 @@ int main(int argc, char *argv[]) {
     
     listen(state.listen_fd, 10);
 
+    /* The SSH admin console (docs/console.md) shares this port: its thread
+     * starts before the first accept.  A hub whose console cannot start
+     * still serves its bots and peers, but no admin can reach it. */
+    if (!hub_console_start(&state))
+        hub_log_error("[CONSOLE] SSH console unavailable — no admin access to "
+                      "this hub until it restarts\n");
+
     while (state.running && !g_hub_stop_signal) {
         hub_check_peers(&state);
         hub_maintenance(&state);
@@ -1444,10 +1544,21 @@ int main(int argc, char *argv[]) {
         FD_ZERO(&write_fds);
         FD_SET(state.listen_fd, &read_fds);
         int max_fd = state.listen_fd;
+        if (state.console_ctl_fd >= 0) {
+            FD_SET(state.console_ctl_fd, &read_fds);
+            if (state.console_ctl_fd > max_fd) max_fd = state.console_ctl_fd;
+        }
+        bool sniffing = false;
 
         for (int i = 0; i < state.client_count; i++) {
             hub_client_t *c = state.clients[i];
             if (c->fd > 0) {
+                /* Not read until its first bytes are known (see below). */
+                if (c->sniff_pending) {
+                    sniffing = true;
+                    if (c->fd > max_fd) max_fd = c->fd;
+                    continue;
+                }
                 FD_SET(c->fd, &read_fds);
                 /* Only watch writability if the per-peer queue or in-flight
                  * cipher buffer has bytes pending. Otherwise select() would
@@ -1476,6 +1587,7 @@ int main(int argc, char *argv[]) {
                 break;
             }
         }
+        if (sniffing && tv.tv_usec > 10 * 1000) tv.tv_usec = 10 * 1000;
         if (select(max_fd + 1, &read_fds, &write_fds, NULL, &tv) < 0) continue;
 
         /* ---- Drain writable peers FIRST.  This keeps URGENT op-flow
@@ -1515,6 +1627,14 @@ int main(int argc, char *argv[]) {
                         c->connected_at = c->last_seen;  /* D4: pre-auth clock */
                         c->inbound = true;
                         c->last_pong_sent = 0;
+                        /* First bytes decide: "SSH-" goes to the console. */
+                        c->sniff_pending = true;
+                        {
+                            struct timeval snow;
+                            gettimeofday(&snow, NULL);
+                            c->sniff_deadline_ms = (long long)snow.tv_sec * 1000 +
+                                                   snow.tv_usec / 1000 + CONSOLE_SNIFF_MS;
+                        }
                         state.clients[state.client_count++] = c;
 
                         increment_active_connections(&state, c->ip);
@@ -1530,10 +1650,42 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        if (state.console_ctl_fd >= 0 && FD_ISSET(state.console_ctl_fd, &read_fds))
+            hub_console_ctl_read(&state);
+
+        /* First-bytes sniff.  Bot and peer frames start with a 4-byte length;
+         * "SSH-" read as one is ~1.4 GB, never valid, so the split is exact.
+         * The bytes are only peeked: the console gets the stream untouched. */
+        if (sniffing) {
+            struct timeval snow;
+            gettimeofday(&snow, NULL);
+            long long now_ms = (long long)snow.tv_sec * 1000 + snow.tv_usec / 1000;
+            for (int i = 0; i < state.client_count; i++) {
+                hub_client_t *c = state.clients[i];
+                if (!c->sniff_pending || c->fd <= 0) continue;
+                unsigned char head[4];
+                ssize_t n = recv(c->fd, head, sizeof(head), MSG_PEEK | MSG_DONTWAIT);
+                if (n == 4) {
+                    c->sniff_pending = false;
+                    if (memcmp(head, "SSH-", 4) == 0) {
+                        hub_console_handoff(&state, c);
+                        i--;
+                    }
+                } else if (n == 0 ||
+                           (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                            errno != EINTR)) {
+                    hub_disconnect_client(&state, c);
+                    i--;
+                } else if (now_ms >= c->sniff_deadline_ms) {
+                    c->sniff_pending = false;   /* bot/peer protocol from here */
+                }
+            }
+        }
+
         for (int i = 0; i < state.client_count; i++) {
             hub_client_t *c = state.clients[i];
             
-            if (c->fd <= 0) continue;
+            if (c->fd <= 0 || c->sniff_pending) continue;
 
             if (FD_ISSET(c->fd, &read_fds)) {
                 int space = c->recv_cap - c->recv_len;  /* D2: per-client cap */
@@ -1570,6 +1722,9 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+
+        /* Events and log lines for the SSH consoles. */
+        hub_console_tick(&state);
     }
     
     /* Shutdown.  The locked pid file is what says "this hub is running" (to
@@ -1585,6 +1740,7 @@ int main(int argc, char *argv[]) {
     }
     while (state.client_count > 0)
         hub_disconnect_client(&state, state.clients[state.client_count - 1]);
+    hub_console_stop(&state);
     if (state.config_dirty) {
         hub_config_write(&state);
         state.config_dirty = false;

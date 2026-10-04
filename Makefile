@@ -26,23 +26,15 @@ BIN_DIR = bin
 OBJ_DIR = $(BUILD_DIR)/obj
 
 # Source files
-HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_update.c
-ADMIN_SOURCES = hub_admin.c hub_crypto.c
-DECRYPT_SOURCES = hub_decrypt.c
-ENCRYPT_SOURCES = hub_encrypt.c
+# One line: tools (the testnet) read this variable with a single-line match.
+HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_update.c hub_console.c hub_console_ui.c hub_console_core.c
 
 # Object files
 HUB_OBJECTS = $(HUB_SOURCES:%.c=$(OBJ_DIR)/%.o)
-ADMIN_OBJECTS = $(ADMIN_SOURCES:%.c=$(OBJ_DIR)/%.o)
-DECRYPT_OBJECTS = $(DECRYPT_SOURCES:%.c=$(OBJ_DIR)/%.o)
-ENCRYPT_OBJECTS = $(ENCRYPT_SOURCES:%.c=$(OBJ_DIR)/%.o)
 
 # Executables
 HUB_TARGET = $(BIN_DIR)/irchub
-ADMIN_TARGET = $(BIN_DIR)/hub_admin
 KEYGEN_TARGET = $(BIN_DIR)/keygen
-DECRYPT_TARGET = $(BIN_DIR)/hub_decrypt
-ENCRYPT_TARGET = $(BIN_DIR)/hub_encrypt
 
 # ============================================================================
 # Compiler Flags
@@ -76,6 +68,27 @@ INCLUDES = -I/usr/include -I/usr/local/include
 # HAVE_CURL exactly as ircbot guards its own updater: a hub built without it
 # still builds and runs, and reports the upgrade feature unavailable.
 LIBS = -lssl -lcrypto -lpthread -lcurl
+
+# libssh: the hub's built-in SSH admin console (hub_console.c).  Always built
+# in — it is the only way an admin reaches the hub.  The signed upstream
+# tarball is pinned in third_party/ (sha256 checked before every build) and
+# built as a minimal static library under $(BUILD_DIR)/libssh: server only, no
+# SFTP, GSSAPI, zlib, pcap, examples, exec or group-exchange.  Needs cmake.
+# Source: https://www.libssh.org/files/0.12/ (LGPL-2.1, see README).
+LIBSSH_VERSION = 0.12.2
+LIBSSH_SHA256  = 49560f677d96e3706a904ac2de1116e25f3680937d51e5c92198fcba4a1c1e9f
+LIBSSH_TARBALL = third_party/libssh-$(LIBSSH_VERSION).tar.xz
+LIBSSH_BUILD   = $(BUILD_DIR)/libssh
+LIBSSH_PREFIX  = $(LIBSSH_BUILD)/inst
+LIBSSH_LIB     = $(LIBSSH_PREFIX)/lib/libssh.a
+LIBSSH_CMAKE   = -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+                 -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_INSTALL_LIBDIR=lib \
+                 -DWITH_SERVER=ON -DWITH_SFTP=OFF -DWITH_GSSAPI=OFF -DWITH_ZLIB=OFF \
+                 -DWITH_PCAP=OFF -DWITH_EXAMPLES=OFF -DWITH_NACL=OFF -DWITH_GEX=OFF \
+                 -DWITH_EXEC=OFF -DWITH_DEBUG_CALLTRACE=OFF -DWITH_SYMBOL_VERSIONING=OFF \
+                 -DWITH_PKCS11_URI=OFF -DWITH_FIDO2=OFF -DUNIT_TESTING=OFF
+INCLUDES += -I$(LIBSSH_PREFIX)/include
+HUB_LIBS = $(LIBSSH_LIB) $(LIBS)
 
 # Linker flags
 LDFLAGS =
@@ -120,10 +133,10 @@ endif
 # ============================================================================
 
 .PHONY: all clean distclean install uninstall help test valgrind \
-        directories debug release production check-openssl keygen
+        directories debug release production check-openssl keygen libssh
 
 # Default target
-all: directories check-openssl $(HUB_TARGET) $(ADMIN_TARGET) $(KEYGEN_TARGET) $(DECRYPT_TARGET) $(ENCRYPT_TARGET)
+all: directories check-openssl $(HUB_TARGET) $(KEYGEN_TARGET)
 
 # Create necessary directories
 directories:
@@ -145,57 +158,51 @@ check-openssl:
 # Hub Server
 # ============================================================================
 
-$(HUB_TARGET): $(HUB_OBJECTS)
+$(HUB_TARGET): $(HUB_OBJECTS) $(LIBSSH_LIB)
 	@echo "Linking $@..."
-	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+	@$(CC) $(LDFLAGS) -o $@ $(HUB_OBJECTS) $(HUB_LIBS)
 	@echo "Built: $@ (mode: $(BUILD_MODE))"
 	@echo ""
 
-# ============================================================================
-# Admin Client
-# ============================================================================
+# The pinned static libssh (see LIBSSH_* above).  Built once per build tree
+# with the same compiler; `make clean` removes it with the rest of build/.
+$(LIBSSH_LIB): $(LIBSSH_TARBALL)
+	@echo "Building libssh $(LIBSSH_VERSION) (static, server only)..."
+	@command -v cmake >/dev/null 2>&1 || { echo "error: cmake is required to build libssh"; exit 1; }
+	@sum=$$( (sha256sum $(LIBSSH_TARBALL) 2>/dev/null || shasum -a 256 $(LIBSSH_TARBALL)) | cut -d' ' -f1); \
+		[ "$$sum" = "$(LIBSSH_SHA256)" ] || \
+		{ echo "error: $(LIBSSH_TARBALL) does not match the pinned sha256"; exit 1; }
+	@rm -rf $(LIBSSH_BUILD) && mkdir -p $(LIBSSH_BUILD)/obj
+	@tar -xoJf $(LIBSSH_TARBALL) -C $(LIBSSH_BUILD)
+	@cd $(LIBSSH_BUILD)/obj && CC="$(CC)" cmake ../libssh-$(LIBSSH_VERSION) \
+		$(LIBSSH_CMAKE) -DCMAKE_INSTALL_PREFIX=$(abspath $(LIBSSH_PREFIX)) \
+		> ../cmake.log 2>&1 || { cat ../cmake.log; exit 1; }
+	@$(MAKE) -C $(LIBSSH_BUILD)/obj -j4 install > $(LIBSSH_BUILD)/make.log 2>&1 || \
+		{ tail -40 $(LIBSSH_BUILD)/make.log; exit 1; }
+	@echo "Built: $@"
 
-$(ADMIN_TARGET): $(ADMIN_OBJECTS)
-	@echo "Linking $@..."
-	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
-	@echo "Built: $@ (mode: $(BUILD_MODE))"
-	@echo ""
+# Just the library (the testnet builds it into its own BUILD_DIR).
+libssh: $(LIBSSH_LIB)
 
 # ============================================================================
 # Key Generator Utility
 # ============================================================================
 
-# keygen.c is self-contained (OpenSSL only) and byte-identical to
-# ircbot/utils/keygen.c — it links nothing from the hub.
-$(KEYGEN_TARGET): $(OBJ_DIR)/keygen.o
+# keygen.c + bcrypt_pbkdf.c are self-contained (OpenSSL only) and
+# byte-identical to their ircbot/utils copies — they link nothing from the hub.
+$(KEYGEN_TARGET): $(OBJ_DIR)/keygen.o $(OBJ_DIR)/bcrypt_pbkdf.o
 	@echo "Linking $@..."
 	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 	@echo "Built: $@ (mode: $(BUILD_MODE))"
 	@echo ""
 
-$(OBJ_DIR)/keygen.o: keygen.c
+$(OBJ_DIR)/keygen.o: keygen.c bcrypt_pbkdf.h
 	@echo "Compiling $<..."
 	@$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-# ============================================================================
-# Config Decryption Utility
-# ============================================================================
-
-$(DECRYPT_TARGET): $(DECRYPT_OBJECTS)
-	@echo "Linking $@..."
-	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
-	@echo "Built: $@ (mode: $(BUILD_MODE))"
-	@echo ""
-
-# ============================================================================
-# Config Encryption Utility
-# ============================================================================
-
-$(ENCRYPT_TARGET): $(ENCRYPT_OBJECTS)
-	@echo "Linking $@..."
-	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
-	@echo "Built: $@ (mode: $(BUILD_MODE))"
-	@echo ""
+$(OBJ_DIR)/bcrypt_pbkdf.o: bcrypt_pbkdf.c bcrypt_pbkdf.h
+	@echo "Compiling $<..."
+	@$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ============================================================================
 # Object Files
@@ -205,7 +212,11 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c hub.h
 	@echo "Compiling $<..."
 	@$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OBJ_DIR)/hub_decrypt.o $(OBJ_DIR)/hub_encrypt.o: hub_tool.h
+# hub_console.c includes libssh's headers, which exist once the library is built.
+$(HUB_OBJECTS): | $(LIBSSH_LIB)
+
+$(OBJ_DIR)/hub_console.o $(OBJ_DIR)/hub_console_ui.o: hub_console.h hub_console_ui.h
+$(OBJ_DIR)/hub_console_core.o: hub_console.h
 
 # ============================================================================
 # Build Modes (shortcuts)
@@ -245,10 +256,7 @@ install: all
 	@install -d $(DATADIR)
 	@install -d $(LOGDIR)
 	@install -m 0755 $(HUB_TARGET) $(BINDIR)/irchub
-	@install -m 0755 $(ADMIN_TARGET) $(BINDIR)/hub_admin
 	@install -m 0755 $(KEYGEN_TARGET) $(BINDIR)/hub_keygen
-	@install -m 0755 $(DECRYPT_TARGET) $(BINDIR)/hub_decrypt
-	@install -m 0755 $(ENCRYPT_TARGET) $(BINDIR)/hub_encrypt
 	@echo "Installed to $(PREFIX)"
 	@echo ""
 	@echo "First-time setup:"
@@ -257,16 +265,15 @@ install: all
 	@echo "  3. Start (prompts for the config password): $(BINDIR)/irchub"
 	@echo ""
 	@echo "Utilities:"
-	@echo "  - Admin client: $(BINDIR)/hub_admin <ip> <port> <name>.private.b64"
-	@echo "  - Decrypt config: $(BINDIR)/hub_decrypt [config_file]"
-	@echo "  - Encrypt config: $(BINDIR)/hub_encrypt [input_file] [output_file]"
+	@echo "  - Admin console: hub_keygen <name> also writes <ts>_<name>_ed25519, then"
+	@echo "    ssh -i <ts>_<name>_ed25519 -o IdentitiesOnly=yes -p <hubport> <name>@<hub>"
 	@echo ""
 
 uninstall:
 	@echo "Uninstalling IRCHub..."
 	@rm -f $(BINDIR)/irchub
-	@rm -f $(BINDIR)/hub_admin
 	@rm -f $(BINDIR)/hub_keygen
+	@# hub_decrypt/hub_encrypt: no longer built; removed if an older install left them.
 	@rm -f $(BINDIR)/hub_decrypt
 	@rm -f $(BINDIR)/hub_encrypt
 	@echo "Uninstalled from $(PREFIX)"
@@ -358,22 +365,25 @@ help:
 	@echo "  make install PREFIX=/opt/irchub  # Install to /opt"
 	@echo ""
 	@echo "After building:"
-	@echo "  bin/keygen robert             # Keypair for admin 'robert' (on their machine)"
+	@echo "  bin/keygen robert             # IRC + SSH keypairs for admin 'robert' (on their machine)"
 	@echo "  bin/irchub -setup             # Initial setup (imports robert's .public.b64)"
 	@echo "  bin/irchub                    # Run hub (prompts for the config password)"
-	@echo "  bin/hub_admin 127.0.0.1 7000 <ts>_robert.private.b64  # Admin client"
+	@echo "  ssh -i <ts>_robert_ed25519 -p 7000 robert@127.0.0.1  # Admin console"
+	@echo "  bin/keygen --passwd <ts>_robert.private.b64  # Add/change the passphrase"
 	@echo ""
 
 # ============================================================================
 # Dependencies
 # ============================================================================
 
-# Auto-generate dependencies
+# Auto-generate dependencies (not for clean: generating them needs libssh's
+# headers, i.e. a libssh build)
+ifeq ($(filter clean distclean help libssh,$(MAKECMDGOALS)),)
 -include $(HUB_OBJECTS:.o=.d)
--include $(ADMIN_OBJECTS:.o=.d)
+endif
 
 # Pattern rule for dependency generation
-$(OBJ_DIR)/%.d: $(SRC_DIR)/%.c
+$(OBJ_DIR)/%.d: $(SRC_DIR)/%.c | $(LIBSSH_LIB)
 	@mkdir -p $(OBJ_DIR)
 	@$(CC) -MM $(CFLAGS) $(INCLUDES) $< | \
 		sed 's,\($*\)\.o[ :]*,$(OBJ_DIR)/\1.o $@ : ,g' > $@
