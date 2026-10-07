@@ -272,6 +272,7 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
         if (state->peers[p].fd == c->fd && c->fd != -1) {
             state->peers[p].connected = false;
             state->peers[p].fd = -1;
+            state->peers[p].link_down_at = time(NULL);
             state->mesh_state_dirty = true;
             /* Its uptime stops being a fact the moment the link drops; the
              * bots beneath it age out of the roster on the TTL. */
@@ -614,9 +615,8 @@ void hub_maintenance(hub_state_t *state) {
             if (hub_should_initiate_scheduled_purge(state)) {
                 hub_log_info("[HUB] Running scheduled purge (older than %d days)\n",
                         state->purge_days_setting);
-                char purge_log[MAX_BUFFER];
                 time_t cutoff = now - ((time_t)state->purge_days_setting * 86400);
-                int purged = hub_execute_purge(state, cutoff, purge_log, sizeof(purge_log));
+                int purged = hub_execute_purge(state, cutoff, NULL);
                 if (purged > 0)
                     hub_log_info("[HUB] Scheduled purge removed %d tombstones\n", purged);
                 hub_broadcast_purge(state, cutoff);
@@ -1527,6 +1527,8 @@ int main(int argc, char *argv[]) {
     }
     
     listen(state.listen_fd, 10);
+    inet_ntop(AF_INET, &addr.sin_addr, state.listen_ip, sizeof(state.listen_ip));
+    state.listen_port = state.port;
 
     /* The SSH admin console (docs/console.md) shares this port: its thread
      * starts before the first accept.  A hub whose console cannot start

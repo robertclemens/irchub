@@ -289,25 +289,14 @@ void hub_config_write(hub_state_t *state) {
     SAFE_WRITE("x|%s|%ld\n", state->ip_deny[i].pattern,
                (long)state->ip_deny[i].added);
 
-  // Write named admin/oper records (a| and o| lines) — skip duplicates by type+name
+  // Write named admin/oper records (a| and o| lines) — every record: a name
+  // added, deleted and added again has one record per incarnation (each its
+  // own uuid).  Writing only the first per name kept the oldest tombstone and
+  // lost the live user on the next start.
   // Format: <a|o>|uuid|name|<pubkey_b64>|add/del|last_seen|timestamp|
   // (pubkey empty when has_pubkey == false; trailing field reserved, empty).
-  char wr_seen_names[MAX_HUB_USER_RECORDS][64];
-  char wr_seen_types[MAX_HUB_USER_RECORDS];
-  int  wr_seen_count = 0;
   for (int i = 0; i < state->user_record_count; i++) {
     hub_user_record_t *u = &state->user_records[i];
-    bool dup = false;
-    for (int j = 0; j < wr_seen_count; j++) {
-      if (wr_seen_types[j] == u->type && strcasecmp(wr_seen_names[j], u->name) == 0) {
-        dup = true;
-        break;
-      }
-    }
-    if (dup) continue;
-    snprintf(wr_seen_names[wr_seen_count], sizeof(wr_seen_names[0]), "%s", u->name);
-    wr_seen_types[wr_seen_count] = u->type;
-    wr_seen_count++;
     char uline[USER_LINE_MAX];
     int ul = hub_format_user_record(u, false, uline, sizeof(uline));
     if (ul <= 0 || ul >= (int)sizeof(uline)) { overflow = true; break; }
@@ -975,7 +964,9 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       /* Check if a record with the same type+name already exists in dedup_users */
       int existing = -1;
       for (int j = 0; j < dedup_user_count; j++) {
-        if (dedup_users[j].type == u->type &&
+        /* only two live records are one user (see process_peer_sync); a
+         * tombstone is a past incarnation and keeps its own uuid */
+        if (u->is_active && dedup_users[j].is_active && dedup_users[j].type == u->type &&
             strcasecmp(dedup_users[j].name, u->name) == 0) {
           existing = j;
           break;

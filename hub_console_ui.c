@@ -6,7 +6,7 @@
  * input line), with the key parser, the command language and the sanitizer
  * that keeps text from bots, peers and logs from reaching the terminal as
  * escape sequences.  No libssh, no hub_state_t. */
-#include "hub_console_ui.h"
+#include "hub_console_fmt.h"
 #include <ctype.h>
 #include <stdarg.h>
 #include <strings.h>
@@ -188,6 +188,13 @@ static bool ci_contains(const char *hay, const char *needle) {
   return false;
 }
 
+static int str_width(const char *s);
+int console_str_width(const char *s) { return str_width(s); }
+int console_uprec(const char *s, size_t max) { return uprec(s, max); }
+size_t console_next_char(const char *s, size_t n, unsigned *cp, int *w) {
+  return next_char(s, n, cp, w);
+}
+
 static int str_width(const char *s) {
   int w = 0;
   size_t n = strlen(s);
@@ -227,9 +234,6 @@ static int wrap_rows(const char *s, int width) {
 /* ==========================================================================
  * Scrollback: a ring of sanitized lines, each with a colour class
  * ========================================================================== */
-enum {
-  L_NORMAL = 0, L_CMD, L_ERR, L_OK, L_INFO, L_WARN, L_DIM
-};
 
 typedef struct {
   char   *text;
@@ -387,17 +391,26 @@ enum { V_CONSOLE = 0, V_LOG, V_NET, V_UPG, V_STATS, V_COUNT };
 static const char *const VIEW_NAME[V_COUNT] = {"console", "log", "network",
                                                "upgrades", "stats"};
 
-typedef enum { CF_NONE = 0, CF_YN, CF_TYPE_ARG, CF_TYPE_HUB, CF_TYPE_VER } confirm_t;
+/* y/N, type an exact word, or type a number that becomes the payload */
+typedef enum { CF_NONE = 0, CF_YN, CF_TYPE, CF_PICK } confirm_t;
 
 /* What a request in flight was for: replies come back in order. */
-enum { RQ_USER = 0, RQ_VIEW_UPG, RQ_VIEW_STATS, RQ_TREE_SYNC };
+enum { RQ_USER = 0, RQ_PRE, RQ_VIEW_UPG, RQ_VIEW_STATS };
+
+/* A read made before a confirmation so the question can name the object
+ * (D2): what it reads, and what the question is built from. */
+enum pre {
+  PRE_NONE = 0, PRE_BOT_DEL, PRE_BOT_KICK, PRE_PEER_DEL, PRE_OPT, PRE_USER_DEL,
+  PRE_USER_KEY, PRE_UPG_START
+};
 
 typedef struct {
   int  kind;
-  int  seq;              /* RQ_USER: the command number */
+  int  seq;              /* the command number */
   char words[32];        /* "bot list" */
   char audit[320];       /* what the audit line says was asked */
   int  audit_level;
+  int  mode;             /* FMT_MODE_* */
 } pending_rq_t;
 
 #define MAX_PENDING_RQ 16
@@ -412,6 +425,27 @@ typedef struct {
   int  loglevel, consolelevel;
   bool have;
 } status_t;
+
+/* The command a pre-read is for, and what its question needs. */
+typedef struct {
+  int           pre;
+  uint8_t       op;
+  unsigned char payload[1024];
+  size_t        len;
+  char          arg[256];      /* the object: uuid, #, name, flags        */
+  char          extra[4][256]; /* upgrade start: hub=, nodes=, botbase=, hubbase= */
+  pending_rq_t  rq;
+} pend_cmd_t;
+
+/* One entry of the full-screen console view: a finished line, or a reply
+ * kept as it came so it can be laid out again at a new width (D5). */
+typedef struct {
+  char   *text;     /* a line, or NULL for a reply                         */
+  uint8_t kind;
+  char   *reply;    /* the reply's records                                 */
+  char    words[32];
+  int     mode;
+} centry_t;
 
 struct console_ui {
   bool line_mode, ascii;
@@ -438,6 +472,7 @@ struct console_ui {
 
   /* commands */
   int  seq;
+  int  ncmds;                   /* commands run, for the goodbye line */
   bool user_busy;               /* a user command is in flight */
   pending_rq_t rq[MAX_PENDING_RQ];
   int  rq_n;
@@ -446,26 +481,38 @@ struct console_ui {
   confirm_t confirming;
   int  confirm_seq;
   char confirm_want[128];
-  char confirm_q[256];
+  int  confirm_pick_max;
   uint8_t confirm_op;
   unsigned char confirm_payload[1024];
   size_t confirm_len;
   pending_rq_t confirm_rq;
+  pend_cmd_t pend;
   /* line mode: events held back while a command's output is pending */
   cbuf_t held;
   unsigned long dropped;
 
+  /* display settings (docs/console.md §2 display) */
+  bool raw;                     /* display format raw */
+  int  width_set;               /* line mode: 0 default, -1 auto, else n */
+  bool events_on;               /* line mode: human event lines */
+  bool greeted;
+  long long now_ms, start_ms;
+
   /* data from the core */
   status_t st;
   char *tree;                   /* rows, '\n'-separated */
-  char *upg_text, *stats_text;
+  char *upg_text, *stats_text;  /* view 4 / 5 replies */
   long long upg_at, stats_at;
+  char last_upg[256];
   bool log_on;                  /* line mode: "log on" */
   int  log_sub_level;
 
   /* full screen */
   int  view;
   sback_t sb[V_COUNT];          /* V_CONSOLE and V_LOG are used */
+  centry_t *ent;                /* V_CONSOLE entries, a ring */
+  long long ent_first, ent_next;
+  int  render_w;                /* width the console view was laid out at */
   long long anchor[V_COUNT];    /* bottom line shown; -1 = live */
   bool act[V_COUNT];
   bool pane_user_off;           /* F3 on a wide terminal */
@@ -493,12 +540,12 @@ struct console_ui {
 };
 
 /* ==========================================================================
- * Command table (docs/console.md §2)
+ * Command table (docs/console.md §2): <noun> <verb> [args] (D15)
  * ========================================================================== */
 enum bk {
-  B_NONE, B_ARG, B_OPTARG, B_PIPE, B_COLON, B_PEER_ADD, B_CHAN_ADD, B_OPT_SET,
-  B_LOGLEVEL, B_LOGSIZE, B_PURGE, B_UPG_RELEASES, B_UPG_START, B_FIXED,
-  B_LOCAL
+  B_NONE, B_ARG, B_PIPE, B_PEER_ADD, B_PEER_DEL, B_PEER_SET, B_CHAN_ADD, B_CHAN_SET,
+  B_CHAN_OP, B_OPT_SET, B_LOG_SET, B_PURGE, B_HUB_SET, B_ACL, B_USER_LIST,
+  B_USER_ADD, B_USER_SET, B_USER_MASK, B_UPG_RELEASES, B_UPG_START, B_FIXED, B_LOCAL
 };
 
 typedef struct {
@@ -507,77 +554,251 @@ typedef struct {
   enum bk     build;
   int         nargs, optargs;
   confirm_t   confirm;
+  int         pre;
   const char *fixed;
   const char *usage;
   const char *help;
+  const char *args;     /* help <group>: a second line for the arguments */
 } cmd_def_t;
 
 static const cmd_def_t CMDS[] = {
-  {"help", NULL, 0, B_LOCAL, 0, 1, CF_NONE, NULL, "help [command]", "list commands, or show one"},
-  {"quit", NULL, 0, B_LOCAL, 0, 0, CF_NONE, NULL, "quit", "close this console"},
-  {"bot", "list", CMD_ADMIN_LIST_FULL, B_NONE, 0, 0, CF_NONE, NULL, "bot list", "every bot the hub knows, with its fields"},
-  {"bot", "summary", CMD_ADMIN_LIST_SUMMARY, B_NONE, 0, 0, CF_NONE, NULL, "bot summary", "bots, one line each"},
-  {"bot", "pending", CMD_ADMIN_GET_PENDING, B_NONE, 0, 0, CF_NONE, NULL, "bot pending", "bots waiting for approval"},
-  {"bot", "approve", CMD_ADMIN_APPROVE, B_ARG, 1, 0, CF_NONE, NULL, "bot approve <index|uuid>", "approve a pending bot"},
-  {"bot", "authorize", CMD_ADMIN_ADD, B_ARG, 1, 0, CF_NONE, NULL, "bot authorize <uuid>", "authorize a bot uuid"},
-  {"bot", "add", CMD_ADMIN_CREATE_BOT, B_PIPE, 3, 0, CF_NONE, NULL, "bot add <nick> <uuid> <pubkey>", "register a bot by the identity its setup printed"},
-  {"bot", "del", CMD_ADMIN_DEL, B_ARG, 1, 0, CF_YN, NULL, "bot del <uuid>", "delete a bot (disconnects it)"},
-  {"bot", "kick", CMD_ADMIN_DISCONNECT_BOT, B_ARG, 1, 0, CF_YN, NULL, "bot kick <uuid>", "disconnect a bot"},
-  {"bot", "rekey", CMD_ADMIN_REKEY_BOT, B_ARG, 1, 0, CF_NONE, NULL, "bot rekey <uuid>", "how to rekey a bot"},
-  {"peer", "list", CMD_ADMIN_LIST_PEERS, B_NONE, 0, 0, CF_NONE, NULL, "peer list", "peer hubs and the mesh matrix"},
-  {"peer", "add", CMD_ADMIN_ADD_PEER, B_PEER_ADD, 5, 0, CF_NONE, NULL, "peer add <ip> <port> <uuid> <name|-> <pubkey>", "add a peer hub"},
-  {"peer", "del", CMD_ADMIN_DEL_PEER, B_OPTARG, 0, 1, CF_TYPE_ARG, NULL, "peer del [index]", "remove a peer hub (no index: list the configured peers)"},
-  {"peer", "setkey", CMD_ADMIN_SET_PEER_PUBKEY, B_COLON, 2, 0, CF_NONE, NULL, "peer setkey <uuid> <pubkey>", "set a peer's public key"},
-  {"peer", "sync", CMD_ADMIN_SYNC_MESH, B_NONE, 0, 0, CF_NONE, NULL, "peer sync", "send a full sync to every peer"},
-  {"hub", "pubkey", CMD_ADMIN_GET_PUBKEY, B_NONE, 0, 0, CF_NONE, NULL, "hub pubkey", "this hub's public key"},
-  {"hub", "setpub", CMD_ADMIN_SET_PUBKEY, B_ARG, 1, 0, CF_NONE, NULL, "hub setpub <pubkey>", "re-store the public key (must match the private key)"},
-  {"hub", "rekey", CMD_ADMIN_REGEN_KEYS, B_NONE, 0, 0, CF_TYPE_HUB, NULL, "hub rekey", "new hub keypair; every peer and bot must re-learn it"},
-  {"hub", "name", CMD_ADMIN_SET_HUB_NAME, B_ARG, 1, 0, CF_NONE, NULL, "hub name <name>", "set this hub's name"},
-  {"hub", "bindip", CMD_ADMIN_SET_BIND_IP, B_ARG, 1, 0, CF_NONE, NULL, "hub bindip <ip>", "set the bind address (restart)"},
-  {"hub", "port", CMD_ADMIN_SET_BIND_PORT, B_ARG, 1, 0, CF_NONE, NULL, "hub port <port>", "set the listening port (restart)"},
-  {"hub", "logsize", CMD_ADMIN_SET_LOG_SIZE, B_LOGSIZE, 1, 0, CF_NONE, NULL, "hub logsize <MB|nk|nb>", "log file size limit (MB, or k/b suffix), at most 1024 MB"},
-  {"hub", "purge", CMD_ADMIN_PURGE_TOMBSTONES, B_PURGE, 1, 0, CF_YN, NULL, "hub purge <now|days>", "purge tombstones now, or older than <days>"},
-  {"hub", "autopurge", CMD_ADMIN_SET_PURGE_DAYS, B_ARG, 1, 0, CF_NONE, NULL, "hub autopurge <days>", "daily purge of tombstones older than <days> (0 = off)"},
-  {"loglevel", NULL, CMD_ADMIN_SET_LOG_LEVEL, B_LOGLEVEL, 1, 1, CF_YN, NULL, "loglevel [file|console] <none|error|warning|info|debug>", "set the log file's (default) or the console log's level"},
-  {"stats", NULL, CMD_ADMIN_STATS, B_NONE, 0, 0, CF_NONE, NULL, "stats", "traffic counters since the hub started"},
-  {"allow", "list", CMD_ADMIN_LIST_ALLOWLIST, B_NONE, 0, 0, CF_NONE, NULL, "allow list", "the IP allowlist"},
-  {"allow", "add", CMD_ADMIN_ADD_ALLOWLIST, B_ARG, 1, 0, CF_NONE, NULL, "allow add <ip[/n]>", "add to the allowlist"},
-  {"allow", "del", CMD_ADMIN_DEL_ALLOWLIST, B_ARG, 1, 0, CF_YN, NULL, "allow del <ip[/n]>", "remove from the allowlist"},
-  {"deny", "list", CMD_ADMIN_LIST_DENYLIST, B_NONE, 0, 0, CF_NONE, NULL, "deny list", "the IP denylist"},
-  {"deny", "add", CMD_ADMIN_ADD_DENYLIST, B_ARG, 1, 0, CF_NONE, NULL, "deny add <ip[/n]>", "add to the denylist"},
-  {"deny", "del", CMD_ADMIN_DEL_DENYLIST, B_ARG, 1, 0, CF_YN, NULL, "deny del <ip[/n]>", "remove from the denylist"},
-  {"opt", "set", CMD_ADMIN_SET_OPT_FLAGS, B_OPT_SET, 1, 0, CF_YN, NULL, "opt set <flags|->", "set the network opt flags (- clears)"},
-  {"opt", NULL, CMD_ADMIN_GET_OPT_FLAGS, B_NONE, 0, 0, CF_NONE, NULL, "opt", "the network opt flags"},
-  {"admin", "list", CMD_ADMIN_LIST_ADMINS, B_NONE, 0, 0, CF_NONE, NULL, "admin list", "admin records"},
-  {"admin", "add", CMD_ADMIN_ADD_ADMIN, B_PIPE, 3, 0, CF_NONE, NULL, "admin add <name> <pubkey> <mask>", "add an admin"},
-  {"admin", "del", CMD_ADMIN_DEL_ADMIN, B_ARG, 1, 0, CF_TYPE_ARG, NULL, "admin del <name>", "remove an admin and their masks"},
-  {"oper", "list", CMD_ADMIN_LIST_OPERS_V2, B_NONE, 0, 0, CF_NONE, NULL, "oper list", "oper records"},
-  {"oper", "add", CMD_ADMIN_ADD_OPER_RECORD, B_PIPE, 3, 0, CF_NONE, NULL, "oper add <name> <pubkey> <mask>", "add an oper"},
-  {"oper", "del", CMD_ADMIN_DEL_OPER_RECORD, B_ARG, 1, 0, CF_YN, NULL, "oper del <name>", "remove an oper and their masks"},
-  {"mask", "add", CMD_ADMIN_ADD_USERMASK, B_PIPE, 2, 0, CF_NONE, NULL, "mask add <name> <mask>", "add a usermask to an admin or oper"},
-  {"mask", "del", CMD_ADMIN_DEL_USERMASK, B_PIPE, 2, 0, CF_YN, NULL, "mask del <name> <mask>", "remove a usermask"},
-  {"userkey", NULL, CMD_ADMIN_SET_USERKEY, B_PIPE, 2, 0, CF_YN, NULL, "userkey <name> <pubkey>", "replace an admin's or oper's key"},
-  {"match", NULL, CMD_ADMIN_MATCH, B_ARG, 1, 0, CF_NONE, NULL, "match <name|*>", "a user's records, or everyone's"},
-  {"chan", "list", CMD_ADMIN_LIST_CHANNELS, B_NONE, 0, 0, CF_NONE, NULL, "chan list", "managed channels"},
-  {"chan", "add", CMD_ADMIN_ADD_CHANNEL, B_CHAN_ADD, 1, 1, CF_NONE, NULL, "chan add <#chan> [key]", "add a channel"},
-  {"chan", "del", CMD_ADMIN_DEL_CHANNEL, B_ARG, 1, 0, CF_YN, NULL, "chan del <#chan>", "remove a channel from every bot"},
-  {"op", NULL, CMD_ADMIN_OP_USER, B_PIPE, 2, 0, CF_NONE, NULL, "op <nick> <#chan>", "have the bots op a user"},
-  {"upgrade", "status", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_NONE, "", "upgrade status", "the upgrade run on this hub"},
-  {"upgrade", "releases", CMD_ADMIN_UPGRADE_STATUS, B_UPG_RELEASES, 0, 2, CF_NONE, NULL, "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes"},
-  {"upgrade", "start", CMD_ADMIN_UPGRADE_NET, B_UPG_START, 1, 4, CF_TYPE_VER, NULL, "upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade"},
-  {"upgrade", "abort", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_YN, "abort", "upgrade abort", "stop the run and roll back"},
-  {"upgrade", "forget", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_YN, "forget", "upgrade forget", "drop the roll-up plan on every hub"},
-  {"tree", NULL, CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, "get|tree", "tree", "the network tree rows"},
-  {"status", NULL, CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, "get|status", "status", "the status fields"},
-  {"log", "on", 0, B_LOCAL, 0, 1, CF_NONE, NULL, "log on [level]", "line mode: show hub log lines"},
-  {"log", "off", 0, B_LOCAL, 0, 0, CF_NONE, NULL, "log off", "line mode: stop log lines"},
-  {"view", NULL, 0, B_LOCAL, 1, 0, CF_NONE, NULL, "view <1-5>", "console, log, network, upgrades, stats"},
-  {"pane", NULL, 0, B_LOCAL, 0, 0, CF_NONE, NULL, "pane", "show or hide the tree pane (F3)"},
-  {"ascii", NULL, 0, B_LOCAL, 0, 0, CF_NONE, NULL, "ascii", "plain ASCII lines for this session"},
-  {"filter", NULL, 0, B_LOCAL, 1, 64, CF_NONE, NULL, "filter <text|clear>", "log view: only lines containing <text>"},
-  {"clear", NULL, 0, B_LOCAL, 0, 0, CF_NONE, NULL, "clear", "clear the current view"},
+  {"help", NULL, 0, B_LOCAL, 0, 2, CF_NONE, 0, NULL, "help [group [command]]", "the command groups, one group's commands, or one command in full (? does the same)", NULL},
+  {"quit", NULL, 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "quit", "close this console", NULL},
+  {"bot", "list", CMD_ADMIN_LIST_FULL, B_NONE, 0, 0, CF_NONE, 0, NULL, "bot list", "every registered bot: state, hub, version, last seen", NULL},
+  {"bot", "show", CMD_ADMIN_LIST_FULL, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot show <uuid|nick>", "one bot in detail", NULL},
+  {"bot", "summary", CMD_ADMIN_LIST_SUMMARY, B_NONE, 0, 0, CF_NONE, 0, NULL, "bot summary", "every bot's nick and uuid", NULL},
+  {"bot", "pending", CMD_ADMIN_GET_PENDING, B_NONE, 0, 0, CF_NONE, 0, NULL, "bot pending", "bots that tried to connect but are not authorized", NULL},
+  {"bot", "approve", CMD_ADMIN_APPROVE, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot approve <#|uuid>", "approve a pending bot; # is the number from bot pending", NULL},
+  {"bot", "authorize", CMD_ADMIN_ADD, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot authorize <uuid>", "authorize a uuid before the bot first connects", NULL},
+  {"bot", "add", CMD_ADMIN_CREATE_BOT, B_PIPE, 3, 0, CF_NONE, 0, NULL, "bot add <nick> <uuid> <key>", "register a bot from the identity its -setup printed", "key: the 88-char base64 public key"},
+  {"bot", "del", CMD_ADMIN_DEL, B_ARG, 1, 0, CF_YN, PRE_BOT_DEL, NULL, "bot del <uuid>", "delete a bot everywhere (asks y/N; disconnects it)", NULL},
+  {"bot", "kick", CMD_ADMIN_DISCONNECT_BOT, B_ARG, 1, 0, CF_YN, PRE_BOT_KICK, NULL, "bot kick <uuid>", "drop its connection to this hub (asks y/N; it reconnects)", NULL},
+  {"bot", "rekey", CMD_ADMIN_REKEY_BOT, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot rekey <uuid>", "how to rekey a bot (only the bot can)", NULL},
+  {"peer", "list", CMD_ADMIN_LIST_PEERS, B_NONE, 0, 0, CF_NONE, 0, NULL, "peer list", "peer hubs, the mesh links and their health", NULL},
+  {"peer", "show", CMD_ADMIN_LIST_PEERS, B_ARG, 1, 0, CF_NONE, 0, NULL, "peer show <#|uuid|name>", "one peer hub in detail", NULL},
+  {"peer", "add", CMD_ADMIN_ADD_PEER, B_PEER_ADD, 5, 0, CF_NONE, 0, NULL, "peer add <ip> <port> <uuid> <name|-> <key>", "add a peer hub", "key: the 88-char key from that hub's hub show"},
+  {"peer", "del", CMD_ADMIN_DEL_PEER, B_PEER_DEL, 0, 1, CF_TYPE, PRE_PEER_DEL, NULL, "peer del [#]", "remove a peer hub (types its number to confirm)", NULL},
+  {"peer", "set", CMD_ADMIN_SET_PEER_PUBKEY, B_PEER_SET, 3, 0, CF_NONE, 0, NULL, "peer set <#|uuid|name> key <key>", "replace a peer's key (the link comes back with it)", NULL},
+  {"peer", "sync", CMD_ADMIN_SYNC_MESH, B_NONE, 0, 0, CF_NONE, 0, NULL, "peer sync", "send a full sync to every peer", NULL},
+  {"network", "tree", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|tree", "network tree", "every hub and bot as a tree", NULL},
+  {"network", "status", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|status", "network status", "the mesh-wide status (what the status bar shows)", NULL},
+  {"hub", "show", CMD_ADMIN_GET_PUBKEY, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub show", "this hub: identity, key, listener, counts", NULL},
+  {"hub", "set", 0, B_HUB_SET, 0, 2, CF_NONE, 0, NULL, "hub set <setting> <value>", "name, bindip, port, pubkey or autopurge (alone: the table)", NULL},
+  {"hub", "stats", CMD_ADMIN_STATS, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub stats", "traffic counters since the hub started", NULL},
+  {"hub", "rekey", CMD_ADMIN_REGEN_KEYS, B_NONE, 0, 0, CF_TYPE, 0, NULL, "hub rekey", "new hub keypair; every peer and bot must re-learn it", NULL},
+  {"hub", "purge", CMD_ADMIN_PURGE_TOMBSTONES, B_PURGE, 1, 0, CF_YN, 0, NULL, "hub purge <now|days>", "purge tombstones now, or those older than <days>", NULL},
+  {"log", "show", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|log", "log show", "log levels, sizes and this session's log", NULL},
+  {"log", "set", 0, B_LOG_SET, 2, 0, CF_NONE, 0, NULL, "log set file|console|size <value>", "the file or console ring level, or the file size limit", "level: none error warning info debug or 0-4 · size: <MB>, <n>k or <n>b, at most 1024 MB"},
+  {"log", "on", 0, B_LOCAL, 0, 1, CF_NONE, 0, NULL, "log on [level]", "line mode: stream hub log lines", NULL},
+  {"log", "off", 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "log off", "line mode: stop the log lines", NULL},
+  {"log", "filter", 0, B_LOCAL, 1, 64, CF_NONE, 0, NULL, "log filter <text|clear>", "full screen: log view lines containing <text>", NULL},
+  {"acl", "list", CMD_ADMIN_LIST_ALLOWLIST, B_NONE, 0, 0, CF_NONE, 0, NULL, "acl list", "the allow and deny lists", NULL},
+  {"acl", "add", 0, B_ACL, 2, 0, CF_NONE, 0, NULL, "acl add allow|deny <ip[/n]>", "add an address or network", NULL},
+  {"acl", "del", 0, B_ACL, 2, 0, CF_YN, 0, NULL, "acl del allow|deny <ip[/n]>", "remove an address or network (asks y/N)", NULL},
+  {"option", "list", CMD_ADMIN_GET_OPT_FLAGS, B_NONE, 0, 0, CF_NONE, 0, NULL, "option list", "the network option flags", NULL},
+  {"option", "set", CMD_ADMIN_SET_OPT_FLAGS, B_OPT_SET, 1, 0, CF_YN, PRE_OPT, NULL, "option set <flags|->", "set the network option flags (- clears)", NULL},
+  {"user", "list", 0, B_USER_LIST, 0, 1, CF_NONE, 0, NULL, "user list [admin|oper]", "every user (or one role): key, last seen, masks", NULL},
+  {"user", "show", CMD_ADMIN_MATCH, B_ARG, 1, 0, CF_NONE, 0, NULL, "user show <name|*>", "one user (or all) with masks and their last use", NULL},
+  {"user", "add", 0, B_USER_ADD, 4, 0, CF_NONE, 0, NULL, "user add admin|oper <name> <key> <mask>", "add an admin or an oper", "key: their 88-char public key · mask: nick!user@host"},
+  {"user", "del", CMD_ADMIN_DEL_ADMIN, B_ARG, 1, 0, CF_YN, PRE_USER_DEL, NULL, "user del <name>", "remove a user and their masks", NULL},
+  {"user", "set", CMD_ADMIN_SET_USERKEY, B_USER_SET, 3, 0, CF_YN, PRE_USER_KEY, NULL, "user set <name> key <key>", "replace a user's key (asks y/N)", NULL},
+  {"user", "mask", 0, B_USER_MASK, 3, 0, CF_NONE, 0, NULL, "user mask add|del <name> <mask>", "add or remove a usermask (del asks y/N)", NULL},
+  {"channel", "list", CMD_ADMIN_LIST_CHANNELS, B_NONE, 0, 0, CF_NONE, 0, NULL, "channel list", "every managed channel with its settings", NULL},
+  {"channel", "show", CMD_ADMIN_LIST_CHANNELS, B_ARG, 1, 0, CF_NONE, 0, NULL, "channel show <#chan>", "one channel in detail", NULL},
+  {"channel", "add", CMD_ADMIN_ADD_CHANNEL, B_CHAN_ADD, 1, 1, CF_NONE, 0, NULL, "channel add <#chan> [key]", "add (or re-add) a channel", NULL},
+  {"channel", "del", CMD_ADMIN_DEL_CHANNEL, B_ARG, 1, 0, CF_YN, 0, NULL, "channel del <#chan>", "remove it from every bot (asks y/N)", NULL},
+  {"channel", "set", CMD_ADMIN_ADD_CHANNEL, B_CHAN_SET, 3, 0, CF_NONE, 0, NULL, "channel set <#chan> <setting> <value|->", "change one setting (key today; - clears)", NULL},
+  {"channel", "op", CMD_ADMIN_OP_USER, B_CHAN_OP, 2, 0, CF_NONE, 0, NULL, "channel op <#chan> <nick>", "have the bots op a user", NULL},
+  {"upgrade", "status", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_NONE, 0, "", "upgrade status", "the upgrade run on this hub", NULL},
+  {"upgrade", "releases", CMD_ADMIN_UPGRADE_STATUS, B_UPG_RELEASES, 0, 2, CF_NONE, 0, NULL, "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes", NULL},
+  {"upgrade", "start", CMD_ADMIN_UPGRADE_NET, B_UPG_START, 1, 4, CF_TYPE, PRE_UPG_START, NULL, "upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade", NULL},
+  {"upgrade", "abort", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_YN, 0, "abort", "upgrade abort", "stop the run and roll back", NULL},
+  {"upgrade", "forget", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_YN, 0, "forget", "upgrade forget", "drop the roll-up plan on every hub", NULL},
+  {"display", "show", 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "display show", "this session's display settings", NULL},
+  {"display", "view", 0, B_LOCAL, 1, 0, CF_NONE, 0, NULL, "display view <1-5>", "full screen: console, log, network, upgrades, stats", NULL},
+  {"display", "pane", 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "display pane", "full screen: show or hide the tree pane (F3)", NULL},
+  {"display", "ascii", 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "display ascii", "plain ASCII glyphs for this session (again: Unicode)", NULL},
+  {"display", "format", 0, B_LOCAL, 1, 0, CF_NONE, 0, NULL, "display format pretty|raw", "laid-out output, or the records as the hub sends them", NULL},
+  {"display", "width", 0, B_LOCAL, 1, 0, CF_NONE, 0, NULL, "display width <60-250|auto>", "line mode: the output width", NULL},
+  {"display", "events", 0, B_LOCAL, 1, 0, CF_NONE, 0, NULL, "display events on|off", "line mode: a line for each peer, bot and upgrade change", NULL},
+  {"display", "clear", 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "display clear", "full screen: clear the current view", NULL},
 };
 #define NCMDS ((int)(sizeof(CMDS) / sizeof(CMDS[0])))
+
+/* The root nouns, in help order, with what each groups. */
+static const struct {
+  const char *name, *what;
+} GROUPS[] = {
+  {"bot", "registered bots"},      {"peer", "peer hubs"},
+  {"network", "the whole mesh"},   {"hub", "this hub"},
+  {"log", "the hub log"},          {"acl", "IP allow / deny lists"},
+  {"option", "network option flags"}, {"user", "admins and opers"},
+  {"channel", "managed channels"}, {"upgrade", "rolling upgrades"},
+  {"display", "this session's screen"},
+};
+#define NGROUPS ((int)(sizeof(GROUPS) / sizeof(GROUPS[0])))
+
+/* help <group> <command> (§2.2): each argument, then examples that run as
+ * typed.  args: "name\ttext" lines; examples: one per line. */
+#define EX_UUID "00010203-0405-4607-8809-0a0b0c0d0e0f"
+#define EX_KEY  "O7Eu2jwpjbXeJVl/VNkk8uF+eKJq2JU+2CGO5oLwu76QIeLzAJ0VLJEb8fJexoOpAnFBZnZ6+9jlvQ+wEk7Lig=="
+static const struct {
+  const char *cmd, *sub, *args, *examples;
+} CMD_HELP[] = {
+  {"help", NULL,
+   "group\tone of: bot peer network hub log acl option user channel upgrade display\n"
+   "command\tone of that group's commands: its arguments and an example\n"
+   "?\ttyped in place of help it does the same",
+   "help\nhelp bot\nhelp bot add\n? upgrade start"},
+  {"quit", NULL, NULL, "quit"},
+  {"bot", "list", NULL, "bot list"},
+  {"bot", "show", "uuid|nick\tthe bot's uuid or its current nick (Tab completes both)",
+   "bot show alpha\nbot show " EX_UUID},
+  {"bot", "summary", NULL, "bot summary"},
+  {"bot", "pending", NULL, "bot pending"},
+  {"bot", "approve",
+   "#|uuid\tthe number bot pending shows in its # column, or the pending bot's uuid",
+   "bot approve 1\nbot approve " EX_UUID},
+  {"bot", "authorize", "uuid\tthe uuid of a bot that has not connected yet",
+   "bot authorize " EX_UUID},
+  {"bot", "add",
+   "nick\tthe bot's IRC nick\n"
+   "uuid\tthe uuid the bot's -setup printed\n"
+   "key\tthe 88-character base64 public key the bot's -setup printed",
+   "bot add alpha " EX_UUID " " EX_KEY},
+  {"bot", "del", "uuid\tthe bot's uuid (Tab completes); asks y/N, then disconnects it",
+   "bot del " EX_UUID},
+  {"bot", "kick", "uuid\ta connected bot's uuid (Tab completes); asks y/N; it reconnects",
+   "bot kick " EX_UUID},
+  {"bot", "rekey", "uuid\tthe bot's uuid; prints how to rekey it on its host",
+   "bot rekey " EX_UUID},
+  {"peer", "list", NULL, "peer list"},
+  {"peer", "show", "#|uuid|name\tthe number peer list shows, the hub's uuid, or its name",
+   "peer show 1\npeer show east"},
+  {"peer", "add",
+   "ip\tthe peer hub's address (no ':', so an IPv4 address or a host name)\n"
+   "port\tits listening port, 1-65535\n"
+   "uuid\tits uuid, from hub show on that hub\n"
+   "name|-\ta name for it, or - to learn its name from the peer\n"
+   "key\tthe 88-character public key from hub show on that hub",
+   "peer add 203.0.113.7 6697 " EX_UUID " east " EX_KEY "\n"
+   "peer add 203.0.113.7 6697 " EX_UUID " - " EX_KEY},
+  {"peer", "del", "#\tthe number peer list shows; alone it lists the peers to pick from; "
+   "you type the number again to confirm",
+   "peer del\npeer del 2"},
+  {"peer", "set",
+   "#|uuid|name\tthe peer: its number in peer list, its uuid, or its name\n"
+   "key\tthe setting; key is the only one\n"
+   "key\tthe new 88-character public key from hub show on that hub",
+   "peer set east key " EX_KEY},
+  {"peer", "sync", NULL, "peer sync"},
+  {"network", "tree", NULL, "network tree"},
+  {"network", "status", NULL, "network status"},
+  {"hub", "show", NULL, "hub show"},
+  {"hub", "set",
+   "setting\tname, bindip, port, pubkey or autopurge; alone it shows them all\n"
+   "value\tname: this hub's name · bindip: the address it listens on · port: 1-65535 · "
+   "pubkey: the key its private key derives (a new key is hub rekey) · "
+   "autopurge: days to keep tombstones, 0 = off",
+   "hub set\nhub set name west\nhub set port 6697\nhub set autopurge 30"},
+  {"hub", "stats", NULL, "hub stats"},
+  {"hub", "rekey", "(confirm)\tyou type this hub's name to go ahead; every peer and bot "
+   "must then learn the new key",
+   "hub rekey"},
+  {"hub", "purge", "now|days\tnow purges every tombstone; a number purges those older "
+   "than that many days (asks y/N)",
+   "hub purge now\nhub purge 30"},
+  {"log", "show", NULL, "log show"},
+  {"log", "set",
+   "file|console|size\twhich: the log file's level, the console ring's level, or the file "
+   "size limit\n"
+   "value\ta level (none error warning info debug, or 0-4) for file and console; for size "
+   "<MB>, <n>k or <n>b, at most 1024 MB",
+   "log set file info\nlog set console debug\nlog set size 50\nlog set size 512k"},
+  {"log", "on", "level\tnone error warning info debug, or 0-4 (default info)",
+   "log on\nlog on debug"},
+  {"log", "off", NULL, "log off"},
+  {"log", "filter", "text|clear\tthe rest of the line is the text a log view line must "
+   "contain (any case); clear drops the filter",
+   "log filter UPGRADE\nlog filter peer east\nlog filter clear"},
+  {"acl", "list", NULL, "acl list"},
+  {"acl", "add",
+   "allow|deny\twhich list\n"
+   "ip[/n]\tan IPv4 or IPv6 address, or a network as address/prefix",
+   "acl add allow 203.0.113.0/24\nacl add deny 198.51.100.9"},
+  {"acl", "del",
+   "allow|deny\twhich list\n"
+   "ip[/n]\tthe entry exactly as acl list shows it (asks y/N)",
+   "acl del deny 198.51.100.9"},
+  {"option", "list", NULL, "option list"},
+  {"option", "set", "flags|-\tthe whole new set of flag letters (it replaces the old "
+   "set; option list explains each); - clears them all (asks y/N)",
+   "option set h\noption set -"},
+  {"user", "list", "admin|oper\tonly that role (default both)",
+   "user list\nuser list oper"},
+  {"user", "show", "name|*\ta user's name, or * for every user", "user show robert\nuser show *"},
+  {"user", "add",
+   "admin|oper\tthe role\n"
+   "name\tthe user's name\n"
+   "key\ttheir 88-character public key (keygen's <stamp>_<name>.public.b64)\n"
+   "mask\ta first usermask, nick!user@host (* and ? match)",
+   "user add oper alice " EX_KEY " alice!*@*.example.net"},
+  {"user", "del", "name\tthe user, either role; their masks go too (an admin: type the "
+   "name to confirm; an oper: y/N)", "user del alice"},
+  {"user", "set",
+   "name\tthe user\n"
+   "key\tthe setting; key is the only one\n"
+   "key\ttheir new 88-character public key (asks y/N)",
+   "user set alice key " EX_KEY},
+  {"user", "mask",
+   "add|del\tadd a mask, or remove one (del asks y/N)\n"
+   "name\tthe user\n"
+   "mask\tnick!user@host (* and ? match)",
+   "user mask add alice alice!*@203.0.113.*\nuser mask del alice alice!*@*.example.net"},
+  {"channel", "list", NULL, "channel list"},
+  {"channel", "show", "#chan\tthe channel's name", "channel show #ops"},
+  {"channel", "add", "#chan\tthe channel's name\nkey\tits channel key, if it has one",
+   "channel add #ops\nchannel add #ops s3cret"},
+  {"channel", "del", "#chan\tthe channel; every bot parts it (asks y/N)", "channel del #ops"},
+  {"channel", "set",
+   "#chan\tthe channel\n"
+   "setting\tthe setting's name; key today\n"
+   "value|-\tthe new value (at most 128 bytes), or - to clear it",
+   "channel set #ops key s3cret\nchannel set #ops key -"},
+  {"channel", "op", "#chan\tthe channel\nnick\tthe user's current nick on IRC",
+   "channel op #ops alice"},
+  {"upgrade", "status", NULL, "upgrade status"},
+  {"upgrade", "releases",
+   "bot=<base>\ta different release site for the bot builds (a URL)\n"
+   "hub=<base>\ta different release site for the hub builds (a URL)",
+   "upgrade releases\nupgrade releases bot=https://example.net/ircbot"},
+  {"upgrade", "start",
+   "botver\tthe bot version to move to, as upgrade releases lists it\n"
+   "hub=<ver>\talso move the hubs to this version (- = leave them)\n"
+   "nodes=<sel>\tonly these nodes: names or uuids, comma-separated; name=c or name=rs "
+   "also switches that node's build (default: the whole network)\n"
+   "botbase=<url>\ta different release site for the bot builds\n"
+   "hubbase=<url>\ta different release site for the hub builds\n"
+   "(confirm)\tit shows the plan, then you type the bot version to start",
+   "upgrade start 2.4.6\nupgrade start 2.4.6 hub=2.4.4\nupgrade start 2.4.6 nodes=alpha,beta=rs"},
+  {"upgrade", "abort", NULL, "upgrade abort"},
+  {"upgrade", "forget", NULL, "upgrade forget"},
+  {"display", "show", NULL, "display show"},
+  {"display", "view", "1-5\t1 console, 2 log, 3 network, 4 upgrades, 5 stats (Alt+1..5)",
+   "display view 2"},
+  {"display", "pane", NULL, "display pane"},
+  {"display", "ascii", NULL, "display ascii"},
+  {"display", "format", "pretty|raw\tpretty lays replies out; raw shows the records as the "
+   "hub sent them",
+   "display format raw\ndisplay format pretty"},
+  {"display", "width", "60-250|auto\tthe columns to lay output out for; auto follows the "
+   "terminal",
+   "display width 100\ndisplay width auto"},
+  {"display", "events", "on|off\ta line for each peer, bot and upgrade change",
+   "display events on"},
+  {"display", "clear", NULL, "display clear"},
+};
+#define NCMDHELP ((int)(sizeof(CMD_HELP) / sizeof(CMD_HELP[0])))
 
 static const char *const LEVEL_WORD[] = {"none", "error", "warning", "info", "debug"};
 
@@ -623,7 +844,9 @@ static void subscribe(console_ui_t *ui) {
 
 /* Line mode: one line of output (already sanitized), ending in CRLF. */
 static void lm_line(console_ui_t *ui, const char *s) {
-  cbuf_adds(&ui->term, s);
+  char *a = ui->ascii ? fmt_ascii(s) : NULL;
+  cbuf_adds(&ui->term, a ? a : s);
+  free(a);
   cbuf_add(&ui->term, "\r\n", 2);
 }
 
@@ -645,6 +868,8 @@ static void lm_async(console_ui_t *ui, const char *text) {
   bool hold = ui->user_busy || ui->confirming;
   cbuf_t *b = hold ? &ui->held : &ui->term;
   if (!hold) cbuf_add(b, "\r", 1);
+  char *a = ui->ascii ? fmt_ascii(text) : NULL;
+  if (a) text = a;
   for (const char *p = text; *p;) {           /* one CRLF line per '\n' */
     const char *nl = strchr(p, '\n');
     size_t n = nl ? (size_t)(nl - p) : strlen(p);
@@ -652,78 +877,166 @@ static void lm_async(console_ui_t *ui, const char *text) {
     cbuf_add(b, "\r\n", 2);
     p = nl ? nl + 1 : p + n;
   }
+  free(a);
   if (!hold) lm_prompt(ui);
+}
+
+/* The width output is laid out for (§1.4). */
+static int main_width(const console_ui_t *ui);
+static int out_width(const console_ui_t *ui) {
+  if (!ui->line_mode) return main_width(ui);
+  if (ui->width_set > 0) return ui->width_set;
+  if (ui->width_set < 0) {
+    int w = ui->cols;
+    return w < CONSOLE_MIN_COLS ? CONSOLE_MIN_COLS : w > CONSOLE_WIDTH_MAX ? CONSOLE_WIDTH_MAX : w;
+  }
+  return CONSOLE_LINE_WIDTH;
+}
+
+static long long now_s(void) { return (long long)time(NULL); }
+
+/* "HH:MM:SSZ" now (UTC, D3) */
+static void clock_utc(char *out, size_t cap, bool secs) {
+  long long t = now_s();
+  long long s = ((t % 86400) + 86400) % 86400;
+  if (secs) usnprintf(out, cap, "%02lld:%02lld:%02lldZ", s / 3600, s / 60 % 60, s % 60);
+  else usnprintf(out, cap, "%02lld:%02lldZ", s / 3600, s / 60 % 60);
+}
+
+static void session_log_phrase(const console_ui_t *ui, char *out, size_t cap);
+
+static void ctx_init(const console_ui_t *ui, fmt_ctx_t *c, int mode, char *slog, size_t slog_cap) {
+  memset(c, 0, sizeof(*c));
+  c->width = out_width(ui);
+  /* full screen keeps its lines in Unicode and shows them through
+   * fmt_ascii, so display ascii can change every line both ways */
+  c->ascii = ui->ascii && ui->line_mode;
+  c->now = now_s();
+  c->admin = ui->admin;
+  c->ip = ui->ip;
+  c->hubname = ui->hubname;
+  c->mode = mode;
+  session_log_phrase(ui, slog, slog_cap);
+  c->session_log = slog;
 }
 
 /* Full screen: add a line to a view's scrollback. */
 static void fs_add(console_ui_t *ui, int view, const char *text, int kind, int level) {
-  sb_add(&ui->sb[view], text, kind, level);
+  /* the console view is rebuilt on a glyph change (relayout), so it holds
+   * the shown form; other views are filtered as drawn (rb_text) */
+  char *a = ui->ascii && view == V_CONSOLE ? fmt_ascii(text) : NULL;
+  sb_add(&ui->sb[view], a ? a : text, kind, level);
+  free(a);
   if (view != ui->view && (view != V_LOG || level <= LOG_WARNING)) ui->act[view] = true;
   ui->dirty = true;
 }
 
-static void fs_timestamped(console_ui_t *ui, int view, const char *text, int kind) {
-  char buf[CONSOLE_INPUT_MAX + 32];
-  time_t now = time(NULL);
-  struct tm tmv;
-  localtime_r(&now, &tmv);
-  usnprintf(buf, sizeof(buf), "%02d:%02d:%02d %s", tmv.tm_hour, tmv.tm_min,
-           tmv.tm_sec, text);
-  fs_add(ui, view, buf, kind, LOG_INFO);
+static void ent_push(console_ui_t *ui, const char *text, int kind, const char *reply,
+                     const char *words, int mode) {
+  if (!ui->ent) return;
+  centry_t *e = &ui->ent[ui->ent_next % CONSOLE_SCROLLBACK];
+  free(e->text);
+  free(e->reply);
+  memset(e, 0, sizeof(*e));
+  e->text = text ? strdup(text) : NULL;
+  e->reply = reply ? strdup(reply) : NULL;
+  e->kind = (uint8_t)kind;
+  if (words) usnprintf(e->words, sizeof(e->words), "%s", words);
+  e->mode = mode;
+  ui->ent_next++;
+  if (ui->ent_next - ui->ent_first > CONSOLE_SCROLLBACK)
+    ui->ent_first = ui->ent_next - CONSOLE_SCROLLBACK;
 }
 
-/* A console-side message (help, a refused command) in either mode. */
+/* Full screen: a finished console-view line (kept for a re-layout). */
+static void fs_line(console_ui_t *ui, const char *text, int kind) {
+  fs_add(ui, V_CONSOLE, text, kind, LOG_INFO);
+  ent_push(ui, text, kind, NULL, NULL, 0);
+}
+
+static void fs_timestamped(console_ui_t *ui, int view, const char *text, int kind) {
+  char buf[CONSOLE_INPUT_MAX + 32], t[16];
+  clock_utc(t, sizeof(t), true);
+  usnprintf(buf, sizeof(buf), "%s %s", t, text);
+  if (view == V_CONSOLE) fs_line(ui, buf, kind);
+  else fs_add(ui, view, buf, kind, LOG_INFO);
+}
+
+/* Lines into the current output: line mode prints, the full screen keeps. */
+static void emit_flines(console_ui_t *ui, flines_t *f) {
+  if (!ui->raw) fmt_wrap(f, out_width(ui));
+  for (int i = 0; i < f->n; i++) {
+    if (ui->line_mode) lm_line(ui, f->v[i].text);
+    else fs_line(ui, f->v[i].text, f->v[i].role);
+  }
+}
+
+/* A console-side note (help, a refused command) in either mode. */
 static void note(console_ui_t *ui, const char *text, int kind) {
   if (ui->line_mode) lm_line(ui, text);
   else fs_timestamped(ui, V_CONSOLE, text, kind);
 }
 
-/* ==========================================================================
- * Replies and events from the core
- * ========================================================================== */
-/* docs/console.md §3.2: an error reply starts with "ERR" (any case) or is
- * exactly "Buffer overflow". */
-static bool reply_is_error(const char *r, size_t len) {
-  static const char BO[] = "Buffer overflow";
-  return (len >= 3 && strncasecmp(r, "ERR", 3) == 0) ||
-         (len == sizeof(BO) - 1 && memcmp(r, BO, len) == 0);
+/* Render a reply into lines (pretty) for the current width. */
+static void render_reply(const console_ui_t *ui, const char *text, size_t len,
+                         const char *words, int mode, flines_t *out) {
+  creply_t rep;
+  creply_parse(text, len, &rep);
+  fmt_ctx_t c;
+  char slog[128];
+  ctx_init(ui, &c, mode, slog, sizeof(slog));
+  c.ascii = ui->ascii;              /* re-rendered by relayout() on a change */
+  fmt_reply(&c, &rep, words, out);
+  creply_free(&rep);
 }
 
-/* Split a reply into sanitized lines, dropping empty trailing ones.  Calls
- * fn for each line.  Returns the first line in first (if given). */
-static void each_line(const char *text, size_t len,
-                      void (*fn)(console_ui_t *, const char *, int), console_ui_t *ui,
-                      int kind, char *first, size_t first_cap) {
+/* Raw format: the records as the hub sent them, sanitized, one per line. */
+static void raw_lines(const char *text, size_t len, flines_t *out, int role) {
   size_t end = len;
-  while (end > 0 && (text[end - 1] == '\n' || text[end - 1] == '\r' ||
-                     text[end - 1] == ' '))
-    end--;
-  if (first && first_cap) first[0] = '\0';
-  bool got_first = false;
+  while (end > 0 && (text[end - 1] == '\n' || text[end - 1] == '\r')) end--;
   for (size_t i = 0; i < end;) {
     size_t j = i;
     while (j < end && text[j] != '\n') j++;
     size_t n = j - i;
     if (n > 0 && text[i + n - 1] == '\r') n--;
-    char *clean = malloc(n * 1 + 2);
+    char *clean = malloc(n + 2);
     if (clean) {
       console_sanitize(text + i, n, clean, n + 2);
-      if (!got_first && first) {
-        usnprintf(first, first_cap, "%s", clean);
-        got_first = true;
-      }
-      fn(ui, clean, kind);
+      flines_add(out, role, clean);
       free(clean);
     }
     i = j + 1;
   }
 }
 
-static void emit_reply_line(console_ui_t *ui, const char *line, int kind) {
-  if (ui->line_mode) lm_line(ui, line);
-  else fs_add(ui, V_CONSOLE, line, kind, LOG_INFO);
+/* Show a reply: laid out (pretty) or as records (raw). */
+static void show_reply(console_ui_t *ui, const char *text, size_t len, const char *words,
+                       int mode, bool err) {
+  flines_t f = {0};
+  if (ui->raw) {
+    raw_lines(text, len, &f, err ? RL_ERR : RL_NORMAL);
+    emit_flines(ui, &f);
+  } else if (ui->line_mode) {
+    render_reply(ui, text, len, words, mode, &f);
+    emit_flines(ui, &f);
+  } else {
+    /* kept as records so a resize lays it out again (D5) */
+    render_reply(ui, text, len, words, mode, &f);
+    for (int i = 0; i < f.n; i++) fs_add(ui, V_CONSOLE, f.v[i].text, f.v[i].role, LOG_INFO);
+    char *copy = malloc(len + 1);
+    if (copy) {
+      memcpy(copy, text, len);
+      copy[len] = '\0';
+      ent_push(ui, NULL, 0, copy, words, mode);
+      free(copy);
+    }
+  }
+  flines_free(&f);
 }
 
+/* ==========================================================================
+ * Replies and events from the core
+ * ========================================================================== */
 static void flush_held(console_ui_t *ui) {
   if (ui->held.len) {
     cbuf_add(&ui->term, ui->held.p, ui->held.len);
@@ -768,15 +1081,92 @@ static void marker_ok(console_ui_t *ui, int seq, const char *words) {
   }
 }
 
-static void marker_err(console_ui_t *ui, int seq, const char *why) {
-  if (ui->line_mode) {
-    char m[CONSOLE_INPUT_MAX + 32];
-    usnprintf(m, sizeof(m), "[err #%d] %s", seq, why);
-    lm_line(ui, m);
-  } else {
-    fs_timestamped(ui, V_CONSOLE, why, L_ERR);
-  }
+/* The error marker: "<msg>" (pretty) or "<code>: <msg>" (raw, D6). */
+static void marker_err(console_ui_t *ui, int seq, const char *code, const char *msg) {
+  if (!ui->line_mode) return;
+  char m[CONSOLE_INPUT_MAX + 96];
+  if (ui->raw && code && *code)
+    usnprintf(m, sizeof(m), "[err #%d] %s: %s", seq, code, msg && *msg ? msg : code);
+  else
+    usnprintf(m, sizeof(m), "[err #%d] %s", seq, msg && *msg ? msg : code ? code : "failed");
+  lm_line(ui, m);
 }
+
+/* A console-side refusal: the ✗ block (pretty), then the marker. */
+static void refuse(console_ui_t *ui, int seq, const char *code, const char *msg,
+                   const char *hint) {
+  if (!ui->raw && strcmp(code, "cmd.cancelled") != 0) {
+    fmt_ctx_t c;
+    char slog[128];
+    ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
+    flines_t f = {0};
+    fmt_error(&c, msg, hint, &f);
+    emit_flines(ui, &f);
+    flines_free(&f);
+  }
+  marker_err(ui, seq, code, msg);
+}
+
+/* A hub-side refusal the console found itself (a D2 pre-read that ends the
+ * command): raw format shows it as the err| record the hub would have sent,
+ * escaped the same way (docs/console.md §3.1), then the marker. */
+static void esc_kv(char *out, size_t cap, size_t *o, const char *key, const char *val) {
+  usnprintf(out + *o, cap - *o, "|%s=", key);
+  *o += strlen(out + *o);
+  for (const char *p = val; *p && *o + 4 < cap; p++) {
+    const char *e = *p == '%' ? "%25" : *p == '|' ? "%7C" : *p == '\n' ? "%0A"
+                  : *p == '\r' ? "%0D" : NULL;
+    if (e) {
+      memcpy(out + *o, e, 3);
+      *o += 3;
+    } else {
+      out[(*o)++] = *p;
+    }
+  }
+  out[*o] = '\0';
+}
+
+static void refuse_hub(console_ui_t *ui, int seq, const char *code, const char *msg,
+                       const char *hint) {
+  if (!ui->raw) {
+    refuse(ui, seq, code, msg, hint);
+    return;
+  }
+  char rec[1024];
+  usnprintf(rec, sizeof(rec), "err|%s", code);
+  size_t o = strlen(rec);
+  esc_kv(rec, sizeof(rec), &o, "msg", msg);
+  if (hint) esc_kv(rec, sizeof(rec), &o, "hint", hint);
+  flines_t f = {0};
+  raw_lines(rec, o, &f, RL_ERR);
+  emit_flines(ui, &f);
+  flines_free(&f);
+  marker_err(ui, seq, code, msg);
+}
+
+/* ✓ result of a console-side command (display, log on/off, …). */
+static void local_ok(console_ui_t *ui, const char *what, const char *subject,
+                     const char *effect_text) {
+  if (ui->raw) return;
+  fmt_ctx_t c;
+  char slog[128];
+  ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
+  flines_t f = {0};
+  fmt_ok(&c, what, subject, &f);
+  if (effect_text) {
+    char e[256];
+    usnprintf(e, sizeof(e), "   %s %s", fmt_glyph(&c, G_BULLET), effect_text);
+    flines_add(&f, RL_NORMAL, e);
+  }
+  emit_flines(ui, &f);
+  flines_free(&f);
+}
+
+static void send_request(console_ui_t *ui, uint8_t op, const void *payload,
+                         size_t len, const pending_rq_t *rq);
+static void ask_confirm(console_ui_t *ui, confirm_t kind, const char *want, int pick_max,
+                        const char *question);
+static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text, size_t len);
 
 static void on_reply(console_ui_t *ui, const char *text, size_t len) {
   if (ui->rq_n == 0) return;   /* nothing asked: ignore */
@@ -789,37 +1179,31 @@ static void on_reply(console_ui_t *ui, const char *text, size_t len) {
     free(*dst);
     *dst = malloc(len + 1);
     if (*dst) {
-      /* keep the newlines, clean each line */
-      size_t o = 0;
-      for (size_t i = 0; i < len;) {
-        size_t j = i;
-        while (j < len && text[j] != '\n') j++;
-        o += console_sanitize(text + i, j - i, *dst + o, len + 1 - o);
-        if (j < len && o + 1 < len + 1) (*dst)[o++] = '\n';
-        i = j + 1;
-      }
-      (*dst)[o] = '\0';
+      memcpy(*dst, text, len);
+      (*dst)[len] = '\0';
     }
     ui->dirty = true;
     return;
   }
+  if (rq.kind == RQ_PRE) {
+    pre_reply(ui, &rq, text, len);
+    return;
+  }
   if (rq.kind != RQ_USER) return;
 
-  char first[256];
-  bool err = len > 0 && reply_is_error(text, len);
-  each_line(text, len, emit_reply_line, ui, err ? L_ERR : L_NORMAL, first,
-            sizeof(first));
-  if (err) {
-    if (ui->line_mode) {
-      char m[320];
-      usnprintf(m, sizeof(m), "[err #%d] %s", rq.seq, first);
-      lm_line(ui, m);
-    }
-  } else {
-    marker_ok(ui, rq.seq, rq.words);
-  }
-  audit(ui, rq.audit_level, "[CONSOLE] %s@%s #%d %s -> %s%.120s", ui->admin,
-        ui->ip, rq.seq, rq.audit, err ? "err: " : "ok", err ? first : "");
+  creply_t rep;
+  creply_parse(text, len, &rep);
+  bool err = rep.err;
+  char code[64], msg[320];
+  usnprintf(code, sizeof(code), "%s", rep.code ? rep.code : "");
+  usnprintf(msg, sizeof(msg), "%s", err && rv(&rep.res, "msg") ? rv(&rep.res, "msg") : "");
+  creply_free(&rep);
+  show_reply(ui, text, len, rq.words, rq.mode, err);
+  if (err) marker_err(ui, rq.seq, code, msg);
+  else marker_ok(ui, rq.seq, rq.words);
+  audit(ui, rq.audit_level, "[CONSOLE] %s@%s #%d %s -> %s%s%s%.*s", ui->admin, ui->ip,
+        rq.seq, rq.audit, err ? "err: " : "ok", err ? code : "", err ? ": " : "",
+        err ? uprec(msg, 120) : 0, err ? msg : "");
   command_done(ui, true);
 }
 
@@ -866,6 +1250,112 @@ static void request_view(console_ui_t *ui, int kind, long long now_ms) {
   }
 }
 
+/* Human event lines (§3, D14): pretty only; line mode with display events
+ * on, the full-screen console view always. */
+static bool human_events(const console_ui_t *ui) {
+  return !ui->raw && (!ui->line_mode || ui->events_on);
+}
+
+static void human_event(console_ui_t *ui, const char *text, int kind) {
+  if (ui->line_mode) lm_async(ui, text);
+  else fs_timestamped(ui, V_CONSOLE, text, kind);
+}
+
+/* ---- tree rows ---- */
+typedef struct {
+  char type;          /* H B D */
+  int  depth;
+  char name[64], uuid[64], ver[24], var[8], server[72];
+  bool online;
+  long long started;  /* H/B: start time, D: last seen */
+} trow_t;
+
+static int parse_tree(const char *tree, trow_t *out, int max);
+#define MAX_TROWS 1400
+
+/* What changed between two trees, as a line each (D14). */
+static void tree_events(console_ui_t *ui, const char *old, const char *cur) {
+  static trow_t a[MAX_TROWS], b[MAX_TROWS];
+  int na = parse_tree(old, a, MAX_TROWS), nb = parse_tree(cur, b, MAX_TROWS);
+  fmt_ctx_t c;
+  char slog[128];
+  ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
+  char line[256];
+  /* peers up/down */
+  for (int j = 0; j < nb; j++) {
+    if (b[j].type != 'H' || b[j].depth < 1) continue;
+    for (int i = 0; i < na; i++) {
+      if (a[i].type != 'H' || strcmp(a[i].uuid, b[j].uuid) || strcmp(a[i].name, b[j].name)) continue;
+      if (a[i].online != b[j].online) {
+        usnprintf(line, sizeof(line), "%s peer %s %s", fmt_glyph(&c, b[j].online ? G_ON : G_WARN),
+                  b[j].name, b[j].online ? "is up" : "went down");
+        human_event(ui, line, b[j].online ? RL_DIM : RL_WARN);
+      }
+      break;
+    }
+  }
+  /* bots in / out / moved: the hub is the nearest H row above */
+  const char *hub_a[MAX_TROWS], *hub_b[MAX_TROWS];
+  const char *h = "";
+  for (int i = 0; i < na; i++) {
+    if (a[i].type == 'H') h = a[i].name;
+    hub_a[i] = h;
+  }
+  h = "";
+  for (int j = 0; j < nb; j++) {
+    if (b[j].type == 'H') h = b[j].name;
+    hub_b[j] = h;
+  }
+  for (int j = 0; j < nb; j++) {
+    if (b[j].type != 'B') continue;
+    int i = 0;
+    while (i < na && !(a[i].type == 'B' && !strcmp(a[i].uuid, b[j].uuid))) i++;
+    if (i == na) {
+      usnprintf(line, sizeof(line), "%s bot %s connected to %s", fmt_glyph(&c, G_ON), b[j].name,
+                hub_b[j]);
+      human_event(ui, line, RL_DIM);
+    } else if (strcmp(hub_a[i], hub_b[j])) {
+      usnprintf(line, sizeof(line), "%s bot %s moved from %s to %s", fmt_glyph(&c, G_ON),
+                b[j].name, hub_a[i], hub_b[j]);
+      human_event(ui, line, RL_DIM);
+    }
+  }
+  for (int i = 0; i < na; i++) {
+    if (a[i].type != 'B') continue;
+    int j = 0;
+    while (j < nb && !(b[j].type == 'B' && !strcmp(b[j].uuid, a[i].uuid))) j++;
+    if (j == nb) {
+      usnprintf(line, sizeof(line), "%s bot %s disconnected from %s", fmt_glyph(&c, G_OFF),
+                a[i].name, hub_a[i]);
+      human_event(ui, line, RL_DIM);
+    }
+  }
+}
+
+/* After login: what the mesh looks like, once (§2.1). */
+static void greet_status(console_ui_t *ui) {
+  if (ui->greeted) return;
+  ui->greeted = true;
+  if (ui->raw || ui->seq > 0) return;
+  fmt_ctx_t c;
+  char slog[128];
+  ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
+  char l1[256], l2[64];
+  const char *dot = fmt_glyph(&c, G_DOT);
+  usnprintf(l1, sizeof(l1), " peers %d/%d up %s bots %d/%d online %s log file %s, console %s",
+            ui->st.peers_up, ui->st.peers_total, dot, ui->st.bots_on, ui->st.bots_total, dot,
+            ui->st.loglevel >= 0 && ui->st.loglevel <= 4 ? LEVEL_WORD[ui->st.loglevel] : "?",
+            ui->st.consolelevel >= 0 && ui->st.consolelevel <= 4 ? LEVEL_WORD[ui->st.consolelevel] : "?");
+  usnprintf(l2, sizeof(l2), " type help for commands");
+  if (ui->line_mode) {
+    lm_async(ui, l1);
+    lm_async(ui, l2);
+  } else {
+    fs_line(ui, l1, RL_DIM);
+    fs_line(ui, l2, RL_DIM);
+  }
+}
+
 static void on_event(console_ui_t *ui, const char *payload, size_t len,
                      long long now_ms) {
   const char *bar = memchr(payload, '|', len);
@@ -893,13 +1383,13 @@ static void on_event(console_ui_t *ui, const char *payload, size_t len,
       }
     }
     free(clean);
+    greet_status(ui);
     ui->dirty = true;
   } else if (!strcmp(topic, "tree")) {
-    free(ui->tree);
     /* each row keeps its newline, and a last row without one gains it:
      * at most dl + 1 bytes of rows, then the NUL */
-    ui->tree = malloc(dl + 2);
-    if (!ui->tree) return;
+    char *tree = malloc(dl + 2);
+    if (!tree) return;
     /* sanitize each row, keep the newlines */
     size_t o = 0;
     int rows = 0;
@@ -907,19 +1397,19 @@ static void on_event(console_ui_t *ui, const char *payload, size_t len,
       size_t j = i;
       while (j < dl && data[j] != '\n') j++;
       if (j > i) {
-        o += console_sanitize(data + i, j - i, ui->tree + o, dl + 2 - o);
-        ui->tree[o++] = '\n';
+        o += console_sanitize(data + i, j - i, tree + o, dl + 2 - o);
+        tree[o++] = '\n';
         rows++;
       }
       i = j + 1;
     }
-    ui->tree[o] = '\0';
+    tree[o] = '\0';
     if (ui->line_mode) {
       size_t cap = o + (size_t)rows * 12 + 64;
       char *blk = malloc(cap);
       if (blk) {
         size_t b = (size_t)usnprintf(blk, cap, "[evt tree] begin %d\n", rows);
-        for (const char *p = ui->tree; *p;) {
+        for (const char *p = tree; *p;) {
           const char *nl = strchr(p, '\n');
           size_t n = nl ? (size_t)(nl - p) : strlen(p);
           b += (size_t)usnprintf(blk + b, cap - b, "[evt tree] %.*s\n", (int)n, p);
@@ -930,6 +1420,9 @@ static void on_event(console_ui_t *ui, const char *payload, size_t len,
         free(blk);
       }
     }
+    if (ui->tree && human_events(ui)) tree_events(ui, ui->tree, tree);
+    free(ui->tree);
+    ui->tree = tree;
     ui->dirty = true;
   } else if (!strcmp(topic, "upg")) {
     char clean[256];
@@ -941,6 +1434,23 @@ static void on_event(console_ui_t *ui, const char *payload, size_t len,
     } else if (ui->view == V_UPG) {
       request_view(ui, RQ_VIEW_UPG, now_ms);
     }
+    if (human_events(ui) && strcmp(clean, ui->last_upg)) {
+      /* <id>|<phase>|<done>/<total>|<failed> */
+      char f[4][64] = {"", "", "", ""};
+      int k = 0;
+      for (const char *p = clean; k < 4;) {
+        const char *q = strchr(p, '|');
+        size_t n = q ? (size_t)(q - p) : strlen(p);
+        usnprintf(f[k++], sizeof(f[0]), "%.*s", (int)(n < 63 ? n : 63), p);
+        if (!q) break;
+        p = q + 1;
+      }
+      char line[300];
+      usnprintf(line, sizeof(line), "upgrade %s: %s done (%s)%s%s%s", f[0], f[2], f[1],
+                atoi(f[3]) > 0 ? ", " : "", atoi(f[3]) > 0 ? f[3] : "", atoi(f[3]) > 0 ? " failed" : "");
+      if (clean[0]) human_event(ui, line, atoi(f[3]) > 0 ? RL_WARN : RL_DIM);
+    }
+    usnprintf(ui->last_upg, sizeof(ui->last_upg), "%s", clean);
   } else if (!strcmp(topic, "log")) {
     const char *b2 = memchr(data, '|', dl);
     if (!b2) return;
@@ -956,22 +1466,33 @@ static void on_event(console_ui_t *ui, const char *payload, size_t len,
       if (!strcmp(lvl, LEVEL_WORD[i])) level = i;
     if (ui->line_mode) {
       if (!ui->log_on) return;
-      char line[CONSOLE_LOG_LINE_MAX + 32];
-      usnprintf(line, sizeof(line), "[log %s] %s", LEVEL_WORD[level], clean);
+      char line[CONSOLE_LOG_LINE_MAX + 48];
+      if (ui->raw) {
+        usnprintf(line, sizeof(line), "[log %s] %s", LEVEL_WORD[level], clean);
+      } else {
+        char t[16];
+        clock_utc(t, sizeof(t), true);
+        usnprintf(line, sizeof(line), "[log %s %s] %s", LEVEL_WORD[level], t, clean);
+      }
       lm_async(ui, line);
     } else {
-      int kind = level == LOG_ERROR ? L_ERR : level == LOG_WARNING ? L_WARN
-               : level == LOG_DEBUG ? L_DIM : L_NORMAL;
+      int kind = level == LOG_ERROR ? RL_ERR : level == LOG_WARNING ? RL_WARN
+               : level == LOG_DEBUG ? RL_DIM : RL_NORMAL;
       fs_add(ui, V_LOG, clean, kind, level);
     }
   } else if (!strcmp(topic, "drop")) {
-    unsigned long n = strtoul(data, NULL, 10);
-    ui->dropped += n;
+    /* the payload is not NUL-terminated: parse a bounded copy */
+    char num[24];
+    size_t nl = dl < sizeof(num) - 1 ? dl : sizeof(num) - 1;
+    memcpy(num, data, nl);
+    num[nl] = '\0';
+    ui->dropped += strtoul(num, NULL, 10);
   }
 }
 
 void ui_core_frame(console_ui_t *ui, uint8_t op, const char *payload, size_t len,
                    long long now_ms) {
+  ui->now_ms = now_ms;
   if (op == CONSOLE_REPLY) on_reply(ui, payload, len);
   else if (op == CMD_CONSOLE) on_event(ui, payload, len, now_ms);
 }
@@ -1002,8 +1523,9 @@ static void split_words(const char *line, words_t *ws) {
   }
 }
 
+static bool cmd_has_subs(const char *cmd);
 static const cmd_def_t *find_cmd(const words_t *ws, int *argi) {
-  const char *c = ws->w[0];
+  const char *c = strcmp(ws->w[0], "?") ? ws->w[0] : "help";   /* ? = help */
   for (int i = 0; i < NCMDS; i++) {
     if (strcasecmp(CMDS[i].cmd, c) != 0) continue;
     if (CMDS[i].sub) {
@@ -1025,17 +1547,149 @@ static bool cmd_known_word(const char *w) {
   return false;
 }
 
-static void show_help(console_ui_t *ui, const char *topic) {
-  char line[256];
-  for (int i = 0; i < NCMDS; i++) {
-    if (topic && strcasecmp(CMDS[i].cmd, topic) != 0) continue;
-    usnprintf(line, sizeof(line), "%-44s %s", CMDS[i].usage, CMDS[i].help);
-    note(ui, line, L_INFO);
+/* help <group> <command>: usage, what it does, each argument, examples. */
+static void help_command(const fmt_ctx_t *c, flines_t *f, const cmd_def_t *d) {
+  char words[32], line[1024];
+  usnprintf(words, sizeof(words), "%s%s%s", d->cmd, d->sub ? " " : "", d->sub ? d->sub : "");
+  const char *args = NULL, *ex = NULL;
+  for (int i = 0; i < NCMDHELP; i++)
+    if (!strcmp(CMD_HELP[i].cmd, d->cmd) &&
+        (CMD_HELP[i].sub ? d->sub && !strcmp(CMD_HELP[i].sub, d->sub) : !d->sub)) {
+      args = CMD_HELP[i].args;
+      ex = CMD_HELP[i].examples;
+    }
+  char right[64];
+  const char *conf = d->confirm == CF_YN ? "asks y/N" : d->confirm == CF_TYPE ? "type to confirm" : NULL;
+  if (d->sub) usnprintf(right, sizeof(right), "%s%shelp %s for the group", conf ? conf : "",
+                        conf ? " · " : "", d->cmd);
+  else usnprintf(right, sizeof(right), "%s", conf ? conf : "");
+  fmt_title(c, f, words, right[0] ? right : NULL);
+  usnprintf(line, sizeof(line), "   %s", d->usage);
+  flines_add(f, RL_NORMAL, line);
+  usnprintf(line, sizeof(line), "   %s", d->help);
+  flines_add(f, RL_DIM, line);
+  /* "name<TAB>text" lines as a two-column list; a long name puts its text
+   * on the next line */
+  if (args) {
+    flines_add(f, RL_NORMAL, "");
+    flines_add(f, RL_HEAD, " Arguments");
+    int nw = 0;
+    for (const char *p = args; *p;) {
+      const char *tab = strchr(p, '\t'), *nl = strchr(p, '\n');
+      if (!nl) nl = p + strlen(p);
+      int w = tab && tab < nl ? (int)(tab - p) : 0;
+      if (w > nw && w <= 16) nw = w;
+      p = *nl ? nl + 1 : nl;
+    }
+    for (const char *p = args; *p;) {
+      const char *tab = strchr(p, '\t'), *nl = strchr(p, '\n');
+      if (!nl) nl = p + strlen(p);
+      if (!tab || tab > nl) tab = p;
+      int w = (int)(tab - p);
+      const char *t = tab == p ? p : tab + 1;
+      if (w <= nw) {
+        usnprintf(line, sizeof(line), "   %.*s%*s  %.*s", w, p, nw - w, "", (int)(nl - t), t);
+        flines_add(f, RL_NORMAL, line);
+      } else {
+        usnprintf(line, sizeof(line), "   %.*s", w, p);
+        flines_add(f, RL_NORMAL, line);
+        usnprintf(line, sizeof(line), "   %*s  %.*s", nw, "", (int)(nl - t), t);
+        flines_add(f, RL_NORMAL, line);
+      }
+      p = *nl ? nl + 1 : nl;
+    }
+  } else {
+    flines_add(f, RL_DIM, "   (no arguments)");
   }
-  if (!topic && !ui->line_mode) {
-    note(ui, "Alt+1..5 views, Alt+Left/Right cycle, F2 log level, F3 tree pane, "
-             "PgUp/PgDn/End scroll, Tab completes, Ctrl-C cancels", L_INFO);
+  if (ex) {
+    flines_add(f, RL_NORMAL, "");
+    flines_add(f, RL_HEAD, strchr(ex, '\n') ? " Examples" : " Example");
+    for (const char *p = ex; *p;) {
+      const char *nl = strchr(p, '\n');
+      if (!nl) nl = p + strlen(p);
+      usnprintf(line, sizeof(line), "   %.*s", (int)(nl - p), p);
+      flines_add(f, RL_CMD, line);          /* never wrapped: it copies as typed */
+      p = *nl ? nl + 1 : nl;
+    }
   }
+}
+
+/* help: the groups; help <group>: its commands; help <group> <command>: one
+ * command in full (§2.2). */
+static void show_help(console_ui_t *ui, const char *topic, const cmd_def_t *one) {
+  fmt_ctx_t c;
+  char slog[128];
+  ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
+  flines_t f = {0};
+  char right[96], line[512];
+  const char *dot = fmt_glyph(&c, G_DOT);
+  if (one) {
+    help_command(&c, &f, one);
+  } else if (!topic) {
+    usnprintf(right, sizeof(right), "%d groups %s help <group> for its commands", NGROUPS, dot);
+    fmt_title(&c, &f, "Commands", right);
+    for (int g = 0; g < NGROUPS; g++) {
+      /* the separator, once per verb */
+      char sep[8];
+      usnprintf(sep, sizeof(sep), " %s ", dot);
+      char joined[512] = "";
+      size_t jo = 0;
+      bool first = true;
+      for (int i = 0; i < NCMDS; i++) {
+        if (!CMDS[i].sub || strcmp(CMDS[i].cmd, GROUPS[g].name)) continue;
+        jo += (size_t)usnprintf(joined + jo, sizeof(joined) - jo, "%s%s", first ? "" : sep,
+                                CMDS[i].sub);
+        first = false;
+      }
+      usnprintf(line, sizeof(line), "   %-9s %-22s %s", GROUPS[g].name, GROUPS[g].what, joined);
+      if (console_str_width(line) <= c.width) {
+        flines_add(&f, RL_NORMAL, line);
+      } else {
+        usnprintf(line, sizeof(line), "   %-9s %s", GROUPS[g].name, GROUPS[g].what);
+        flines_add(&f, RL_NORMAL, line);
+        usnprintf(line, sizeof(line), "             %s", joined);
+        flines_add(&f, RL_DIM, line);
+      }
+    }
+    usnprintf(line, sizeof(line), "   help [group [command]] %s ? [group [command]] %s quit", dot, dot);
+    flines_add(&f, RL_NORMAL, line);
+    if (!ui->line_mode) {
+      flines_add(&f, RL_NORMAL, "");
+      flines_add(&f, RL_DIM, " Keys  Alt+1..5 views, Alt+Left/Right cycle, F2 log level, F3 tree pane,");
+      flines_add(&f, RL_DIM, "       PgUp/PgDn/End scroll, Tab completes, Up/Down history, Ctrl-C cancels");
+    }
+  } else {
+    int n = 0, uw = 0;
+    for (int i = 0; i < NCMDS; i++)
+      if (!strcasecmp(CMDS[i].cmd, topic)) {
+        n++;
+        int w = console_str_width(CMDS[i].usage);
+        if (w > uw) uw = w;
+      }
+    if (uw > 34) uw = 34;
+    usnprintf(right, sizeof(right), "%d command%s %s help %s <command> for one", n,
+              n == 1 ? "" : "s", dot, topic);
+    fmt_title(&c, &f, topic, right);
+    for (int i = 0; i < NCMDS; i++) {
+      if (strcasecmp(CMDS[i].cmd, topic)) continue;
+      int w = console_str_width(CMDS[i].usage);
+      if (w <= uw && 1 + uw + 2 + console_str_width(CMDS[i].help) <= c.width) {
+        usnprintf(line, sizeof(line), " %s%*s  %s", CMDS[i].usage, uw - w, "", CMDS[i].help);
+        flines_add(&f, RL_NORMAL, line);
+      } else {
+        usnprintf(line, sizeof(line), " %s", CMDS[i].usage);
+        flines_add(&f, RL_NORMAL, line);
+        usnprintf(line, sizeof(line), " %*s  %s", uw, "", CMDS[i].help);
+        flines_add(&f, RL_NORMAL, line);
+      }
+      if (CMDS[i].args) {
+        usnprintf(line, sizeof(line), " %*s  %s", uw, "", CMDS[i].args);
+        flines_add(&f, RL_DIM, line);
+      }
+    }
+  }
+  emit_flines(ui, &f);
+  flines_free(&f);
 }
 
 static int level_arg(const char *a) {
@@ -1062,7 +1716,7 @@ static const char *kv_opt(const char *arg, const char *key) {
 static void send_request(console_ui_t *ui, uint8_t op, const void *payload,
                          size_t len, const pending_rq_t *rq) {
   if (ui->rq_n >= MAX_PENDING_RQ) {
-    marker_err(ui, rq->seq, "too many requests in flight");
+    refuse(ui, rq->seq, "cmd.busy", "too many requests in flight", NULL);
     return;
   }
   ui->rq[ui->rq_n++] = *rq;
@@ -1070,80 +1724,258 @@ static void send_request(console_ui_t *ui, uint8_t op, const void *payload,
   ui->user_busy = true;
 }
 
+static void session_log_phrase(const console_ui_t *ui, char *out, size_t cap) {
+  if (ui->line_mode) {
+    if (ui->log_on)
+      usnprintf(out, cap, "%s and worse (log on)", LEVEL_WORD[ui->log_sub_level]);
+    else
+      usnprintf(out, cap, "off (log on [level] streams it here)");
+  } else {
+    usnprintf(out, cap, "log view (Alt+2): %s and worse%s%s", LEVEL_WORD[ui->log_show],
+              ui->filter[0] ? ", filter " : "", ui->filter);
+  }
+}
+
+static void display_show(console_ui_t *ui) {
+  fmt_ctx_t c;
+  char slog[128];
+  ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
+  flines_t f = {0};
+  char right[64], v[192];
+  if (ui->line_mode) usnprintf(right, sizeof(right), "line mode %d", out_width(ui));
+  else usnprintf(right, sizeof(right), "full screen %d%s%d", ui->cols, "×", ui->rows);
+  fmt_title(&c, &f, "Display", right);
+  const int L = 9;
+  if (!ui->line_mode) {
+    usnprintf(v, sizeof(v), "%s (Alt+%d)", VIEW_NAME[ui->view], ui->view + 1);
+    fmt_card_line(&c, &f, L, "view", v, RL_NORMAL);
+    bool shown = ui->cols >= CONSOLE_PANE_MIN_COLS ? !ui->pane_user_off : ui->overlay;
+    fmt_card_line(&c, &f, L, "tree pane", shown ? "shown (F3 hides it)" : "hidden (F3 shows it)", RL_NORMAL);
+  }
+  fmt_card_line(&c, &f, L, "glyphs", ui->ascii ? "ascii" : "unicode", RL_NORMAL);
+  fmt_card_line(&c, &f, L, "format", ui->raw ? "raw" : "pretty", RL_NORMAL);
+  if (ui->line_mode) {
+    if (ui->width_set < 0) usnprintf(v, sizeof(v), "auto (%d)", out_width(ui));
+    else usnprintf(v, sizeof(v), "%d", out_width(ui));
+    fmt_card_line(&c, &f, L, "width", v, RL_NORMAL);
+    fmt_card_line(&c, &f, L, "events", ui->events_on ? "on" : "off", RL_NORMAL);
+    fmt_card_line(&c, &f, L, "colors", "off (line mode)", RL_NORMAL);
+  } else {
+    usnprintf(v, sizeof(v), "%d for output", out_width(ui));
+    fmt_card_line(&c, &f, L, "width", v, RL_NORMAL);
+    fmt_card_line(&c, &f, L, "colors", "on", RL_NORMAL);
+  }
+  session_log_phrase(ui, v, sizeof(v));
+  fmt_card_line(&c, &f, L, "log", v, RL_NORMAL);
+  emit_flines(ui, &f);
+  flines_free(&f);
+}
+
 static void local_command(console_ui_t *ui, const cmd_def_t *c, const words_t *ws,
                           int argi, const char *line, int seq, const char *words) {
   const char *a1 = ws->n > argi ? ws->w[argi] : NULL;
+  char from[64];
   if (!strcmp(c->cmd, "help")) {
     if (a1 && !cmd_known_word(a1)) {
-      marker_err(ui, seq, "unknown command");
+      char m[96];
+      usnprintf(m, sizeof(m), "no command group \"%.*s\"", uprec(a1, 40), a1);
+      refuse(ui, seq, "cmd.unknown", m, "help");
       return;
     }
-    show_help(ui, a1);
+    const cmd_def_t *one = NULL;
+    const char *a2 = ws->n > argi + 1 ? ws->w[argi + 1] : NULL;
+    if (a1 && (a2 || !cmd_has_subs(a1))) {
+      for (int i = 0; i < NCMDS && !one; i++)
+        if (!strcasecmp(CMDS[i].cmd, a1) &&
+            (CMDS[i].sub ? a2 && !strcasecmp(CMDS[i].sub, a2) : !a2))
+          one = &CMDS[i];
+      if (!one) {
+        char m[128], h[64];
+        usnprintf(m, sizeof(m), "%s has no command %.*s", a1, uprec(a2 ? a2 : "", 40), a2 ? a2 : "");
+        usnprintf(h, sizeof(h), "help %s", a1);
+        refuse(ui, seq, "cmd.unknown", m, h);
+        return;
+      }
+    }
+    show_help(ui, a1, one);
   } else if (!strcmp(c->cmd, "quit")) {
+    if (!ui->raw) {
+      char m[160], d[32];
+      long long s = (ui->now_ms - ui->start_ms) / 1000;
+      if (s < 0) s = 0;
+      usnprintf(d, sizeof(d), "%02lld:%02lld:%02lld", s / 3600, s / 60 % 60, s % 60);
+      fmt_ctx_t cx;
+      char slog[128];
+      ctx_init(ui, &cx, FMT_MODE_NORMAL, slog, sizeof(slog));
+      const char *dot = fmt_glyph(&cx, G_DOT);
+      usnprintf(m, sizeof(m), " Goodbye %s %s session %s %s %d command%s", ui->admin, dot, d, dot,
+                ui->ncmds, ui->ncmds == 1 ? "" : "s");
+      note(ui, m, RL_DIM);
+    }
     marker_ok(ui, seq, words);
     ui->closing = true;
     usnprintf(ui->close_why, sizeof(ui->close_why), "quit");
     return;
   } else if (!strcmp(c->cmd, "log")) {
-    if (!ui->line_mode) {
-      marker_err(ui, seq, "the log is the Alt+2 view in the full-screen console");
-      return;
-    }
-    if (!strcmp(c->sub, "on")) {
-      int lvl = a1 ? level_arg(a1) : LOG_INFO;
-      if (lvl <= 0) {
-        marker_err(ui, seq, "level: error, warning, info or debug");
+    if (!strcmp(c->sub, "filter")) {
+      if (ui->line_mode) {
+        refuse(ui, seq, "cmd.mode", "only in the full-screen console", "log on [level] in line mode");
         return;
       }
-      ui->log_on = true;
-      ui->log_sub_level = lvl;
-    } else {
-      ui->log_on = false;
-    }
-    subscribe(ui);
-  } else {
-    if (ui->line_mode) {
-      marker_err(ui, seq, "not available in line mode");
-      return;
-    }
-    if (!strcmp(c->cmd, "view")) {
-      if (!a1 || strlen(a1) != 1 || a1[0] < '1' || a1[0] > '5') {
-        marker_err(ui, seq, "view 1-5");
-        return;
-      }
-      ui->view = a1[0] - '1';
-      ui->act[ui->view] = false;
-    } else if (!strcmp(c->cmd, "pane")) {
-      if (ui->cols >= CONSOLE_PANE_MIN_COLS) ui->pane_user_off = !ui->pane_user_off;
-      else ui->overlay = !ui->overlay;
-    } else if (!strcmp(c->cmd, "ascii")) {
-      ui->ascii = !ui->ascii;
-      ui->full_redraw = true;
-    } else if (!strcmp(c->cmd, "filter")) {
       const char *rest = line + ws->off[argi];
+      usnprintf(from, sizeof(from), "%s", ui->filter[0] ? ui->filter : "-");
       if (!strcasecmp(rest, "clear")) ui->filter[0] = '\0';
       else usnprintf(ui->filter, sizeof(ui->filter), "%s", rest);
-    } else if (!strcmp(c->cmd, "clear")) {
+      ui->dirty = true;
+      char s[300];
+      usnprintf(s, sizeof(s), "filter   %s %s %s", from, "→",
+                ui->filter[0] ? ui->filter : "-");
+      local_ok(ui, "Log", s, NULL);
+    } else {
+      if (!ui->line_mode) {
+        refuse(ui, seq, "cmd.mode", "the log is the Alt+2 view in the full-screen console", NULL);
+        return;
+      }
+      if (!strcmp(c->sub, "on")) {
+        int lvl = a1 ? level_arg(a1) : LOG_INFO;
+        if (lvl <= 0) {
+          refuse(ui, seq, "cmd.bad_arg", "level: error, warning, info or debug", "log on [level]");
+          return;
+        }
+        ui->log_on = true;
+        ui->log_sub_level = lvl;
+        char s[96], e[96];
+        usnprintf(s, sizeof(s), "%s and worse", LEVEL_WORD[lvl]);
+        usnprintf(e, sizeof(e), "the ring keeps %s; log off stops it",
+                  ui->st.have && ui->st.consolelevel >= 0 && ui->st.consolelevel <= 4
+                      ? LEVEL_WORD[ui->st.consolelevel] : "what its level says");
+        local_ok(ui, "Log stream on", s, e);
+      } else {
+        ui->log_on = false;
+        local_ok(ui, "Log stream off", NULL, NULL);
+      }
+      subscribe(ui);
+    }
+  } else if (!strcmp(c->cmd, "display")) {
+    const char *sub = c->sub;
+    bool fs_only = !strcmp(sub, "view") || !strcmp(sub, "pane") || !strcmp(sub, "clear");
+    bool lm_only = !strcmp(sub, "width") || !strcmp(sub, "events");
+    if (fs_only && ui->line_mode) {
+      refuse(ui, seq, "cmd.mode", "only in the full-screen console", NULL);
+      return;
+    }
+    if (lm_only && !ui->line_mode) {
+      refuse(ui, seq, "cmd.mode", "only in line mode", NULL);
+      return;
+    }
+    const char *arrow = "→";      /* lm_line / fs_add show it as -> */
+    char s[160];
+    if (!strcmp(sub, "show")) {
+      display_show(ui);
+    } else if (!strcmp(sub, "view")) {
+      if (!a1 || strlen(a1) != 1 || a1[0] < '1' || a1[0] > '5') {
+        refuse(ui, seq, "cmd.bad_arg", "view 1-5", "display view <1-5>");
+        return;
+      }
+      usnprintf(from, sizeof(from), "%s", VIEW_NAME[ui->view]);
+      ui->view = a1[0] - '1';
+      ui->act[ui->view] = false;
+      usnprintf(s, sizeof(s), "view   %s %s %s", from, arrow, VIEW_NAME[ui->view]);
+      local_ok(ui, "Display", s, NULL);
+    } else if (!strcmp(sub, "pane")) {
+      bool was;
+      if (ui->cols >= CONSOLE_PANE_MIN_COLS) {
+        was = !ui->pane_user_off;
+        ui->pane_user_off = !ui->pane_user_off;
+      } else {
+        was = ui->overlay;
+        ui->overlay = !ui->overlay;
+      }
+      usnprintf(s, sizeof(s), "tree pane   %s %s %s (F3 toggles)", was ? "shown" : "hidden", arrow,
+                was ? "hidden" : "shown");
+      local_ok(ui, "Display", s, NULL);
+    } else if (!strcmp(sub, "ascii")) {
+      bool was = ui->ascii;
+      ui->ascii = !ui->ascii;
+      ui->full_redraw = true;
+      ui->render_w = -1;
+      usnprintf(s, sizeof(s), "glyphs   %s %s %s", was ? "ascii" : "unicode", "→",
+                ui->ascii ? "ascii" : "unicode");
+      local_ok(ui, "Display", s, NULL);
+    } else if (!strcmp(sub, "format")) {
+      bool raw;
+      if (!strcasecmp(a1, "raw")) raw = true;
+      else if (!strcasecmp(a1, "pretty")) raw = false;
+      else {
+        refuse(ui, seq, "cmd.bad_arg", "format: pretty or raw", "display format pretty|raw");
+        return;
+      }
+      bool was = ui->raw;
+      usnprintf(s, sizeof(s), "format   %s %s %s%s", was ? "raw" : "pretty", arrow,
+                raw ? "raw" : "pretty", raw ? " (records as the hub sends them)" : "");
+      local_ok(ui, "Display", s, NULL);
+      ui->raw = raw;
+    } else if (!strcmp(sub, "width")) {
+      int was = out_width(ui);
+      if (!strcasecmp(a1, "auto")) {
+        ui->width_set = -1;
+      } else if (all_digits(a1) && atoi(a1) >= CONSOLE_WIDTH_MIN && atoi(a1) <= CONSOLE_WIDTH_MAX) {
+        ui->width_set = atoi(a1);
+      } else {
+        refuse(ui, seq, "cmd.bad_arg", "width: 60-250 or auto", "display width <60-250|auto>");
+        return;
+      }
+      usnprintf(s, sizeof(s), "width   %d %s %d%s", was, arrow, out_width(ui),
+                ui->width_set < 0 ? " (auto)" : "");
+      local_ok(ui, "Display", s, NULL);
+    } else if (!strcmp(sub, "events")) {
+      bool on;
+      if (!strcasecmp(a1, "on")) on = true;
+      else if (!strcasecmp(a1, "off")) on = false;
+      else {
+        refuse(ui, seq, "cmd.bad_arg", "events: on or off", "display events on|off");
+        return;
+      }
+      usnprintf(s, sizeof(s), "events   %s %s %s", ui->events_on ? "on" : "off", arrow, on ? "on" : "off");
+      ui->events_on = on;
+      local_ok(ui, "Display", s, NULL);
+    } else if (!strcmp(sub, "clear")) {
       if (ui->view == V_CONSOLE || ui->view == V_LOG) sb_clear(&ui->sb[ui->view]);
+      if (ui->view == V_CONSOLE) {
+        for (long long e = ui->ent_first; e < ui->ent_next; e++) {
+          centry_t *x = &ui->ent[e % CONSOLE_SCROLLBACK];
+          free(x->text);
+          free(x->reply);
+          memset(x, 0, sizeof(*x));
+        }
+        ui->ent_first = ui->ent_next;
+      }
       ui->anchor[ui->view] = -1;
+      usnprintf(s, sizeof(s), "%s view cleared", VIEW_NAME[ui->view]);
+      local_ok(ui, "Display", s, NULL);
     }
     ui->dirty = true;
   }
   marker_ok(ui, seq, words);
 }
 
-/* Build the request payload; false (with *why) when the arguments are bad. */
+/* Build the request (op and payload); false (with *why, *hint) when the
+ * arguments are bad.  *op starts as the table's opcode and *confirm as its
+ * confirmation; a command whose arguments pick the opcode sets both. */
 static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *ws,
-                          int argi, unsigned char *out, size_t *outlen,
-                          const char **why) {
+                          int argi, unsigned char *out, size_t *outlen, uint8_t *op,
+                          confirm_t *confirm, int *mode, const char **why,
+                          const char **hint) {
   (void)ui;
   int na = ws->n - argi;
   const char *const *a = (const char *const *)&ws->w[argi];
   char *o = (char *)out;
   size_t cap = 1024;
   int w = 0;
+  *hint = c->usage;
   switch (c->build) {
   case B_NONE:
+  case B_LOCAL:
     *outlen = 0;
     return true;
   case B_FIXED:
@@ -1152,19 +1984,10 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
   case B_ARG:
     w = usnprintf(o, cap, "%s", a[0]);
     break;
-  case B_OPTARG:
-    w = usnprintf(o, cap, "%s", na > 0 ? a[0] : "");
-    break;
-  case B_PIPE:
-  case B_COLON: {
-    char sep = c->build == B_PIPE ? '|' : ':';
+  case B_PIPE: {
     size_t off = 0;
     for (int i = 0; i < na; i++) {
-      if (c->build == B_COLON && strchr(a[i], ':')) {
-        *why = "':' is not allowed in an argument here";
-        return false;
-      }
-      int k = usnprintf(o + off, cap - off, "%s%s", i ? (char[2]){sep, 0} : "", a[i]);
+      int k = usnprintf(o + off, cap - off, "%s%s", i ? "|" : "", a[i]);
       if (k < 0 || (size_t)k >= cap - off) {
         *why = "arguments too long";
         return false;
@@ -1180,27 +2003,85 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
         *why = "':' is not allowed in an argument here";
         return false;
       }
-    w = usnprintf(o, cap, "%s:%s:%s:%s:%s", a[0], a[1], a[2],
-                 strcmp(a[3], "-") ? a[3] : "", a[4]);
+    w = usnprintf(o, cap, "%s:%s:%s:%s:%s", a[0], a[1], a[2], strcmp(a[3], "-") ? a[3] : "", a[4]);
+    break;
+  case B_PEER_DEL:
+    if (na > 0 && !all_digits(a[0])) {
+      *why = "a peer is removed by its number in peer list";
+      *hint = "peer del [#]";
+      return false;
+    }
+    w = usnprintf(o, cap, "%s", na > 0 ? a[0] : "");
+    break;
+  case B_PEER_SET:
+    if (strcasecmp(a[1], "key")) {
+      *why = "unknown peer setting";
+      *hint = "settings: key";
+      return false;
+    }
+    if (strchr(a[0], ':') || strchr(a[2], ':')) {
+      *why = "':' is not allowed in an argument here";
+      return false;
+    }
+    w = usnprintf(o, cap, "%s:%s", a[0], a[2]);
     break;
   case B_CHAN_ADD:
     w = usnprintf(o, cap, "%s|%s", a[0], na > 1 ? a[1] : "");
     break;
+  case B_CHAN_SET: {
+    for (const char *p = a[1]; *p; p++)
+      if (!(*p >= 'a' && *p <= 'z') && *p != '_') {
+        *why = "a setting name is lowercase letters and _";
+        *hint = "settings: key";
+        return false;
+      }
+    if (strlen(a[2]) > 128) {
+      *why = "a setting value is at most 128 bytes";
+      return false;
+    }
+    w = usnprintf(o, cap, "set|%s|%s|%s", a[0], a[1], strcmp(a[2], "-") ? a[2] : "");
+    break;
+  }
+  case B_CHAN_OP:
+    w = usnprintf(o, cap, "%s|%s", a[1], a[0]);   /* the hub takes nick|chan */
+    break;
   case B_OPT_SET:
     w = usnprintf(o, cap, "%s", strcmp(a[0], "-") ? a[0] : "");
     break;
-  case B_LOGLEVEL: {
-    /* <target><level>: target 0 = the log file, 1 = the console log. */
-    int target = 0;
-    if (na == 2) {
-      if (strcasecmp(a[0], "file") == 0) target = 0;
-      else if (strcasecmp(a[0], "console") == 0) target = 1;
-      else {
-        *why = "target: file or console";
+  case B_LOG_SET: {
+    if (!strcasecmp(a[0], "size")) {
+      /* <n> MB, <n>k KiB or <n>b bytes, at most 1024 MB (the hub clamps it
+       * to its own limits) */
+      char num[16];
+      size_t al = strlen(a[1]);
+      unsigned long long mult = 1024ull * 1024ull;
+      usnprintf(num, sizeof(num), "%s", a[1]);
+      if (al > 1 && al < sizeof(num) && strchr("kKbB", a[1][al - 1])) {
+        mult = (a[1][al - 1] == 'k' || a[1][al - 1] == 'K') ? 1024ull : 1ull;
+        num[al - 1] = '\0';
+      }
+      unsigned long long v = all_digits(num) ? strtoull(num, NULL, 10) * mult : 0;
+      if (v < 1 || v > 1024ull * 1024ull * 1024ull) {
+        *why = "size: <MB>, <n>k or <n>b, at most 1024 MB";
+        *hint = "log set size <MB|nk|nb>";
         return false;
       }
+      uint32_t bytes = htonl((uint32_t)v);
+      memcpy(out, &bytes, 4);
+      *outlen = 4;
+      *op = CMD_ADMIN_SET_LOG_SIZE;
+      *confirm = CF_NONE;
+      return true;
     }
-    int lvl = level_arg(a[na - 1]);
+    /* <target><level>: target 0 = the log file, 1 = the console log */
+    int target;
+    if (!strcasecmp(a[0], "file")) target = 0;
+    else if (!strcasecmp(a[0], "console")) target = 1;
+    else {
+      *why = "say file, console or size";
+      return false;
+    }
+    int lvl = level_arg(a[1]);
     if (lvl < 0) {
       *why = "level: none, error, warning, info, debug or 0-4";
       return false;
@@ -1208,27 +2089,8 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
     out[0] = (unsigned char)target;
     out[1] = (unsigned char)lvl;
     *outlen = 2;
-    return true;
-  }
-  case B_LOGSIZE: {
-    /* <n> MB, <n>k KiB or <n>b bytes, at most 1024 MB (the hub clamps it
-     * to its own limits). */
-    char num[16];
-    size_t al = strlen(a[0]);
-    unsigned long long mult = 1024ull * 1024ull;
-    usnprintf(num, sizeof(num), "%s", a[0]);
-    if (al > 1 && al < sizeof(num) && strchr("kKbB", a[0][al - 1])) {
-      mult = (a[0][al - 1] == 'k' || a[0][al - 1] == 'K') ? 1024ull : 1ull;
-      num[al - 1] = '\0';
-    }
-    unsigned long long v = all_digits(num) ? strtoull(num, NULL, 10) * mult : 0;
-    if (v < 1 || v > 1024ull * 1024ull * 1024ull) {
-      *why = "size: <MB>, <n>k or <n>b, at most 1024 MB";
-      return false;
-    }
-    uint32_t bytes = htonl((uint32_t)v);
-    memcpy(out, &bytes, 4);
-    *outlen = 4;
+    *op = CMD_ADMIN_SET_LOG_LEVEL;
+    *confirm = CF_YN;
     return true;
   }
   case B_PURGE:
@@ -1238,6 +2100,94 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       *why = "purge now, or purge <days>";
       return false;
     }
+    break;
+  case B_HUB_SET: {
+    if (na == 0) {
+      /* the settings table: hub show's record, laid out as one */
+      *op = CMD_ADMIN_GET_PUBKEY;
+      *mode = FMT_MODE_HUB_SETTINGS;
+      *outlen = 0;
+      return true;
+    }
+    static const struct { const char *name; uint8_t op; } HS[] = {
+      {"name", CMD_ADMIN_SET_HUB_NAME}, {"bindip", CMD_ADMIN_SET_BIND_IP},
+      {"port", CMD_ADMIN_SET_BIND_PORT}, {"pubkey", CMD_ADMIN_SET_PUBKEY},
+      {"autopurge", CMD_ADMIN_SET_PURGE_DAYS}};
+    int k = -1;
+    for (int i = 0; i < 5; i++)
+      if (!strcasecmp(a[0], HS[i].name)) k = i;
+    if (k < 0) {
+      static char m[96];
+      usnprintf(m, sizeof(m), "unknown hub setting \"%.*s\"", uprec(a[0], 40), a[0]);
+      *why = m;
+      *hint = "name, bindip, port, pubkey, autopurge";
+      return false;
+    }
+    if (na < 2) {
+      *why = "say the new value";
+      return false;
+    }
+    *op = HS[k].op;
+    w = usnprintf(o, cap, "%s", a[1]);
+    break;
+  }
+  case B_ACL: {
+    bool add = !strcmp(c->sub, "add");
+    if (!strcasecmp(a[0], "allow")) *op = add ? CMD_ADMIN_ADD_ALLOWLIST : CMD_ADMIN_DEL_ALLOWLIST;
+    else if (!strcasecmp(a[0], "deny")) *op = add ? CMD_ADMIN_ADD_DENYLIST : CMD_ADMIN_DEL_DENYLIST;
+    else {
+      *why = "say which list";
+      return false;
+    }
+    w = usnprintf(o, cap, "%s", a[1]);
+    break;
+  }
+  case B_USER_LIST:
+    if (na == 0) {
+      *op = CMD_ADMIN_LIST_ADMINS;
+      w = usnprintf(o, cap, "*");
+    } else if (!strcasecmp(a[0], "admin")) {
+      *op = CMD_ADMIN_LIST_ADMINS;
+      w = 0;
+      o[0] = '\0';
+    } else if (!strcasecmp(a[0], "oper")) {
+      *op = CMD_ADMIN_LIST_OPERS_V2;
+      w = 0;
+      o[0] = '\0';
+    } else {
+      *why = "role is admin or oper";
+      return false;
+    }
+    break;
+  case B_USER_ADD:
+    if (!strcasecmp(a[0], "admin")) *op = CMD_ADMIN_ADD_ADMIN;
+    else if (!strcasecmp(a[0], "oper")) *op = CMD_ADMIN_ADD_OPER_RECORD;
+    else {
+      *why = "role is admin or oper";
+      return false;
+    }
+    w = usnprintf(o, cap, "%s|%s|%s", a[1], a[2], a[3]);
+    break;
+  case B_USER_SET:
+    if (strcasecmp(a[1], "key")) {
+      *why = "unknown user setting";
+      *hint = "settings: key";
+      return false;
+    }
+    w = usnprintf(o, cap, "%s|%s", a[0], a[2]);
+    break;
+  case B_USER_MASK:
+    if (!strcasecmp(a[0], "add")) {
+      *op = CMD_ADMIN_ADD_USERMASK;
+      *confirm = CF_NONE;
+    } else if (!strcasecmp(a[0], "del")) {
+      *op = CMD_ADMIN_DEL_USERMASK;
+      *confirm = CF_YN;
+    } else {
+      *why = "say add or del";
+      return false;
+    }
+    w = usnprintf(o, cap, "%s|%s", a[1], a[2]);
     break;
   case B_UPG_RELEASES: {
     const char *bot = "", *hub = "";
@@ -1269,13 +2219,9 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
     }
     /* ver|variant|kind|min_from|base|hub_ver|hub_base|sel — variant, kind
      * and min_from are left to each node, as hub_admin always did. */
-    w = usnprintf(o, cap, "%s||||%s|%s|%s|%s", a[0], bb, hubv, *hubv ? hb : "",
-                 nodes);
+    w = usnprintf(o, cap, "%s||||%s|%s|%s|%s", a[0], bb, hubv, *hubv ? hb : "", nodes);
     break;
   }
-  case B_LOCAL:
-    *outlen = 0;
-    return true;
   }
   if (w < 0 || (size_t)w >= cap) {
     *why = "arguments too long";
@@ -1285,55 +2231,355 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
   return true;
 }
 
+/* Enter a confirmation: the question as [confirm #N] (line mode) or a
+ * highlighted line, and the next input line answers it. */
+static void ask_confirm(console_ui_t *ui, confirm_t kind, const char *want, int pick_max,
+                        const char *question) {
+  ui->confirming = kind;
+  usnprintf(ui->confirm_want, sizeof(ui->confirm_want), "%s", want ? want : "");
+  ui->confirm_pick_max = pick_max;
+  if (ui->line_mode) {
+    char m[CONSOLE_INPUT_MAX];
+    usnprintf(m, sizeof(m), "[confirm #%d] %s", ui->confirm_seq, question);
+    lm_line(ui, m);
+  } else {
+    fs_timestamped(ui, V_CONSOLE, question, RL_WARN);
+  }
+}
+
+static void stage_confirm(console_ui_t *ui, int seq, uint8_t op, const unsigned char *p,
+                          size_t n, const pending_rq_t *rq) {
+  ui->confirm_seq = seq;
+  ui->confirm_op = op;
+  memcpy(ui->confirm_payload, p, n);
+  ui->confirm_len = n;
+  ui->confirm_rq = *rq;
+}
+
+/* Warning lines above a question (hub rekey). */
+static void warn_lines(console_ui_t *ui, const char *const *lines, int n) {
+  if (ui->raw) return;
+  fmt_ctx_t c;
+  char slog[128];
+  ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
+  flines_t f = {0};
+  char l[300];
+  for (int i = 0; i < n; i++) {
+    if (i == 0) usnprintf(l, sizeof(l), " %s %s", fmt_glyph(&c, G_WARN), lines[i]);
+    else usnprintf(l, sizeof(l), "   %s", lines[i]);
+    flines_add(&f, RL_WARN, l);
+  }
+  emit_flines(ui, &f);
+  flines_free(&f);
+}
+
+static const char *opt_meaning(char f) {
+  return f == 'h' ? "hub-only mutation" : f == 'F' ? "config frozen" : "unknown flag";
+}
+
+/* A pre-read came back: the question names the object, or the command ends
+ * here with what the read found (D2). */
+static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text, size_t len) {
+  pend_cmd_t *pc = &ui->pend;
+  creply_t rep;
+  creply_parse(text, len, &rep);
+  if (rep.err || !rep.ok) {
+    show_reply(ui, text, len, rq->words, FMT_MODE_NORMAL, true);
+    char code[64], msg[320];
+    usnprintf(code, sizeof(code), "%s", rep.code ? rep.code : "");
+    usnprintf(msg, sizeof(msg), "%s", rv(&rep.res, "msg") ? rv(&rep.res, "msg") : "failed");
+    marker_err(ui, rq->seq, code, msg);
+    audit(ui, rq->audit_level, "[CONSOLE] %s@%s #%d %s -> err: %s", ui->admin, ui->ip, rq->seq,
+          pc->rq.audit, code);
+    creply_free(&rep);
+    command_done(ui, true);
+    return;
+  }
+  fmt_ctx_t c;
+  char slog[128];
+  ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
+  const char *dot = fmt_glyph(&c, G_DOT), *arrow = fmt_glyph(&c, G_ARROW);
+  char q[CONSOLE_INPUT_MAX - 64];
+  confirm_t kind = CF_YN;
+  char want[128] = "";
+  int pick = 0;
+  const crec_t *r0 = NULL;
+  for (int i = 0; i < rep.n && !r0; i++) r0 = &rep.r[i];
+  stage_confirm(ui, rq->seq, pc->op, pc->payload, pc->len, &pc->rq);
+  bool ok = true;
+  const char *fail_code = NULL;
+  char fail_msg[256] = "", fail_hint[256] = "";
+  switch (pc->pre) {
+  case PRE_BOT_DEL:
+  case PRE_BOT_KICK: {
+    const crec_t *b = NULL;
+    for (int i = 0; i < rep.n && !b; i++)
+      if (!strcmp(rep.r[i].type, "bot")) b = &rep.r[i];
+    const char *nick = b && rvs(b, "nick") ? rv(b, "nick") : pc->arg;
+    bool on = b && rvb(b, "online");
+    bool local = on && rv(b, "hub") && !strcmp(rv(b, "hub"), "local");
+    char u8[16];
+    const char *id = b && rv(b, "uuid") ? rv(b, "uuid") : pc->arg;
+    usnprintf(u8, sizeof(u8), "%.*s%s", uprec(id, 8), id,
+              fmt_glyph(&c, G_ELL));
+    if (pc->pre == PRE_BOT_DEL) {
+      if (local)
+        usnprintf(q, sizeof(q), "Delete bot %s (%s)? It is online on this hub and will be disconnected. (y/N)", nick, u8);
+      else if (on)
+        usnprintf(q, sizeof(q), "Delete bot %s (%s)? It is online on %s and is dropped everywhere. (y/N)", nick, u8,
+                  rvs(b, "hub_name") ? rv(b, "hub_name") : "another hub");
+      else
+        usnprintf(q, sizeof(q), "Delete bot %s (%s)? It is offline. (y/N)", nick, u8);
+    } else if (!local) {
+      ok = false;
+      fail_code = "bot.not_local";
+      usnprintf(fail_msg, sizeof(fail_msg), "%s is not connected to this hub", nick);
+      if (on) usnprintf(fail_hint, sizeof(fail_hint), "it is on %s: kick it there",
+                        rvs(b, "hub_name") ? rv(b, "hub_name") : "another hub");
+      else usnprintf(fail_hint, sizeof(fail_hint), "bot list");
+    } else {
+      usnprintf(q, sizeof(q), "Disconnect bot %s from this hub? It will reconnect on its own. (y/N)", nick);
+    }
+    break;
+  }
+  case PRE_PEER_DEL: {
+    int n = 0;
+    const crec_t *hit = NULL;
+    for (int i = 0; i < rep.n; i++) {
+      if (strcmp(rep.r[i].type, "peer")) continue;
+      n++;
+      if (pc->arg[0] && rvi(&rep.r[i], "n", 0) == atoll(pc->arg)) hit = &rep.r[i];
+    }
+    if (!n) {
+      ok = false;
+      fail_code = "peer.none";
+      usnprintf(fail_msg, sizeof(fail_msg), "no peer hubs are configured");
+      usnprintf(fail_hint, sizeof(fail_hint), "peer list");
+      break;
+    }
+    if (pc->arg[0]) {
+      if (!hit) {
+        ok = false;
+        fail_code = "peer.not_found";
+        usnprintf(fail_msg, sizeof(fail_msg), "no peer #%s (%d configured)", pc->arg, n);
+        usnprintf(fail_hint, sizeof(fail_hint), "peer list");
+        break;
+      }
+      kind = CF_TYPE;
+      usnprintf(want, sizeof(want), "%s", pc->arg);
+      usnprintf(q, sizeof(q), "Type %s to remove peer %s (%s:%lld):", pc->arg,
+                rvs(hit, "name") ? rv(hit, "name") : rv(hit, "ip") ? rv(hit, "ip") : "?",
+                rv(hit, "ip") ? rv(hit, "ip") : "?", rvi(hit, "port", 0));
+    } else {
+      /* no number: the configured peers, then the number is the answer */
+      if (ui->raw) {
+        show_reply(ui, text, len, rq->words, FMT_MODE_NORMAL, false);
+      } else {
+        flines_t f = {0};
+        char right[48];
+        usnprintf(right, sizeof(right), "%d configured", n);
+        fmt_title(&c, &f, "Peer hubs", right);
+        int nw = 4, aw = 7;
+        for (int i = 0; i < rep.n; i++) {
+          const crec_t *p = &rep.r[i];
+          if (strcmp(p->type, "peer")) continue;
+          char ad[96];
+          usnprintf(ad, sizeof(ad), "%s:%lld", rv(p, "ip") ? rv(p, "ip") : "?", rvi(p, "port", 0));
+          const char *nm = rvs(p, "name") ? rv(p, "name") : fmt_glyph(&c, G_DASH);
+          if (console_str_width(nm) > nw) nw = console_str_width(nm);
+          if (console_str_width(ad) > aw) aw = console_str_width(ad);
+        }
+        char l[512];
+        usnprintf(l, sizeof(l), "   #  %-*s  %-*s  LINK", nw, "NAME", aw, "ADDRESS");
+        flines_add(&f, RL_HEAD, l);
+        for (int i = 0; i < rep.n; i++) {
+          const crec_t *p = &rep.r[i];
+          if (strcmp(p->type, "peer")) continue;
+          char ad[96];
+          usnprintf(ad, sizeof(ad), "%s:%lld", rv(p, "ip") ? rv(p, "ip") : "?", rvi(p, "port", 0));
+          const char *nm = rvs(p, "name") ? rv(p, "name") : fmt_glyph(&c, G_DASH);
+          bool up = rvb(p, "up");
+          usnprintf(l, sizeof(l), "  %2lld  %s%*s  %s%*s  %s %s", rvi(p, "n", 0), nm,
+                    nw - console_str_width(nm), "", ad, aw - console_str_width(ad), "",
+                    fmt_glyph(&c, up ? G_ON : G_ERR), up ? "up" : "down");
+          flines_add(&f, up ? RL_NORMAL : RL_WARN, l);
+        }
+        emit_flines(ui, &f);
+        flines_free(&f);
+      }
+      kind = CF_PICK;
+      pick = n;
+      usnprintf(q, sizeof(q), "Type the number of the peer to remove:");
+    }
+    break;
+  }
+  case PRE_OPT: {
+    const char *cur = rv(&rep.res, "flags") ? rv(&rep.res, "flags") : "";
+    /* what the hub will store: letters and digits, each once */
+    char nf[64] = "";
+    size_t o = 0;
+    for (const char *p = pc->arg; *p && o + 1 < sizeof(nf); p++)
+      if (isalnum((unsigned char)*p) && !strchr(nf, *p)) {
+        nf[o++] = *p;
+        nf[o] = '\0';
+      }
+    char changes[256] = "";
+    size_t co = 0;
+    /* co counts what usnprintf wanted: once it reaches the end nothing more
+     * is appended (sizeof - co would wrap) */
+    for (const char *p = nf; *p; p++)
+      if (!strchr(cur, *p) && co + 1 < sizeof(changes))
+        co += (size_t)usnprintf(changes + co, sizeof(changes) - co, "%sadds %c: %s", co ? "; " : "", *p,
+                                opt_meaning(*p));
+    for (const char *p = cur; *p; p++)
+      if (!strchr(nf, *p) && co + 1 < sizeof(changes))
+        co += (size_t)usnprintf(changes + co, sizeof(changes) - co, "%sremoves %c: %s", co ? "; " : "",
+                                *p, opt_meaning(*p));
+    usnprintf(q, sizeof(q), "Change flags %s %s %s%s%s%s? (y/N)", cur[0] ? cur : "none", arrow,
+              nf[0] ? nf : "none", co ? " (" : "", changes, co ? ")" : "");
+    break;
+  }
+  case PRE_USER_DEL:
+  case PRE_USER_KEY: {
+    /* the named user's record (MATCH sends only it), and its masks */
+    const crec_t *u = NULL;
+    int masks = 0;
+    for (int i = 0; i < rep.n; i++) {
+      if (!u && !strcmp(rep.r[i].type, "user") && rv(&rep.r[i], "name") &&
+          !strcasecmp(rv(&rep.r[i], "name"), pc->arg))
+        u = &rep.r[i];
+      else if (u && !strcmp(rep.r[i].type, "mask")) masks++;
+      else if (u && !strcmp(rep.r[i].type, "user")) break;
+    }
+    if (!u) {
+      ok = false;
+      fail_code = "user.not_found";
+      usnprintf(fail_msg, sizeof(fail_msg), "no user called \"%s\"", pc->arg);
+      usnprintf(fail_hint, sizeof(fail_hint), "user list");
+      break;
+    }
+    const char *name = rv(u, "name") ? rv(u, "name") : pc->arg;
+    bool admin = rv(u, "role") && !strcmp(rv(u, "role"), "admin");
+    if (pc->pre == PRE_USER_DEL) {
+      if (admin) {
+        kind = CF_TYPE;
+        usnprintf(want, sizeof(want), "%s", name);
+        usnprintf(q, sizeof(q), "Type %s to remove admin %s and their %d mask%s:", name, name, masks,
+                  masks == 1 ? "" : "s");
+      } else {
+        usnprintf(q, sizeof(q), "Remove oper %s and their %d mask%s? (y/N)", name, masks,
+                  masks == 1 ? "" : "s");
+      }
+    } else {
+      usnprintf(q, sizeof(q), "Replace %s's key %s with the new one?%s (y/N)", name,
+                rvs(u, "fp") ? rv(u, "fp") : "(none)", admin ? " Their open consoles close." : "");
+    }
+    break;
+  }
+  case PRE_UPG_START: {
+    /* the plan card: how many nodes already run the target (D2) */
+    const char *bv = pc->arg, *hv = pc->extra[0];
+    int b_on = 0, b_to = 0, h_on = 0, h_to = 0;
+    for (int i = 0; i < rep.n; i++) {
+      const crec_t *nd = &rep.r[i];
+      if (strcmp(nd->type, "node")) continue;
+      bool bot = rv(nd, "kind") && !strcmp(rv(nd, "kind"), "bot");
+      const char *ver = rv(nd, "ver") ? rv(nd, "ver") : "";
+      if (bot && !strcmp(ver, bv)) b_on++;
+      else if (bot) b_to++;
+      else if (hv[0] && !strcmp(ver, hv)) h_on++;
+      else h_to++;
+    }
+    if (!ui->raw) {
+      flines_t f = {0};
+      fmt_title(&c, &f, "Upgrade plan", NULL);
+      char v[512];
+      usnprintf(v, sizeof(v), "%s %s   (%d already on it, %d to upgrade)", arrow, bv, b_on, b_to);
+      fmt_card_line(&c, &f, 6, "bots", v, RL_NORMAL);
+      if (hv[0]) usnprintf(v, sizeof(v), "%s %s   (%d already on it, %d to upgrade)", arrow, hv, h_on, h_to);
+      else usnprintf(v, sizeof(v), "stay where they are");
+      fmt_card_line(&c, &f, 6, "hubs", v, RL_NORMAL);
+      fmt_card_line(&c, &f, 6, "nodes", pc->extra[1][0] ? pc->extra[1] : "whole network", RL_NORMAL);
+      usnprintf(v, sizeof(v), "bots: %s %s hubs: %s", pc->extra[2][0] ? pc->extra[2] : "default", dot,
+                pc->extra[3][0] ? pc->extra[3] : "default");
+      fmt_card_line(&c, &f, 6, "bases", v, RL_NORMAL);
+      emit_flines(ui, &f);
+      flines_free(&f);
+    }
+    kind = CF_TYPE;
+    usnprintf(want, sizeof(want), "%s", bv);
+    usnprintf(q, sizeof(q), "Type %s to start the upgrade:", bv);
+    break;
+  }
+  default:
+    usnprintf(q, sizeof(q), "Go ahead? (y/N)");
+  }
+  creply_free(&rep);
+  if (!ok) {
+    refuse_hub(ui, rq->seq, fail_code, fail_msg, fail_hint[0] ? fail_hint : NULL);
+    audit(ui, LOG_INFO, "[CONSOLE] %s@%s #%d %s -> err: %s", ui->admin, ui->ip, rq->seq,
+          pc->rq.audit, fail_code);
+    command_done(ui, true);
+    return;
+  }
+  ask_confirm(ui, kind, want, pick, q);
+  /* lines typed ahead answer it; then the prompt */
+  command_done(ui, true);
+}
+
 static void run_line(console_ui_t *ui, const char *line) {
   while (*line == ' ') line++;
   if (!*line) return;
   if (ui->user_busy || ui->confirming) {
     if (ui->queued_n < MAX_QUEUED_LINES) ui->queued[ui->queued_n++] = strdup(line);
-    else note(ui, "busy: line dropped", L_ERR);
+    else note(ui, "busy: line dropped", RL_ERR);
     return;
   }
   const char *l = line[0] == '/' ? line + 1 : line;
   int seq = ++ui->seq;
+  ui->ncmds++;
   words_t ws;
   split_words(l, &ws);
   if (ws.n == 0) {
-    marker_err(ui, seq, "empty command");
+    refuse(ui, seq, "cmd.empty", "empty command", NULL);
     return;
+  }
+  if (!ui->line_mode) {
+    char echo[CONSOLE_INPUT_MAX + 4];
+    usnprintf(echo, sizeof(echo), "> %s", l);
+    fs_timestamped(ui, V_CONSOLE, echo, RL_CMD);
   }
   int argi = 1;
   const cmd_def_t *c = find_cmd(&ws, &argi);
   if (!c) {
     if (cmd_known_word(ws.w[0])) {
-      char why[128];
-      usnprintf(why, sizeof(why), "usage: see help %s", ws.w[0]);
-      marker_err(ui, seq, why);
+      char m[128], h[64];
+      if (ws.n >= 2) usnprintf(m, sizeof(m), "%s has no command %.*s", ws.w[0], uprec(ws.w[1], 40), ws.w[1]);
+      else usnprintf(m, sizeof(m), "%s needs a command", ws.w[0]);
+      usnprintf(h, sizeof(h), "help %s", ws.w[0]);
+      refuse(ui, seq, "cmd.usage", m, h);
     } else {
-      marker_err(ui, seq, "unknown command (help lists them)");
+      char m[128];
+      usnprintf(m, sizeof(m), "unknown command \"%.*s\"", uprec(ws.w[0], 40), ws.w[0]);
+      refuse(ui, seq, "cmd.unknown", m, "help");
     }
     return;
   }
   char words[32];
-  usnprintf(words, sizeof(words), "%s%s%s", c->cmd, c->sub ? " " : "",
-           c->sub ? c->sub : "");
+  usnprintf(words, sizeof(words), "%s%s%s", c->cmd, c->sub ? " " : "", c->sub ? c->sub : "");
   int na = ws.n - argi;
-  if (na < c->nargs || (c->build != B_LOCAL && na > c->nargs + c->optargs) ||
-      (c->build == B_LOCAL && strcmp(c->cmd, "filter") && na > c->nargs + c->optargs)) {
-    char why[160];
-    usnprintf(why, sizeof(why), "usage: %s", c->usage);
-    marker_err(ui, seq, why);
+  bool rest_arg = c->build == B_LOCAL && c->sub && !strcmp(c->sub, "filter");
+  if (na < c->nargs || (!rest_arg && na > c->nargs + c->optargs)) {
+    char m[160];
+    usnprintf(m, sizeof(m), "usage: %s", c->usage);
+    refuse(ui, seq, "cmd.usage", m, NULL);
     return;
   }
   for (int i = argi; i < ws.n; i++)
     if (c->build != B_LOCAL && strchr(ws.w[i], '|')) {
-      marker_err(ui, seq, "'|' is not allowed in an argument");
+      refuse(ui, seq, "cmd.bad_arg", "'|' is not allowed in an argument", NULL);
       return;
     }
-  if (!ui->line_mode) {
-    char echo[CONSOLE_INPUT_MAX + 4];
-    usnprintf(echo, sizeof(echo), "> %s", l);
-    fs_timestamped(ui, V_CONSOLE, echo, L_CMD);
-  }
   if (c->build == B_LOCAL) {
     local_command(ui, c, &ws, argi, l, seq, words);
     return;
@@ -1341,9 +2587,12 @@ static void run_line(console_ui_t *ui, const char *line) {
 
   unsigned char payload[1024];
   size_t plen = 0;
-  const char *why = NULL;
-  if (!build_payload(ui, c, &ws, argi, payload, &plen, &why)) {
-    marker_err(ui, seq, why ? why : "bad arguments");
+  const char *why = NULL, *hint = NULL;
+  uint8_t op = c->op;
+  confirm_t confirm = c->confirm;
+  int mode = FMT_MODE_NORMAL;
+  if (!build_payload(ui, c, &ws, argi, payload, &plen, &op, &confirm, &mode, &why, &hint)) {
+    refuse(ui, seq, "cmd.bad_arg", why ? why : "bad arguments", hint);
     return;
   }
 
@@ -1351,71 +2600,128 @@ static void run_line(console_ui_t *ui, const char *line) {
   memset(&rq, 0, sizeof(rq));
   rq.kind = RQ_USER;
   rq.seq = seq;
+  rq.mode = mode;
   usnprintf(rq.words, sizeof(rq.words), "%s", words);
-  usnprintf(rq.audit, sizeof(rq.audit), "%.300s", l);
-  rq.audit_level = (c->confirm != CF_NONE || c->op == CMD_ADMIN_SET_LOG_LEVEL)
-                       ? LOG_WARNING : LOG_INFO;
+  usnprintf(rq.audit, sizeof(rq.audit), "%.*s", uprec(l, 300), l);
+  rq.audit_level = (confirm != CF_NONE || op == CMD_ADMIN_SET_LOG_LEVEL) ? LOG_WARNING : LOG_INFO;
 
-  /* An optional argument that was left out asks nothing (peer del alone
-   * lists what could be deleted). */
-  if (c->confirm == CF_NONE || (c->build == B_OPTARG && na == 0)) {
-    send_request(ui, c->op, payload, plen, &rq);
+  const char *a1 = na > 0 ? ws.w[argi] : "";
+  if (confirm == CF_NONE) {
+    send_request(ui, op, payload, plen, &rq);
     return;
   }
+
+  /* D2: read first, so the question names the object */
+  if (c->pre != PRE_NONE) {
+    pend_cmd_t *pc = &ui->pend;
+    memset(pc, 0, sizeof(*pc));
+    pc->pre = c->pre;
+    pc->op = op;
+    memcpy(pc->payload, payload, plen);
+    pc->len = plen;
+    pc->rq = rq;
+    usnprintf(pc->arg, sizeof(pc->arg), "%s", a1);
+    uint8_t pop = 0;
+    char pp[600] = "";
+    switch (c->pre) {
+    case PRE_BOT_DEL:
+    case PRE_BOT_KICK:
+      pop = CMD_ADMIN_LIST_FULL;
+      usnprintf(pp, sizeof(pp), "%s", a1);
+      break;
+    case PRE_PEER_DEL:
+      pop = CMD_ADMIN_LIST_PEERS;
+      break;
+    case PRE_OPT:
+      pop = CMD_ADMIN_GET_OPT_FLAGS;
+      usnprintf(pc->arg, sizeof(pc->arg), "%s", strcmp(a1, "-") ? a1 : "");
+      break;
+    case PRE_USER_DEL:
+    case PRE_USER_KEY:
+      pop = CMD_ADMIN_MATCH;
+      usnprintf(pp, sizeof(pp), "%s", a1);
+      break;
+    case PRE_UPG_START: {
+      pop = CMD_ADMIN_UPGRADE_STATUS;
+      const char *bb = "", *hb = "";
+      for (int i = argi + 1; i < ws.n; i++) {
+        const char *v;
+        if ((v = kv_opt(ws.w[i], "hub"))) usnprintf(pc->extra[0], sizeof(pc->extra[0]), "%s", strcmp(v, "-") ? v : "");
+        else if ((v = kv_opt(ws.w[i], "nodes"))) usnprintf(pc->extra[1], sizeof(pc->extra[1]), "%s", v);
+        else if ((v = kv_opt(ws.w[i], "botbase"))) bb = v;
+        else if ((v = kv_opt(ws.w[i], "hubbase"))) hb = v;
+      }
+      usnprintf(pc->extra[2], sizeof(pc->extra[2]), "%s", bb);
+      usnprintf(pc->extra[3], sizeof(pc->extra[3]), "%s", hb);
+      if (*bb || *hb) usnprintf(pp, sizeof(pp), "releases|%s|%s", bb, hb);
+      else usnprintf(pp, sizeof(pp), "releases");
+      break;
+    }
+    }
+    pending_rq_t pr = rq;
+    pr.kind = RQ_PRE;
+    send_request(ui, pop, pp, strlen(pp), &pr);
+    return;
+  }
+
   /* Ask first; the next line answers. */
-  ui->confirming = c->confirm;
-  ui->confirm_seq = seq;
-  ui->confirm_op = c->op;
-  memcpy(ui->confirm_payload, payload, plen);
-  ui->confirm_len = plen;
-  ui->confirm_rq = rq;
-  const char *a1 = na > 0 ? ws.w[argi] : "";
-  switch (c->confirm) {
-  case CF_YN: {
-    /* every argument: "Really loglevel console debug?" */
-    char all[256] = "";
-    size_t o = 0;
-    for (int i = argi; i < ws.n && o < sizeof(all); i++)
-      o += (size_t)usnprintf(all + o, sizeof(all) - o, "%s%s", i > argi ? " " : "", ws.w[i]);
-    ui->confirm_want[0] = '\0';
-    usnprintf(ui->confirm_q, sizeof(ui->confirm_q), "Really %s %s? (y/N)", words, all);
-    break;
-  }
-  case CF_TYPE_ARG:
-    usnprintf(ui->confirm_want, sizeof(ui->confirm_want), "%s", a1);
-    usnprintf(ui->confirm_q, sizeof(ui->confirm_q), "Type '%s' to confirm %s:", a1, words);
-    break;
-  case CF_TYPE_HUB:
-    usnprintf(ui->confirm_want, sizeof(ui->confirm_want), "%s",
-             ui->hubname[0] ? ui->hubname : "hub");
-    usnprintf(ui->confirm_q, sizeof(ui->confirm_q),
-             "Type the hub name '%s' to confirm %s:", ui->confirm_want, words);
-    break;
-  case CF_TYPE_VER:
-    usnprintf(ui->confirm_want, sizeof(ui->confirm_want), "%s", a1);
-    usnprintf(ui->confirm_q, sizeof(ui->confirm_q),
-             "Type the bot version '%s' to start the upgrade:", a1);
-    break;
-  case CF_NONE:
-    break;
-  }
-  if (ui->line_mode) {
-    char m[320];
-    usnprintf(m, sizeof(m), "[confirm #%d] %s", seq, ui->confirm_q);
-    lm_line(ui, m);
+  stage_confirm(ui, seq, op, payload, plen, &rq);
+  char q[CONSOLE_INPUT_MAX - 64];
+  char want[128] = "";
+  confirm_t kind = CF_YN;
+  const char *a2 = na > 1 ? ws.w[argi + 1] : "";
+  if (op == CMD_ADMIN_REGEN_KEYS) {
+    const char *hn = ui->hubname[0] ? ui->hubname : "hub";
+    char l1[160];
+    usnprintf(l1, sizeof(l1), "hub rekey makes a new identity for %s.", hn);
+    const char *lines[3] = {l1,
+                            "Every peer and bot link drops now; each peer runs peer set <uuid> key, each bot +hub with the new key.",
+                            "Back up .irchub.cnf first: the old key is overwritten."};
+    warn_lines(ui, lines, 3);
+    kind = CF_TYPE;
+    usnprintf(want, sizeof(want), "%s", hn);
+    usnprintf(q, sizeof(q), "Type %s to go ahead:", hn);
+  } else if (op == CMD_ADMIN_PURGE_TOMBSTONES) {
+    if (!strcasecmp(a1, "now")) usnprintf(q, sizeof(q), "Purge every tombstone now, here and on all peers? (y/N)");
+    else usnprintf(q, sizeof(q), "Purge tombstones older than %s days, here and on all peers? (y/N)", a1);
+  } else if (op == CMD_ADMIN_DEL_ALLOWLIST || op == CMD_ADMIN_DEL_DENYLIST) {
+    usnprintf(q, sizeof(q), "Remove %s from the %s list? (y/N)", a2,
+              op == CMD_ADMIN_DEL_ALLOWLIST ? "allow" : "deny");
+  } else if (op == CMD_ADMIN_SET_LOG_LEVEL) {
+    int lvl = level_arg(a2);
+    usnprintf(q, sizeof(q), "Set the %s log level to %s? (y/N)", payload[0] ? "console" : "file",
+              lvl >= 0 && lvl <= 4 ? LEVEL_WORD[lvl] : a2);
+  } else if (op == CMD_ADMIN_DEL_USERMASK) {
+    usnprintf(q, sizeof(q), "Remove mask %s from %s? (y/N)", na > 2 ? ws.w[argi + 2] : "", a2);
+  } else if (op == CMD_ADMIN_DEL_CHANNEL) {
+    usnprintf(q, sizeof(q), "Remove %s from every bot? They part it. (y/N)", a1);
+  } else if (op == CMD_ADMIN_UPGRADE_STATUS && !strcmp(c->sub, "abort")) {
+    usnprintf(q, sizeof(q), "Abort the running upgrade and roll back what it moved? (y/N)");
+  } else if (op == CMD_ADMIN_UPGRADE_STATUS && !strcmp(c->sub, "forget")) {
+    usnprintf(q, sizeof(q), "Forget the roll-up plan here and on every hub? (y/N)");
   } else {
-    fs_timestamped(ui, V_CONSOLE, ui->confirm_q, L_WARN);
+    usnprintf(q, sizeof(q), "Really %s? (y/N)", words);
   }
+  ask_confirm(ui, kind, want, 0, q);
 }
 
 static void confirm_answer(console_ui_t *ui, const char *answer, bool cancelled) {
   confirm_t kind = ui->confirming;
   ui->confirming = CF_NONE;
-  bool ok = !cancelled &&
-            (kind == CF_YN ? (!strcasecmp(answer, "y") || !strcasecmp(answer, "yes"))
-                           : !strcmp(answer, ui->confirm_want));
+  bool ok = !cancelled;
+  if (ok) {
+    if (kind == CF_YN) {
+      ok = !strcasecmp(answer, "y") || !strcasecmp(answer, "yes");
+    } else if (kind == CF_PICK) {
+      ok = all_digits(answer) && atoi(answer) >= 1 && atoi(answer) <= ui->confirm_pick_max;
+      if (ok) ui->confirm_len = (size_t)usnprintf((char *)ui->confirm_payload,
+                                                  sizeof(ui->confirm_payload), "%d", atoi(answer));
+    } else {
+      ok = !strcmp(answer, ui->confirm_want);
+    }
+  }
   if (!ok) {
-    marker_err(ui, ui->confirm_seq, "cancelled");
+    refuse(ui, ui->confirm_seq, "cmd.cancelled", "cancelled", NULL);
     audit(ui, LOG_INFO, "[CONSOLE] %s@%s #%d %s -> cancelled", ui->admin, ui->ip,
           ui->confirm_seq, ui->confirm_rq.audit);
     secure_wipe(ui->confirm_payload, sizeof(ui->confirm_payload));
@@ -1487,7 +2793,7 @@ static void in_backspace(console_ui_t *ui) {
 }
 
 /* What Tab offers for one argument of a command (docs/console.md §2). */
-enum ck { CK_NONE, CK_CMD, CK_WORDS, CK_BOT, CK_BOT_ON, CK_HUB };
+enum ck { CK_NONE, CK_GROUP, CK_WORDS, CK_BOT, CK_BOT_ON, CK_BOT_NICK, CK_HUB_NAME };
 
 typedef struct {
   const char *cmd, *sub;
@@ -1498,19 +2804,33 @@ typedef struct {
 
 #define LEVEL_WORDS "none error warning info debug"
 static const arg_comp_t ARG_COMP[] = {
-  {"help", NULL, 0, CK_CMD, NULL},
+  {"help", NULL, 0, CK_GROUP, NULL},
+  {"bot", "show", 0, CK_BOT_NICK, NULL},
   {"bot", "del", 0, CK_BOT, NULL},
   {"bot", "kick", 0, CK_BOT_ON, NULL},
   {"bot", "rekey", 0, CK_BOT, NULL},
-  {"peer", "setkey", 0, CK_HUB, NULL},
+  {"peer", "show", 0, CK_HUB_NAME, NULL},
+  {"peer", "set", 0, CK_HUB_NAME, NULL},
+  {"peer", "set", 1, CK_WORDS, "key"},
+  {"hub", "set", 0, CK_WORDS, "name bindip port pubkey autopurge"},
   {"hub", "purge", 0, CK_WORDS, "now"},
-  {"loglevel", NULL, 0, CK_WORDS, "file console " LEVEL_WORDS},
-  {"loglevel", NULL, 1, CK_WORDS, LEVEL_WORDS}, /* after file|console */
+  {"log", "set", 0, CK_WORDS, "file console size"},
+  {"log", "set", 1, CK_WORDS, LEVEL_WORDS}, /* after file|console */
   {"log", "on", 0, CK_WORDS, LEVEL_WORDS},
-  {"view", NULL, 0, CK_WORDS, "1 2 3 4 5"},
-  {"filter", NULL, 0, CK_WORDS, "clear"},
+  {"log", "filter", 0, CK_WORDS, "clear"},
+  {"acl", "add", 0, CK_WORDS, "allow deny"},
+  {"acl", "del", 0, CK_WORDS, "allow deny"},
+  {"user", "list", 0, CK_WORDS, "admin oper"},
+  {"user", "add", 0, CK_WORDS, "admin oper"},
+  {"user", "set", 1, CK_WORDS, "key"},
+  {"user", "mask", 0, CK_WORDS, "add del"},
+  {"channel", "set", 1, CK_WORDS, "key"},
   {"upgrade", "releases", -1, CK_WORDS, "bot= hub="},
   {"upgrade", "start", -1, CK_WORDS, "hub= nodes= botbase= hubbase="},
+  {"display", "view", 0, CK_WORDS, "1 2 3 4 5"},
+  {"display", "format", 0, CK_WORDS, "pretty raw"},
+  {"display", "width", 0, CK_WORDS, "auto"},
+  {"display", "events", 0, CK_WORDS, "on off"},
 };
 #define NARGCOMP ((int)(sizeof(ARG_COMP) / sizeof(ARG_COMP[0])))
 
@@ -1539,6 +2859,13 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
     for (int i = 0; i < NCMDS; i++) ADD_CAND(CMDS[i].cmd);
     return n;
   }
+  if (!strcmp(w[0], "?")) usnprintf(w[0], 64, "help");
+  /* help <group> <command> */
+  if (!strcasecmp(w[0], "help") && word_idx == 2) {
+    for (int i = 0; i < NCMDS; i++)
+      if (CMDS[i].sub && !strcasecmp(CMDS[i].cmd, w[1])) ADD_CAND(CMDS[i].sub);
+    return n;
+  }
   bool subs = cmd_has_subs(w[0]);
   if (word_idx == 1 && subs) {
     for (int i = 0; i < NCMDS; i++)
@@ -1555,8 +2882,8 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
     if (!sub) return 0;
     pos--;
   }
-  if (!strcasecmp(w[0], "loglevel") && pos == 1 &&
-      strcasecmp(w[1], "file") && strcasecmp(w[1], "console"))
+  if (!strcasecmp(w[0], "log") && sub && !strcmp(sub, "set") && pos == 1 &&
+      strcasecmp(w[2], "file") && strcasecmp(w[2], "console"))
     return 0;
   const arg_comp_t *ac = NULL;
   for (int i = 0; i < NARGCOMP && !ac; i++)
@@ -1565,8 +2892,8 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
         (ARG_COMP[i].pos < 0 || ARG_COMP[i].pos == pos))
       ac = &ARG_COMP[i];
   if (!ac) return 0;
-  if (ac->kind == CK_CMD) {
-    for (int i = 0; i < NCMDS; i++) ADD_CAND(CMDS[i].cmd);
+  if (ac->kind == CK_GROUP) {
+    for (int i = 0; i < NGROUPS; i++) ADD_CAND(GROUPS[i].name);
     return n;
   }
   if (ac->kind == CK_WORDS) {
@@ -1581,8 +2908,8 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
     }
     return n;
   }
-  /* uuids from the tree rows: H|depth|name|uuid|..., B|depth|nick|uuid|...,
-   * D|nick|uuid|... (a bot that is offline) */
+  /* uuids (and for show / peer set, names) from the tree rows:
+   * H|depth|name|uuid|..., B|depth|nick|uuid|..., D|nick|uuid|... (offline) */
   for (const char *p = ui->tree; p && *p && n < max && *pooln < 128;) {
     const char *nl = strchr(p, '\n');
     size_t ll = nl ? (size_t)(nl - p) : strlen(p);
@@ -1595,13 +2922,22 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
       char *save = NULL;
       for (char *t = strtok_r(row, "|", &save); t && nf < 10; t = strtok_r(NULL, "|", &save))
         f[nf++] = t;
-      const char *uuid = NULL;
+      const char *cand[2] = {NULL, NULL};
       char ty = nf ? f[0][0] : 0;
-      if (ac->kind == CK_HUB && ty == 'H' && nf >= 4) uuid = f[3];
-      else if ((ac->kind == CK_BOT || ac->kind == CK_BOT_ON) && ty == 'B' && nf >= 4) uuid = f[3];
-      else if (ac->kind == CK_BOT && ty == 'D' && nf >= 3) uuid = f[2];
-      if (uuid && strcmp(uuid, "-")) {
-        usnprintf(pool[*pooln], 72, "%s", uuid);
+      if (ac->kind == CK_HUB_NAME && ty == 'H' && nf >= 4 && strcmp(f[1], "0")) {
+        cand[0] = f[2];
+        cand[1] = f[3];
+      } else if ((ac->kind == CK_BOT || ac->kind == CK_BOT_ON || ac->kind == CK_BOT_NICK) &&
+                 ty == 'B' && nf >= 4) {
+        cand[0] = f[3];
+        if (ac->kind == CK_BOT_NICK) cand[1] = f[2];
+      } else if ((ac->kind == CK_BOT || ac->kind == CK_BOT_NICK) && ty == 'D' && nf >= 3) {
+        cand[0] = f[2];
+        if (ac->kind == CK_BOT_NICK) cand[1] = f[1];
+      }
+      for (int k = 0; k < 2 && *pooln < 128; k++) {
+        if (!cand[k] || !strcmp(cand[k], "-")) continue;
+        usnprintf(pool[*pooln], 72, "%s", cand[k]);
         size_t before = (size_t)n;
         ADD_CAND(pool[*pooln]);
         if ((size_t)n > before) (*pooln)++;
@@ -1659,7 +2995,7 @@ static void complete(console_ui_t *ui) {
     size_t o = 0;
     for (int i = 0; i < n && o + 2 < sizeof(line); i++)
       o += (size_t)usnprintf(line + o, sizeof(line) - o, "%s%s", i ? "  " : "", out[i]);
-    note(ui, line, L_INFO);
+    note(ui, line, RL_RULE);
   }
   ui->dirty = true;
 }
@@ -1904,6 +3240,7 @@ static void feed_seq(console_ui_t *ui, const unsigned char *s, size_t n, long lo
 
 void ui_input(console_ui_t *ui, const unsigned char *data, size_t n, long long now_ms) {
   ui->last_input_ms = now_ms;
+  ui->now_ms = now_ms;
   for (size_t i = 0; i < n; i++) {
     unsigned char b = data[i];
     if (ui->esc_len > 0) {
@@ -1980,13 +3317,15 @@ void ui_input(console_ui_t *ui, const unsigned char *data, size_t n, long long n
 
 static const char *kind_sgr(int kind) {
   switch (kind) {
-  case L_CMD:  return "0;1";
-  case L_ERR:  return "0;31";
-  case L_OK:   return "0;32";
-  case L_INFO: return "0;36";
-  case L_WARN: return "0;33";
-  case L_DIM:  return "0;90";
-  default:     return SGR_RESET;
+  case RL_CMD:   return "0;1";
+  case RL_ERR:   return "0;31";
+  case RL_OK:    return "0;32";
+  case RL_TITLE: return "0;1;36";
+  case RL_RULE:  return "0;36";
+  case RL_HEAD:  return "0;1";
+  case RL_WARN:  return "0;33";
+  case RL_DIM:   return "0;90";
+  default:       return SGR_RESET;
   }
 }
 
@@ -2008,6 +3347,7 @@ typedef struct {
   cbuf_t b;
   int    w;        /* cells used */
   int    max;      /* cells allowed */
+  bool   ascii;    /* display ascii: non-ASCII through fmt_ascii_char */
 } rowb_t;
 
 static void rb_start(rowb_t *r, int max) {
@@ -2032,8 +3372,15 @@ static void rb_text(rowb_t *r, const char *s, int cells) {
     unsigned cp;
     int cw;
     size_t ul = next_char(s + i, n - i, &cp, &cw);
+    const char *a = NULL;
+    if (r->ascii && (unsigned char)s[i] >= 0x80) {
+      size_t al;
+      a = fmt_ascii_char(s + i, n - i, &al);
+      if (a) cw = (int)strlen(a);
+    }
     if (used + cw > lim) break;
-    cbuf_add(&r->b, s + i, ul);
+    if (a) cbuf_adds(&r->b, a);
+    else cbuf_add(&r->b, s + i, ul);
     used += cw;
     i += ul;
   }
@@ -2062,15 +3409,6 @@ static void rb_right(rowb_t *r, const char *s, int width) {
   rb_pad(r, r->w + (width - sw));
   rb_text(r, s, width);
 }
-
-/* ---- tree rows ---- */
-typedef struct {
-  char type;          /* H B D */
-  int  depth;
-  char name[64], uuid[64], ver[24], var[8], server[72];
-  bool online;
-  long long started;  /* H/B: start time, D: last seen */
-} trow_t;
 
 /* Copy a (sanitized) field into dst[cap]: at most cap-1 bytes, never
  * splitting a UTF-8 character, so a cut field still renders cleanly. */
@@ -2155,8 +3493,6 @@ static void fmt_age(long long since, char *out, size_t cap) {
   else if (d < 86400) usnprintf(out, cap, "%lldh", d / 3600);
   else usnprintf(out, cap, "%lldd", d / 86400);
 }
-
-#define MAX_TROWS 1400
 
 /* One pane line for tree row i. */
 static void tree_line(const console_ui_t *ui, rowb_t *r, const trow_t *t, int i,
@@ -2294,25 +3630,33 @@ static void scroll_view(console_ui_t *ui, int dir) {
   ui->dirty = true;
 }
 
-/* A text blob (upgrade status, stats) shown from line anchor[view] on. */
-static void blob_rows(const console_ui_t *ui, int view, const char *text, int W,
+/* Views 4 and 5: the upgrade status / statistics reply, laid out by the
+ * same renderer as the commands (no result line), from line anchor[view]. */
+static void view_rows(const console_ui_t *ui, int view, const char *text, int W,
                       int H, rowb_t *rows, int col0) {
-  long long top = ui->anchor[view] < 0 ? 0 : ui->anchor[view];
-  long long line = 0;
-  int y = 0;
-  for (const char *p = text; p && *p && y < H;) {
-    const char *nl = strchr(p, '\n');
-    size_t ll = nl ? (size_t)(nl - p) : strlen(p);
-    if (line++ >= top) {
-      char buf[1024];
-      usnprintf(buf, sizeof(buf), "%.*s", (int)(ll < sizeof(buf) - 1 ? ll : sizeof(buf) - 1), p);
-      rb_sgr(&rows[y], SGR_RESET);
-      rb_text(&rows[y], buf, W);
-      rb_pad(&rows[y], col0 + W);
-      y++;
-    }
-    p = nl ? nl + 1 : NULL;
+  flines_t f = {0};
+  if (!text) {
+    flines_add(&f, RL_DIM, "(asking the hub...)");
+  } else {
+    creply_t rep;
+    creply_parse(text, strlen(text), &rep);
+    fmt_ctx_t c;
+    char slog[128];
+    ctx_init(ui, &c, FMT_MODE_VIEW, slog, sizeof(slog));
+    c.ascii = ui->ascii;
+    c.width = W;
+    fmt_reply(&c, &rep, view == V_UPG ? "upgrade status" : "hub stats", &f);
+    creply_free(&rep);
   }
+  long long top = ui->anchor[view] < 0 ? 0 : ui->anchor[view];
+  int y = 0;
+  for (int i = (int)(top < f.n ? top : f.n); i < f.n && y < H; i++, y++) {
+    rb_sgr(&rows[y], kind_sgr(f.v[i].role));
+    rb_text(&rows[y], f.v[i].text, W);
+    rb_sgr(&rows[y], SGR_RESET);
+    rb_pad(&rows[y], col0 + W);
+  }
+  flines_free(&f);
 }
 
 static void net_rows_count(const console_ui_t *ui, int *n) {
@@ -2356,12 +3700,7 @@ static void net_view(console_ui_t *ui, int W, int H, rowb_t *rows, int col0) {
   if (detail && n) {
     const trow_t *t = &tr[ui->net_sel];
     char line[256], when[64] = "--";
-    if (t->started > 0) {
-      time_t ts = (time_t)t->started;
-      struct tm tmv;
-      localtime_r(&ts, &tmv);
-      strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &tmv);
-    }
+    if (t->started > 0) fmt_when(t->started, now_s(), when, sizeof(when));
     const char *kind = t->type == 'H' ? "hub" : t->type == 'B' ? "bot" : "bot (not connected)";
     int y0 = H - detail;
     rb_sgr(&rows[y0], SGR_LINE);
@@ -2382,13 +3721,11 @@ static void status_bar(console_ui_t *ui, rowb_t *r, long long now_ms, bool pane_
   typedef struct { char text[96]; int prio; const char *sgr; } seg;
   seg s[16];
   int n = 0;
-  time_t now = time(NULL);
-  struct tm tmv;
-  localtime_r(&now, &tmv);
+  char clk[16];
+  clock_utc(clk, sizeof(clk), false);
 #define SEG(p, sg, ...) do { if (n < 16) { usnprintf(s[n].text, sizeof(s[n].text), __VA_ARGS__); s[n].prio = p; s[n].sgr = sg; n++; } } while (0)
   const char *hn = ui->hubname[0] ? ui->hubname : "hub";
-  SEG(1, SGR_STATUS, "%02d:%02d %.*s %.*s", tmv.tm_hour, tmv.tm_min, uprec(hn, 40), hn,
-      uprec(ui->admin, 40), ui->admin);
+  SEG(1, SGR_STATUS, "%s %.*s %.*s", clk, uprec(hn, 40), hn, uprec(ui->admin, 40), ui->admin);
   if (ui->st.have) {
     SEG(2, SGR_STATUS, "peers %d/%d", ui->st.peers_up, ui->st.peers_total);
     SEG(2, SGR_STATUS, "bots %d/%d", ui->st.bots_on, ui->st.bots_total);
@@ -2447,10 +3784,51 @@ static void status_bar(console_ui_t *ui, rowb_t *r, long long now_ms, bool pane_
   rb_sgr(r, SGR_RESET);
 }
 
+/* The output pane's width (the terminal minus the tree pane). */
+static int main_width(const console_ui_t *ui) {
+  int C = ui->cols;
+  bool wide = C >= CONSOLE_PANE_MIN_COLS;
+  int pane_w = 0;
+  if (wide && !ui->pane_user_off) {
+    pane_w = C * 30 / 100;
+    if (pane_w < CONSOLE_PANE_MIN) pane_w = CONSOLE_PANE_MIN;
+    if (pane_w > CONSOLE_PANE_MAX) pane_w = CONSOLE_PANE_MAX;
+  }
+  if (!wide && ui->overlay) pane_w = C - 20 < CONSOLE_PANE_MIN ? C - 20 : CONSOLE_PANE_MIN;
+  if (pane_w < 0) pane_w = 0;
+  return pane_w ? C - pane_w - 1 : C;
+}
+
+/* D5: the console view laid out again for a new width — every reply it
+ * holds is rendered anew from its records. */
+static void relayout(console_ui_t *ui) {
+  int w = main_width(ui);
+  if (ui->render_w == w || !ui->ent) return;
+  ui->render_w = w;
+  sb_clear(&ui->sb[V_CONSOLE]);
+  for (long long e = ui->ent_first; e < ui->ent_next; e++) {
+    const centry_t *x = &ui->ent[e % CONSOLE_SCROLLBACK];
+    if (x->text) {
+      char *a = ui->ascii ? fmt_ascii(x->text) : NULL;
+      sb_add(&ui->sb[V_CONSOLE], a ? a : x->text, x->kind, LOG_INFO);
+      free(a);
+    } else if (x->reply) {
+      flines_t f = {0};
+      render_reply(ui, x->reply, strlen(x->reply), x->words, x->mode, &f);
+      for (int i = 0; i < f.n; i++) sb_add(&ui->sb[V_CONSOLE], f.v[i].text, f.v[i].role, LOG_INFO);
+      flines_free(&f);
+    }
+  }
+  ui->anchor[V_CONSOLE] = -1;
+}
+
 static void compose(console_ui_t *ui, rowb_t *rows, int *cur_row, int *cur_col,
                     long long now_ms) {
   int C = ui->cols, R = ui->rows;
-  for (int y = 0; y < R; y++) rb_start(&rows[y], y == R - 1 ? C - 1 : C);
+  for (int y = 0; y < R; y++) {
+    rb_start(&rows[y], y == R - 1 ? C - 1 : C);
+    rows[y].ascii = ui->ascii;
+  }
   if (C < CONSOLE_MIN_COLS || R < CONSOLE_MIN_ROWS) {
     rb_text(&rows[0], "terminal too small (40x10 at least)", -1);
     for (int y = 0; y < R; y++) rb_pad(&rows[y], rows[y].max);
@@ -2507,7 +3885,9 @@ static void compose(console_ui_t *ui, rowb_t *rows, int *cur_row, int *cur_col,
       if (!l || !l->text) continue;
       char buf[CONSOLE_INPUT_MAX * 2];
       size_t n = segs[y].to - segs[y].from;
-      if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+      /* a row of 3-byte glyphs (or zero-width marks) can outgrow buf: cut
+       * where no character is split, or the terminal gets half of one */
+      if (n >= sizeof(buf)) n = utf8_cut(l->text + segs[y].from, sizeof(buf) - 1);
       memcpy(buf, l->text + segs[y].from, n);
       buf[n] = '\0';
       bool hit = ui->view == V_LOG && ui->search[0] && ci_contains(l->text, ui->search) &&
@@ -2521,7 +3901,7 @@ static void compose(console_ui_t *ui, rowb_t *rows, int *cur_row, int *cur_col,
     net_view(ui, main_w, H, body, 0);
   } else {
     const char *text = ui->view == V_UPG ? ui->upg_text : ui->stats_text;
-    blob_rows(ui, ui->view, text ? text : "(asking the hub...)", main_w, H, body, 0);
+    view_rows(ui, ui->view, text, main_w, H, body, 0);
   }
   for (int y = 0; y < H; y++) {
     rb_sgr(&body[y], SGR_RESET);
@@ -2575,6 +3955,7 @@ static void compose(console_ui_t *ui, rowb_t *rows, int *cur_row, int *cur_col,
 
 static void draw(console_ui_t *ui, long long now_ms) {
   if (ui->line_mode) return;
+  relayout(ui);
   int R = ui->rows;
   rowb_t *rows = calloc((size_t)R, sizeof(rowb_t));
   if (!rows) return;
@@ -2628,7 +4009,9 @@ console_ui_t *ui_new(bool line_mode, int cols, int rows, const char *admin,
   if (!line_mode) {
     sb_init(&ui->sb[V_CONSOLE], CONSOLE_SCROLLBACK);
     sb_init(&ui->sb[V_LOG], CONSOLE_LOG_SCROLLBACK);
+    ui->ent = calloc(CONSOLE_SCROLLBACK, sizeof(centry_t));
   }
+  ui->render_w = -1;
   for (int v = 0; v < V_COUNT; v++) ui->anchor[v] = -1;
   ui->log_show = LOG_DEBUG;
   ui->log_sub_level = LOG_INFO;
@@ -2645,6 +4028,11 @@ void ui_free(console_ui_t *ui) {
   for (int i = 0; i < ui->queued_n; i++) free(ui->queued[i]);
   for (int i = 0; i < ui->prev_n; i++) free(ui->prev_rows[i]);
   free(ui->prev_rows);
+  for (int i = 0; ui->ent && i < CONSOLE_SCROLLBACK; i++) {
+    free(ui->ent[i].text);
+    free(ui->ent[i].reply);
+  }
+  free(ui->ent);
   free(ui->tree);
   free(ui->upg_text);
   free(ui->stats_text);
@@ -2657,11 +4045,15 @@ void ui_free(console_ui_t *ui) {
 
 void ui_start(console_ui_t *ui, long long now_ms) {
   ui->last_input_ms = now_ms;
+  ui->now_ms = ui->start_ms = now_ms;
   ui->started = true;
   subscribe(ui);
-  char hello[256];
-  usnprintf(hello, sizeof(hello), "irchub console %s on %s - logged in as %s",
-           HUB_VERSION, ui->hubname[0] ? ui->hubname : "hub", ui->admin);
+  /* §2.1: "irchub console" stays the first words (scripts look for it); the
+   * mesh summary follows once the first status event is in */
+  char hello[320];
+  usnprintf(hello, sizeof(hello), "irchub console %s (%s) %s %s %s admin %s from %s",
+            HUB_VERSION, HUB_UPDATE_VARIANT, "·",
+            ui->hubname[0] ? ui->hubname : "hub", "·", ui->admin, ui->ip);
   if (ui->line_mode) {
     lm_line(ui, hello);
     lm_prompt(ui);
@@ -2669,9 +4061,7 @@ void ui_start(console_ui_t *ui, long long now_ms) {
   }
   /* alternate screen, bracketed paste */
   cbuf_adds(&ui->term, "\x1b[?1049h\x1b[?2004h\x1b[H\x1b[2J");
-  fs_timestamped(ui, V_CONSOLE, hello, L_INFO);
-  fs_timestamped(ui, V_CONSOLE, "help lists the commands; Alt+1..5 switch views "
-                 "(or: view <n>)", L_INFO);
+  fs_line(ui, hello, RL_TITLE);
   ui->dirty = true;
 }
 
@@ -2686,6 +4076,7 @@ void ui_resize(console_ui_t *ui, int cols, int rows, long long now_ms) {
 
 void ui_tick(console_ui_t *ui, long long now_ms) {
   if (!ui->started) return;
+  ui->now_ms = now_ms;
   if (ui->esc_len > 0 && now_ms - ui->esc_ms >= CONSOLE_ESC_MS) {
     if (ui->esc_len == 1) handle_key(ui, (ckey_t){K_ESC, 0}, now_ms);
     ui->esc_len = 0;
@@ -2704,7 +4095,7 @@ void ui_tick(console_ui_t *ui, long long now_ms) {
       lm_async(ui, m);
     } else {
       usnprintf(m, sizeof(m), "[%lu lines dropped]", n);
-      fs_add(ui, V_LOG, m, L_WARN, LOG_ERROR);
+      fs_add(ui, V_LOG, m, RL_WARN, LOG_ERROR);
     }
   }
   if (ui->line_mode) return;

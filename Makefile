@@ -17,7 +17,7 @@ $(info [build] using CC=$(CC))
 PROJECT = irchub
 
 # Version
-VERSION = 2.4.2
+VERSION = 2.4.4
 
 # Directories
 SRC_DIR = .
@@ -27,7 +27,7 @@ OBJ_DIR = $(BUILD_DIR)/obj
 
 # Source files
 # One line: tools (the testnet) read this variable with a single-line match.
-HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_update.c hub_console.c hub_console_ui.c hub_console_core.c
+HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_update.c hub_reply.c hub_console.c hub_console_ui.c hub_console_fmt.c hub_console_core.c
 
 # Object files
 HUB_OBJECTS = $(HUB_SOURCES:%.c=$(OBJ_DIR)/%.o)
@@ -215,8 +215,9 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c hub.h
 # hub_console.c includes libssh's headers, which exist once the library is built.
 $(HUB_OBJECTS): | $(LIBSSH_LIB)
 
-$(OBJ_DIR)/hub_console.o $(OBJ_DIR)/hub_console_ui.o: hub_console.h hub_console_ui.h
-$(OBJ_DIR)/hub_console_core.o: hub_console.h
+$(OBJ_DIR)/hub_console.o $(OBJ_DIR)/hub_console_ui.o $(OBJ_DIR)/hub_console_fmt.o: hub_console.h hub_console_ui.h hub_console_fmt.h
+$(OBJ_DIR)/hub_console_core.o: hub_console.h hub_reply.h
+$(OBJ_DIR)/hub_logic.o $(OBJ_DIR)/hub_reply.o: hub_reply.h hub_console.h
 
 # ============================================================================
 # Build Modes (shortcuts)

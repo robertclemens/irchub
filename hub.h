@@ -130,7 +130,7 @@
  * the Makefile; -D-overridable so a release build can stamp its own version
  * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
 #ifndef HUB_VERSION
-#define HUB_VERSION "2.4.3"
+#define HUB_VERSION "2.4.4"
 #endif
 
 /* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
@@ -722,6 +722,7 @@ typedef struct {
   char nick[32];
   char ip[64];
   time_t last_attempt;
+  int attempts;            // connection attempts while pending (console)
 } pending_bot_t;
 
 typedef struct {
@@ -919,6 +920,9 @@ typedef struct {
    * that sends one reports in. */
   char   remote_variant[ROSTER_VARIANT_MAX + 1];
   char last_gossip[MAX_BUFFER];
+  /* When the link last went down (volatile, 0 = not since this hub started):
+   * the console's "down since". */
+  time_t link_down_at;
 
   /* Peer auth (HUBv3): per-peer Curve25519 public keys. has_pubkey is
    * required — a peer without one is refused (there is no shared secret). */
@@ -1061,7 +1065,8 @@ typedef struct {
   char   version[ROSTER_VERSION_MAX + 1];
   char   variant[ROSTER_VARIANT_MAX + 1]; /* code base: "c" / "rs" / ""  */
   char   server[ROSTER_SERVER_MAX + 1];   /* the bot's IRC link           */
-  time_t connected_at;                    /* bot -> hub, for uptime       */
+  time_t connected_at;                    /* bot's own start, for uptime  */
+  time_t link_since;                      /* bot -> its hub link, 0 = unknown */
   time_t reported_at;                     /* local clock: drives the TTL  */
 } bot_roster_t;
 
@@ -1120,6 +1125,10 @@ typedef struct {
   int listen_fd;
   int port;
   char bind_ip[64];          // IP this hub advertises itself as in mesh
+  /* What the listener actually bound at startup: bind_ip / port changed
+   * since take effect on the next start (the console's "pending"). */
+  char listen_ip[64];
+  int listen_port;
   char hub_uuid[64];         // This hub's UUID
   char hub_friendly_name[64]; // This hub's friendly name
   /* /proc/self/exe — the binary an upgrade replaces, and the one
@@ -1468,8 +1477,6 @@ time_t hub_storage_global_ts(const hub_state_t *state, const char *key,
 /* Soft-delete a registered bot: a d|1 tombstone stamped past any earlier 'd'.
  * False when the uuid is unknown or already deleted; *ts_out = the stamp. */
 bool hub_storage_delete(hub_state_t *state, const char *uuid, time_t *ts_out);
-int hub_storage_get_full_list(hub_state_t *state, char *buffer, int max_len);
-int hub_storage_get_summary_list(hub_state_t *state, char *buffer, int max_len);
 
 void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len);
 /* proto_v2: the receiving connection advertised v|2 (new a|/o|/b| shapes);
@@ -1479,9 +1486,10 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
 void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
                                  int exclude_fd);
 
-// cutoff==0: purge all tombstones; cutoff>0: purge tombstones older than cutoff
-int hub_execute_purge(hub_state_t *state, time_t cutoff,
-                      char *log_out, int log_max_len);
+// cutoff==0: purge all tombstones; cutoff>0: purge tombstones older than cutoff.
+// tombs (may be NULL) gets one tomb|kind|id|name|ts record per tombstone.
+struct reply;
+int hub_execute_purge(hub_state_t *state, time_t cutoff, struct reply *tombs);
 
 /* Send PURGE|<cutoff>|<id> to every peer hub, under a fresh random id that
  * this hub records as seen.  False (nothing sent) if no id could be drawn. */

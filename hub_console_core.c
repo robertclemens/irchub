@@ -13,6 +13,8 @@
 #define _DEFAULT_SOURCE
 #include "hub.h"
 #include "hub_console.h"
+#include "hub_reply.h"
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/mman.h>
@@ -48,6 +50,7 @@ struct hub_console_link {
 typedef struct {
   uint64_t seq;
   int      level;
+  time_t   ts;
   char     text[CONSOLE_LOG_LINE_MAX];
 } console_log_entry_t;
 
@@ -96,6 +99,7 @@ void hub_console_log_append(int level, const char *line, size_t len) {
   /* The rest of the slot still holds an older line: clear it. */
   memset(e->text + o, 0, sizeof(e->text) - o);
   e->level = level < LOG_ERROR ? LOG_ERROR : level > LOG_DEBUG ? LOG_DEBUG : level;
+  e->ts = time(NULL);
 }
 
 static const char *log_level_word(int level) {
@@ -513,18 +517,33 @@ bool hub_console_frame(hub_state_t *state, hub_client_t *c, uint8_t op,
     console_subscribe(l, payload + 4);
     return true;   /* no reply: a subscription is not a command */
   }
+  /* get|tree and get|status: the result line, then the rows / key=value
+   * lines exactly as the events carry them (docs/console.md §3.4). */
   if (strcmp(payload, "get|tree") == 0 || strcmp(payload, "get|status") == 0) {
     char *rows = malloc(MAX_TREE_PAYLOAD);
-    if (!rows) return hub_console_send(c, CONSOLE_REPLY, "ERROR: out of memory", 20);
+    if (!rows) {
+      static const char OOM[] = "err|internal.oom|msg=out of memory";
+      return hub_console_send(c, CONSOLE_REPLY, OOM, sizeof(OOM) - 1);
+    }
     hub_console_tree_rows(state, rows, MAX_TREE_PAYLOAD);
     bool ok;
     if (payload[4] == 't') {
-      ok = hub_console_send(c, CONSOLE_REPLY, rows, strlen(rows));
+      size_t rl = strlen(rows);
+      while (rl > 0 && rows[rl - 1] == '\n') rows[--rl] = '\0';
+      char *out = malloc(rl + 32);
+      if (!out) {
+        free(rows);
+        static const char OOM[] = "err|internal.oom|msg=out of memory";
+        return hub_console_send(c, CONSOLE_REPLY, OOM, sizeof(OOM) - 1);
+      }
+      int n = snprintf(out, rl + 32, "ok|network.tree%s%s", rl ? "\n" : "", rows);
+      ok = hub_console_send(c, CONSOLE_REPLY, out, (size_t)n);
+      free(out);
     } else {
       char line[256], out[512];
       hub_console_status_line(state, rows, line, sizeof(line));
       /* one key=value per line */
-      size_t o = 0;
+      size_t o = (size_t)snprintf(out, sizeof(out), "ok|network.status\n");
       for (const char *p = line; *p && o + 2 < sizeof(out); p++)
         out[o++] = (*p == '|') ? '\n' : *p;
       out[o] = '\0';
@@ -533,7 +552,33 @@ bool hub_console_frame(hub_state_t *state, hub_client_t *c, uint8_t op,
     free(rows);
     return ok;
   }
-  return hub_console_send(c, CONSOLE_REPLY, "ERROR: unknown console request", 30);
+  /* get|log: the log settings and how full the file and the ring are */
+  if (strcmp(payload, "get|log") == 0) {
+    reply_t r;
+    reply_init(&r);
+    reply_ok(&r, "log.show");
+    reply_kvi(&r, "file_level", state->log_level);
+    reply_kvi(&r, "console_level", state->console_log_level);
+    reply_kv(&r, "file", HUB_LOG_FILE);
+    struct stat st;
+    reply_kvi(&r, "file_bytes", stat(HUB_LOG_FILE, &st) == 0 ? (long long)st.st_size : 0);
+    reply_kvi(&r, "limit",
+              state->log_max_size > 0 ? state->log_max_size : HUB_LOG_FILE_SIZE);
+    uint64_t lines = g_log_next > 1 ? g_log_next - 1 : 0;
+    if (lines > CONSOLE_LOG_RING) lines = CONSOLE_LOG_RING;
+    reply_kvu(&r, "ring_lines", (unsigned long long)lines);
+    reply_kvi(&r, "ring_cap", CONSOLE_LOG_RING);
+    if (lines && g_log_ring) {
+      const console_log_entry_t *e = &g_log_ring[(g_log_next - lines) % CONSOLE_LOG_RING];
+      if (e->ts > 0) reply_kvi(&r, "ring_oldest", (long long)e->ts);
+    }
+    reply_kvi(&r, "session_level", l->log_level);
+    bool ok = hub_console_send(c, CONSOLE_REPLY, reply_text(&r), strlen(reply_text(&r)));
+    reply_free(&r);
+    return ok;
+  }
+  static const char UNK[] = "err|console.unknown|msg=unknown console request";
+  return hub_console_send(c, CONSOLE_REPLY, UNK, sizeof(UNK) - 1);
 }
 
 /* ---- Per-pass work ------------------------------------------------------ */
