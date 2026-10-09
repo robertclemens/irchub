@@ -1639,7 +1639,10 @@ static const char *const OPNAME[256] = {
  [0x63] = "CMD_ADMIN_UPGRADE_NET", [0x64] = "CMD_ADMIN_UPGRADE_STATUS",
  [0x65] = "CMD_BOT_RELAY_FWD", [0x66] = "CMD_UPGRADE_FORGET", [0x67] = "CMD_PEER_BCAST",
  [0x68] = "CMD_ADMIN_STATS", [0x69] = "CMD_ACTIVITY", [0x6A] = "CMD_ACTIVITY_QUERY",
- [0x6B] = "CMD_ACTIVITY_REPLY", [0x6C] = "CMD_CONSOLE",
+ [0x6B] = "CMD_ACTIVITY_REPLY", [0x6C] = "CMD_CONSOLE", [0x6D] = "CMD_CHAN_PROBE",
+ [0x6E] = "CMD_CHAN_PROBE_ACK", [0x6F] = "CMD_CHAN_DO", [0x70] = "CMD_CHAN_DONE",
+ [0x71] = "CMD_CHAN_ELECT_FWD", [0x72] = "CMD_CHAN_ELECT_ACK", [0x73] = "CMD_CHAN_ELECT_DO",
+ [0x74] = "CMD_CHAN_ELECT_DONE", [0x75] = "CMD_ADMIN_INVITE_USER",
 };
 
 static unsigned long long rvu(const crec_t *r, const char *k) {
@@ -2248,9 +2251,30 @@ static void render_channel_change(const fmt_ctx_t *ctx, const creply_t *rep, fli
     else snprintf(ph, sizeof(ph), "the tombstone stays until hub purge (autopurge is off)");
     effect(ctx, out, ph);
   } else {
+    bool inv = !strcmp(code, "channel.invite");
     snprintf(subj, sizeof(subj), "%s on %s", rv(r, "nick") ? rv(r, "nick") : "?",
              rv(r, "chan") ? rv(r, "chan") : "?");
-    fmt_ok(ctx, "Op request sent", subj, out);
+    long long asked = rvi(r, "asked", 0), hubs = rvi(r, "hubs", 0);
+    if (rvs(r, "by")) { /* one bot was picked and did it */
+      fmt_ok(ctx, inv ? "Invited" : "Opped", subj, out);
+      snprintf(ph, sizeof(ph), "%s on %s did it%s%s%s", rv(r, "by"),
+               rv(r, "hub_name") ? rv(r, "hub_name") : "?", rvs(r, "detail") ? " (" : "",
+               rvs(r, "detail") ? rv(r, "detail") : "", rvs(r, "detail") ? ")" : "");
+      effect(ctx, out, ph);
+      snprintf(ph, sizeof(ph), "%lld bot%s asked on %lld hub%s; one acted", asked,
+               asked == 1 ? "" : "s", hubs, hubs == 1 ? "" : "s");
+      effect(ctx, out, ph);
+      return;
+    }
+    if (rvi(r, "legacy", 0) > 0) { /* nobody ready; older bots asked */
+      fmt_ok(ctx, inv ? "Invite request sent" : "Op request sent", subj, out);
+      long long lg = rvi(r, "legacy", 0);
+      snprintf(ph, sizeof(ph), "no bot reported ready; %lld older bot%s asked the old way", lg,
+               lg == 1 ? "" : "s");
+      effect(ctx, out, ph);
+      return;
+    }
+    fmt_ok(ctx, inv ? "Invite request sent" : "Op request sent", subj, out);
     long long local = rvi(r, "local", 0);
     if (local > 0)
       snprintf(ph, sizeof(ph), "%lld bot%s on this hub asked; forwarded to %lld peer hub%s", local,
@@ -2258,8 +2282,8 @@ static void render_channel_change(const fmt_ctx_t *ctx, const creply_t *rep, fli
     else
       snprintf(ph, sizeof(ph), "no bots on this hub; forwarded to %lld peer hub%s", peers, peers == 1 ? "" : "s");
     effect(ctx, out, ph);
-    snprintf(ph, sizeof(ph), "a bot that is opped on %s and sees %s will op them",
-             rv(r, "chan") ? rv(r, "chan") : "?", rv(r, "nick") ? rv(r, "nick") : "?");
+    snprintf(ph, sizeof(ph), "a bot that is opped on %s %s", rv(r, "chan") ? rv(r, "chan") : "?",
+             inv ? "will invite them" : "and sees them will op them");
     effect(ctx, out, ph);
   }
 }
@@ -2297,6 +2321,13 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
       fmt_span(ctx->now - rvi(ru, "set", 0), b, sizeof(b));
       snprintf(v, sizeof(v), "%s  (set %s %s %s ago)", plan, a, GL(G_DOT), b);
       fmt_card_line(ctx, out, L, "roll-up plan", v, RL_NORMAL);
+      /* Kept only for nodes that were down when the run went through. */
+      if (rvi(ru, "expires", 0) > 0) {
+        long long left = rvi(ru, "expires", 0) - ctx->now;
+        fmt_span(left > 0 ? left : 0, b, sizeof(b));
+        snprintf(v, sizeof(v), "waiting for nodes that missed the run; dropped in %s", b);
+        fmt_card_line(ctx, out, L, "", v, RL_DIM);
+      }
     } else {
       fmt_card_line(ctx, out, L, "roll-up plan", "none", RL_NORMAL);
     }

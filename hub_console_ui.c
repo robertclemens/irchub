@@ -608,7 +608,8 @@ static const cmd_def_t CMDS[] = {
   {"channel", "add", CMD_ADMIN_ADD_CHANNEL, B_CHAN_ADD, 1, 1, CF_NONE, 0, NULL, "channel add <#chan> [key]", "add (or re-add) a channel", NULL},
   {"channel", "del", CMD_ADMIN_DEL_CHANNEL, B_ARG, 1, 0, CF_YN, 0, NULL, "channel del <#chan>", "remove it from every bot (asks y/N)", NULL},
   {"channel", "set", CMD_ADMIN_ADD_CHANNEL, B_CHAN_SET, 3, 0, CF_NONE, 0, NULL, "channel set <#chan> <setting> <value|->", "change one setting (key today; - clears)", NULL},
-  {"channel", "op", CMD_ADMIN_OP_USER, B_CHAN_OP, 2, 0, CF_NONE, 0, NULL, "channel op <#chan> <nick>", "have the bots op a user", NULL},
+  {"channel", "op", CMD_ADMIN_OP_USER, B_CHAN_OP, 2, 0, CF_NONE, 0, NULL, "channel op <#chan> <nick>", "have one opped bot op a user", NULL},
+  {"channel", "invite", CMD_ADMIN_INVITE_USER, B_CHAN_OP, 2, 0, CF_NONE, 0, NULL, "channel invite <#chan> <nick>", "have one opped bot invite a user", NULL},
   {"upgrade", "status", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_NONE, 0, "", "upgrade status", "the upgrade run on this hub", NULL},
   {"upgrade", "releases", CMD_ADMIN_UPGRADE_STATUS, B_UPG_RELEASES, 0, 2, CF_NONE, 0, NULL, "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes", NULL},
   {"upgrade", "start", CMD_ADMIN_UPGRADE_NET, B_UPG_START, 1, 4, CF_TYPE, PRE_UPG_START, NULL, "upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade", NULL},
@@ -767,6 +768,8 @@ static const struct {
    "channel set #ops key s3cret\nchannel set #ops key -"},
   {"channel", "op", "#chan\tthe channel\nnick\tthe user's current nick on IRC",
    "channel op #ops alice"},
+  {"channel", "invite", "#chan\tthe channel\nnick\tthe user's current nick on IRC",
+   "channel invite #ops alice"},
   {"upgrade", "status", NULL, "upgrade status"},
   {"upgrade", "releases",
    "bot=<base>\ta different release site for the bot builds (a URL)\n"
@@ -1235,6 +1238,9 @@ static void parse_status(console_ui_t *ui, const char *data) {
 }
 
 static void request_view(console_ui_t *ui, int kind, long long now_ms) {
+  /* Replies come back in request order, and a command may be answered late
+   * (channel op waits for a bot): refresh only between commands. */
+  if (ui->user_busy) return;
   for (int i = 0; i < ui->rq_n; i++)
     if (ui->rq[i].kind == kind) return;         /* one at a time */
   if (ui->rq_n >= MAX_PENDING_RQ) return;
@@ -3024,6 +3030,7 @@ static void on_enter(console_ui_t *ui) {
       return;
     }
     hist_add(ui, line);
+    ui->hist_pos = ui->hist_n; /* after the add: Up must land on this line */
     run_line(ui, line);
   }
   if (ui->line_mode && !ui->closing) {

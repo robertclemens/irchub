@@ -130,7 +130,7 @@
  * the Makefile; -D-overridable so a release build can stamp its own version
  * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
 #ifndef HUB_VERSION
-#define HUB_VERSION "2.4.4"
+#define HUB_VERSION "2.4.5"
 #endif
 
 /* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
@@ -343,6 +343,45 @@
 #define CMD_CHAN_FWD_REQUEST 0x5C // Hub -> Hub: forward the action
 #define CMD_CHAN_FWD_REPLY   0x5D // Hub -> Hub: route a reply home
 
+/* ---- Channel-request election (docs/plans/2026-10-07_chan_election_plan.md)
+ * One bot acts, not every bot that could.  The hub asks its own bots whether
+ * they can (PROBE -> PROBE_ACK, answered at once from the bot's own state),
+ * hands the action to ONE ready bot picked at random (DO -> DONE), and moves
+ * on to the next ready bot when that one fails.  With nobody ready here the
+ * origin floods the question to the mesh (ELECT_FWD), each hub probes its own
+ * bots and answers ELECT_ACK back along the path, and the origin hands it to
+ * one hub with a ready bot (ELECT_DO -> ELECT_DONE, along the same path).
+ * Bots that never answer a probe predate it: when nobody is ready they get
+ * the old CMD_OP_GRANT / CMD_CHAN_ACTION.  A mesh holding any hub older than
+ * CHAN_ELECT_MIN_HUB keeps the old ask-everyone path.  Mirrors ircbot/bot.h
+ * and irchub.rs consts.rs.
+ *   PROBE      hub->bot  eid|kind|channel
+ *   PROBE_ACK  bot->hub  eid|1| or eid|0|reason
+ *   DO         hub->bot  eid|kind|channel|requester|nick|hostmask
+ *   DONE       bot->hub  eid|ok|detail or eid|fail|detail
+ *   ELECT_FWD  hub->hub  eid|origin_hub|kind|channel|requester|nick|hostmask|origin_ts
+ *   ELECT_ACK  hub->hub  eid|hub_uuid|hub_name|asked|ready|silent
+ *   ELECT_DO   hub->hub  eid|hub_uuid|elect or eid|hub_uuid|legacy
+ *   ELECT_DONE hub->hub  eid|hub_uuid|hub_name|bot_uuid|bot_nick|status|detail
+ * kind = op / invite / unban / key; requester = a bot uuid, or ADMIN. */
+#define CMD_CHAN_PROBE       0x6D
+#define CMD_CHAN_PROBE_ACK   0x6E
+#define CMD_CHAN_DO          0x6F
+#define CMD_CHAN_DONE        0x70
+#define CMD_CHAN_ELECT_FWD   0x71
+#define CMD_CHAN_ELECT_ACK   0x72
+#define CMD_CHAN_ELECT_DO    0x73
+#define CMD_CHAN_ELECT_DONE  0x74
+#define CMD_ADMIN_INVITE_USER 0x75 // Admin: invite a user (nick|#chan)
+#define CHAN_ELECT_MIN_HUB    "2.4.5" /* every hub in the mesh map at least */
+#define CHAN_ELECT_PROBE_WAIT 2   /* s: local bots' answers                 */
+#define CHAN_ELECT_MESH_WAIT  4   /* s: other hubs' answers, after the flood */
+#define CHAN_ELECT_DO_WAIT    5   /* s: one bot's DONE                      */
+#define CHAN_ELECT_HUB_WAIT   12  /* s: one hub's ELECT_DONE (it may retry)  */
+#define CHAN_ELECT_TTL        40  /* s: hard end of any election            */
+#define MAX_CHAN_ELECTIONS    16
+#define CHAN_ELECT_REASON_MAX 48
+
 /* --- Network-wide upgrade coordination (console-initiated rolling upgrade).
  * Fan PREPARE out to bots + peer hubs, collect READY/UNABLE acks routed home by
  * origin_fd (like CMD_OP_*), then COMMIT node-by-node and await RESULT.  Mirror
@@ -528,6 +567,11 @@
 #define ROLLUP_SETTLE      20   /* seconds after a node appears before we try */
 #define ROLLUP_TIMEOUT     300  /* give up on one attempt after this        */
 #define MAX_ROLLUP_TRIES   64   /* nodes remembered in the attempt ledger   */
+/* A plan only exists while somebody is owed it: it is dropped as soon as every
+ * registered bot and every known hub is on the target, and after this long
+ * regardless -- a bot down for a day is likely coming back, one down for
+ * months is not, and its admin can still run an upgrade by hand. */
+#define ROLLUP_PLAN_TTL    (7 * 86400)
 
 typedef struct {
   char request_id[64];
@@ -538,6 +582,7 @@ typedef struct {
   time_t timestamp;
   bool active;
 } pending_chan_request_t;
+
 
 #define MESH_ANTI_ENTROPY_INTERVAL 300
 #define MAX_BOT_ENTRIES 64
@@ -627,6 +672,7 @@ typedef struct {
 #define ROSTER_VERSION_MAX    15   /* "2.3.0", with room to grow             */
 #define ROSTER_VARIANT_MAX    7    /* code base: "c" / "rs"                  */
 #define ROSTER_SERVER_MAX     63   /* host:port of the bot's IRC link        */
+#define ROSTER_IP_MAX         45   /* INET6_ADDRSTRLEN - 1                   */
 #define ROSTER_FRAME_BUDGET   8192 /* chunk gossip well under MAX_BUFFER     */
 #define TREE_ROW_MAX          256  /* one tree row at its field caps         */
 /* One entry per (reporting hub, bot).  A hub only ever reports bots connected
@@ -981,6 +1027,10 @@ typedef struct {
    * the console thread already authenticated.  Plaintext frames, no pings,
    * no CLIENT_TIMEOUT (the console has its own idle timeout). */
   bool internal;
+  /* Never reused while the process lives (hub_next_conn_serial): what a late
+   * answer is bound to, so a console that took over a closed one's fd never
+   * gets a reply it did not ask for. */
+  uint64_t conn_serial;
   struct hub_console_link *console;
   /* First-bytes sniff of an accepted connection: until 4 bytes are there (or
    * CONSOLE_SNIFF_MS passed) it is not read, so an "SSH-" stream can be
@@ -1053,6 +1103,52 @@ typedef struct {
   time_t seen_at;        // When we first processed this request
 } seen_forward_t;
 
+/* One election (see CMD_CHAN_PROBE).  `from_fd` is the peer the question came
+ * from (-1: this hub started it); `admin_fd` the console owed the answer. */
+typedef enum {
+  CE_PROBE,      /* asking our own bots                                 */
+  CE_LOCAL_DO,   /* one of our bots was handed the action               */
+  CE_MESH_WAIT,  /* origin: flooded, collecting the other hubs' answers  */
+  CE_MESH_DO,    /* origin: one hub was handed the action               */
+  CE_ACKED       /* relay: answered the origin, routing DO/DONE now     */
+} chan_elect_phase_t;
+
+typedef struct {
+  char uuid[64];
+  char nick[MAX_NICK];
+  char st;                               /* a asked, y ready, n no, t tried */
+  char reason[CHAN_ELECT_REASON_MAX];
+} chan_elect_bot_t;
+
+typedef struct {
+  char uuid[64];
+  char name[64];
+  int  fd;                               /* the peer its answer came from */
+  int  asked, ready, silent;
+  bool tried;
+} chan_elect_hub_t;
+
+typedef struct {
+  bool   active;
+  char   id[64];
+  bool   origin;
+  int    from_fd;
+  int    admin_fd;
+  uint64_t admin_serial;                 /* admin_fd's conn_serial        */
+  char   kind[8];
+  char   channel[MAX_CHAN];
+  char   requester[64];
+  char   nick[MAX_NICK];
+  char   hostmask[MAX_MASK_LEN];
+  chan_elect_phase_t phase;
+  time_t phase_at, created;
+  chan_elect_bot_t bots[MAX_CLIENTS];
+  int    bot_n;
+  chan_elect_hub_t hubs[MAX_MESH_HUBS];
+  int    hub_n;
+  char   doing[64];                      /* bot (CE_LOCAL_DO) or hub uuid  */
+} chan_elect_t;
+
 /* One bot's live presence, as reported by the hub it is connected to.  Purely
  * in-memory: never written to the config, never tombstoned, never purged.  An
  * entry whose reported_at falls behind BOT_ROSTER_TTL is dropped, so a bot
@@ -1067,6 +1163,7 @@ typedef struct {
   char   server[ROSTER_SERVER_MAX + 1];   /* the bot's IRC link           */
   time_t connected_at;                    /* bot's own start, for uptime  */
   time_t link_since;                      /* bot -> its hub link, 0 = unknown */
+  char   ip[ROSTER_IP_MAX + 1];           /* bot's address as its hub sees it */
   time_t reported_at;                     /* local clock: drives the TTL  */
 } bot_roster_t;
 
@@ -1177,6 +1274,7 @@ typedef struct {
 
   pending_op_request_t pending_op_requests[MAX_PENDING_OP_REQUESTS];
   pending_chan_request_t pending_chan_requests[MAX_PENDING_CHAN_REQUESTS];
+  chan_elect_t chan_elections[MAX_CHAN_ELECTIONS];
 
   /* The network upgrade this hub is driving, if any (one at a time). */
   pending_upgrade_t upgrade;
@@ -1503,6 +1601,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client);
 bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
                                unsigned char *data, int packet_len);
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c);
+uint64_t hub_next_conn_serial(void);
+void hub_chan_elect_forget_admin(hub_state_t *state, const hub_client_t *c);
 void hub_broadcast_mesh_state(hub_state_t *state);
 
 /* ---- Bot presence / the 'bots' tree (hub_logic.c) ----
@@ -1581,6 +1681,7 @@ const char *hub_update_host_variant(void);
 int hub_update_check_cli(const char *variant);
 void hub_roster_expire(hub_state_t *state, time_t now);
 void hub_roster_mark_dirty(hub_state_t *state, bool local);
+void hub_chan_elect_tick(hub_state_t *state, time_t now);
 
 /* ---- Mesh transport: per-peer outbound queue (see docs/mesh.md) ---- */
 

@@ -311,6 +311,7 @@ static void ctl_open(hub_state_t *state, char *args) {
   l->log_level = -1;
   l->log_next = g_log_next;
   c->fd = fd;
+  c->conn_serial = hub_next_conn_serial();
   snprintf(c->ip, sizeof(c->ip), "%s", ip);
   snprintf(c->id, sizeof(c->id), "ADMIN:%s", name);
   c->type = CLIENT_ADMIN;

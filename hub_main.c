@@ -258,8 +258,18 @@ static void handle_signal(int sig) {
     g_hub_stop_signal = sig;
 }
 
+/* Connection serials start at 1 and only grow: at one connection per
+ * nanosecond a 64-bit counter would take ~584 years to wrap. */
+uint64_t hub_next_conn_serial(void) {
+    static uint64_t next = 0;
+    return ++next;
+}
+
 void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
     if (!c) return;
+
+    /* A console that goes away is owed nothing any more. */
+    if (c->internal) hub_chan_elect_forget_admin(state, c);
 
     /* fd -1: a socket handed to the SSH console, not a disconnect */
     if (c->fd >= 0)
@@ -542,6 +552,9 @@ void hub_maintenance(hub_state_t *state) {
     /* Rolling network upgrade: one step per tick (no-op unless running). */
     hub_upgrade_tick(state, now);
 
+    /* Channel-request elections: probe windows and hand-off timeouts. */
+    hub_chan_elect_tick(state, now);
+
     /* The full config push owed to the bots, coalesced across a burst. */
     hub_flush_bot_config(state, now);
 
@@ -755,6 +768,7 @@ void hub_check_peers(hub_state_t *state) {
                     }
 
                     c->fd = sockfd;
+                    c->conn_serial = hub_next_conn_serial();
                     snprintf(c->ip, sizeof(c->ip), "%s", state->peers[i].ip);
                     c->type = CLIENT_HUB;
                     c->last_seen = time(NULL);
@@ -938,6 +952,9 @@ done:
  * Neither defends against root.  Called before any config or key material is
  * loaded.  Mirrors harden_process() in ircbot/main.c. */
 static void harden_process(void) {
+    /* Private by default whatever the shell's umask (Ubuntu's is 002): the
+     * setup wizard, pid, log and upgrade staging all inherit it. */
+    umask(0077);
     struct rlimit rl = { 0, 0 };
     setrlimit(RLIMIT_CORE, &rl);
 #ifdef PR_SET_DUMPABLE
@@ -951,8 +968,8 @@ static void harden_process(void) {
  * path comes from /proc/self/exe (argv[0] has no directory when launched
  * through PATH); fills `exe` with it and chdir()s to its directory.  That
  * directory holds the binary an upgrade replaces, its .prev and the upgrade
- * script, so refuse one another user owns or group/other can write -- they
- * could swap any of them. */
+ * script, so refuse one another user owns and chmod go-w one group/other can
+ * write -- they could swap any of them. */
 static bool instance_dir_enter(char *exe, size_t exe_len) {
     ssize_t n = readlink("/proc/self/exe", exe, exe_len - 1);
     if (n <= 0 || (size_t)n >= exe_len - 1) {
@@ -968,21 +985,42 @@ static bool instance_dir_enter(char *exe, size_t exe_len) {
         return false;
     }
     slash[slash == dir ? 1 : 0] = '\0';
+    /* fd-based from here on: the directory inspected is the one fixed and
+     * entered. */
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     struct stat st;
-    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (dfd < 0 || fstat(dfd, &st) != 0) {
+        if (dfd >= 0) close(dfd);
         fprintf(stderr, "Cannot stat my own directory %s\n", dir);
         return false;
     }
-    if (st.st_uid != geteuid() || (st.st_mode & (S_IWGRP | S_IWOTH))) {
+    if (st.st_uid != geteuid()) {
+        close(dfd);
         fprintf(stderr, "Refusing to run from %s: it must be owned by this "
-                        "user and not writable by group or others "
-                        "(chmod go-w)\n", dir);
+                        "user\n", dir);
         return false;
     }
-    if (chdir(dir) != 0) {
+    /* Group/other write (a 002 umask makes 0775 directories): we own it, so
+     * close the hole rather than refuse -- refusing turned every upgrade on
+     * such a host into a watchdog rollback and a fresh install into a dead
+     * start.  Nothing is weakened: the directory was open before we ran. */
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+        mode_t m = st.st_mode & 07777 & ~(mode_t)(S_IWGRP | S_IWOTH);
+        if (fchmod(dfd, m) != 0) {
+            fprintf(stderr, "Refusing to run from %s: group/other can write it "
+                            "and chmod go-w failed (%s)\n", dir, strerror(errno));
+            close(dfd);
+            return false;
+        }
+        fprintf(stderr, "Removed group/other write from %s (now %04o)\n", dir,
+                (unsigned)m);
+    }
+    if (fchdir(dfd) != 0) {
+        close(dfd);
         fprintf(stderr, "Cannot change to my own directory %s\n", dir);
         return false;
     }
+    close(dfd);
     return true;
 }
 
@@ -1109,6 +1147,14 @@ int main(int argc, char *argv[]) {
     state.log_max_size = HUB_LOG_FILE_SIZE;
 
     if (selftest_mode) {
+        /* The swap happens in this directory: one another user owns is
+         * refused at start (a group/other-writable one we own is tightened
+         * there). */
+        struct stat dst;
+        if (stat(".", &dst) != 0 || dst.st_uid != geteuid()) {
+            printf("selftest: FAIL this directory is not owned by this user\n");
+            return 1;
+        }
         if (access(HUB_CONFIG_FILE, R_OK) != 0) {
             printf("selftest: FAIL no readable %s\n", HUB_CONFIG_FILE);
             return 1;
@@ -1624,6 +1670,7 @@ int main(int argc, char *argv[]) {
                      * grown to MAX_BUFFER once the handshake completes. */
                     if (c && hub_client_alloc_buffers(c, PREAUTH_BUF_SIZE)) {
                         c->fd = new_fd;
+                        c->conn_serial = hub_next_conn_serial();
                         snprintf(c->ip, sizeof(c->ip), "%s", incoming_ip);
                         c->last_seen = time(NULL);
                         c->connected_at = c->last_seen;  /* D4: pre-auth clock */
