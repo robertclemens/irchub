@@ -531,6 +531,12 @@ struct console_ui {
   long long last_input_ms;
   bool started;
 
+  int       idle_s;                /* hub set ssh idle                       */
+  int       cmd_n, cmd_s;          /* hub set ssh cmdrate                    */
+  long long rate_start_ms;         /* start of the current command window    */
+  int       rate_used;             /* commands started in it                 */
+  bool      from_queue;            /* run_line is replaying a held line      */
+
   char audit_msg[MAX_AUDIT][384];
   int  audit_lvl[MAX_AUDIT];
   int  audit_n;
@@ -545,7 +551,8 @@ struct console_ui {
 enum bk {
   B_NONE, B_ARG, B_PIPE, B_PEER_ADD, B_PEER_DEL, B_PEER_SET, B_CHAN_ADD, B_CHAN_SET,
   B_CHAN_OP, B_OPT_SET, B_LOG_SET, B_PURGE, B_HUB_SET, B_ACL, B_USER_LIST,
-  B_USER_ADD, B_USER_SET, B_USER_MASK, B_UPG_RELEASES, B_UPG_START, B_FIXED, B_LOCAL
+  B_USER_ADD, B_USER_SET, B_USER_MASK, B_UPG_RELEASES, B_UPG_START, B_FIXED, B_LOCAL,
+  B_CHAN_MODES, B_BAN, B_NET_SET
 };
 
 typedef struct {
@@ -582,8 +589,9 @@ static const cmd_def_t CMDS[] = {
   {"peer", "sync", CMD_ADMIN_SYNC_MESH, B_NONE, 0, 0, CF_NONE, 0, NULL, "peer sync", "send a full sync to every peer", NULL},
   {"network", "tree", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|tree", "network tree", "every hub and bot as a tree", NULL},
   {"network", "status", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|status", "network status", "the mesh-wide status (what the status bar shows)", NULL},
+  {"network", "set", CMD_ADMIN_NET_SET, B_NET_SET, 0, 3, CF_NONE, 0, NULL, "network set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default>]", "show the bot network settings, or change one (every bot gets it)", NULL},
   {"hub", "show", CMD_ADMIN_GET_PUBKEY, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub show", "this hub: identity, key, listener, counts", NULL},
-  {"hub", "set", 0, B_HUB_SET, 0, 2, CF_NONE, 0, NULL, "hub set <setting> <value>", "name, bindip, port, pubkey or autopurge (alone: the table)", NULL},
+  {"hub", "set", 0, B_HUB_SET, 0, 3, CF_NONE, 0, NULL, "hub set <setting> <value> | hub set ssh|conn [<name> <value|default>]", "name, bindip, port, pubkey or autopurge; ssh and conn: this hub's connection limits (alone: the table)", NULL},
   {"hub", "stats", CMD_ADMIN_STATS, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub stats", "traffic counters since the hub started", NULL},
   {"hub", "rekey", CMD_ADMIN_REGEN_KEYS, B_NONE, 0, 0, CF_TYPE, 0, NULL, "hub rekey", "new hub keypair; every peer and bot must re-learn it", NULL},
   {"hub", "purge", CMD_ADMIN_PURGE_TOMBSTONES, B_PURGE, 1, 0, CF_YN, 0, NULL, "hub purge <now|days>", "purge tombstones now, or those older than <days>", NULL},
@@ -593,8 +601,8 @@ static const cmd_def_t CMDS[] = {
   {"log", "off", 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "log off", "line mode: stop the log lines", NULL},
   {"log", "filter", 0, B_LOCAL, 1, 64, CF_NONE, 0, NULL, "log filter <text|clear>", "full screen: log view lines containing <text>", NULL},
   {"acl", "list", CMD_ADMIN_LIST_ALLOWLIST, B_NONE, 0, 0, CF_NONE, 0, NULL, "acl list", "the allow and deny lists", NULL},
-  {"acl", "add", 0, B_ACL, 2, 0, CF_NONE, 0, NULL, "acl add allow|deny <ip[/n]>", "add an address or network", NULL},
-  {"acl", "del", 0, B_ACL, 2, 0, CF_YN, 0, NULL, "acl del allow|deny <ip[/n]>", "remove an address or network (asks y/N)", NULL},
+  {"acl", "add", 0, B_ACL, 2, 1, CF_NONE, 0, NULL, "acl add allow|deny <ip[/n]> [console]", "add an address or network (console: applies only to SSH logins)", NULL},
+  {"acl", "del", 0, B_ACL, 2, 1, CF_YN, 0, NULL, "acl del allow|deny <ip[/n]> [console]", "remove an address or network (asks y/N)", NULL},
   {"option", "list", CMD_ADMIN_GET_OPT_FLAGS, B_NONE, 0, 0, CF_NONE, 0, NULL, "option list", "the network option flags", NULL},
   {"option", "set", CMD_ADMIN_SET_OPT_FLAGS, B_OPT_SET, 1, 0, CF_YN, PRE_OPT, NULL, "option set <flags|->", "set the network option flags (- clears)", NULL},
   {"user", "list", 0, B_USER_LIST, 0, 1, CF_NONE, 0, NULL, "user list [admin|oper]", "every user (or one role): key, last seen, masks", NULL},
@@ -607,9 +615,13 @@ static const cmd_def_t CMDS[] = {
   {"channel", "show", CMD_ADMIN_LIST_CHANNELS, B_ARG, 1, 0, CF_NONE, 0, NULL, "channel show <#chan>", "one channel in detail", NULL},
   {"channel", "add", CMD_ADMIN_ADD_CHANNEL, B_CHAN_ADD, 1, 1, CF_NONE, 0, NULL, "channel add <#chan> [key]", "add (or re-add) a channel", NULL},
   {"channel", "del", CMD_ADMIN_DEL_CHANNEL, B_ARG, 1, 0, CF_YN, 0, NULL, "channel del <#chan>", "remove it from every bot (asks y/N)", NULL},
-  {"channel", "set", CMD_ADMIN_ADD_CHANNEL, B_CHAN_SET, 3, 0, CF_NONE, 0, NULL, "channel set <#chan> <setting> <value|->", "change one setting (key today; - clears)", NULL},
+  {"channel", "mode", CMD_ADMIN_CHAN_MODE, B_CHAN_MODES, 1, 3, CF_NONE, 0, NULL, "channel mode <#chan> [<+modes> [key] [limit] | -]", "show the channel's modes, or store them and apply them once", "modes: i m n p s t k l · - = the network default"},
+  {"channel", "set", CMD_ADMIN_CHAN_SET, B_CHAN_SET, 1, 48, CF_NONE, 0, NULL, "channel set <#chan|default> [+opt|-opt|<name> <value>|flood <type> <N:S|off>]", "show a channel's settings, or change them (default = the network default)", NULL},
   {"channel", "op", CMD_ADMIN_OP_USER, B_CHAN_OP, 2, 0, CF_NONE, 0, NULL, "channel op <#chan> <nick>", "have one opped bot op a user", NULL},
   {"channel", "invite", CMD_ADMIN_INVITE_USER, B_CHAN_OP, 2, 0, CF_NONE, 0, NULL, "channel invite <#chan> <nick>", "have one opped bot invite a user", NULL},
+  {"ban", "list", CMD_ADMIN_BAN, B_BAN, 0, 1, CF_NONE, 0, NULL, "ban list [#chan|*]", "the network's listed bans (one channel, or * = every channel)", NULL},
+  {"ban", "add", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; the bots set it on the channel (never on a bot or user)", NULL},
+  {"ban", "del", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban del <#chan|*> <mask>", "remove a listed ban", NULL},
   {"upgrade", "status", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_NONE, 0, "", "upgrade status", "the upgrade run on this hub", NULL},
   {"upgrade", "releases", CMD_ADMIN_UPGRADE_STATUS, B_UPG_RELEASES, 0, 2, CF_NONE, 0, NULL, "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes", NULL},
   {"upgrade", "start", CMD_ADMIN_UPGRADE_NET, B_UPG_START, 1, 4, CF_TYPE, PRE_UPG_START, NULL, "upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade", NULL},
@@ -634,7 +646,8 @@ static const struct {
   {"network", "the whole mesh"},   {"hub", "this hub"},
   {"log", "the hub log"},          {"acl", "IP allow / deny lists"},
   {"option", "network option flags"}, {"user", "admins and opers"},
-  {"channel", "managed channels"}, {"upgrade", "rolling upgrades"},
+  {"channel", "managed channels"}, {"ban", "listed bans"},
+  {"upgrade", "rolling upgrades"},
   {"display", "this session's screen"},
 };
 #define NGROUPS ((int)(sizeof(GROUPS) / sizeof(GROUPS[0])))
@@ -647,7 +660,7 @@ static const struct {
   const char *cmd, *sub, *args, *examples;
 } CMD_HELP[] = {
   {"help", NULL,
-   "group\tone of: bot peer network hub log acl option user channel upgrade display\n"
+   "group\tone of: bot peer network hub log acl option user channel ban upgrade display\n"
    "command\tone of that group's commands: its arguments and an example\n"
    "?\ttyped in place of help it does the same",
    "help\nhelp bot\nhelp bot add\n? upgrade start"},
@@ -695,13 +708,29 @@ static const struct {
   {"peer", "sync", NULL, "peer sync"},
   {"network", "tree", NULL, "network tree"},
   {"network", "status", NULL, "network status"},
+  {"network", "set",
+   "flood\tbot flood limits: cmd = commands per user, msg = other messages per host, "
+   "ctcp = CTCP per host\n"
+   "N:S|off|default\tmore than N events in S seconds trips it (N 1-1000, S 1-3600); off "
+   "disables it; default returns to the built-in\n"
+   "ignoretime\tminutes a flooding host stays ignored (1-1440); alone the command shows all\n"
+   "sendq\thow fast a bot may send lines to IRC: B:I lets B lines (1-100) out at once, then "
+   "one every I ms (0-10000, 0 = no delay); default is 10:100",
+   "network set\nnetwork set flood cmd 10:30\nnetwork set flood msg off\nnetwork set ignoretime 20\nnetwork set sendq 5:250"},
   {"hub", "show", NULL, "hub show"},
   {"hub", "set",
-   "setting\tname, bindip, port, pubkey or autopurge; alone it shows them all\n"
+   "setting\tname, bindip, port, pubkey or autopurge; alone it shows them all. ssh and conn "
+   "are this hub's connection limits: hub set ssh | hub set conn show them; ssh <name> "
+   "<value|default> changes one (ssh: preauth preauthip sessions grace authtries idle "
+   "authfail connect block cmdrate; conn: perip churn authfail). N:S is N per S seconds; "
+   "block doubles per repeat within 24 h up to 24 h. A change applies to the next "
+   "connection\n"
    "value\tname: this hub's name · bindip: the address it listens on · port: 1-65535 · "
    "pubkey: the key its private key derives (a new key is hub rekey) · "
    "autopurge: days to keep tombstones, 0 = off",
-   "hub set\nhub set name west\nhub set port 6697\nhub set autopurge 30"},
+   "hub set\nhub set name west\nhub set port 6697\nhub set autopurge 30\nhub set ssh\n"
+   "hub set ssh preauth 16\nhub set ssh authfail 3:3600\nhub set conn perip 8\n"
+   "hub set conn churn 30:10:30"},
   {"hub", "stats", NULL, "hub stats"},
   {"hub", "rekey", "(confirm)\tyou type this hub's name to go ahead; every peer and bot "
    "must then learn the new key",
@@ -725,12 +754,15 @@ static const struct {
   {"acl", "list", NULL, "acl list"},
   {"acl", "add",
    "allow|deny\twhich list\n"
-   "ip[/n]\tan IPv4 or IPv6 address, or a network as address/prefix",
-   "acl add allow 203.0.113.0/24\nacl add deny 198.51.100.9"},
+   "ip[/n]\tan IPv4 or IPv6 address, or a network as address/prefix\n"
+   "console\toptional scope word: the entry applies only once the connection says SSH "
+   "(bots and peers are not affected); without it the entry applies to everything",
+   "acl add allow 203.0.113.0/24\nacl add deny 198.51.100.9\nacl add allow 203.0.113.7 console"},
   {"acl", "del",
    "allow|deny\twhich list\n"
-   "ip[/n]\tthe entry exactly as acl list shows it (asks y/N)",
-   "acl del deny 198.51.100.9"},
+   "ip[/n]\tthe entry exactly as acl list shows it\n"
+   "console\tgive it for an entry that was added with it (asks y/N)",
+   "acl del deny 198.51.100.9\nacl del allow 203.0.113.7 console"},
   {"option", "list", NULL, "option list"},
   {"option", "set", "flags|-\tthe whole new set of flag letters (it replaces the old "
    "set; option list explains each); - clears them all (asks y/N)",
@@ -761,15 +793,42 @@ static const struct {
   {"channel", "add", "#chan\tthe channel's name\nkey\tits channel key, if it has one",
    "channel add #ops\nchannel add #ops s3cret"},
   {"channel", "del", "#chan\tthe channel; every bot parts it (asks y/N)", "channel del #ops"},
+  {"channel", "mode",
+   "#chan\tthe channel; alone it shows its stored and live modes\n"
+   "+modes\tthe modes it should have, from i m n p s t k l with + and - (+nt, +stnkl key 20, "
+   "-i); stored on every hub and bot, then applied once by one opped bot\n"
+   "key, limit\tthe argument +k takes (no space or comma, 30 bytes), then the one +l takes "
+   "(1-99999), left to right\n"
+   "-\tgo back to the network default (+nt unless the network sets one)",
+   "channel mode #ops\nchannel mode #ops +nt\nchannel mode #ops +stnkl s3cret 20\n"
+   "channel mode #ops -"},
   {"channel", "set",
-   "#chan\tthe channel\n"
-   "setting\tthe setting's name; key today\n"
-   "value|-\tthe new value (at most 128 bytes), or - to clear it",
-   "channel set #ops key s3cret\nchannel set #ops key -"},
+   "#chan|default\tthe channel, or default for the network default every channel inherits; "
+   "alone it lists every setting and where its value comes from\n"
+   "+opt -opt\tturn an on/off option on or off: enforcemodes bitch protectops revenge "
+   "stopnethack enforcebans dynamicbans dontkickops cycle dynamiclimit\n"
+   "name value\tbantime (minutes, 0 = permanent), bantype (0-9), banidle (minutes), limitgap, "
+   "limitdelay (seconds); default removes the channel's own value\n"
+   "flood type\tchan ctcp join nick deop kick ban, then N:S (more than N in S seconds), off "
+   "or default",
+   "channel set #ops\nchannel set #ops +bitch +enforcemodes\nchannel set #ops bantime 60\n"
+   "channel set #ops flood join 10:60\nchannel set default -dynamicbans"},
   {"channel", "op", "#chan\tthe channel\nnick\tthe user's current nick on IRC",
    "channel op #ops alice"},
   {"channel", "invite", "#chan\tthe channel\nnick\tthe user's current nick on IRC",
    "channel invite #ops alice"},
+  {"ban", "list", "#chan|*\tonly that channel's bans, or * for the global ones (default: all)",
+   "ban list\nban list #ops\nban list *"},
+  {"ban", "add",
+   "#chan|*\tthe channel, or * for every managed channel\n"
+   "mask\tnick!user@host (* and ? match); refused if it would also match a bot or an "
+   "authorised user\n"
+   "min|perm\thow long it lasts (default perm)\n"
+   "sticky\tthe bots put it back at once if an op removes it from the channel\n"
+   "reason\tthe rest of the line (120 bytes)",
+   "ban add #ops *!*@203.0.113.7\nban add * *!*@*.badhost.example 1440 sticky open proxy"},
+  {"ban", "del", "#chan|*\tas listed by ban list\nmask\tthe mask exactly as ban list shows it",
+   "ban del #ops *!*@203.0.113.7"},
   {"upgrade", "status", NULL, "upgrade status"},
   {"upgrade", "releases",
    "bot=<base>\ta different release site for the bot builds (a URL)\n"
@@ -783,7 +842,7 @@ static const struct {
    "botbase=<url>\ta different release site for the bot builds\n"
    "hubbase=<url>\ta different release site for the hub builds\n"
    "(confirm)\tit shows the plan, then you type the bot version to start",
-   "upgrade start 2.4.6\nupgrade start 2.4.6 hub=2.4.4\nupgrade start 2.4.6 nodes=alpha,beta=rs"},
+   "upgrade start 2.4.5\nupgrade start 2.4.5 hub=2.4.4\nupgrade start 2.4.5 nodes=alpha,beta=rs"},
   {"upgrade", "abort", NULL, "upgrade abort"},
   {"upgrade", "forget", NULL, "upgrade forget"},
   {"display", "show", NULL, "display show"},
@@ -859,6 +918,13 @@ static void lm_prompt(console_ui_t *ui) {
   cbuf_add(&ui->term, ui->in, (size_t)ui->in_len);
 }
 
+/* Line mode: a command is in flight or a typed line waits its turn (a rate
+ * token, an earlier command): no prompt is owed yet, so nothing may print
+ * over one — the waiting line's reply would land on it. */
+static bool line_pending(const console_ui_t *ui) {
+  return ui->user_busy || ui->confirming || ui->queued_n > 0;
+}
+
 /* Line mode: something arrives while the admin is at the prompt.  A CR puts
  * it over the prompt (a reader takes the text after a line's last CR), then
  * the prompt and the partial input are printed again.  While a command is in
@@ -868,7 +934,7 @@ static void lm_async(console_ui_t *ui, const char *text) {
     ui->dropped++;
     return;
   }
-  bool hold = ui->user_busy || ui->confirming;
+  bool hold = line_pending(ui);
   cbuf_t *b = hold ? &ui->held : &ui->term;
   if (!hold) cbuf_add(b, "\r", 1);
   char *a = ui->ascii ? fmt_ascii(text) : NULL;
@@ -1050,6 +1116,24 @@ static void flush_held(console_ui_t *ui) {
 static void run_line(console_ui_t *ui, const char *line);
 static void confirm_answer(console_ui_t *ui, const char *answer, bool cancelled);
 
+/* hub set ssh cmdrate: at most cmd_n commands start per cmd_s seconds.  A
+ * token is taken when a command starts; without one the line waits in the
+ * queue (never dropped) and tick releases it when the window turns over. */
+static bool rate_take(console_ui_t *ui) {
+  if (ui->now_ms - ui->rate_start_ms >= (long long)ui->cmd_s * 1000) {
+    ui->rate_start_ms = ui->now_ms;
+    ui->rate_used = 0;
+  }
+  if (ui->rate_used >= ui->cmd_n) return false;
+  ui->rate_used++;
+  return true;
+}
+
+static bool rate_ready(const console_ui_t *ui) {
+  return ui->now_ms - ui->rate_start_ms >= (long long)ui->cmd_s * 1000 ||
+         ui->rate_used < ui->cmd_n;
+}
+
 /* The command in flight finished: held events, then the next queued line.
  * from_reply: it ended with the core's answer (asynchronously), so line mode
  * owes the prompt here; otherwise the input handler prints it. */
@@ -1059,14 +1143,22 @@ static void command_done(console_ui_t *ui, bool from_reply) {
   /* Lines typed ahead: the next one answers a confirmation a queued
    * command asked for, as it would have at the prompt. */
   while (!ui->user_busy && ui->queued_n > 0 && !ui->closing) {
+    /* a command (not a confirmation answer) needs a rate token; none: it
+     * stays at the head and tick comes back for it */
+    if (!ui->confirming && !rate_ready(ui)) break;
     char *next = ui->queued[0];
     ui->queued_n--;
     memmove(ui->queued, ui->queued + 1, sizeof(char *) * (size_t)ui->queued_n);
-    if (ui->confirming) confirm_answer(ui, next, false);
-    else run_line(ui, next);
+    if (ui->confirming) {
+      confirm_answer(ui, next, false);
+    } else {
+      ui->from_queue = true;
+      run_line(ui, next);
+      ui->from_queue = false;
+    }
     free(next);
   }
-  if (ui->line_mode && from_reply && !ui->user_busy && !ui->closing) {
+  if (ui->line_mode && from_reply && !ui->user_busy && ui->queued_n == 0 && !ui->closing) {
     if (ui->confirming) {
       lm_prompt(ui);
     } else {
@@ -1506,17 +1598,22 @@ void ui_core_frame(console_ui_t *ui, uint8_t op, const char *payload, size_t len
 /* ==========================================================================
  * Running a command line
  * ========================================================================== */
-#define MAX_WORDS 16
+/* channel set <#chan> takes the hub's 16 tokens of up to three words each
+ * (flood <type> <value>): 3 + 16 * 3 = 51. */
+#define MAX_WORDS 52
 
 typedef struct {
   char  buf[CONSOLE_INPUT_MAX];
   char *w[MAX_WORDS];
   int   n;
   size_t off[MAX_WORDS];   /* where each word starts in the original line */
+  bool  more;             /* words past MAX_WORDS were left over */
+  const char *line;        /* the line itself (outlives the words_t) */
 } words_t;
 
 static void split_words(const char *line, words_t *ws) {
   usnprintf(ws->buf, sizeof(ws->buf), "%s", line);
+  ws->line = line;
   ws->n = 0;
   char *p = ws->buf;
   while (*p && ws->n < MAX_WORDS) {
@@ -1527,6 +1624,8 @@ static void split_words(const char *line, words_t *ws) {
     while (*p && *p != ' ') p++;
     if (*p) *p++ = '\0';
   }
+  while (*p == ' ') p++;
+  ws->more = *p != '\0';
 }
 
 static bool cmd_has_subs(const char *cmd);
@@ -2035,17 +2134,122 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
     w = usnprintf(o, cap, "%s|%s", a[0], na > 1 ? a[1] : "");
     break;
   case B_CHAN_SET: {
-    for (const char *p = a[1]; *p; p++)
-      if (!(*p >= 'a' && *p <= 'z') && *p != '_') {
-        *why = "a setting name is lowercase letters and _";
-        *hint = "settings: key";
-        return false;
-      }
-    if (strlen(a[2]) > 128) {
-      *why = "a setting value is at most 128 bytes";
+    /* <#chan|default> then tokens: +opt / -opt, <name> <value> as
+     * name=value, flood <type> <value> as "flood type=value".  Names and
+     * values are lowercased; the hub validates them. */
+    size_t off = 0;
+    int k = usnprintf(o, cap, "%s", a[0]);
+    if (k < 0 || (size_t)k >= cap) {
+      *why = "arguments too long";
       return false;
     }
-    w = usnprintf(o, cap, "set|%s|%s|%s", a[0], a[1], strcmp(a[2], "-") ? a[2] : "");
+    off = (size_t)k;
+    for (int i = 1; i < na;) {
+      char tok[96];
+      if ((a[i][0] == '+' || a[i][0] == '-') && a[i][1]) {
+        usnprintf(tok, sizeof(tok), "%s", a[i]);
+        i++;
+      } else if (!strcasecmp(a[i], "flood")) {
+        if (i + 2 >= na) {
+          *why = "flood takes a type and a value";
+          *hint = "channel set <#chan|default> flood <chan|ctcp|join|nick|deop|kick|ban> <N:S|off|default>";
+          return false;
+        }
+        usnprintf(tok, sizeof(tok), "flood %s=%s", a[i + 1], a[i + 2]);
+        i += 3;
+      } else {
+        if (i + 1 >= na) {
+          static char m[96];
+          usnprintf(m, sizeof(m), "say a value for %.*s (or default)", uprec(a[i], 40), a[i]);
+          *why = m;
+          *hint = "channel set <#chan|default> <name> <value|default>";
+          return false;
+        }
+        usnprintf(tok, sizeof(tok), "%s=%s", a[i], a[i + 1]);
+        i += 2;
+      }
+      for (char *t = tok; *t; t++) *t = (char)tolower((unsigned char)*t);
+      k = usnprintf(o + off, cap - off, "|%s", tok);
+      if (k < 0 || (size_t)k >= cap - off) {
+        *why = "arguments too long";
+        return false;
+      }
+      off += (size_t)k;
+    }
+    *outlen = off;
+    return true;
+  }
+  case B_CHAN_MODES: {
+    size_t off = 0;
+    for (int i = 0; i < na; i++) {
+      int k = usnprintf(o + off, cap - off, "%s%s", i ? "|" : "", a[i]);
+      if (k < 0 || (size_t)k >= cap - off) {
+        *why = "arguments too long";
+        return false;
+      }
+      off += (size_t)k;
+    }
+    *outlen = off;
+    return true;
+  }
+  case B_BAN: {
+    if (!strcmp(c->sub, "list")) {
+      w = usnprintf(o, cap, "list|%s", na > 0 ? a[0] : "");
+      break;
+    }
+    if (!strcmp(c->sub, "del")) {
+      w = usnprintf(o, cap, "del|%s|%s", a[0], a[1]);
+      break;
+    }
+    /* add <#chan|*> <mask> [<min>|perm] [sticky] [reason...]: the reason is
+     * the rest of the line as typed */
+    int i = 2;
+    char dur[16] = "perm";
+    bool sticky = false;
+    if (i < na && (!strcasecmp(a[i], "perm") || all_digits(a[i]))) {
+      if (all_digits(a[i])) {
+        unsigned long m = strtoul(a[i], NULL, 10);
+        if (strlen(a[i]) > 7 || m < 1 || m > 5256000ul) {
+          *why = "a ban lasts 1 to 5256000 minutes (10 years), or perm";
+          return false;
+        }
+        usnprintf(dur, sizeof(dur), "%lu", m);
+      }
+      i++;
+    }
+    if (i < na && !strcasecmp(a[i], "sticky")) {
+      sticky = true;
+      i++;
+    }
+    char reason[256] = "";
+    if (i < na && ws->line) {
+      usnprintf(reason, sizeof(reason), "%s", ws->line + ws->off[argi + i]);
+      size_t rl = strlen(reason);
+      while (rl > 0 && reason[rl - 1] == ' ') reason[--rl] = '\0';
+      if (rl > 120 || strchr(reason, '|')) {
+        *why = "a ban reason is at most 120 bytes and has no '|'";
+        return false;
+      }
+    }
+    w = usnprintf(o, cap, "add|%s|%s|%s|%d|%s", a[0], a[1], dur, sticky ? 1 : 0, reason);
+    break;
+  }
+  case B_NET_SET: {
+    if (na == 0) {
+      *outlen = 0;
+      return true;
+    }
+    if (!strcasecmp(a[0], "flood") && na == 3) {
+      w = usnprintf(o, cap, "flood|%s|%s", a[1], a[2]);
+    } else if (!strcasecmp(a[0], "ignoretime") && na == 2) {
+      w = usnprintf(o, cap, "ignoretime|%s", a[1]);
+    } else if (!strcasecmp(a[0], "sendq") && na == 2) {
+      w = usnprintf(o, cap, "sendq|%s", a[1]);
+    } else {
+      *why = "network set flood <cmd|msg|ctcp> <N:S|off|default>, ignoretime <min|default>, or sendq <B:I|default>";
+      return false;
+    }
+    for (char *t = o; *t; t++) *t = (char)tolower((unsigned char)*t);
     break;
   }
   case B_CHAN_OP:
@@ -2115,6 +2319,28 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       *outlen = 0;
       return true;
     }
+    if (!strcasecmp(a[0], "ssh") || !strcasecmp(a[0], "conn")) {
+      bool conn = !strcasecmp(a[0], "conn");
+      *op = CMD_ADMIN_SET_SSH;
+      if (na == 1) {
+        *mode = FMT_MODE_LIMITS;
+        w = conn ? usnprintf(o, cap, "conn") : 0;
+        if (!conn) o[0] = '\0';
+        break;
+      }
+      if (na != 3) {
+        *why = conn ? "usage: hub set conn <perip|churn|authfail> <value|default>"
+                    : "usage: hub set ssh <name> <value|default>";
+        return false;
+      }
+      w = usnprintf(o, cap, "%s%s|%s", conn ? "conn|" : "", a[1], a[2]);
+      for (char *t = o; *t; t++) *t = (char)tolower((unsigned char)*t);
+      break;
+    }
+    if (na > 2) {
+      *why = "hub set takes a setting and one value";
+      return false;
+    }
     static const struct { const char *name; uint8_t op; } HS[] = {
       {"name", CMD_ADMIN_SET_HUB_NAME}, {"bindip", CMD_ADMIN_SET_BIND_IP},
       {"port", CMD_ADMIN_SET_BIND_PORT}, {"pubkey", CMD_ADMIN_SET_PUBKEY},
@@ -2126,7 +2352,7 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       static char m[96];
       usnprintf(m, sizeof(m), "unknown hub setting \"%.*s\"", uprec(a[0], 40), a[0]);
       *why = m;
-      *hint = "name, bindip, port, pubkey, autopurge";
+      *hint = "name, bindip, port, pubkey, autopurge, ssh, conn";
       return false;
     }
     if (na < 2) {
@@ -2145,7 +2371,12 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       *why = "say which list";
       return false;
     }
-    w = usnprintf(o, cap, "%s", a[1]);
+    if (na > 3 || (na == 3 && strcasecmp(a[2], "console"))) {
+      *why = "the only scope word is console";
+      *hint = "acl add allow|deny <ip[/n]> [console]";
+      return false;
+    }
+    w = na == 3 ? usnprintf(o, cap, "%s|console", a[1]) : usnprintf(o, cap, "%s", a[1]);
     break;
   }
   case B_USER_LIST:
@@ -2536,11 +2767,17 @@ static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text
 static void run_line(console_ui_t *ui, const char *line) {
   while (*line == ' ') line++;
   if (!*line) return;
-  if (ui->user_busy || ui->confirming) {
+  /* Held lines (busy, confirming, or waiting for a rate token) go first. */
+  bool held_for_rate = false;
+  if (ui->user_busy || ui->confirming || (!ui->from_queue && ui->queued_n > 0) ||
+      (!ui->from_queue && (held_for_rate = !rate_take(ui)))) {
     if (ui->queued_n < MAX_QUEUED_LINES) ui->queued[ui->queued_n++] = strdup(line);
     else note(ui, "busy: line dropped", RL_ERR);
+    if (held_for_rate && !ui->line_mode && ui->queued_n == 1)
+      note(ui, "too many commands: held until the next window (hub set ssh cmdrate)", RL_DIM);
     return;
   }
+  if (ui->from_queue) (void)rate_take(ui);
   const char *l = line[0] == '/' ? line + 1 : line;
   int seq = ++ui->seq;
   ui->ncmds++;
@@ -2554,6 +2791,10 @@ static void run_line(console_ui_t *ui, const char *line) {
     char echo[CONSOLE_INPUT_MAX + 4];
     usnprintf(echo, sizeof(echo), "> %s", l);
     fs_timestamped(ui, V_CONSOLE, echo, RL_CMD);
+  }
+  if (ws.more) { /* never act on a line cut short */
+    refuse(ui, seq, "cmd.usage", "too many words on one line", NULL);
+    return;
   }
   int argi = 1;
   const cmd_def_t *c = find_cmd(&ws, &argi);
@@ -2574,7 +2815,8 @@ static void run_line(console_ui_t *ui, const char *line) {
   char words[32];
   usnprintf(words, sizeof(words), "%s%s%s", c->cmd, c->sub ? " " : "", c->sub ? c->sub : "");
   int na = ws.n - argi;
-  bool rest_arg = c->build == B_LOCAL && c->sub && !strcmp(c->sub, "filter");
+  bool rest_arg = (c->build == B_LOCAL && c->sub && !strcmp(c->sub, "filter")) ||
+                  (c->build == B_BAN && !strcmp(c->sub, "add"));
   if (na < c->nargs || (!rest_arg && na > c->nargs + c->optargs)) {
     char m[160];
     usnprintf(m, sizeof(m), "usage: %s", c->usage);
@@ -2799,7 +3041,8 @@ static void in_backspace(console_ui_t *ui) {
 }
 
 /* What Tab offers for one argument of a command (docs/console.md §2). */
-enum ck { CK_NONE, CK_GROUP, CK_WORDS, CK_BOT, CK_BOT_ON, CK_BOT_NICK, CK_HUB_NAME };
+enum ck { CK_NONE, CK_GROUP, CK_WORDS, CK_BOT, CK_BOT_ON, CK_BOT_NICK, CK_HUB_NAME,
+          CK_CHSET, CK_NETSET, CK_HUBSET };
 
 typedef struct {
   const char *cmd, *sub;
@@ -2818,7 +3061,7 @@ static const arg_comp_t ARG_COMP[] = {
   {"peer", "show", 0, CK_HUB_NAME, NULL},
   {"peer", "set", 0, CK_HUB_NAME, NULL},
   {"peer", "set", 1, CK_WORDS, "key"},
-  {"hub", "set", 0, CK_WORDS, "name bindip port pubkey autopurge"},
+  {"hub", "set", -1, CK_HUBSET, NULL},
   {"hub", "purge", 0, CK_WORDS, "now"},
   {"log", "set", 0, CK_WORDS, "file console size"},
   {"log", "set", 1, CK_WORDS, LEVEL_WORDS}, /* after file|console */
@@ -2826,11 +3069,21 @@ static const arg_comp_t ARG_COMP[] = {
   {"log", "filter", 0, CK_WORDS, "clear"},
   {"acl", "add", 0, CK_WORDS, "allow deny"},
   {"acl", "del", 0, CK_WORDS, "allow deny"},
+  {"acl", "add", 2, CK_WORDS, "console"},
+  {"acl", "del", 2, CK_WORDS, "console"},
   {"user", "list", 0, CK_WORDS, "admin oper"},
   {"user", "add", 0, CK_WORDS, "admin oper"},
   {"user", "set", 1, CK_WORDS, "key"},
   {"user", "mask", 0, CK_WORDS, "add del"},
-  {"channel", "set", 1, CK_WORDS, "key"},
+  {"channel", "set", 0, CK_WORDS, "default"},
+  {"channel", "set", -1, CK_CHSET, NULL},
+  {"ban", "list", 0, CK_WORDS, "*"},
+  {"ban", "add", 0, CK_WORDS, "*"},
+  {"ban", "add", 2, CK_WORDS, "perm sticky"},
+  {"ban", "add", 3, CK_WORDS, "sticky"},
+  {"ban", "del", 0, CK_WORDS, "*"},
+  {"network", "set", 0, CK_WORDS, "flood ignoretime sendq"},
+  {"network", "set", -1, CK_NETSET, NULL},
   {"upgrade", "releases", -1, CK_WORDS, "bot= hub="},
   {"upgrade", "start", -1, CK_WORDS, "hub= nodes= botbase= hubbase="},
   {"display", "view", 0, CK_WORDS, "1 2 3 4 5"},
@@ -2839,6 +3092,41 @@ static const arg_comp_t ARG_COMP[] = {
   {"display", "events", 0, CK_WORDS, "on off"},
 };
 #define NARGCOMP ((int)(sizeof(ARG_COMP) / sizeof(ARG_COMP[0])))
+
+/* channel set: the setting words that fit after the words before this one
+ * (p1 = the previous word, p2 = the one before it). */
+#define CHSET_FLAGS_ON  "+enforcemodes +bitch +protectops +revenge +stopnethack +enforcebans " \
+                        "+dynamicbans +dontkickops +cycle +dynamiclimit"
+#define CHSET_FLAGS_OFF "-enforcemodes -bitch -protectops -revenge -stopnethack -enforcebans " \
+                        "-dynamicbans -dontkickops -cycle -dynamiclimit"
+#define CHSET_VALUED    "bantime bantype banidle limitgap limitdelay flood"
+static const char *chset_words(const char *prefix, const char *p1, const char *p2) {
+  if (!strcasecmp(p1, "flood")) return "chan ctcp join nick deop kick ban";
+  if (!strcasecmp(p2, "flood")) return "off default";
+  static const char *const valued[] = {"bantime", "bantype", "banidle", "limitgap", "limitdelay"};
+  for (size_t i = 0; i < sizeof(valued) / sizeof(valued[0]); i++)
+    if (!strcasecmp(p1, valued[i])) return "default";
+  if (prefix[0] == '+') return CHSET_FLAGS_ON;
+  if (prefix[0] == '-') return CHSET_FLAGS_OFF;
+  return CHSET_VALUED;
+}
+
+static const char *netset_words(const char *p1, const char *p2) {
+  if (!strcasecmp(p1, "flood")) return "cmd msg ctcp";
+  if (!strcasecmp(p2, "flood")) return "off default";
+  if (!strcasecmp(p1, "ignoretime") || !strcasecmp(p1, "sendq")) return "default";
+  return "";
+}
+
+/* hub set <setting> | ssh <name> <value> | conn <name> <value> */
+static const char *hubset_words(int pos, const char *p1, const char *p2) {
+  if (pos == 0) return "name bindip port pubkey autopurge ssh conn";
+  if (pos == 1 && !strcasecmp(p1, "ssh"))
+    return "preauth preauthip sessions grace authtries idle authfail connect block cmdrate";
+  if (pos == 1 && !strcasecmp(p1, "conn")) return "perip churn authfail";
+  if (pos == 2 && (!strcasecmp(p2, "ssh") || !strcasecmp(p2, "conn"))) return "default";
+  return "";
+}
 
 static bool cmd_has_subs(const char *cmd) {
   for (int i = 0; i < NCMDS; i++)
@@ -2852,7 +3140,7 @@ static bool cmd_has_subs(const char *cmd) {
  * pubkey or an admin name. */
 static int completions(console_ui_t *ui, int word_idx, char w[][64],
                        const char *prefix, const char **out, int max,
-                       char pool[][72], int *pooln) {
+                       char pool[][72], int *pooln, const char *p1, const char *p2) {
   int n = 0;
   size_t pl = strlen(prefix);
 #define ADD_CAND(s)                                                         \
@@ -2902,8 +3190,13 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
     for (int i = 0; i < NGROUPS; i++) ADD_CAND(GROUPS[i].name);
     return n;
   }
-  if (ac->kind == CK_WORDS) {
-    for (const char *p = ac->words; *p && *pooln < 128;) {
+  if (ac->kind == CK_WORDS || ac->kind == CK_CHSET || ac->kind == CK_NETSET ||
+      ac->kind == CK_HUBSET) {
+    const char *words = ac->kind == CK_WORDS ? ac->words
+                        : ac->kind == CK_CHSET ? chset_words(prefix, p1, p2)
+                        : ac->kind == CK_HUBSET ? hubset_words(pos, p1, p2)
+                                                : netset_words(p1, p2);
+    for (const char *p = words; *p && *pooln < 128;) {
       size_t l = strcspn(p, " ");
       usnprintf(pool[*pooln], 72, "%.*s", (int)l, p);
       size_t before = (size_t)n;
@@ -2962,6 +3255,7 @@ static void complete(console_ui_t *ui) {
   usnprintf(prefix, sizeof(prefix), "%.*s", ui->in_cur - ws, ui->in + ws);
   /* the words before this one (the first without its '/') */
   char w[3][64] = {"", "", ""};
+  char prev1[64] = "", prev2[64] = "";   /* the two words just before this one */
   int idx = 0;
   for (int i = 0; i < ws;) {
     while (i < ws && ui->in[i] == ' ') i++;
@@ -2972,13 +3266,15 @@ static void complete(console_ui_t *ui) {
       int skip = (idx == 0 && ui->in[s] == '/') ? 1 : 0;
       usnprintf(w[idx], sizeof(w[0]), "%.*s", i - s - skip, ui->in + s + skip);
     }
+    memcpy(prev2, prev1, sizeof(prev2));
+    usnprintf(prev1, sizeof(prev1), "%.*s", i - s, ui->in + s);
     idx++;
   }
   const char *pfx = (idx == 0 && prefix[0] == '/') ? prefix + 1 : prefix;
   const char *out[64];
   char pool[128][72];
   int pooln = 0;
-  int n = completions(ui, idx, w, pfx, out, 64, pool, &pooln);
+  int n = completions(ui, idx, w, pfx, out, 64, pool, &pooln, prev1, prev2);
   if (n == 0) return;
   size_t common = strlen(out[0]);
   for (int i = 1; i < n; i++) {
@@ -3033,9 +3329,9 @@ static void on_enter(console_ui_t *ui) {
     ui->hist_pos = ui->hist_n; /* after the add: Up must land on this line */
     run_line(ui, line);
   }
-  if (ui->line_mode && !ui->closing) {
-    if (!ui->user_busy && !ui->confirming) flush_held(ui);
-    if (!ui->user_busy) lm_prompt(ui);
+  if (ui->line_mode && !ui->closing && !ui->user_busy && ui->queued_n == 0) {
+    if (!ui->confirming) flush_held(ui);
+    lm_prompt(ui);
   }
   ui->dirty = true;
 }
@@ -3049,7 +3345,7 @@ static void cancel_input(console_ui_t *ui) {
   } else if (ui->confirming) {
     confirm_answer(ui, "", true);
   }
-  if (ui->line_mode && !ui->user_busy) {
+  if (ui->line_mode && !line_pending(ui)) {
     flush_held(ui);
     lm_prompt(ui);
   }
@@ -3760,7 +4056,7 @@ static void status_bar(console_ui_t *ui, rowb_t *r, long long now_ms, bool pane_
         o += (size_t)usnprintf(act + o, sizeof(act) - o, "%s%d", o ? "," : "", v + 1);
     if (o) SEG(5, SGR_STATUS, "[Act: %s]", act);
   }
-  long long idle_left = CONSOLE_IDLE_TIMEOUT - (now_ms - ui->last_input_ms) / 1000;
+  long long idle_left = ui->idle_s - (now_ms - ui->last_input_ms) / 1000;
   if (idle_left <= 60) SEG(6, SGR_ALERT, "idle %llds", idle_left < 0 ? 0 : idle_left);
 #undef SEG
   /* drop the lowest priority until it fits */
@@ -4018,6 +4314,9 @@ console_ui_t *ui_new(bool line_mode, int cols, int rows, const char *admin,
     sb_init(&ui->sb[V_LOG], CONSOLE_LOG_SCROLLBACK);
     ui->ent = calloc(CONSOLE_SCROLLBACK, sizeof(centry_t));
   }
+  ui->idle_s = CONSOLE_IDLE_TIMEOUT;
+  ui->cmd_n = SSH_DEF_CMDRATE_N;
+  ui->cmd_s = SSH_DEF_CMDRATE_S;
   ui->render_w = -1;
   for (int v = 0; v < V_COUNT; v++) ui->anchor[v] = -1;
   ui->log_show = LOG_DEBUG;
@@ -4026,6 +4325,14 @@ console_ui_t *ui_new(bool line_mode, int cols, int rows, const char *admin,
   ui->st.consolelevel = -1;
   ui->full_redraw = true;
   return ui;
+}
+
+void ui_set_limits(console_ui_t *ui, int idle_s, int cmd_n, int cmd_s) {
+  if (idle_s >= 60) ui->idle_s = idle_s;
+  if (cmd_n >= 1 && cmd_s >= 1) {
+    ui->cmd_n = cmd_n;
+    ui->cmd_s = cmd_s;
+  }
 }
 
 void ui_free(console_ui_t *ui) {
@@ -4088,10 +4395,19 @@ void ui_tick(console_ui_t *ui, long long now_ms) {
     if (ui->esc_len == 1) handle_key(ui, (ckey_t){K_ESC, 0}, now_ms);
     ui->esc_len = 0;
   }
-  if (now_ms - ui->last_input_ms >= (long long)CONSOLE_IDLE_TIMEOUT * 1000 && !ui->closing) {
+  if (now_ms - ui->last_input_ms >= (long long)ui->idle_s * 1000 && !ui->closing) {
     ui->closing = true;
     usnprintf(ui->close_why, sizeof(ui->close_why), "idle timeout");
     return;
+  }
+  /* lines held by the command rate go out as the window turns over */
+  if (ui->queued_n > 0 && !ui->user_busy && !ui->confirming && !ui->closing && rate_ready(ui)) {
+    int before = ui->queued_n;
+    command_done(ui, false);
+    if (ui->line_mode && ui->queued_n < before && !line_pending(ui) && !ui->closing) {
+      flush_held(ui);
+      lm_prompt(ui);
+    }
   }
   if (ui->dropped && ui->term.len < CONSOLE_TERM_OUTQ_MAX / 2) {
     char m[64];
@@ -4112,7 +4428,7 @@ void ui_tick(console_ui_t *ui, long long now_ms) {
   if (ui->view == V_STATS && now_ms - ui->stats_at >= CONSOLE_STATS_REFRESH_MS)
     request_view(ui, RQ_VIEW_STATS, now_ms);
   /* the clock, and the idle countdown in its last minute */
-  long long idle_left = CONSOLE_IDLE_TIMEOUT - (now_ms - ui->last_input_ms) / 1000;
+  long long idle_left = ui->idle_s - (now_ms - ui->last_input_ms) / 1000;
   long long tick = idle_left <= 60 ? 1000 : 60000;
   if (now_ms / tick != ui->last_clock_ms / tick) {
     ui->last_clock_ms = now_ms;

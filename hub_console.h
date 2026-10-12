@@ -7,8 +7,6 @@
 
 #include "hub.h"
 
-/* Most unauthenticated SSH connections from one address at a time. */
-#define CONSOLE_MAX_PREAUTH_PER_IP 2
 /* Largest control / session frame either side accepts. */
 #define CONSOLE_FRAME_MAX (4 * 1024 * 1024)
 
@@ -24,6 +22,10 @@ void console_publish_creds(const console_cred_t *creds, int n);
 void console_publish_hostkey(const unsigned char seed[32],
                              const unsigned char pub[32]);
 void console_publish_hubname(const char *name);
+/* The SSH limits (`hub set ssh`): the core publishes a copy on start and after
+ * each change; the console thread takes a copy per connection. */
+void console_publish_limits(const hub_conn_cfg_t *cfg);
+void console_limits_get(hub_conn_cfg_t *out);
 
 /* Start / stop the console thread.  ctl_fd is the thread's end of the
  * control socketpair; the thread owns it from here on. */

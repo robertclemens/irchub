@@ -33,6 +33,8 @@ static int g_ncreds;
 static unsigned char g_host_seed[32], g_host_pub[32];
 static unsigned g_host_gen;   /* bumped on every host key change */
 static char g_hubname[64];
+static hub_conn_cfg_t g_limits;     /* hub set ssh; defaults until published */
+static bool g_limits_set;
 
 void console_publish_creds(const console_cred_t *creds, int n) {
   pthread_mutex_lock(&g_pub_mu);
@@ -49,6 +51,21 @@ void console_publish_hostkey(const unsigned char seed[32], const unsigned char p
   memcpy(g_host_pub, pub, 32);
   g_host_gen++;
   pthread_mutex_unlock(&g_pub_mu);
+}
+
+void console_publish_limits(const hub_conn_cfg_t *cfg) {
+  pthread_mutex_lock(&g_pub_mu);
+  g_limits = *cfg;
+  g_limits_set = true;
+  pthread_mutex_unlock(&g_pub_mu);
+}
+
+void console_limits_get(hub_conn_cfg_t *out) {
+  pthread_mutex_lock(&g_pub_mu);
+  if (g_limits_set) *out = g_limits;
+  else hub_conn_cfg_defaults(out);
+  pthread_mutex_unlock(&g_pub_mu);
+  hub_conn_cfg_fix(out);
 }
 
 void console_publish_hubname(const char *name) {
@@ -204,6 +221,7 @@ typedef struct csess {
   unsigned char *core_in;
   size_t        core_in_len, core_in_cap;
   console_ui_t *ui;
+  hub_conn_cfg_t lim;           /* hub set ssh as of this connection */
 } csess_t;
 
 static pthread_t g_thread;
@@ -351,7 +369,6 @@ static void report_fail(csess_t *x, const char *why) {
 
 static int cb_auth_pubkey(ssh_session s, const char *user, struct ssh_key_struct *pubkey,
                           char signature_state, void *ud) {
-  (void)s;
   csess_t *x = ud;
   if (x->authed || x->drop) return SSH_AUTH_DENIED;
   snprintf(x->user, sizeof(x->user), "%s", user ? user : "");
@@ -361,9 +378,13 @@ static int cb_auth_pubkey(ssh_session s, const char *user, struct ssh_key_struct
     x->authed = true;
     return SSH_AUTH_SUCCESS;
   }
-  if (++x->refused >= CONSOLE_MAX_AUTH_TRIES) {
+  if (++x->refused >= x->lim.authtries) {
     report_fail(x, "too many refused keys");
     sess_drop(x, "authentication failed");
+    /* End it now, not when the loop frees the session: a request already
+     * buffered behind this one would otherwise get one more FAILURE reply. */
+    socket_t fd = ssh_get_fd(s);
+    if (fd != SSH_INVALID_SOCKET) shutdown(fd, SHUT_RDWR);
   }
   return SSH_AUTH_DENIED;
 }
@@ -526,6 +547,7 @@ static int cb_shell(ssh_session s, ssh_channel c, void *ud) {
     sess_drop(x, "out of memory");
     return -1;
   }
+  ui_set_limits(x->ui, x->lim.idle, x->lim.cmdrate_n, x->lim.cmdrate_s);
   ui_start(x->ui, now_ms());
   return 0;
 }
@@ -620,7 +642,7 @@ static int count_preauth(const char *ip, int *per_ip) {
   int n = 0;
   *per_ip = 0;
   for (csess_t *x = g_sessions; x; x = x->next) {
-    if (x->shell) continue;
+    if (x->shell || x->drop) continue;   /* a dropped one is about to go */
     n++;
     if (!strcmp(x->ip, ip)) (*per_ip)++;
   }
@@ -635,12 +657,39 @@ static int count_consoles(void) {
 }
 
 static void sess_new(int fd, const char *ip) {
+  hub_conn_cfg_t lim;
+  console_limits_get(&lim);
   int per_ip = 0;
   int pre = count_preauth(ip, &per_ip);
-  if (pre >= CONSOLE_MAX_PREAUTH || per_ip >= CONSOLE_MAX_PREAUTH_PER_IP) {
-    ctl_log(LOG_WARNING, "[CONSOLE] Too many SSH logins in progress; dropped %s", ip);
+  if (per_ip >= hub_conn_cfg_preauthip(&lim)) {
+    ctl_log(LOG_WARNING, "[CONSOLE] Too many SSH logins in progress from %s; dropped it", ip);
     close(fd);
     return;
+  }
+  if (pre >= lim.preauth) {
+    /* Every slot is taken: the newcomer replaces the oldest login in progress
+     * of the address holding the most slots, so a few addresses cannot keep
+     * the admin out. */
+    enum { EV_MAX = 128 };
+    const char *ips[EV_MAX];
+    long long st[EV_MAX];
+    csess_t *who[EV_MAX];
+    int n = 0;
+    for (csess_t *y = g_sessions; y && n < EV_MAX; y = y->next) {
+      if (y->shell || y->drop) continue;
+      ips[n] = y->ip;
+      st[n] = y->start_ms;
+      who[n++] = y;
+    }
+    int v = hub_ssh_evict_pick(ips, st, n, ip);
+    if (v < 0) {
+      ctl_log(LOG_WARNING, "[CONSOLE] Too many SSH logins in progress; dropped %s", ip);
+      close(fd);
+      return;
+    }
+    ctl_log(LOG_WARNING, "[CONSOLE] SSH logins full: dropped the oldest login of %s for "
+            "a new one from %s", who[v]->ip, ip);
+    sess_drop(who[v], "replaced by a newer connection");
   }
   pthread_mutex_lock(&g_pub_mu);
   unsigned gen = g_host_gen;
@@ -656,6 +705,7 @@ static void sess_new(int fd, const char *ip) {
     return;
   }
   x->core_fd = -1;
+  x->lim = lim;
   snprintf(x->ip, sizeof(x->ip), "%s", ip);
   x->start_ms = now_ms();
   x->s = ssh_new();
@@ -717,14 +767,16 @@ static void sess_free(csess_t *x) {
 }
 
 static void sess_service(csess_t *x, long long t) {
-  if (!x->shell && t - x->start_ms > (long long)CONSOLE_LOGIN_GRACE * 1000) {
+  if (!x->shell && t - x->start_ms > (long long)x->lim.grace * 1000) {
     if (!x->authed && x->refused > 0) report_fail(x, "login grace expired");
     sess_drop(x, "login grace expired");
   }
   int st = ssh_get_status(x->s);
   if (st & (SSH_CLOSED | SSH_CLOSED_ERROR)) sess_drop(x, "connection closed");
   if (x->shell && x->core_fd >= 0 && !x->core_in_event) {
-    if (count_consoles() > CONSOLE_MAX_SESSIONS) {
+    hub_conn_cfg_t now_lim;
+    console_limits_get(&now_lim);
+    if (count_consoles() > now_lim.sessions) {
       sess_drop(x, "too many consoles");
     } else if (ssh_event_add_fd(g_ev, x->core_fd, POLLIN, cb_core_fd, x) == SSH_OK) {
       x->core_in_event = true;

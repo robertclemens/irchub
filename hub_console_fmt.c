@@ -1478,12 +1478,76 @@ static void render_hub_settings(const fmt_ctx_t *ctx, const crec_t *h, flines_t 
   tbl_free(&t);
 }
 
+/* hub set ssh / hub set conn: this hub's connection limits.  ok|hub.show with
+ * group=ssh|conn and, per setting, <name>=<value> and <name>_def=<built-in>. */
+static const struct {
+  const char *group, *name, *meaning;
+} LIMIT_ROWS[] = {
+  {"ssh", "preauth", "SSH logins in progress, all addresses (1-64)"},
+  {"ssh", "preauthip", "SSH logins in progress from one address (1 to preauth)"},
+  {"ssh", "sessions", "open consoles (1-32)"},
+  {"ssh", "grace", "seconds from connect to a running console (5-120)"},
+  {"ssh", "authtries", "refused keys before a connection is dropped (1-6)"},
+  {"ssh", "idle", "seconds without a keystroke before the console closes (60-86400)"},
+  {"ssh", "authfail", "refused SSH logins per address, N:S, then blocked"},
+  {"ssh", "connect", "new SSH connections per address, N:S, then blocked"},
+  {"ssh", "block", "seconds blocked; doubles per repeat within 24 h, up to 24 h (30-86400)"},
+  {"ssh", "cmdrate", "console commands per session, N:S; more are queued, not dropped"},
+  {"conn", "perip", "connections at once from one address, bots, peers and SSH (2-64)"},
+  {"conn", "churn", "new connections per address, N:S[:B], then blocked B seconds"},
+  {"conn", "authfail", "failed logins per address, N:S[:B], then blocked B seconds"},
+};
+
+static void render_limits(const fmt_ctx_t *ctx, const crec_t *h, flines_t *out) {
+  const char *group = rv(h, "group") ? rv(h, "group") : "ssh";
+  bool conn = !strcmp(group, "conn");
+  static const col_t cols[] = {{"SETTING", 'L', 1}, {"VALUE", 'L', 1}, {"FROM", 'L', 1},
+                               {"MEANING", 'L', 2}};
+  tbl_t t;
+  tbl_init(&t, cols, 4, -1, 0, 1);
+  int changed = 0;
+  for (size_t i = 0; i < sizeof(LIMIT_ROWS) / sizeof(LIMIT_ROWS[0]); i++) {
+    if (strcmp(LIMIT_ROWS[i].group, group)) continue;
+    char key[48];
+    snprintf(key, sizeof(key), "%s_def", LIMIT_ROWS[i].name);
+    const char *v = rv(h, LIMIT_ROWS[i].name) ? rv(h, LIMIT_ROWS[i].name) : GL(G_DASH);
+    const char *d = rv(h, key) ? rv(h, key) : "";
+    bool set = strcmp(v, d) != 0;
+    if (set) changed++;
+    const char *cells[4] = {LIMIT_ROWS[i].name, v, set ? "set here" : "built-in",
+                            LIMIT_ROWS[i].meaning};
+    tbl_row(ctx, &t, RL_NORMAL, NULL, cells);
+  }
+  char right[96];
+  snprintf(right, sizeof(right), "this hub only %s %d changed", GL(G_DOT), changed);
+  fmt_title(ctx, out, conn ? "Connection limits" : "SSH limits", right);
+  tbl_render(ctx, out, &t);
+  tbl_free(&t);
+  rule_line(ctx, out);
+  line(out, RL_DIM, "  a change applies to the next connection; logins in progress keep theirs");
+  hint(out, conn ? "hub set conn <perip|churn|authfail> <value|default>"
+                 : "hub set ssh <name> <value|default> · hub set conn shows the shared limits");
+}
+
 static void render_hub_set(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   const crec_t *r = &rep->res;
   const char *setting = rv(r, "setting") ? rv(r, "setting") : "?";
   char what[160], subj[512], ph[160];
   const char *old = rvs(r, "old") ? rv(r, "old") : GL(G_DASH);
   const char *val = rvs(r, "value") ? rv(r, "value") : GL(G_DASH);
+  if (rvs(r, "group")) {   /* hub set ssh|conn */
+    snprintf(what, sizeof(what), "%s", !strcmp(rv(r, "group"), "conn") ? "Connection limits" : "SSH limits");
+    snprintf(subj, sizeof(subj), "%s   %s %s %s", setting, old, GL(G_ARROW), val);
+    fmt_ok(ctx, what, subj, out);
+    if (!rvb(r, "written")) {
+      effect(ctx, out, "no change: it already had that value");
+    } else {
+      snprintf(ph, sizeof(ph), "%s", rvb(r, "reset") ? "built-in value restored" : "saved on this hub");
+      effect(ctx, out, ph);
+      effect(ctx, out, "applies to the next connection; logins in progress keep theirs");
+    }
+    return;
+  }
   snprintf(what, sizeof(what), "Hub %s",
            !strcmp(setting, "name") ? old : ctx->hubname && *ctx->hubname ? ctx->hubname : "hub");
   if (!strcmp(setting, "pubkey")) {
@@ -1643,6 +1707,8 @@ static const char *const OPNAME[256] = {
  [0x6E] = "CMD_CHAN_PROBE_ACK", [0x6F] = "CMD_CHAN_DO", [0x70] = "CMD_CHAN_DONE",
  [0x71] = "CMD_CHAN_ELECT_FWD", [0x72] = "CMD_CHAN_ELECT_ACK", [0x73] = "CMD_CHAN_ELECT_DO",
  [0x74] = "CMD_CHAN_ELECT_DONE", [0x75] = "CMD_ADMIN_INVITE_USER",
+ [0x76] = "CMD_ADMIN_CHAN_MODE", [0x77] = "CMD_ADMIN_CHAN_SET", [0x78] = "CMD_ADMIN_BAN",
+ [0x79] = "CMD_ADMIN_NET_SET", [0x7A] = "CMD_ADMIN_SET_SSH", [0x7B] = "CMD_CHAN_EVENT",
 };
 
 static unsigned long long rvu(const crec_t *r, const char *k) {
@@ -1859,9 +1925,9 @@ static void render_acl_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
     fmt_title(ctx, out, pass == 0 ? "Allow" : "Deny",
               pass == 0 ? "only these addresses may connect" : "these addresses are refused");
     static const col_t cols[] = {{"#", 'R', 1}, {"PATTERN", 'L', 1}, {"COVERS", 'L', 1},
-                                 {"ADDED", 'L', 1}, {"", 'L', 1}};
+                                 {"SCOPE", 'L', 1}, {"ADDED", 'L', 1}, {"", 'L', 1}};
     tbl_t t;
-    tbl_init(&t, cols, 5, -1, 1, 1);
+    tbl_init(&t, cols, 6, -1, 1, 1);
     for (int i = 0; i < rep->n; i++) {
       const crec_t *x = &rep->r[i];
       if (strcmp(x->type, "acl") || !rv(x, "list") || strcmp(rv(x, "list"), list)) continue;
@@ -1873,7 +1939,8 @@ static void render_acl_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
       when_ago(ctx, rvi(x, "ts", 0), added, sizeof(added));
       char you[16];
       snprintf(you, sizeof(you), "%s you", ctx->ascii ? "<-" : "←");
-      const char *cells[5] = {nn, rv(x, "pattern"), cov, added,
+      const char *cells[6] = {nn, rv(x, "pattern"), cov,
+                              rv(x, "scope") ? rv(x, "scope") : "all", added,
                               acl_covers(rv(x, "pattern"), rv(r, "self_ip")) ? you : " "};
       tbl_row(ctx, &t, RL_NORMAL, NULL, cells);
     }
@@ -1889,15 +1956,22 @@ static void render_acl_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
   bool add = !strcmp(rep->code, "acl.added");
   const char *list = rv(r, "list") ? rv(r, "list") : "?";
   char what[32], subj[160], c[32];
-  snprintf(what, sizeof(what), "%s list", !strcmp(list, "allow") ? "Allow" : "Deny");
+  bool cscope = rv(r, "scope") && !strcmp(rv(r, "scope"), "console");
+  snprintf(what, sizeof(what), "%s list%s", !strcmp(list, "allow") ? "Allow" : "Deny",
+           cscope ? " (console)" : "");
   unsigned long long sz = strtoull(rv(r, "size") ? rv(r, "size") : "0", NULL, 10);
   fmt_count(sz, c, sizeof(c));
   snprintf(subj, sizeof(subj), "%s   %s  (%s address%s)", add ? "added" : "removed",
            rv(r, "pattern") ? rv(r, "pattern") : "?", c, sz == 1 ? "" : "es");
   fmt_ok(ctx, what, subj, out);
   effect(ctx, out, "local to this hub (the lists are not synced)");
-  if (rvb(r, "first")) warn(ctx, out, "the allow list was empty: from now on only listed addresses can connect");
-  if (rvb(r, "empty")) warn(ctx, out, "the allow list is empty now: every address may connect");
+  if (cscope) effect(ctx, out, "console scope: applies to SSH logins only, bots and peers are not affected");
+  if (rvb(r, "first"))
+    warn(ctx, out, cscope ? "the console allow list was empty: from now on only listed addresses can open the console"
+                          : "the allow list was empty: from now on only listed addresses can connect");
+  if (rvb(r, "empty"))
+    warn(ctx, out, cscope ? "the console allow list is empty now: every address may open the console"
+                          : "the allow list is empty now: every address may connect");
   long long closing = rvi(r, "closing", 0);
   if (closing > 0) {
     char p[96];
@@ -2188,6 +2262,9 @@ static void render_channel_list(const fmt_ctx_t *ctx, const creply_t *rep, fline
        GL(G_DOT), keyed);
 }
 
+static const char *modes_source_phrase(const char *src);
+static void overrides_phrase(const char *ov, char *out, size_t cap);
+
 static void render_channel_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   const crec_t *c = NULL;
   for (int i = 0; i < rep->n && !c; i++)
@@ -2197,15 +2274,34 @@ static void render_channel_show(const fmt_ctx_t *ctx, const creply_t *rep, fline
   snprintf(title, sizeof(title), "Channel %s", rv(c, "name") ? rv(c, "name") : "?");
   fmt_title(ctx, out, title, "managed");
   const int L = 12;
-  for (int s = 0; s < NCHANSET; s++) {
-    chan_value(CHAN_SETTINGS[s].key, rv(c, CHAN_SETTINGS[s].key), v, sizeof(v));
-    fmt_card_line(ctx, out, L, CHAN_SETTINGS[s].label, v[0] ? v : GL(G_DASH), RL_NORMAL);
+  if (rvs(&rep->res, "want")) {
+    /* 2.4.5: the key, the stored modes (and where they come from), the live
+     * modes a bot last reported, the channel's own settings, its bans */
+    const crec_t *res = &rep->res;
+    fmt_card_line(ctx, out, L, "key", rvs(c, "key") ? rv(c, "key") : GL(G_DASH), RL_NORMAL);
+    snprintf(v, sizeof(v), "%s   (%s)", rv(res, "want"), modes_source_phrase(rv(res, "want_src")));
+    fmt_card_line(ctx, out, L, "modes", v, RL_NORMAL);
+    if (rvs(c, "modes")) snprintf(v, sizeof(v), "+%s   (i and k as last reported by a bot)", rv(c, "modes"));
+    else snprintf(v, sizeof(v), "not reported");
+    fmt_card_line(ctx, out, L, "live modes", v, RL_NORMAL);
+    char ov[512];
+    overrides_phrase(rv(res, "overrides"), ov, sizeof(ov));
+    fmt_card_line(ctx, out, L, "settings", ov[0] ? ov : "all default", RL_NORMAL);
+    snprintf(v, sizeof(v), "%lld", rvi(res, "bans", 0));
+    fmt_card_line(ctx, out, L, "bans", v, RL_NORMAL);
+  } else {
+    for (int s = 0; s < NCHANSET; s++) {
+      chan_value(CHAN_SETTINGS[s].key, rv(c, CHAN_SETTINGS[s].key), v, sizeof(v));
+      fmt_card_line(ctx, out, L, CHAN_SETTINGS[s].label, v[0] ? v : GL(G_DASH), RL_NORMAL);
+    }
   }
   when_ago(ctx, rvi(c, "ts", 0), v, sizeof(v));
   fmt_card_line(ctx, out, L, "changed", v, RL_NORMAL);
   static const char *const known[] = {"name", "ts", "key", "modes", NULL};
   unknown_keys(ctx, out, c, known, L);
   line(out, RL_DIM, "  bot presence per channel: not reported yet");
+  if (rvs(&rep->res, "want"))
+    hint(out, "channel mode <#chan> · channel set <#chan> · ban list <#chan>");
 }
 
 static void render_channel_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
@@ -2232,15 +2328,6 @@ static void render_channel_change(const fmt_ctx_t *ctx, const creply_t *rep, fli
       snprintf(ph, sizeof(ph), "recorded modes +%s kept", rv(r, "modes"));
       effect(ctx, out, ph);
     }
-  } else if (!strcmp(code, "channel.set")) {
-    char what[96];
-    snprintf(what, sizeof(what), "Channel %s", name);
-    snprintf(subj, sizeof(subj), "%s   %s %s %s", rv(r, "setting") ? rv(r, "setting") : "?",
-             rvs(r, "old") ? rv(r, "old") : GL(G_DASH), GL(G_ARROW),
-             rvs(r, "value") ? rv(r, "value") : GL(G_DASH));
-    fmt_ok(ctx, what, subj, out);
-    snprintf(ph, sizeof(ph), "pushed to %lld bot%s; %s", bots, bots == 1 ? "" : "s", pp);
-    effect(ctx, out, ph);
   } else if (!strcmp(code, "channel.removed")) {
     fmt_ok(ctx, "Channel removed", name, out);
     if (!rvb(r, "existed")) warn(ctx, out, "it was not a managed channel here; the removal still syncs");
@@ -2285,6 +2372,335 @@ static void render_channel_change(const fmt_ctx_t *ctx, const creply_t *rep, fli
     snprintf(ph, sizeof(ph), "a bot that is opped on %s %s", rv(r, "chan") ? rv(r, "chan") : "?",
              inv ? "will invite them" : "and sees them will op them");
     effect(ctx, out, ph);
+  }
+}
+
+/* ==========================================================================
+ * Modes, settings, bans (docs/modes.md §5.1)
+ * ========================================================================== */
+/* The on/off options: a setting not in this list is valued (a number or a
+ * flood limit).  A new on/off option is one word here. */
+static const char *const FLAG_SETTINGS[] = {
+  "enforcemodes", "bitch", "protectops", "revenge", "stopnethack", "enforcebans",
+  "dynamicbans", "dontkickops", "cycle", "dynamiclimit", NULL};
+
+static bool is_flag_setting(const char *name) {
+  for (int i = 0; FLAG_SETTINGS[i]; i++)
+    if (!strcmp(FLAG_SETTINGS[i], name)) return true;
+  return false;
+}
+
+/* A setting's value as a person reads it: on / off, minutes, seconds,
+ * permanent; floods stay N:S or off. */
+static void setting_value(const char *name, const char *kind, const char *v, char *out,
+                          size_t cap) {
+  if (!v) v = "";
+  if (kind && !strcmp(kind, "flag")) snprintf(out, cap, "%s", !strcmp(v, "1") ? "on" : "off");
+  else if (!strcmp(name, "bantime") && !strcmp(v, "0")) snprintf(out, cap, "permanent");
+  else if (!strcmp(name, "bantime") || !strcmp(name, "banidle") || !strcmp(name, "ignoretime"))
+    snprintf(out, cap, "%s min", v);
+  else if (!strcmp(name, "limitdelay")) snprintf(out, cap, "%s s", v);
+  else snprintf(out, cap, "%s", v);
+}
+
+static const char *src_phrase(const char *src) {
+  if (!src) return "?";
+  if (!strcmp(src, "chan")) return "channel";
+  if (!strcmp(src, "net")) return "network";
+  return "built-in";
+}
+
+static const char *modes_source_phrase(const char *src) {
+  if (!src) return "";
+  if (!strcmp(src, "chan")) return "set on this channel";
+  if (!strcmp(src, "net")) return "network default";
+  return "built-in default";
+}
+
+/* D38: a command that wrote C|/D|/B| names the hubs that will drop them. */
+static void old_hubs_warn(const fmt_ctx_t *ctx, const crec_t *r, flines_t *out) {
+  const char *h = rvs(r, "old_hubs");
+  if (!h) return;
+  char m[512];
+  snprintf(m, sizeof(m),
+           "older hubs drop settings, modes and bans: %s %s upgrade them to 2.4.5 or the bots "
+           "behind them get none",
+           h, GL(G_DASH));
+  warn(ctx, out, m);
+}
+
+static void push_effects(const fmt_ctx_t *ctx, const crec_t *r, flines_t *out) {
+  char ph[160], pp[96];
+  long long bots = rvi(r, "bots", 0), peers = rvi(r, "peers", 0);
+  if (peers > 0) snprintf(pp, sizeof(pp), "synced to %lld peer hub%s", peers, peers == 1 ? "" : "s");
+  else snprintf(pp, sizeof(pp), "no peer hub linked");
+  snprintf(ph, sizeof(ph), "pushed to %lld bot%s; %s", bots, bots == 1 ? "" : "s", pp);
+  effect(ctx, out, ph);
+}
+
+/* channel.mode: the view (view=1) or the answer to a store-and-apply. */
+static void render_channel_mode(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  const crec_t *r = &rep->res;
+  const char *chan = rv(r, "chan") ? rv(r, "chan") : "?", *eff = rv(r, "effective");
+  char v[256], ph[200];
+  if (rvb(r, "view")) {
+    char title[96];
+    snprintf(title, sizeof(title), "Modes %s", chan);
+    fmt_title(ctx, out, title, "managed");
+    const int L = 8;
+    snprintf(v, sizeof(v), "%s   (%s)", eff ? eff : "?", modes_source_phrase(rv(r, "source")));
+    fmt_card_line(ctx, out, L, "stored", v, RL_NORMAL);
+    fmt_card_line(ctx, out, L, "key", rvb(r, "key_set") ? "set (channel show has it)" : "none",
+                  RL_NORMAL);
+    if (rvs(r, "live")) snprintf(v, sizeof(v), "+%s   (i and k as last reported by a bot)", rv(r, "live"));
+    else snprintf(v, sizeof(v), "not reported");
+    fmt_card_line(ctx, out, L, "live", v, RL_NORMAL);
+    if (rvb(r, "dynlimit"))
+      warn(ctx, out, "+l is stored but +dynamiclimit is on: the dynamic limit wins");
+    hint(out, "channel mode <#chan> <+modes> [key] [limit]  stores and applies · channel mode <#chan> -  network default");
+    return;
+  }
+  snprintf(v, sizeof(v), "%s   %s", chan, eff ? eff : "?");
+  fmt_ok(ctx, "Modes applied", v, out);
+  snprintf(ph, sizeof(ph), "stored on every hub and bot (%s)", modes_source_phrase(rv(r, "source")));
+  effect(ctx, out, ph);
+  if (rvs(r, "by")) {
+    snprintf(ph, sizeof(ph), "%s on %s applied them%s%s%s", rv(r, "by"),
+             rv(r, "hub_name") ? rv(r, "hub_name") : "?", rvs(r, "detail") ? " (" : "",
+             rvs(r, "detail") ? rv(r, "detail") : "", rvs(r, "detail") ? ")" : "");
+    effect(ctx, out, ph);
+    long long asked = rvi(r, "asked", 0), hubs = rvi(r, "hubs", 0);
+    snprintf(ph, sizeof(ph), "%lld bot%s asked on %lld hub%s; one acted", asked,
+             asked == 1 ? "" : "s", hubs, hubs == 1 ? "" : "s");
+    effect(ctx, out, ph);
+  }
+  if (rvb(r, "dynlimit"))
+    warn(ctx, out, "+l is stored but +dynamiclimit is on: the dynamic limit wins");
+  old_hubs_warn(ctx, r, out);
+}
+
+/* channel.settings / network.settings: every setting, its value, where it comes from. */
+static void render_settings_table(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out,
+                                  bool network) {
+  const crec_t *r = &rep->res;
+  bool net_target = !network && rv(r, "name") && !strcmp(rv(r, "name"), "default");
+  char title[96], right[160];
+  int overrides = 0, rows = 0;
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *c = &rep->r[i];
+    if (strcmp(c->type, "setting")) continue;
+    rows++;
+    const char *s = rv(c, "src");
+    /* a channel counts its own values; the network default and the bot
+     * floods count what the network changed */
+    if (s && !strcmp(s, net_target || network ? "net" : "chan")) overrides++;
+  }
+  if (network) {
+    snprintf(title, sizeof(title), "Bot floods");
+    snprintf(right, sizeof(right), "network-wide %s %d changed", GL(G_DOT), overrides);
+  } else {
+    snprintf(title, sizeof(title), "Settings %s", rv(r, "name") ? rv(r, "name") : "?");
+    snprintf(right, sizeof(right), "%d %s", overrides, net_target ? "changed" : "of its own");
+  }
+  fmt_title(ctx, out, title, right);
+  static const col_t cols[] = {{"SETTING", 'L', 1}, {"VALUE", 'L', 1}, {"FROM", 'L', 1}};
+  tbl_t t;
+  tbl_init(&t, cols, 3, -1, 0, 0);
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *c = &rep->r[i];
+    if (strcmp(c->type, "setting")) continue;
+    char val[48];
+    const char *name = rv(c, "name") ? rv(c, "name") : "?";
+    setting_value(name, rv(c, "kind"), rv(c, "value"), val, sizeof(val));
+    const char *cells[3] = {name, val, src_phrase(rv(c, "src"))};
+    tbl_row(ctx, &t, RL_NORMAL, NULL, cells);
+  }
+  if (!rows) {
+    empty_note(out, "no settings", NULL);
+    tbl_free(&t);
+    return;
+  }
+  tbl_render(ctx, out, &t);
+  tbl_free(&t);
+  rule_line(ctx, out);
+  char v[200];
+  if (network) {
+    line(out, RL_DIM, "  cmd counts per user, msg and ctcp per host; a flooding host is ignored for ignoretime");
+    line(out, RL_DIM, "  sendq paces what a bot says: B lines at once, then one every I ms (I 0 = no delay)");
+    hint(out, "network set flood <cmd|msg|ctcp> <N:S|off|default> · network set ignoretime <min|default> · network set sendq <B:I|default>");
+  } else {
+    const char *eff = rv(r, "effective");
+    snprintf(v, sizeof(v), "  modes %s (%s)", eff ? eff : "?", modes_source_phrase(rv(r, "source")));
+    line(out, RL_DIM, "%s", v);
+    hint(out, net_target ? "channel set default +opt|-opt|<name> <value|default>"
+                         : "channel set <#chan> +opt|-opt|<name> <value|default> · flood <type> <N:S|off|default>");
+  }
+}
+
+/* channel.set / network.set: what changed, old -> new. */
+static void render_settings_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  const crec_t *r = &rep->res;
+  bool network = !strcmp(rep->code, "network.set");
+  const char *name = rv(r, "name") ? rv(r, "name") : "?";
+  bool net_target = !network && !strcmp(name, "default");
+  char what[96], subj[160], ph[200], a[48], b[48];
+  if (network) {
+    snprintf(what, sizeof(what), "Bot floods");
+    const char *st = rv(r, "setting") ? rv(r, "setting") : "?";
+    setting_value(st, rv(r, "kind"), rv(r, "old"), a, sizeof(a));
+    setting_value(st, rv(r, "kind"), rv(r, "value"), b, sizeof(b));
+    snprintf(subj, sizeof(subj), "%s   %s %s %s", st, a, GL(G_ARROW), b);
+    fmt_ok(ctx, what, subj, out);
+    if (!rvb(r, "written")) effect(ctx, out, "no change: it already had that value");
+    else {
+      snprintf(ph, sizeof(ph), "now %s (%s)", b, src_phrase(rv(r, "src")));
+      effect(ctx, out, ph);
+      push_effects(ctx, r, out);
+    }
+    old_hubs_warn(ctx, r, out);
+    return;
+  }
+  if (net_target) snprintf(what, sizeof(what), "Network default");
+  else snprintf(what, sizeof(what), "Channel %s", name);
+  long long n = rvi(r, "changes", 0);
+  snprintf(subj, sizeof(subj), "%lld setting%s", n, n == 1 ? "" : "s");
+  fmt_ok(ctx, what, subj, out);
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *c = &rep->r[i];
+    if (strcmp(c->type, "chg")) continue;
+    const char *st = rv(c, "setting") ? rv(c, "setting") : "?";
+    setting_value(st, rv(c, "kind"), rv(c, "old"), a, sizeof(a));
+    setting_value(st, rv(c, "kind"), rv(c, "value"), b, sizeof(b));
+    snprintf(ph, sizeof(ph), "%s   %s %s %s   (%s)", st, a, GL(G_ARROW), b,
+             rvb(c, "reset") ? "default restored" : src_phrase(rv(c, "src")));
+    effect(ctx, out, ph);
+  }
+  if (!rvb(r, "written")) effect(ctx, out, "no change: it already had these values");
+  else push_effects(ctx, r, out);
+  old_hubs_warn(ctx, r, out);
+}
+
+/* ban.* */
+static void ban_expiry(const fmt_ctx_t *ctx, long long expires, char *out, size_t cap) {
+  if (expires <= 0) {
+    snprintf(out, cap, "permanent");
+  } else if (expires <= ctx->now) {
+    snprintf(out, cap, "expired");
+  } else {
+    char w[32], s[32];
+    fmt_when(expires, ctx->now, w, sizeof(w));
+    fmt_span(expires - ctx->now, s, sizeof(s));
+    snprintf(out, cap, "%s %s in %s", w, GL(G_DOT), s);
+  }
+}
+
+static int ban_row_cmp(const void *pa, const void *pb) {
+  const crec_t *a = *(const crec_t *const *)pa, *b = *(const crec_t *const *)pb;
+  const char *ca = rv(a, "chan") ? rv(a, "chan") : "", *cb = rv(b, "chan") ? rv(b, "chan") : "";
+  /* "*" (every channel) first, then channel, mask, added */
+  int ga = !strcmp(ca, "*"), gb = !strcmp(cb, "*");
+  if (ga != gb) return gb - ga;
+  int c = ci_cmp(ca, cb);
+  if (c) return c;
+  c = strcmp(ca, cb);
+  if (c) return c;
+  const char *ma = rv(a, "mask") ? rv(a, "mask") : "", *mb = rv(b, "mask") ? rv(b, "mask") : "";
+  c = ci_cmp(ma, mb);
+  if (c) return c;
+  c = strcmp(ma, mb);
+  if (c) return c;
+  long long ta = rvi(a, "ts", 0), tb = rvi(b, "ts", 0);
+  return ta < tb ? -1 : ta > tb ? 1 : 0;
+}
+
+static void render_ban_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  const crec_t *r = &rep->res;
+  long long count = rvi(r, "count", 0);
+  char right[120];
+  if (rvs(r, "chan"))
+    snprintf(right, sizeof(right), "%lld ban%s %s %s", count, count == 1 ? "" : "s", GL(G_DOT),
+             !strcmp(rv(r, "chan"), "*") ? "global" : rv(r, "chan"));
+  else snprintf(right, sizeof(right), "%lld ban%s", count, count == 1 ? "" : "s");
+  fmt_title(ctx, out, "Bans", right);
+  const crec_t **rows = calloc((size_t)rep->n + 1, sizeof(*rows));
+  int nr = 0;
+  for (int i = 0; rows && i < rep->n; i++)
+    if (!strcmp(rep->r[i].type, "ban")) rows[nr++] = &rep->r[i];
+  if (!nr) {
+    empty_note(out, "no bans listed", "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]");
+    free(rows);
+    return;
+  }
+  qsort(rows, (size_t)nr, sizeof(*rows), ban_row_cmp);
+  static const col_t cols[] = {{"CHANNEL", 'L', 1}, {"MASK", 'L', 1}, {"EXPIRES", 'L', 1},
+                               {"STICKY", 'L', 2}, {"BY", 'L', 2}, {"REASON", 'L', 2},
+                               {"ADDED", 'L', 2}};
+  tbl_t t;
+  tbl_init(&t, cols, 7, -1, 1, 1);
+  for (int i = 0; i < nr; i++) {
+    const crec_t *c = rows[i];
+    char ex[96], when[64];
+    ban_expiry(ctx, rvi(c, "expires", 0), ex, sizeof(ex));
+    when_ago(ctx, rvi(c, "ts", 0), when, sizeof(when));
+    const char *cells[7] = {rv(c, "chan"), rv(c, "mask"), ex, rvb(c, "sticky") ? "yes" : "no",
+                            rv(c, "setter"), rv(c, "reason"), when};
+    tbl_row(ctx, &t, RL_NORMAL, NULL, cells);
+  }
+  tbl_render(ctx, out, &t);
+  tbl_free(&t);
+  free(rows);
+  if (rvb(r, "truncated")) warn(ctx, out, "only the first bans are shown; name a channel to narrow the list");
+}
+
+static void render_ban_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  const crec_t *r = &rep->res;
+  char subj[256], ph[256], ex[96];
+  const char *chan = rv(r, "chan") ? rv(r, "chan") : "?", *mask = rv(r, "mask") ? rv(r, "mask") : "?";
+  snprintf(subj, sizeof(subj), "%s   %s", !strcmp(chan, "*") ? "every channel" : chan, mask);
+  if (!strcmp(rep->code, "ban.removed")) {
+    fmt_ok(ctx, "Ban removed", subj, out);
+    push_effects(ctx, r, out);
+    old_hubs_warn(ctx, r, out);
+    return;
+  }
+  fmt_ok(ctx, rvb(r, "existed") ? "Ban updated" : "Ban added", subj, out);
+  ban_expiry(ctx, rvi(r, "expires", 0), ex, sizeof(ex));
+  snprintf(ph, sizeof(ph), "lasts: %s", ex);
+  effect(ctx, out, ph);
+  if (rvb(r, "sticky")) effect(ctx, out, "sticky: the bots put it back at once if an op removes it");
+  if (rvs(r, "reason")) {
+    snprintf(ph, sizeof(ph), "reason: %s", rv(r, "reason"));
+    effect(ctx, out, ph);
+  }
+  push_effects(ctx, r, out);
+  old_hubs_warn(ctx, r, out);
+}
+
+/* The settings a channel overrides ("bitch=1,flood join=5:60") as a person
+ * would type them: +bitch, flood join 5:60. */
+static void overrides_phrase(const char *ov, char *out, size_t cap) {
+  size_t o = 0;
+  out[0] = '\0';
+  for (const char *p = ov; p && *p;) {
+    const char *end = strchr(p, ',');
+    size_t tl = end ? (size_t)(end - p) : strlen(p);
+    const char *eq = memchr(p, '=', tl);
+    char name[48], val[48];
+    if (eq && (size_t)(eq - p) < sizeof(name) && tl - (size_t)(eq - p) - 1 < sizeof(val)) {
+      size_t nl = (size_t)(eq - p), vl = tl - nl - 1;
+      memcpy(name, p, nl);
+      name[nl] = '\0';
+      memcpy(val, eq + 1, vl);
+      val[vl] = '\0';
+      char one[112];
+      if (is_flag_setting(name)) snprintf(one, sizeof(one), "%c%s", !strcmp(val, "1") ? '+' : '-', name);
+      else snprintf(one, sizeof(one), "%s %s", name, val);
+      int w = snprintf(out + o, cap - o, "%s%s", o ? ", " : "", one);
+      if (w < 0 || (size_t)w >= cap - o) return;
+      o += (size_t)w;
+    }
+    p += tl;
+    if (*p == ',') p++;
   }
 }
 
@@ -2833,6 +3249,7 @@ void fmt_reply(const fmt_ctx_t *ctx, const creply_t *rep, const char *words, fli
   const char *c = rep->code ? rep->code : "";
   if (rep->err) {
     fmt_error(ctx, rv(&rep->res, "msg"), rv(&rep->res, "hint"), out);
+    old_hubs_warn(ctx, &rep->res, out);
     if (!strcmp(c, "bot.ambiguous")) {
       static const col_t cols[] = {{"UUID", 'L', 1}, {"NICK", 'L', 1}, {"STATE", 'L', 1}};
       tbl_t t;
@@ -2856,6 +3273,7 @@ void fmt_reply(const fmt_ctx_t *ctx, const creply_t *rep, const char *words, fli
     return;
   }
   if (ctx->mode == FMT_MODE_HUB_SETTINGS && !strcmp(c, "hub.show")) render_hub_settings(ctx, &rep->res, out);
+  else if (ctx->mode == FMT_MODE_LIMITS && !strcmp(c, "hub.show")) render_limits(ctx, &rep->res, out);
   else if (!strcmp(c, "bot.list")) render_bot_list(ctx, rep, out);
   else if (!strcmp(c, "bot.show")) render_bot_show(ctx, rep, out);
   else if (!strcmp(c, "bot.summary")) render_bot_summary(ctx, rep, out);
@@ -2880,6 +3298,13 @@ void fmt_reply(const fmt_ctx_t *ctx, const creply_t *rep, const char *words, fli
   else if (!strncmp(c, "user.", 5)) render_user_change(ctx, rep, out);
   else if (!strcmp(c, "channel.list")) render_channel_list(ctx, rep, out);
   else if (!strcmp(c, "channel.show")) render_channel_show(ctx, rep, out);
+  else if (!strcmp(c, "channel.settings")) render_settings_table(ctx, rep, out, false);
+  else if (!strcmp(c, "channel.mode")) render_channel_mode(ctx, rep, out);
+  else if (!strcmp(c, "channel.set")) render_settings_change(ctx, rep, out);
+  else if (!strcmp(c, "ban.list")) render_ban_list(ctx, rep, out);
+  else if (!strncmp(c, "ban.", 4)) render_ban_change(ctx, rep, out);
+  else if (!strcmp(c, "network.settings")) render_settings_table(ctx, rep, out, true);
+  else if (!strcmp(c, "network.set")) render_settings_change(ctx, rep, out);
   else if (!strncmp(c, "channel.", 8)) render_channel_change(ctx, rep, out);
   else if (!strcmp(c, "upg.status")) render_upg_status(ctx, rep, out);
   else if (!strcmp(c, "upg.releases")) render_upg_releases(ctx, rep, out);

@@ -40,6 +40,9 @@ typedef struct console_ui console_ui_t;
 console_ui_t *ui_new(bool line_mode, int cols, int rows, const char *admin,
                      const char *ip, const char *hubname);
 void ui_free(console_ui_t *ui);
+/* The session's `hub set ssh` limits: idle close (seconds) and commands per
+ * window (cmd_n per cmd_s seconds; over it, lines queue, they are not dropped). */
+void ui_set_limits(console_ui_t *ui, int idle_s, int cmd_n, int cmd_s);
 /* Greeting, first draw, subscriptions. */
 void ui_start(console_ui_t *ui, long long now_ms);
 void ui_input(console_ui_t *ui, const unsigned char *data, size_t n,

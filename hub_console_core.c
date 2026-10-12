@@ -28,8 +28,9 @@ int  hub_console_tree_rows(hub_state_t *state, char *buf, int max_len);
 void hub_console_status_line(hub_state_t *state, const char *tree,
                              char *out, size_t out_size);
 void hub_console_upg_line(hub_state_t *state, char *out, size_t out_size);
-void hub_console_record_failed_auth(hub_state_t *state, const char *ip);
-void hub_console_note_login(hub_state_t *state, const char *name);
+void hub_console_ssh_failed(hub_state_t *state, const char *ip);
+bool hub_console_ssh_admit(hub_state_t *state, const char *ip);
+void hub_console_note_login(hub_state_t *state, const char *name, const char *ip);
 
 struct hub_console_link {
   char          admin[CONSOLE_NAME_MAX];
@@ -217,6 +218,7 @@ bool hub_console_start(hub_state_t *state) {
   (void)fcntl(sv[1], F_SETFD, FD_CLOEXEC);
   console_publish_hostkey_from(state);
   console_refresh_creds(state, true);
+  console_publish_limits(&state->conn_cfg);
   if (!console_thread_start(sv[1])) {
     hub_log_error("[CONSOLE] Could not start the console thread\n");
     close(sv[0]);
@@ -235,6 +237,10 @@ void hub_console_stop(hub_state_t *state) {
   state->console_ctl_fd = -1;
 }
 
+void hub_console_limits_changed(hub_state_t *state) {
+  console_publish_limits(&state->conn_cfg);
+}
+
 void hub_console_hostkey_changed(hub_state_t *state) {
   console_publish_hostkey_from(state);
 }
@@ -242,7 +248,10 @@ void hub_console_hostkey_changed(hub_state_t *state) {
 void hub_console_handoff(hub_state_t *state, hub_client_t *c) {
   int fd = c->fd;
   bool sent = false;
-  if (state->console_ctl_fd >= 0) {
+  /* Only now that the stream says SSH do the console scope of the ACL and the
+   * SSH block / connect window apply (bots and peers never reach this). */
+  bool admitted = state->console_ctl_fd >= 0 && hub_console_ssh_admit(state, c->ip);
+  if (admitted) {
     char msg[128];
     snprintf(msg, sizeof(msg), "NEW|%d|%s", fd, c->ip);
     sent = console_ctl_write(state->console_ctl_fd, msg);
@@ -252,7 +261,7 @@ void hub_console_handoff(hub_state_t *state, hub_client_t *c) {
      * before the client is dropped, so hub_disconnect_client leaves it open. */
     c->fd = -1;
     hub_log_debug("[CONSOLE] SSH connection from %s handed to the console\n", c->ip);
-  } else {
+  } else if (state->console_ctl_fd < 0) {
     hub_log_warning("[CONSOLE] SSH connection from %s refused: console not "
                     "running\n", c->ip);
   }
@@ -327,7 +336,7 @@ static void ctl_open(hub_state_t *state, char *args) {
   hub_crypto_key_fingerprint(pub, fp);
   hub_log_info("[HUB] Admin Login (SSH console, key %s): %s as '%s'\n", fp, ip,
                name);
-  hub_console_note_login(state, name);
+  hub_console_note_login(state, name, ip);
 }
 
 static void ctl_frame(hub_state_t *state, char *text) {
@@ -342,7 +351,7 @@ static void ctl_frame(hub_state_t *state, char *text) {
     if (!ip) return;
     hub_log_warning("[CONSOLE] Refused SSH login '%s' from %s: %s\n",
                     name ? name : "?", ip, why ? why : "refused");
-    hub_console_record_failed_auth(state, ip);
+    hub_console_ssh_failed(state, ip);
   } else if (strncmp(text, "LOG|", 4) == 0) {
     /* LOG|<level>|<text> — audit lines; the console thread never logs itself. */
     char *msg = strchr(text + 4, '|');

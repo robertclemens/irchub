@@ -555,6 +555,9 @@ void hub_maintenance(hub_state_t *state) {
     /* Channel-request elections: probe windows and hand-off timeouts. */
     hub_chan_elect_tick(state, now);
 
+    /* Expired bans: one `del` per ban, self-throttled to BAN_SWEEP_INTERVAL. */
+    hub_bans_sweep(state, now);
+
     /* The full config push owed to the bots, coalesced across a burst. */
     hub_flush_bot_config(state, now);
 
@@ -1145,6 +1148,7 @@ int main(int argc, char *argv[]) {
     state.log_level = HUB_DEFAULT_LOG_LEVEL;
     state.console_log_level = HUB_DEFAULT_CONSOLE_LOG_LEVEL;
     state.log_max_size = HUB_LOG_FILE_SIZE;
+    hub_conn_cfg_defaults(&state.conn_cfg);
 
     if (selftest_mode) {
         /* The swap happens in this directory: one another user owns is

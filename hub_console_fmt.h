@@ -71,7 +71,8 @@ typedef struct {
 enum {
   FMT_MODE_NORMAL = 0,
   FMT_MODE_HUB_SETTINGS,   /* "hub set" alone: the settings table         */
-  FMT_MODE_VIEW            /* full-screen views 4/5: no result line       */
+  FMT_MODE_VIEW,           /* full-screen views 4/5: no result line       */
+  FMT_MODE_LIMITS          /* "hub set ssh|conn" alone: the limits table  */
 };
 
 /* Render a parsed reply.  `words` is the command ("bot list"). */

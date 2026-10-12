@@ -373,6 +373,39 @@
 #define CMD_CHAN_ELECT_DO    0x73
 #define CMD_CHAN_ELECT_DONE  0x74
 #define CMD_ADMIN_INVITE_USER 0x75 // Admin: invite a user (nick|#chan)
+
+/* ---- Modes, settings, bans, flood protection (docs/modes.md, 2.4.5) ------
+ * Mirrors ircbot/bot.h and irchub.rs/ircbot.rs consts.rs.
+ *   CMD_ADMIN_CHAN_MODE  console->hub  #chan (view) | #chan|<modes>|<arg>... | #chan|-
+ *   CMD_ADMIN_CHAN_SET   console->hub  <#chan|default> | <#chan|default>|<tok>|<tok>...
+ *   CMD_ADMIN_BAN        console->hub  list|<#c|*|""> | add|<#c|*>|<mask>|<min|perm>|<sticky 0/1>|<reason>
+ *                                      | del|<#c|*>|<mask>
+ *   CMD_ADMIN_NET_SET    console->hub  "" | flood|<cmd|msg|ctcp>|<N:S|off|default> | ignoretime|<min|default> | sendq|<B:I|default>
+ *   CMD_ADMIN_SET_SSH    console->hub  "" | <name>|<value|default> | conn|<name>|<value>
+ *   CMD_CHAN_EVENT       bot->hub      #chan|<action>|<target>|<detail>   (D42)
+ * CMD_CHAN_EVENT: action is deop reop kick ban unban moderevert limit
+ * floodtrip ignore; target (nick or mask) <= CHAN_EVENT_TARGET_MAX bytes,
+ * detail <= CHAN_EVENT_DETAIL_MAX, no control characters.  The hub checks the
+ * bounds, rate-limits per bot connection (CHAN_EVENT_MAX_PER_WINDOW per
+ * CHAN_EVENT_WINDOW seconds, the rest dropped) and writes one info line to
+ * its log ring, "chan #c <action> <target> by <botname>: <detail>".  Hub
+ * local: never stored, never forwarded to peers or other bots. */
+#define CMD_ADMIN_CHAN_MODE 0x76
+#define CMD_ADMIN_CHAN_SET  0x77
+#define CMD_ADMIN_BAN       0x78
+#define CMD_ADMIN_NET_SET   0x79
+#define CMD_ADMIN_SET_SSH   0x7A
+#define CMD_CHAN_EVENT      0x7B
+#define CHAN_EVENT_TARGET_MAX     120
+#define CHAN_EVENT_DETAIL_MAX     160
+#define CHAN_EVENT_WINDOW         60
+#define CHAN_EVENT_MAX_PER_WINDOW 30
+/* kind = "mode" (2.4.5, docs/modes.md §3.1): apply the stored modes of a
+ * channel once.  The DO payload carries nothing extra; the elected bot reads
+ * the stored C| modes + c| key (it has them in its config) and sends the MODE
+ * line(s) that move the live modes there.  DONE ok|detail, or fail|reason; a
+ * `channel op` to a nick that is not authorised on a +bitch channel answers
+ * fail|bitch, which the origin turns into channel.not_authorised. */
 #define CHAN_ELECT_MIN_HUB    "2.4.5" /* every hub in the mesh map at least */
 #define CHAN_ELECT_PROBE_WAIT 2   /* s: local bots' answers                 */
 #define CHAN_ELECT_MESH_WAIT  4   /* s: other hubs' answers, after the flood */
@@ -491,6 +524,7 @@
 #define CMD_CONSOLE        0x6C
 #define CONSOLE_REPLY      0x00  /* core -> console: reply to the request   */
 #define CONSOLE_MAX_PREAUTH   8     /* SSH connections not yet logged in    */
+#define CONSOLE_MAX_PREAUTH_CAP 64  /* ceiling `hub set ssh preauth` accepts */
 #define CONSOLE_MAX_SESSIONS  8     /* open consoles                        */
 #define CONSOLE_LOGIN_GRACE   20    /* connect -> running shell, seconds    */
 #define CONSOLE_IDLE_TIMEOUT  1800  /* seconds without a keystroke          */
@@ -611,6 +645,47 @@ typedef struct {
 #define PEER_LINE_MAX     256    /* peer|/opt| sync lines */
 #define PAYLOAD_SLACK     8192
 
+/* ---- Modes / settings / bans records (docs/modes.md §2, 2.4.5) ----------
+ * C|<#chan>|<modes>|<settings>|<op>|<ts>   channel settings (console only)
+ * D|<modes>|<settings>|<ts>                network defaults (console only)
+ * B|<#chan|*>|<mask>|<expires>|<flags>|<setter>|<reason>|<op>|<ts>   one ban
+ * They live in global_entries[] beside c|, under the same LWW store.  Every
+ * field is capped at the single ingest point (hub_storage_put_record), and the
+ * bulk ceilings below grow by exactly these counts x line sizes, so they stay
+ * hard bounds.  Mirrored in ircbot/bot.h.  MAX_BANS_TOTAL counts live bans
+ * AND tombstones. */
+#define MAX_CHANNELS        MAX_BOT_ENTRIES /* c| and C| records each      */
+#define C_MODES_MAX         64    /* modes field, e.g. "+stnkl 20"          */
+#define C_SETTINGS_MAX      512   /* C| settings field                      */
+#define D_SETTINGS_MAX      512   /* D| settings field                      */
+#define BAN_MASK_MAX        120
+#define BAN_REASON_MAX      120
+#define BAN_SETTER_MAX      64    /* admin name or bot uuid, with the NUL   */
+#define MAX_BANS_PER_CHAN   100
+#define MAX_GLOBAL_BANS     100   /* bans whose channel is "*"              */
+#define MAX_BANS_TOTAL      (MAX_CHANNELS * MAX_BANS_PER_CHAN + MAX_GLOBAL_BANS)
+/* One serialized line each: tag + every field at its cap + op + 20-digit
+ * stamp + separators + newline, rounded up. */
+#define C_LINE_MAX          704
+#define D_LINE_MAX          640
+#define B_LINE_MAX          448
+/* global_entries[]: the old c/m/o rows (MAX_BOT_ENTRIES), then C, D, B. */
+#define MAX_GLOBAL_ENTRIES \
+  ( MAX_BOT_ENTRIES + MAX_CHANNELS + 1 + MAX_BANS_TOTAL )
+#define GLOBAL_IDX_SLOTS    ( 2 * MAX_GLOBAL_ENTRIES )  /* open addressing, load <= 0.5 */
+/* Live bans of one channel: rep = index + 1 of a B entry that names it. */
+typedef struct { int rep; int live; } global_ban_slot_t;
+#define BOT_BANS_PER_CHAN   10    /* live bans one bot may hold per channel  */
+#define TOMB_MIN_AGE_OFF    (7 * 86400L) /* tombstone age kept when purge is off */
+/* Oldest hub that stores and forwards C|/D|/B| (older ones drop them). */
+#define MODES_MIN_HUB       "2.4.5"
+#define BAN_BOT_SLACK       60    /* s a bot-written ban may exceed bantime */
+#define BANTIME_DEFAULT_MIN 120   /* built-in bantime (minutes)             */
+#define BAN_SWEEP_INTERVAL  60    /* s between expiry sweeps                */
+/* What C|, D| and B| add to a bulk payload at their caps. */
+#define MODES_RECORDS_MAX \
+  ( MAX_CHANNELS * C_LINE_MAX + D_LINE_MAX + MAX_BANS_TOTAL * B_LINE_MAX )
+
 /* Bot config payload (hub_generate_bot_payload): globals + users + masks +
  * this bot's own fields + one b| line per other bot. */
 #define MAX_CONFIG_PAYLOAD \
@@ -619,6 +694,7 @@ typedef struct {
     MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
     BOT_SYNC_FIELDS      * BOT_FIELD_LINE  + \
     MAX_BOTS             * BLINE_MAX       + \
+    MODES_RECORDS_MAX                          + \
     PAYLOAD_SLACK )
 
 /* Hub<->hub full-state sync (hub_generate_sync_packet): globals + users +
@@ -629,6 +705,7 @@ typedef struct {
     MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
     MAX_BOTS * BOT_SYNC_FIELDS * BOT_FIELD_LINE + \
     MAX_PEERS            * PEER_LINE_MAX   + \
+    MODES_RECORDS_MAX                          + \
     PAYLOAD_SLACK )
 
 /* hub_config_write() buffer: every serialized section at its bound, with the
@@ -644,6 +721,7 @@ typedef struct {
     (size_t)MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
     (size_t)MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
     (size_t)MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
+    (size_t)MODES_RECORDS_MAX                      + \
     (size_t)2 * MAX_IP_ACL_ENTRIES * IP_ACL_LINE_MAX + \
     (size_t)MAX_PEERS            * 512 )
 #define HUB_CONFIG_PER_BOT_MAX ((size_t)MAX_BOT_ENTRIES * 1100)
@@ -932,6 +1010,61 @@ typedef struct {
   int    churn_count;        // D1: new connections counted in current window
 } ip_rate_limit_t;
 
+/* Per-hub connection limits (hub_connlimits.c).  `hub set ssh ...` (the SSH
+ * console's own limits) and `hub set conn ...` (the limits shared by every
+ * connection) edit this; it lives in .irchub.cnf as `ssh|<name>|<value>` and
+ * `conn|<name>|<value>` lines, written only for values that differ from the
+ * built-ins.  The main thread owns it; the console thread gets a copy
+ * published under hub_console.c's mutex (console_publish_limits). */
+typedef struct {
+  /* ssh group */
+  int preauth;       /* SSH logins in progress, all addresses               */
+  int preauthip;     /* ... and from one address (<= preauth)               */
+  int sessions;      /* open consoles                                       */
+  int grace;         /* connect -> shell, seconds                           */
+  int authtries;     /* refused keys per connection before the drop         */
+  int idle;          /* seconds without a keystroke                         */
+  int authfail_n, authfail_s;   /* refused SSH logins per address per window */
+  int connect_n, connect_s;     /* new SSH connections per address / window  */
+  int block;         /* base SSH block, seconds (doubles per repeat)        */
+  int cmdrate_n, cmdrate_s;     /* console commands per session / window     */
+  /* conn group: shared by bots, peers and SSH */
+  int perip;                    /* connections at once from one address      */
+  int churn_n, churn_s, churn_block;  /* new connections per window -> block */
+  int fail_n, fail_s, fail_block;     /* failed logins per window -> block   */
+} hub_conn_cfg_t;
+
+/* Built-ins (the former compile-time constants). */
+#define SSH_DEF_PREAUTHIP   2
+#define SSH_DEF_AUTHFAIL_N  3
+#define SSH_DEF_AUTHFAIL_S  3600
+#define SSH_DEF_CONNECT_N   6
+#define SSH_DEF_CONNECT_S   60
+#define SSH_DEF_BLOCK       300
+#define SSH_DEF_CMDRATE_N   20
+#define SSH_DEF_CMDRATE_S   10
+#define SSH_BLOCK_MAX       86400   /* escalation ceiling: 24 h            */
+#define SSH_BLOCK_MEMORY    86400   /* a repeat within this doubles        */
+#define MAX_SSH_IPS         256
+#define SSH_SUCCESS_MEMORY  86400   /* an address with a console login this recent skips the
+                                       connect window and the churn block (not authfail/ACL) */
+
+/* One address in the SSH-only table (D26): refused logins and the connect
+ * window of connections that sniffed as SSH.  Separate from ip_rate_limit_t,
+ * so an admin's mistyped keys never block a bot or peer on the same address. */
+typedef struct {
+  char   ip[64];
+  time_t win_start;      /* connect window */
+  int    conn_n;
+  time_t fail_last;      /* refused-login window */
+  int    fail_n;
+  time_t blocked_until;
+  time_t last_block;     /* start of the latest block (escalation memory) */
+  int    level;          /* blocks in a row within SSH_BLOCK_MEMORY */
+  time_t last_seen;
+  time_t last_success;   /* latest successful console auth (0 = never) */
+} ssh_ip_t;
+
 /* IP allow/deny list entry (the admin console 0x38-0x3D).  The lists are local to
  * this hub: never replicated to peers, never pushed to bots; config lines
  * w|<pattern>|<ts> (allow) and x|<pattern>|<ts> (deny).  IPv4 only (the hub
@@ -945,6 +1078,7 @@ typedef struct {
   uint32_t net;              /* host byte order */
   uint32_t mask;             /* host byte order */
   time_t   added;
+  bool     console;          /* D27: applies only once the first bytes say SSH */
 } hub_ip_acl_t;
 
 typedef struct {
@@ -1043,6 +1177,11 @@ typedef struct {
    * Per connection on purpose: a downgraded binary reconnecting is never
    * mistaken for a passwordless one. */
   int bot_proto;
+  /* CMD_CHAN_EVENT rate limit for this connection (CHAN_EVENT_MAX_PER_WINDOW
+   * per CHAN_EVENT_WINDOW seconds); dropped events are counted. */
+  time_t chan_ev_window;
+  int    chan_ev_count;
+  int    chan_ev_dropped;
   unsigned char *recv_buf;         // D2: heap; PREAUTH_BUF_SIZE then MAX_BUFFER
   int           recv_cap;          // D2: allocated capacity of recv_buf
   bot_auth_state_t bot_auth_state;
@@ -1256,8 +1395,14 @@ typedef struct {
   int bot_count;
 
   // GLOBAL CONFIG STORE (Shared by all bots)
-  config_entry_t global_entries[MAX_BOT_ENTRIES];
+  config_entry_t global_entries[MAX_GLOBAL_ENTRIES];
   int global_entry_count;
+  /* Derived from global_entries[] (hub_storage.c): hash index of (class,
+   * folded identity) -> entry index + 1, entries per class, and live bans per
+   * channel.  hub_global_reindex() rebuilds all of it. */
+  int global_idx[GLOBAL_IDX_SLOTS];
+  global_ban_slot_t global_ban_chan[GLOBAL_IDX_SLOTS];
+  int global_n_old, global_n_C, global_n_D, global_n_B;
 
   // Named admin/oper records and their usermasks
   hub_user_record_t user_records[MAX_HUB_USER_RECORDS];
@@ -1323,6 +1468,10 @@ typedef struct {
   hub_ip_acl_t ip_deny[MAX_IP_ACL_ENTRIES];
   int ip_deny_count;
   bool ip_acl_changed;
+
+  hub_conn_cfg_t conn_cfg;               /* hub set ssh / hub set conn      */
+  ssh_ip_t       ssh_ips[MAX_SSH_IPS];   /* D26: SSH-only failure table     */
+  int            ssh_ip_count;
 
   int purge_days_setting;  // Days threshold for tombstone purge (0 = disabled)
   bool trust_loopback;     // D3: if true, 127.0.0.1/::1 bypass rate limiting
@@ -1561,6 +1710,38 @@ typedef enum { IP_ACL_ADDED, IP_ACL_DUPLICATE, IP_ACL_FULL, IP_ACL_BAD_LIST } ip
 ip_acl_add_t hub_ip_acl_add(hub_state_t *state, char list, const hub_ip_acl_t *e);
 bool hub_ip_acl_remove(hub_state_t *state, char list, const hub_ip_acl_t *e);
 
+/* ---- Connection limits (hub_connlimits.c) --------------------------------
+ * Setting table behind `hub set ssh|conn`, the SSH-only address table (D26) and
+ * the eviction choice.  Main thread, except hub_ssh_evict_pick. */
+enum { HUB_CONN_SSH = 0, HUB_CONN_CONN = 1 };
+typedef enum { HUB_CONN_OK, HUB_CONN_UNKNOWN, HUB_CONN_BAD } hub_conn_set_t;
+void hub_conn_cfg_defaults(hub_conn_cfg_t *c);
+int  hub_conn_cfg_count(int group);
+const char *hub_conn_cfg_name(int group, int idx);
+bool hub_conn_cfg_get(const hub_conn_cfg_t *c, int group, const char *name, char *out, size_t cap);
+bool hub_conn_cfg_default(int group, const char *name, char *out, size_t cap);
+bool hub_conn_cfg_is_default(const hub_conn_cfg_t *c, int group, const char *name);
+int  hub_conn_cfg_preauthip(const hub_conn_cfg_t *c);
+hub_conn_set_t hub_conn_cfg_set(hub_conn_cfg_t *c, int group, const char *name,
+                                const char *value, char *why, size_t whycap);
+bool hub_conn_cfg_load(hub_conn_cfg_t *c, int group, const char *body);
+size_t hub_conn_cfg_lines(const hub_conn_cfg_t *c, char *out, size_t cap);
+void hub_conn_cfg_fix(hub_conn_cfg_t *c);
+bool hub_ssh_table_connect(ssh_ip_t *tab, int *count, const hub_conn_cfg_t *cfg,
+                           const char *ip, time_t now, int *new_block);
+void hub_ssh_table_success(ssh_ip_t *tab, int *count, const char *ip, time_t now);
+/* The address's row, or NULL (never creates one). */
+const ssh_ip_t *hub_ssh_table_peek(const ssh_ip_t *tab, int count, const char *ip);
+/* True when `ip` authenticated a console within SSH_SUCCESS_MEMORY. */
+bool hub_ssh_table_recent_ok(const ssh_ip_t *tab, int count, const char *ip, time_t now);
+void hub_ssh_table_failed(ssh_ip_t *tab, int *count, const hub_conn_cfg_t *cfg,
+                          const char *ip, time_t now, int *new_block);
+int  hub_ssh_evict_pick(const char *const *ips, const long long *start_ms, int n,
+                        const char *new_ip);
+/* The console scope of the ACL (D27): same decision as hub_ip_acl_permits, over
+ * the entries written with the `console` word. */
+bool hub_ip_acl_permits_console(const hub_state_t *state, const char *ip);
+
 void hub_storage_init(void);
 bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
                               const char *key, const char *value,
@@ -1572,6 +1753,156 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
  * (same match as the update above), or 0 if there is none. */
 time_t hub_storage_global_ts(const hub_state_t *state, const char *key,
                              const char *value);
+/* ---- Modes / settings / bans store (hub_storage.c + hub_modes.c) -------- */
+
+/* Status every store-side modes function returns; the console renders it. */
+typedef enum {
+  HUB_MODES_OK = 0,
+  HUB_MODES_BAD_CHAN,     /* not a channel name (or "*" where one is needed)  */
+  HUB_MODES_NOT_MANAGED,  /* no live c| record: channel.not_found             */
+  HUB_MODES_BAD_MODES,    /* mode string fails docs/modes.md §3.2: channel.bad_mode */
+  HUB_MODES_BAD_SETTING,  /* unknown name / bad value / bad range; `bad` names it */
+  HUB_MODES_TOO_LONG,     /* a field is over its cap                          */
+  HUB_MODES_BAD_MASK,     /* ban mask empty, too long, or has a bad character */
+  HUB_MODES_BAD_REASON,   /* ban reason too long or has a control character   */
+  HUB_MODES_BAD_EXPIRY,   /* expiry in the past or absurdly far               */
+  HUB_MODES_PROTECTED,    /* ban.protected: overlaps a trusted bot / usermask */
+  HUB_MODES_NOT_FOUND,    /* ban del: no such live ban                        */
+  HUB_MODES_FULL,         /* MAX_BANS_PER_CHAN / MAX_GLOBAL_BANS / MAX_BANS_TOTAL */
+  HUB_MODES_FROZEN        /* an upgrade run holds the config freeze           */
+} hub_modes_status_t;
+
+/* One C| (channel settings) or D| (network defaults) record, live. */
+typedef struct {
+  bool   present;                       /* a live record exists            */
+  char   chan[MAX_CHAN];                /* stored spelling ("" for D|)     */
+  char   modes[C_MODES_MAX + 1];        /* "" = network default            */
+  char   settings[C_SETTINGS_MAX + 1];  /* only overrides, "" = none       */
+  time_t ts;
+} hub_chanset_t;
+
+/* One live B| ban. */
+typedef struct {
+  char   chan[MAX_CHAN];                /* "#chan" or "*"                  */
+  char   mask[BAN_MASK_MAX + 1];
+  time_t expires;                       /* absolute unix time, 0 = permanent */
+  char   flags[8];                      /* "s" = sticky, "" = none         */
+  char   setter[BAN_SETTER_MAX];        /* admin name or bot uuid          */
+  char   reason[BAN_REASON_MAX + 1];
+  time_t ts;
+} hub_ban_t;
+
+/* ASCII case-insensitive equality (channel names, ban masks; D39). */
+bool hub_ascii_ieq(const char *a, const char *b);
+/* Whether two stored values of global key `key` are the same RECORD: c|/C|
+ * compare the channel field, B| the channel and mask (all ASCII
+ * case-insensitive), the singletons a/p/D always match, every other key its
+ * first field case-sensitively.  `a`/`b` may be a full stored value or just
+ * its identity prefix. */
+bool hub_global_identity_eq(const char *key, const char *a, const char *b);
+/* Syntax check of one stored C/D/B value (all fields, caps, charsets, op).
+ * The single validator behind every ingest path. */
+bool hub_record_valid(const char *key, const char *value);
+/* Store one C|, D| or B| record (full stored value incl. its op, no stamp)
+ * under LWW: newer stamp wins; on a tie a delete beats an add, otherwise the
+ * byte-wise greater value wins.  Validates, applies the per-class ceilings
+ * (MAX_CHANNELS, MAX_BANS_PER_CHAN, MAX_GLOBAL_BANS, MAX_BANS_TOTAL), keeps
+ * the stored spelling of the channel/mask.  False = rejected or not newer. */
+bool hub_storage_put_record(hub_state_t *state, const char *key,
+                            const char *value, time_t ts);
+/* Room for one more global entry of `key`'s class (c/m/o, C, D, B). */
+bool hub_global_room(const hub_state_t *state, const char *key);
+/* Index of the stored global entry `value` addresses under `key`, or -1. */
+int hub_global_find(const hub_state_t *state, const char *key, const char *value);
+/* After global_entries[] was changed behind the store's back (the purge
+ * compaction): rebuild the index and counts.  hub_global_note_new(i): entry i
+ * was just appended. */
+void hub_global_reindex(hub_state_t *state);
+void hub_global_note_new(hub_state_t *state, int i);
+
+/* Channel stamp for a delete that must beat the channel's c|, C| and every
+ * B| line: past the newest stored stamp of any of them. */
+time_t hub_chan_del_stamp(const hub_state_t *state, const char *chan);
+/* Write `del` on the channel's C| and B| lines with stamp `ts` (LWW decides
+ * each); announce: also send them to the peers and owe the bots a push.  The
+ * c| line itself is the caller's.  Returns how many records changed. */
+int hub_chan_cascade_del(hub_state_t *state, const char *chan, time_t ts, bool announce);
+/* True when `chan` has a live c| record (ASCII case-insensitive); copies the
+ * stored spelling to `name` when not NULL. */
+bool hub_chan_live(const hub_state_t *state, const char *chan, char *name, size_t cap);
+
+/* §3.2 mode string ("+stnkl 20", "" = default) and §4 settings string
+ * ("bitch=1,flood join=5:60"): HUB_MODES_OK or BAD_MODES / BAD_SETTING /
+ * TOO_LONG.  `bad` (may be NULL) receives the offending token. */
+hub_modes_status_t hub_modes_check(const char *modes);
+hub_modes_status_t hub_settings_check(const char *settings, bool net_default,
+                                      char *bad, size_t bad_cap);
+/* The setting table, for the console's views: NULL name past the end;
+ * kind is "flag" / "num" / "flood" / "sendq" (NULL for an unknown name); net_only =
+ * lives only in D| (the bot floods, ignoretime and sendq). */
+int hub_setting_count(void);
+const char *hub_setting_name(int i);
+const char *hub_setting_kind(const char *name);
+bool hub_setting_net_only(const char *name);
+/* Range of a numeric setting; false for a flag, a flood or an unknown name. */
+bool hub_setting_range(const char *name, long *lo, long *hi);
+/* One name/value against the contract's names and ranges. */
+hub_modes_status_t hub_setting_check(const char *name, const char *value,
+                                     bool net_default);
+/* Value of `name` in a settings string; false if it is not there. */
+bool hub_settings_get(const char *settings, const char *name, char *out, size_t cap);
+/* Set (value) or remove (value NULL) one token in a settings string of
+ * capacity `cap`; HUB_MODES_TOO_LONG when it would not fit. */
+hub_modes_status_t hub_settings_set(char *settings, size_t cap, const char *name,
+                                    const char *value);
+/* Effective value of a setting for a channel: channel C| override, else the
+ * D| default, else the built-in.  Returns 'c' / 'n' / 'b' for the source, 0
+ * for an unknown name.  chan NULL: network level only. */
+int hub_setting_effective(const hub_state_t *state, const char *chan,
+                          const char *name, char *out, size_t cap);
+
+/* C| / D| store.  put replaces the whole record (the caller merges); both
+ * empty writes a delete (back to defaults).  Needs a live c| for C|. */
+bool hub_chanset_get(const hub_state_t *state, const char *chan, hub_chanset_t *out);
+hub_modes_status_t hub_chanset_put(hub_state_t *state, const char *chan,
+                                   const char *modes, const char *settings);
+bool hub_netset_get(const hub_state_t *state, hub_chanset_t *out);
+hub_modes_status_t hub_netset_put(hub_state_t *state, const char *modes,
+                                  const char *settings);
+
+/* Bans.  chan is "#chan" (must be a live channel) or "*".  expires 0 =
+ * permanent.  add is also the update of an existing mask.  On PROTECTED,
+ * `who` (may be NULL) receives what the mask would hit ("bot <nick>" /
+ * "user <name>").  The §6.2 step 1 check (members in the channel) is the
+ * bot's. */
+hub_modes_status_t hub_ban_protected(const hub_state_t *state, const char *mask,
+                                     char *who, size_t who_cap);
+hub_modes_status_t hub_ban_add(hub_state_t *state, const char *chan, const char *mask,
+                               time_t expires, bool sticky, const char *setter,
+                               const char *reason, char *who, size_t who_cap);
+hub_modes_status_t hub_ban_del(hub_state_t *state, const char *chan, const char *mask);
+/* Live bans of `chan` ("*" = global only, NULL = all), oldest first, up to
+ * `max`; returns how many were written. */
+int hub_ban_list(const hub_state_t *state, const char *chan, hub_ban_t *out, int max);
+/* A ban a bot pushed (B| line body without the tag, and its stamp): accepted
+ * only under the contract's bot rules; the caller forwards on true. */
+bool hub_ban_bot_write(hub_state_t *state, const char *bot_uuid, const char *value,
+                       time_t ts);
+/* 60 s sweep: `del` for every expired ban, announced to peers and bots. */
+void hub_bans_sweep(hub_state_t *state, time_t now);
+/* Names of peer hubs known to predate MODES_MIN_HUB (2.4.5) -- they drop C|,
+ * D| and B| -- for the console warning.  Hubs whose version is not known yet
+ * are not listed.  Returns the count (<= max). */
+int hub_old_hubs(const hub_state_t *state, char names[][64], int max);
+/* CMD_CHAN_EVENT from an authenticated bot (validate, rate-limit, log). */
+void hub_chan_event_receive(hub_state_t *state, hub_client_t *client, const char *payload);
+/* Start the apply-once election (kind "mode") for `channel` on behalf of
+ * `admin` (the console owed the answer, or NULL).  The answer comes later on
+ * that console: ok "channel.mode" {chan, by, by_uuid, hub_name, asked, hubs}
+ * or error "channel.nobody".  False = the election table is full. */
+bool hub_chan_mode_apply(hub_state_t *state, const char *channel,
+                         const hub_client_t *admin);
+
 /* Soft-delete a registered bot: a d|1 tombstone stamped past any earlier 'd'.
  * False when the uuid is unknown or already deleted; *ts_out = the stamp. */
 bool hub_storage_delete(hub_state_t *state, const char *uuid, time_t *ts_out);
@@ -1733,6 +2064,8 @@ bool hub_delta_seen_check_and_update(hub_state_t *state,
  * console thread (hub_console.c) and publishes the host key and the admin
  * credentials to it; hub_console_stop joins it at shutdown. */
 bool hub_console_start(hub_state_t *state);
+/* Publish state->conn_cfg to the console thread (start, and after each change). */
+void hub_console_limits_changed(hub_state_t *state);
 void hub_console_stop(hub_state_t *state);
 /* Re-publish the host key after the hub key changed (REGEN_KEYS etc.). */
 void hub_console_hostkey_changed(hub_state_t *state);

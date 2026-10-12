@@ -281,9 +281,10 @@ static int peer_encrypt_into_writing(hub_client_t *peer, queued_msg_t *m) {
    * BOT-destined opcode must be stamped in network order -- peers and admins
    * keep host order for wire compatibility.  CMD_BOT_TREE joined that list;
    * without it the bot computed a garbage length, failed its bounds check and
-   * silently dropped every tree push. */
+   * silently dropped every tree push.  CMD_CHAN_DO is queued behind a config
+   * push (send_cmd_to_bot_after_config). */
   if (m->cmd == CMD_CONFIG_DATA || m->cmd == CMD_BOT_TREE ||
-      m->cmd == CMD_ACTIVITY_REPLY) {
+      m->cmd == CMD_ACTIVITY_REPLY || m->cmd == CMD_CHAN_DO) {
     inner_len_field = htonl((uint32_t)m->payload_len);
   } else {
     inner_len_field = (uint32_t)m->payload_len;
@@ -835,23 +836,29 @@ bool is_ip_allowed(hub_state_t *state, const char *ip) {
      * so each call is exactly one new connection attempt. Count attempts in a
      * sliding window; a connect/close flood trips a temporary block here even
      * though it never exceeds the concurrency limit or fails auth. */
-    if (now - entry->churn_window_start >= CHURN_WINDOW_SEC) {
+    const hub_conn_cfg_t *cc = &state->conn_cfg;   /* hub set conn */
+    /* An address with a console login in the last 24 h is not held to the churn
+     * limit (a tightened limit must not lock its admin out); the block above
+     * (authfail, or a churn block from before) still applies. */
+    if (hub_ssh_table_recent_ok(state->ssh_ips, state->ssh_ip_count, ip, now))
+        return entry->active_connections < cc->perip;
+    if (now - entry->churn_window_start >= cc->churn_s) {
         entry->churn_window_start = now;
         entry->churn_count = 0;
     }
     entry->churn_count++;
-    if (entry->churn_count > CHURN_MAX_CONNS) {
-        entry->blocked_until = now + CHURN_BLOCK_SEC;
+    if (entry->churn_count > cc->churn_n) {
+        entry->blocked_until = now + cc->churn_block;
         hub_log_warning("[RATE_LIMIT] IP %s connection churn flood (%d conns/%ds) — "
-                "blocked %ds\n", ip, entry->churn_count, CHURN_WINDOW_SEC,
-                CHURN_BLOCK_SEC);
+                "blocked %ds\n", ip, entry->churn_count, cc->churn_s,
+                cc->churn_block);
         return false;
     }
 
     // Check connection limit
-    if (entry->active_connections >= MAX_CONNECTIONS_PER_IP) {
+    if (entry->active_connections >= cc->perip) {
         hub_log_warning("[RATE_LIMIT] IP %s exceeded connection limit (%d/%d)\n",
-                ip, entry->active_connections, MAX_CONNECTIONS_PER_IP);
+                ip, entry->active_connections, cc->perip);
         return false;
     }
 
@@ -885,8 +892,9 @@ static void record_failed_auth(hub_state_t *state, const char *ip) {
 
     time_t now = time(NULL);
 
-    // Reset counter if last failure was over FAILED_AUTH_RESET_TIME ago
-    if (now - entry->last_failed_auth > FAILED_AUTH_RESET_TIME) {
+    const hub_conn_cfg_t *cc = &state->conn_cfg;   /* hub set conn */
+    // Reset counter if last failure was over the window ago
+    if (now - entry->last_failed_auth > cc->fail_s) {
         entry->failed_auth_count = 0;
     }
 
@@ -894,13 +902,13 @@ static void record_failed_auth(hub_state_t *state, const char *ip) {
     entry->last_failed_auth = now;
 
     hub_log_warning("[AUTH_FAIL] IP %s failed auth (attempt %d/%d)\n",
-            ip, entry->failed_auth_count, MAX_FAILED_AUTH_ATTEMPTS);
+            ip, entry->failed_auth_count, cc->fail_n);
 
     // Block if exceeded max attempts
-    if (entry->failed_auth_count >= MAX_FAILED_AUTH_ATTEMPTS) {
-        entry->blocked_until = now + FAILED_AUTH_BLOCK_DURATION;
+    if (entry->failed_auth_count >= cc->fail_n) {
+        entry->blocked_until = now + cc->fail_block;
         hub_log_warning("[AUTH_BLOCK] IP %s blocked for %d seconds (too many failed attempts)\n",
-                ip, FAILED_AUTH_BLOCK_DURATION);
+                ip, cc->fail_block);
     }
 }
 
@@ -984,6 +992,7 @@ bool hub_ip_acl_parse(const char *in, hub_ip_acl_t *out) {
     out->net = ntohl(a.s_addr) & mask;
     out->mask = mask;
     out->added = 0;
+    out->console = false;
 
     char buf[INET_ADDRSTRLEN];
     struct in_addr na = { .s_addr = htonl(out->net) };
@@ -994,33 +1003,47 @@ bool hub_ip_acl_parse(const char *in, hub_ip_acl_t *out) {
     return w > 0 && w < (int)sizeof(out->pattern);
 }
 
-static bool ip_acl_match(const hub_ip_acl_t *list, int count, uint32_t addr) {
+/* Entries of one scope: console (D27, applies once the first bytes say SSH)
+ * or not (every inbound connection).  The two scopes never mix: an allowlist
+ * with only console entries leaves bots and peers unrestricted. */
+static bool ip_acl_match(const hub_ip_acl_t *list, int count, uint32_t addr, bool console) {
     for (int i = 0; i < count; i++)
-        if ((addr & list[i].mask) == list[i].net) return true;
+        if (list[i].console == console && (addr & list[i].mask) == list[i].net) return true;
     return false;
 }
 
+static int ip_acl_scope_count(const hub_ip_acl_t *list, int count, bool console) {
+    int n = 0;
+    for (int i = 0; i < count; i++)
+        if (list[i].console == console) n++;
+    return n;
+}
+
 /* 0 = permitted, 1 = on the denylist, 2 = not on a non-empty allowlist. */
-static int ip_acl_verdict(const hub_state_t *state, const char *ip) {
+static int ip_acl_verdict(const hub_state_t *state, const char *ip, bool console) {
     struct in_addr a;
     bool parsed = ip && inet_pton(AF_INET, ip, &a) == 1;
     uint32_t addr = parsed ? ntohl(a.s_addr) : 0;
 
-    if (state->ip_deny_count > 0 &&
-        (!parsed || ip_acl_match(state->ip_deny, state->ip_deny_count, addr)))
+    if (ip_acl_scope_count(state->ip_deny, state->ip_deny_count, console) > 0 &&
+        (!parsed || ip_acl_match(state->ip_deny, state->ip_deny_count, addr, console)))
         return 1;
-    if (state->ip_allow_count > 0 &&
-        (!parsed || !ip_acl_match(state->ip_allow, state->ip_allow_count, addr)))
+    if (ip_acl_scope_count(state->ip_allow, state->ip_allow_count, console) > 0 &&
+        (!parsed || !ip_acl_match(state->ip_allow, state->ip_allow_count, addr, console)))
         return 2;
     return 0;
 }
 
 bool hub_ip_acl_permits(const hub_state_t *state, const char *ip) {
-    return ip_acl_verdict(state, ip) == 0;
+    return ip_acl_verdict(state, ip, false) == 0;
+}
+
+bool hub_ip_acl_permits_console(const hub_state_t *state, const char *ip) {
+    return ip_acl_verdict(state, ip, true) == 0;
 }
 
 bool check_ip_access_lists(hub_state_t *state, const char *ip) {
-    int verdict = ip_acl_verdict(state, ip);
+    int verdict = ip_acl_verdict(state, ip, false);
     if (verdict == 0) return true;
     hub_log_warning("[ACCESS_CONTROL] IP %s denied (%s)\n", ip,
             verdict == 1 ? "denylist" : "not in allowlist");
@@ -1035,7 +1058,8 @@ static hub_ip_acl_t *ip_acl_list(hub_state_t *state, char list, int **count) {
 
 static int ip_acl_find(const hub_ip_acl_t *list, int count, const hub_ip_acl_t *e) {
     for (int i = 0; i < count; i++)
-        if (list[i].net == e->net && list[i].mask == e->mask) return i;
+        if (list[i].net == e->net && list[i].mask == e->mask &&
+            list[i].console == e->console) return i;
     return -1;
 }
 
@@ -2732,10 +2756,17 @@ static void broadcast_full_config_to_all_bots(hub_state_t *state) {
   state->bot_config_pending = true;
 }
 
+static void send_owed_bot_config(hub_state_t *state, time_t now);
+
 void hub_flush_bot_config(hub_state_t *state, time_t now) {
   if (!state->bot_config_pending ||
       now - state->last_bot_config_push < BOT_CONFIG_PUSH_COALESCE)
     return;
+  send_owed_bot_config(state, now);
+}
+
+
+static void send_owed_bot_config(hub_state_t *state, time_t now) {
   state->bot_config_pending = false;
   state->last_bot_config_push = now;
   int sent_count = 0;
@@ -2841,9 +2872,12 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       continue;
     }
 
-    /* Reject hub-authoritative record types from bots while opt 'h' is active. */
+    /* Reject hub-authoritative record types from bots while opt 'h' is active.
+     * 'c' is the exception for what a bot learns (key / modes of a channel
+     * that is already managed): that is enforcement, not an admin change, and
+     * stays accepted (D43) -- see the 'c' branch below. */
     if (hub_only_mutations &&
-        (type == 'a' || type == 'o' || type == 'm' || type == 'c')) {
+        (type == 'a' || type == 'o' || type == 'm')) {
       hub_log_warning("[HUB] opt 'h' active: REJECTED bot-pushed '%c' record from %s "
               "(hub-authoritative — mutation must originate from the admin console)\n",
               type, client->id);
@@ -2881,6 +2915,15 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         }
       }
 
+      /* Opt 'h': a bot may only report the key / modes of a channel the
+       * admins already manage; it may not add or remove one (D43). */
+      if (parsed >= 3 && hub_only_mutations &&
+          (strcmp(op, "add") != 0 || !hub_chan_live(state, chan, NULL, 0))) {
+        hub_log_warning("[HUB] opt 'h' active: REJECTED bot-pushed 'c' %s for %s "
+                "from %s (hub-authoritative)\n", op, chan, client->id);
+        parsed = 0;
+      }
+
       if (parsed >= 3) {
         /* Build extra as "key|modes" so storage value = "chan|key|modes|op" */
         char extra[80];
@@ -2903,6 +2946,27 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
             sync_offset += w;
         }
       }
+    } else if (type == 'B') {
+      /* Enforcement ban: B|chan|mask|expires|flags|setter|reason|op|ts.  A bot
+       * writes only its own timed bans (hub_ban_bot_write holds the rules);
+       * opt 'h' does not gate it (D43). */
+      char *tsp = strrchr(data, '|');
+      char bval[1024];
+      if (tsp && tsp > data && (size_t)(tsp - data) < sizeof(bval)) {
+        memcpy(bval, data, (size_t)(tsp - data));
+        bval[tsp - data] = '\0';
+        long long bts = atoll(tsp + 1);
+        if (hub_ban_bot_write(state, client->id, bval, (time_t)bts)) {
+          updates++;
+          int w = snprintf(sync_buffer + sync_offset,
+                           sizeof(sync_buffer) - sync_offset, "B|%s|%lld\n", bval, bts);
+          if (w > 0 && w < (int)sizeof(sync_buffer) - sync_offset) sync_offset += w;
+        }
+      }
+    } else if (type == 'C' || type == 'D') {
+      /* Channel settings and network defaults are written by the console only. */
+      hub_log_warning("[HUB] Ignored bot-pushed '%c' record from %s (console only)\n",
+              type, client->id);
     } else if (type == 'm') {
       /* New format: uuid|mask|add/del|last_used|timestamp
        * Old format: mask|add/del|timestamp (legacy, ignored — hub drives config) */
@@ -3169,64 +3233,52 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
 static bool is_global_key(const char *key) {
   return (strcmp(key, "c") == 0 || strcmp(key, "m") == 0 ||
           strcmp(key, "o") == 0 || strcmp(key, "a") == 0 ||
-          strcmp(key, "p") == 0);
+          strcmp(key, "p") == 0 ||
+          /* 2.4.5: channel settings, network defaults, bans */
+          strcmp(key, "C") == 0 || strcmp(key, "D") == 0 ||
+          strcmp(key, "B") == 0);
 }
 
 // Helper: Store global entry directly without re-formatting (value is already combined)
 static bool store_global_entry_raw(hub_state_t *state, const char *key,
                                    const char *value, time_t ts) {
-  bool is_singleton = (strcmp(key, "a") == 0 || strcmp(key, "p") == 0);
+  /* C|, D|, B|: one validator, one LWW, one set of ceilings. */
+  if (strcmp(key, "C") == 0 || strcmp(key, "D") == 0 || strcmp(key, "B") == 0)
+    return hub_storage_put_record(state, key, value, ts);
 
-  for (int i = 0; i < state->global_entry_count; i++) {
-    bool match = false;
-    if (is_singleton) {
-      if (strcmp(state->global_entries[i].key, key) == 0)
-        match = true;
-    } else {
-      // List match: compare key and first part of value (before first |)
-      char stored_first[1024], incoming_first[1024];
-      const char *pipe = strchr(state->global_entries[i].value, '|');
-      if (pipe) {
-        size_t len = pipe - state->global_entries[i].value;
-        if (len >= sizeof(stored_first))
-          len = sizeof(stored_first) - 1;
-        memcpy(stored_first, state->global_entries[i].value, len);
-        stored_first[len] = 0;
-      } else {
-        snprintf(stored_first, sizeof(stored_first), "%s",
-                 state->global_entries[i].value);
-      }
-      const char *incoming_pipe = strchr(value, '|');
-      if (incoming_pipe) {
-        size_t len = incoming_pipe - value;
-        if (len >= sizeof(incoming_first))
-          len = sizeof(incoming_first) - 1;
-        memcpy(incoming_first, value, len);
-        incoming_first[len] = 0;
-      } else {
-        snprintf(incoming_first, sizeof(incoming_first), "%s", value);
-      }
-      if (strcmp(state->global_entries[i].key, key) == 0 &&
-          strcmp(stored_first, incoming_first) == 0) {
-        match = true;
+  int i = hub_global_find(state, key, value);
+  if (i >= 0) {
+    config_entry_t *g = &state->global_entries[i];
+    /* A channel keeps the spelling of its first writer (D39). */
+    char norm[sizeof(g->value)];
+    snprintf(norm, sizeof(norm), "%s", value);
+    if (strcmp(key, "c") == 0) {
+      const char *bar = strchr(value, '|');
+      size_t sl = strcspn(g->value, "|");
+      if (bar && sl + strlen(bar) < sizeof(norm)) {
+        memcpy(norm, g->value, sl);
+        strcpy(norm + sl, bar);
       }
     }
-
-    if (match) {
-      if (hub_lww_accepts(ts, hub_global_value_active(value),
-                          state->global_entries[i].timestamp,
-                          hub_global_value_active(state->global_entries[i].value))) {
-        snprintf(state->global_entries[i].value,
-                 sizeof(state->global_entries[i].value), "%s", value);
-        state->global_entries[i].timestamp = ts;
-        return true;
+    if (hub_lww_accepts(ts, hub_global_value_active(norm), g->timestamp,
+                        hub_global_value_active(g->value))) {
+      snprintf(g->value, sizeof(g->value), "%s", norm);
+      g->timestamp = ts;
+      if (strcmp(key, "c") == 0 && !hub_global_value_active(norm)) {
+        char chan[MAX_CHAN];
+        size_t cl = strcspn(norm, "|");
+        if (cl >= sizeof(chan)) cl = sizeof(chan) - 1;
+        memcpy(chan, norm, cl);
+        chan[cl] = '\0';
+        hub_chan_cascade_del(state, chan, ts, false);
       }
-      return false;
+      return true;
     }
+    return false;
   }
 
   // Add new entry
-  if (state->global_entry_count < MAX_BOT_ENTRIES) {
+  if (hub_global_room(state, key)) {
     snprintf(state->global_entries[state->global_entry_count].key,
              sizeof(state->global_entries[state->global_entry_count].key), "%s",
              key);
@@ -3235,6 +3287,7 @@ static bool store_global_entry_raw(hub_state_t *state, const char *key,
              "%s", value);
     state->global_entries[state->global_entry_count].timestamp = ts;
     state->global_entry_count++;
+    hub_global_note_new(state, state->global_entry_count - 1);
     return true;
   }
   return false;
@@ -3308,7 +3361,7 @@ static bool parse_global_channel_value(const char *value,
  * MODE change — so a re-add must carry forward what is already stored.  Global
  * entries are overwritten wholesale once the timestamp wins
  * (hub_storage_update_global_entry), so not carrying them forward erases them.
- * Matched case-sensitively on the channel name, same as the storage layer. */
+ * Matched ASCII case-insensitively on the channel name (D39), same as the storage layer. */
 static int global_channel_modes(hub_state_t *state, const char *chan) {
   for (int i = 0; i < state->global_entry_count; i++) {
     if (strcmp(state->global_entries[i].key, "c") != 0)
@@ -3319,7 +3372,7 @@ static int global_channel_modes(hub_state_t *state, const char *chan) {
                                     stored_chan, sizeof(stored_chan),
                                     NULL, 0, &modes, NULL, 0))
       continue;
-    if (strcmp(stored_chan, chan) == 0)
+    if (hub_ascii_ieq(stored_chan, chan))
       return modes;
   }
   return 0;
@@ -3899,8 +3952,8 @@ static void purge_note(reply_t *tombs, const char *kind, const char *id,
 int hub_execute_purge(hub_state_t *state, time_t cutoff, reply_t *tombs) {
   int purged_count = 0;
 
-  // --- Purge tombstoned global entries (channels, admin masks, oper masks) ---
-  config_entry_t new_entries[MAX_BOT_ENTRIES];
+  // --- Purge tombstoned global entries (channels, admin masks, oper masks,
+  //     channel settings, bans), compacted in place ---
   int new_count = 0;
 
   for (int i = 0; i < state->global_entry_count; i++) {
@@ -3908,7 +3961,8 @@ int hub_execute_purge(hub_state_t *state, time_t cutoff, reply_t *tombs) {
     const config_entry_t *g = &state->global_entries[i];
 
     if (strcmp(g->key, "c") == 0 || strcmp(g->key, "m") == 0 ||
-        strcmp(g->key, "o") == 0) {
+        strcmp(g->key, "o") == 0 || strcmp(g->key, "C") == 0 ||
+        strcmp(g->key, "B") == 0) {
       const char *last_pipe = strrchr(g->value, '|');
       if (last_pipe && strcmp(last_pipe + 1, "del") == 0) {
         is_tombstone = true;
@@ -3920,18 +3974,18 @@ int hub_execute_purge(hub_state_t *state, time_t cutoff, reply_t *tombs) {
       char name[256];
       size_t n = strcspn(g->value, "|");
       snprintf(name, sizeof(name), "%.*s", (int)(n < 255 ? n : 255), g->value);
-      purge_note(tombs, g->key[0] == 'c' ? "channel" : g->key[0] == 'm' ? "mask" : "oper",
+      purge_note(tombs, g->key[0] == 'c' ? "channel" : g->key[0] == 'm' ? "mask" :
+                 g->key[0] == 'C' ? "chanset" : g->key[0] == 'B' ? "ban" : "oper",
                  NULL, name, g->timestamp);
     } else {
-      if (new_count < MAX_BOT_ENTRIES) {
-        memcpy(&new_entries[new_count++], g, sizeof(config_entry_t));
-      }
+      if (new_count != i)
+        memmove(&state->global_entries[new_count], g, sizeof(config_entry_t));
+      new_count++;
     }
   }
 
-  memcpy(state->global_entries, new_entries,
-         sizeof(config_entry_t) * new_count);
   state->global_entry_count = new_count;
+  hub_global_reindex(state);
 
   // --- Purge tombstoned user_records (admins/opers) ---
   hub_user_record_t new_users[MAX_HUB_USER_RECORDS];
@@ -4409,7 +4463,7 @@ static config_entry_t *chan_entry(hub_state_t *state, const char *chan) {
     char name[128];
     if (parse_global_channel_value(e->value, name, sizeof(name), NULL, 0, NULL,
                                    NULL, 0) &&
-        strcmp(name, chan) == 0)
+        hub_ascii_ieq(name, chan))
       return e;
   }
   return NULL;
@@ -4586,11 +4640,27 @@ static bool admin_ip_acl_change(hub_state_t *state, hub_client_t *client,
 
   if (!payload || !payload[0])
     return admin_err(state, client, "acl.usage", "say which address",
-                     "acl add|del allow|deny <ip[/n]>");
-  if (!hub_ip_acl_parse(payload, &e)) {
-    snprintf(msg, sizeof(msg), "%.40s is not an IPv4 address or CIDR", payload);
+                     "acl add|del allow|deny <ip[/n]> [console]");
+  /* "<pattern>" or "<pattern>|console" (D27: the entry applies only once the
+   * first bytes say SSH).  Anything else after the pattern is refused. */
+  char pat[IP_ACL_PATTERN_MAX + 2];
+  bool console_scope = false;
+  const char *bar = strchr(payload, '|');
+  if (bar) {
+    if (strcmp(bar + 1, "console") != 0 || (size_t)(bar - payload) >= sizeof(pat))
+      return admin_err(state, client, "acl.bad_scope", "the only scope word is console",
+                       "acl add allow <ip[/n]> console");
+    memcpy(pat, payload, (size_t)(bar - payload));
+    pat[bar - payload] = '\0';
+    console_scope = true;
+  } else {
+    snprintf(pat, sizeof(pat), "%s", payload);
+  }
+  if (!hub_ip_acl_parse(pat, &e)) {
+    snprintf(msg, sizeof(msg), "%.40s is not an IPv4 address or CIDR", pat);
     return admin_err(state, client, "acl.bad_pattern", msg, "1.2.3.4 or 1.2.3.0/24");
   }
+  e.console = console_scope;
 
   hub_ip_acl_t *l = list == 'w' ? state->ip_allow : state->ip_deny;
   int *count = list == 'w' ? &state->ip_allow_count : &state->ip_deny_count;
@@ -4603,7 +4673,8 @@ static bool admin_ip_acl_change(hub_state_t *state, hub_client_t *client,
     ip_acl_add_t r = hub_ip_acl_add(state, list, &e);
     if (r != IP_ACL_ADDED) {
       if (r == IP_ACL_DUPLICATE) {
-        snprintf(msg, sizeof(msg), "%s is already on the %s list", e.pattern, name);
+        snprintf(msg, sizeof(msg), "%s is already on the %s list%s", e.pattern, name,
+                 console_scope ? " (console scope)" : "");
         return admin_err(state, client, "acl.exists", msg, "acl list");
       }
       snprintf(msg, sizeof(msg), "the %s list is full (%d entries)", name,
@@ -4611,11 +4682,14 @@ static bool admin_ip_acl_change(hub_state_t *state, hub_client_t *client,
       return admin_err(state, client, "acl.full", msg, "acl del to make room");
     }
   } else if (!hub_ip_acl_remove(state, list, &e)) {
-    snprintf(msg, sizeof(msg), "%s is not on the %s list", e.pattern, name);
+    snprintf(msg, sizeof(msg), "%s is not on the %s list%s", e.pattern, name,
+             console_scope ? " with the console scope" : "");
     return admin_err(state, client, "acl.not_found", msg, "acl list");
   }
 
-  if (!hub_ip_acl_permits(state, client->ip)) {
+  /* The admin is on an SSH console: both scopes must let this address in. */
+  if (!hub_ip_acl_permits(state, client->ip) ||
+      !hub_ip_acl_permits_console(state, client->ip)) {
     memcpy(l, saved, sizeof(saved));
     *count = saved_count;
     snprintf(msg, sizeof(msg), "refused: this would lock out your own address %s",
@@ -4641,8 +4715,10 @@ static bool admin_ip_acl_change(hub_state_t *state, hub_client_t *client,
   reply_kv(&r, "list", name);
   reply_kv(&r, "pattern", e.pattern);
   reply_kvu(&r, "size", acl_size(&e));
-  if (list == 'w' && add && *count == 1) reply_kvb(&r, "first", true);
-  if (list == 'w' && !add && *count == 0) reply_kvb(&r, "empty", true);
+  if (console_scope) reply_kv(&r, "scope", "console");
+  int in_scope = ip_acl_scope_count(l, *count, console_scope);
+  if (list == 'w' && add && in_scope == 1) reply_kvb(&r, "first", true);
+  if (list == 'w' && !add && in_scope == 0) reply_kvb(&r, "empty", true);
   reply_kvi(&r, "closing", closing);
   return send_reply(state, client, &r);
 }
@@ -4656,7 +4732,8 @@ static bool admin_list_acl(hub_state_t *state, hub_client_t *client) {
   reply_kv(&r, "self_ip", client->ip);
   reply_kv(&r, "self",
            !state->ip_allow_count && !state->ip_deny_count ? "open"
-           : hub_ip_acl_permits(state, client->ip)          ? "allowed"
+           : hub_ip_acl_permits(state, client->ip) &&
+             hub_ip_acl_permits_console(state, client->ip)  ? "allowed"
                                                              : "denied");
   for (int pass = 0; pass < 2; pass++) {
     const hub_ip_acl_t *l = pass == 0 ? state->ip_allow : state->ip_deny;
@@ -4667,6 +4744,7 @@ static bool admin_list_acl(hub_state_t *state, hub_client_t *client) {
       reply_kvi(&r, "n", i + 1);
       reply_kv(&r, "pattern", l[i].pattern);
       reply_kvu(&r, "size", acl_size(&l[i]));
+      if (l[i].console) reply_kv(&r, "scope", "console");
       if (l[i].added > 0) reply_kvi(&r, "ts", (long long)l[i].added);
     }
   }
@@ -4746,6 +4824,792 @@ static bool hub_set_reply(hub_state_t *state, hub_client_t *client,
   return send_reply(state, client, &r);
 }
 
+/* ==========================================================================
+ * Modes, channel settings, network defaults, bans (docs/modes.md §5.1)
+ *
+ * channel mode / channel set / ban / network set.  The store functions are
+ * hub_modes.c's; this is the console's side: parse the (hostile) payload,
+ * call them, answer in records.  Every payload field is length-checked into
+ * a fixed buffer before it is looked at.
+ * ========================================================================== */
+#define MF_MAX_TOKENS 16
+#define MF_BANS_LIST_MAX 600
+#define MF_BANS_CHAN_MAX 128 /* >= MAX_BANS_PER_CHAN and MAX_GLOBAL_BANS */
+#define MF_BAN_MINUTES_MAX 5256000L /* 10 years, the store's own ceiling */
+
+static int mf_field_count(const char *s) {
+  int n = 1;
+  for (; s && *s; s++)
+    if (*s == '|') n++;
+  return n;
+}
+
+/* The name a console session logs in as ("ADMIN:robert" -> "robert"). */
+static const char *mf_admin_name(const hub_client_t *c) {
+  return strncmp(c->id, "ADMIN:", 6) == 0 ? c->id + 6 : c->id;
+}
+
+static int mf_str_cmp(const void *a, const void *b) { return strcmp(a, b); }
+
+/* D38: names of the peer hubs older than 2.4.5, sorted, comma-joined, as
+ * old_hubs=; nothing when there are none.  A command that wrote C|/D|/B|
+ * calls this on its reply. */
+static void mf_reply_old_hubs(const hub_state_t *state, reply_t *r) {
+  char names[16][64];
+  int n = hub_old_hubs(state, names, 16);
+  if (n <= 0) return;
+  qsort(names, (size_t)n, sizeof(names[0]), mf_str_cmp);
+  char joined[16 * 65 + 1];
+  size_t o = 0;
+  for (int i = 0; i < n; i++) {
+    if (i) joined[o++] = ',';
+    for (const char *p = names[i]; *p && o + 2 < sizeof(joined); p++)
+      joined[o++] = (*p == ',' || (unsigned char)*p < 0x20 || *p == 0x7f) ? '_' : *p;
+  }
+  joined[o] = '\0';
+  reply_kv(r, "old_hubs", joined);
+}
+
+static bool mf_status_err(hub_state_t *state, hub_client_t *client, hub_modes_status_t st,
+                          const char *what) {
+  char msg[256];
+  switch (st) {
+  case HUB_MODES_FROZEN:
+    return admin_err(state, client, "config.frozen",
+                     "the config is frozen while an upgrade runs",
+                     "upgrade status; a stale freeze is lifted with option set");
+  case HUB_MODES_BAD_CHAN:
+    return admin_err(state, client, "channel.bad_name",
+                     "a channel name starts with # or & and has no spaces, commas or "
+                     "control characters",
+                     NULL);
+  case HUB_MODES_NOT_MANAGED:
+    snprintf(msg, sizeof(msg), "%.64s is not a managed channel", what ? what : "?");
+    return admin_err(state, client, "channel.not_found", msg, "channel add <#chan>");
+  case HUB_MODES_BAD_MODES:
+    return admin_err(state, client, "channel.bad_mode", "that is not a valid mode string",
+                     "channel mode <#chan> <+modes> [args]");
+  case HUB_MODES_TOO_LONG:
+    return admin_err(state, client, "channel.too_long",
+                     "the settings would not fit the record (512 bytes)",
+                     "reset some with <name> default");
+  case HUB_MODES_BAD_SETTING:
+    return admin_err(state, client, "channel.bad_value", "that setting value is not valid",
+                     NULL);
+  case HUB_MODES_BAD_MASK:
+    return admin_err(state, client, "ban.bad_mask",
+                     "a ban mask is 1-120 printable characters with no spaces, commas or |",
+                     "ban add <#chan|*> nick!user@host");
+  case HUB_MODES_BAD_REASON:
+    return admin_err(state, client, "ban.bad_reason",
+                     "a ban reason is at most 120 bytes with no control characters", NULL);
+  case HUB_MODES_BAD_EXPIRY:
+    return admin_err(state, client, "ban.bad_time",
+                     "a ban lasts 1 minute to 10 years, or perm", "ban add <#chan|*> <mask> [<min>|perm]");
+  case HUB_MODES_NOT_FOUND:
+    return admin_err(state, client, "ban.not_found", "no such ban", "ban list [#chan|*]");
+  case HUB_MODES_FULL:
+    return admin_err(state, client, "ban.full",
+                     "the record or ban table is full (100 bans per channel, 100 global)",
+                     "ban del <#chan|*> <mask>");
+  case HUB_MODES_PROTECTED:
+  case HUB_MODES_OK:
+    break;
+  }
+  return admin_err(state, client, "modes.failed", "the change was refused", NULL);
+}
+
+/* Whether a stored mode string ("+stnkl 20", "-i+t") sets `letter` on. */
+static bool mf_modes_plus(const char *modes, char letter) {
+  char sign = 0;
+  for (; *modes && *modes != ' '; modes++) {
+    if (*modes == '+' || *modes == '-') sign = *modes;
+    else if (*modes == letter && sign == '+') return true;
+  }
+  return false;
+}
+
+/* The channel's mode card: stored string (""= network default), the string in
+ * force and where it comes from, the modes a bot last reported live, whether
+ * a key is set, and whether +l fights +dynamiclimit.  cname must be a live
+ * channel. */
+static void mf_mode_card_extra(hub_state_t *state, reply_t *r, const char *cname) {
+  hub_chanset_t cs, ns;
+  bool have = hub_chanset_get(state, cname, &cs);
+  hub_netset_get(state, &ns);
+  const char *eff = "+nt", *src = "built-in";
+  if (have && cs.modes[0]) {
+    eff = cs.modes;
+    src = "chan";
+  } else if (ns.modes[0]) {
+    eff = ns.modes;
+    src = "net";
+  }
+  reply_kv(r, "modes", have ? cs.modes : "");
+  reply_kv(r, "effective", eff);
+  reply_kv(r, "source", src);
+  char key[64], ml[4], dyn[8];
+  chan_active_key(state, cname, key, sizeof(key));
+  reply_kvb(r, "key_set", key[0] != '\0');
+  secure_wipe(key, sizeof(key));
+  chan_modes_letters(global_channel_modes(state, cname), ml);
+  reply_kv(r, "live", ml);
+  hub_setting_effective(state, cname, "dynamiclimit", dyn, sizeof(dyn));
+  reply_kvb(r, "dynlimit", mf_modes_plus(eff, 'l') && strcmp(dyn, "1") == 0);
+}
+
+static void mf_mode_card(hub_state_t *state, reply_t *r, const char *cname) {
+  reply_kv(r, "chan", cname);
+  mf_mode_card_extra(state, r, cname);
+}
+
+/* Channel mode strings the console sends: "<+modes>|<arg>|<arg>".  Fills the
+ * stored form (letters, then the limit) and the key to set / clear.  NULL on
+ * success, else the message. */
+static const char *mf_parse_modes(const char *modes, char args[][64], int nargs,
+                                  char *stored, size_t cap, int *key_op, char *key,
+                                  size_t keycap) {
+  char sign = 0, limit[16] = "";
+  bool seen[256] = {false};
+  int ai = 0;
+  bool plus_s = false, plus_p = false;
+  *key_op = 0;
+  key[0] = '\0';
+  if (!modes[0]) return "say the modes, e.g. +nt";
+  for (const char *p = modes; *p; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (c == '+' || c == '-') {
+      sign = (char)c;
+      continue;
+    }
+    if (!strchr("imnpstkl", c) || !c) return "modes are i m n p s t k l";
+    if (!sign) return "start the modes with + or -";
+    if (seen[c]) return "a mode letter may appear only once";
+    seen[c] = true;
+    if (sign == '+' && c == 's') plus_s = true;
+    if (sign == '+' && c == 'p') plus_p = true;
+    if (c == 'k') {
+      if (sign == '+') {
+        if (ai >= nargs) return "+k needs a key";
+        const char *k = args[ai++];
+        size_t kl = strlen(k);
+        if (kl < 1 || kl > 30) return "a key is 1-30 bytes";
+        for (size_t i = 0; i < kl; i++)
+          if ((unsigned char)k[i] <= 0x20 || k[i] == ',' || (unsigned char)k[i] == 0x7f)
+            return "a key has no spaces, commas or control characters";
+        snprintf(key, keycap, "%s", k);
+        *key_op = 1;
+      } else {
+        *key_op = -1;
+      }
+    } else if (c == 'l' && sign == '+') {
+      if (ai >= nargs) return "+l needs a limit";
+      const char *l = args[ai++];
+      size_t ll = strlen(l);
+      if (ll < 1 || ll > 5) return "the limit is 1-99999";
+      long v = 0;
+      for (size_t i = 0; i < ll; i++) {
+        if (l[i] < '0' || l[i] > '9') return "the limit is 1-99999";
+        v = v * 10 + (l[i] - '0');
+      }
+      if (v < 1 || v > 99999) return "the limit is 1-99999";
+      snprintf(limit, sizeof(limit), "%ld", v);
+    }
+  }
+  if (ai != nargs) return "more arguments than +k and +l take";
+  if (plus_s && plus_p) return "+s and +p cannot both be set";
+  int w = snprintf(stored, cap, "%s%s%s", modes, limit[0] ? " " : "", limit);
+  if (w < 0 || (size_t)w >= cap) return "the mode string is too long";
+  if (hub_modes_check(stored) != HUB_MODES_OK) return "that is not a valid mode string";
+  return NULL;
+}
+
+/* channel mode: #chan | #chan|<modes>|<arg>... | #chan|- */
+static bool admin_chan_mode(hub_state_t *state, hub_client_t *client, const char *payload) {
+  char chan[MAX_CHAN], cname[MAX_CHAN];
+  if (!payload || !payload[0] || !wire_field(payload, 0, chan, sizeof(chan)))
+    return admin_err(state, client, "channel.usage", "say which channel",
+                     "channel mode <#chan> [<+modes> [args]]");
+  if (!chan_name_valid(chan)) return mf_status_err(state, client, HUB_MODES_BAD_CHAN, chan);
+  if (!hub_chan_live(state, chan, cname, sizeof(cname)))
+    return mf_status_err(state, client, HUB_MODES_NOT_MANAGED, chan);
+  int nf = mf_field_count(payload);
+  reply_t r;
+  if (nf == 1) {
+    reply_init(&r);
+    reply_ok(&r, "channel.mode");
+    reply_kvb(&r, "view", true);
+    mf_mode_card(state, &r, cname);
+    return send_reply(state, client, &r);
+  }
+  if (nf > 5) return admin_err(state, client, "channel.bad_mode", "too many arguments",
+                               "channel mode <#chan> <+modes> [key] [limit]");
+  char modes[C_MODES_MAX + 2], stored[C_MODES_MAX + 1], args[3][64], key[64] = "";
+  if (!wire_field(payload, 1, modes, sizeof(modes)))
+    return admin_err(state, client, "channel.bad_mode", "the mode string is too long", NULL);
+  int nargs = nf - 2, key_op = 0;
+  for (int i = 0; i < nargs; i++)
+    if (!wire_field(payload, 2 + i, args[i], sizeof(args[i])))
+      return admin_err(state, client, "channel.bad_mode", "an argument is too long", NULL);
+  if (strcmp(modes, "-") == 0 && nargs == 0) {
+    stored[0] = '\0';
+  } else {
+    const char *why = mf_parse_modes(modes, args, nargs, stored, sizeof(stored), &key_op, key,
+                                     sizeof(key));
+    if (why) {
+      secure_wipe(key, sizeof(key));
+      secure_wipe(args, sizeof(args));
+      return admin_err(state, client, "channel.bad_mode", why,
+                       "channel mode <#chan> <+modes> [key] [limit]  (- = network default)");
+    }
+  }
+  hub_chanset_t cs;
+  hub_chanset_get(state, cname, &cs);
+  hub_modes_status_t st = hub_chanset_put(state, cname, stored, cs.settings);
+  if (st == HUB_MODES_OK && key_op) {
+    char cur[64];
+    chan_active_key(state, cname, cur, sizeof(cur));
+    const char *want = key_op > 0 ? key : "";
+    if (strcmp(cur, want) != 0) chan_store(state, cname, want);
+    secure_wipe(cur, sizeof(cur));
+  }
+  secure_wipe(key, sizeof(key));
+  secure_wipe(args, sizeof(args));
+  if (st != HUB_MODES_OK) return mf_status_err(state, client, st, cname);
+  /* Apply once: the answer (channel.mode with who did it, or channel.nobody)
+   * comes when the election ends. */
+  if (!hub_chan_mode_apply(state, cname, client))
+    return admin_err(state, client, "channel.busy",
+                     "the modes are stored, but too many channel requests are in flight "
+                     "to apply them now",
+                     "channel mode <#chan> again in a few seconds");
+  return true;
+}
+
+/* Effective value of `name` as seen from `work` (a settings string being
+ * edited) with the network level below it; src 'c' / 'n' / 'b'. */
+static int mf_eff(const hub_state_t *state, const char *work, bool net_target,
+                  const char *name, char *out, size_t cap) {
+  if (hub_settings_get(work, name, out, cap)) return net_target ? 'n' : 'c';
+  return hub_setting_effective(state, NULL, name, out, cap);
+}
+
+static const char *mf_src_word(int s) { return s == 'c' ? "chan" : s == 'n' ? "net" : "built-in"; }
+
+/* Canonical text of a validated value: numbers without leading zeros, floods
+ * as N:S or off. */
+static void mf_canon(const char *kind, char *value, size_t cap) {
+  long a, b;
+  if (strcmp(kind, "num") == 0 && sscanf(value, "%ld", &a) == 1) snprintf(value, cap, "%ld", a);
+  else if ((strcmp(kind, "flood") == 0 && strcmp(value, "off") != 0 &&
+            sscanf(value, "%ld:%ld", &a, &b) == 2) ||
+           (strcmp(kind, "sendq") == 0 && sscanf(value, "%ld:%ld", &a, &b) == 2))
+    snprintf(value, cap, "%ld:%ld", a, b);
+}
+
+static const char *mf_value_hint(const char *name, const char *kind, char *buf, size_t cap) {
+  long lo, hi;
+  if (strcmp(kind, "num") == 0 && hub_setting_range(name, &lo, &hi))
+    snprintf(buf, cap, "%s is a whole number from %ld to %ld", name, lo, hi);
+  else if (strcmp(kind, "sendq") == 0)
+    snprintf(buf, cap, "%s takes B:I (B 1-100 lines, I 0-10000 ms)", name);
+  else if (strcmp(kind, "flood") == 0)
+    snprintf(buf, cap, "%s takes N:S (N 1-1000 events in S 1-3600 seconds), off or default", name);
+  else
+    snprintf(buf, cap, "%s is an on/off option: use +%s or -%s", name, name, name);
+  return buf;
+}
+
+/* One edit of a settings string.  tok: "+name", "-name" or "name=value"
+ * (value may be "default").  net: the target is D| (channel set default).
+ * The change goes to `work`; the pieces of the reply to `chg`.  NULL on
+ * success, else sets *code / returns the message. */
+typedef struct {
+  char name[48], kind[8], old[24], val[24];
+  int old_src, src;
+  bool reset;
+} mf_chg_t;
+
+static const char *mf_edit(const hub_state_t *state, char *work, size_t cap, bool net,
+                           const char *tok, mf_chg_t *chg, const char **code,
+                           char *msgbuf, size_t msgcap) {
+  const char *eq = strchr(tok, '=');
+  char name[48], value[48];
+  bool signed_form = tok[0] == '+' || tok[0] == '-';
+  if (signed_form) {
+    snprintf(name, sizeof(name), "%.47s", tok + 1);
+    snprintf(value, sizeof(value), "%s", tok[0] == '+' ? "1" : "0");
+    if (strlen(tok + 1) >= sizeof(name) || eq) {
+      *code = "channel.unknown_setting";
+      return "that is not a setting name";
+    }
+  } else {
+    size_t nl = eq ? (size_t)(eq - tok) : 0;
+    if (!eq || nl == 0 || nl >= sizeof(name) || strlen(eq + 1) >= sizeof(value)) {
+      *code = "channel.usage";
+      return "say a value after the setting name";
+    }
+    memcpy(name, tok, nl);
+    name[nl] = '\0';
+    snprintf(value, sizeof(value), "%s", eq + 1);
+  }
+  for (const char *p = name; *p; p++)
+    if (!((*p >= 'a' && *p <= 'z') || *p == ' ')) {
+      *code = "channel.unknown_setting";
+      snprintf(msgbuf, msgcap, "unknown setting \"%.40s\"", name);
+      return msgbuf;
+    }
+  if (strcmp(name, "key") == 0) {
+    *code = "channel.moved";
+    return "the channel key is a mode now: use channel mode <#chan> +k <key>";
+  }
+  const char *kind = hub_setting_kind(name);
+  if (!kind || hub_setting_net_only(name)) {
+    *code = "channel.unknown_setting";
+    snprintf(msgbuf, msgcap, "unknown setting \"%.40s\"", name);
+    return msgbuf;
+  }
+  bool reset = strcmp(value, "default") == 0;
+  if (!reset) {
+    bool flag = strcmp(kind, "flag") == 0;
+    if (flag != signed_form) {
+      *code = "channel.bad_value";
+      return mf_value_hint(name, kind, msgbuf, msgcap);
+    }
+    if (hub_setting_check(name, value, net) != HUB_MODES_OK) {
+      *code = "channel.bad_value";
+      return mf_value_hint(name, kind, msgbuf, msgcap);
+    }
+    mf_canon(kind, value, sizeof(value));
+  }
+  memset(chg, 0, sizeof(*chg));
+  snprintf(chg->name, sizeof(chg->name), "%s", name);
+  snprintf(chg->kind, sizeof(chg->kind), "%s", kind);
+  chg->old_src = mf_eff(state, work, net, name, chg->old, sizeof(chg->old));
+  hub_modes_status_t st = hub_settings_set(work, cap, name, reset ? NULL : value);
+  if (st != HUB_MODES_OK) {
+    *code = "channel.too_long";
+    return "the settings would not fit the record (512 bytes)";
+  }
+  chg->src = mf_eff(state, work, net, name, chg->val, sizeof(chg->val));
+  chg->reset = reset;
+  return NULL;
+}
+
+static void mf_chg_rec(reply_t *r, const mf_chg_t *c, const char *shown) {
+  reply_rec(r, "chg");
+  reply_kv(r, "setting", shown);
+  reply_kv(r, "kind", c->kind);
+  reply_kv(r, "old", c->old);
+  reply_kv(r, "old_src", mf_src_word(c->old_src));
+  reply_kv(r, "value", c->val);
+  reply_kv(r, "src", mf_src_word(c->src));
+  reply_kvb(r, "reset", c->reset);
+}
+
+/* One `setting` row per table entry of the wanted class, with the value in
+ * force and where it comes from. */
+static void mf_setting_rows(const hub_state_t *state, reply_t *r, const char *cname,
+                            bool net_rows) {
+  for (int i = 0; i < hub_setting_count(); i++) {
+    const char *n = hub_setting_name(i);
+    if (hub_setting_net_only(n) != net_rows) continue;
+    char v[24], shown[48];
+    int s = hub_setting_effective(state, cname, n, v, sizeof(v));
+    if (strncmp(n, "bflood ", 7) == 0) snprintf(shown, sizeof(shown), "flood %s", n + 7);
+    else snprintf(shown, sizeof(shown), "%s", n);
+    reply_rec(r, "setting");
+    reply_kv(r, "name", shown);
+    reply_kv(r, "kind", hub_setting_kind(n));
+    reply_kv(r, "value", v);
+    reply_kv(r, "src", mf_src_word(s));
+  }
+}
+
+/* channel set <#chan|default> [tokens...] */
+static bool admin_chan_set(hub_state_t *state, hub_client_t *client, const char *payload) {
+  char target[MAX_CHAN], cname[MAX_CHAN] = "";
+  if (!payload || !payload[0] || !wire_field(payload, 0, target, sizeof(target)))
+    return admin_err(state, client, "channel.usage", "say which channel, or default",
+                     "channel set <#chan|default> [+opt|-opt|<name> <value>]");
+  bool net = strcmp(target, "default") == 0;
+  hub_chanset_t cur;
+  if (net) {
+    hub_netset_get(state, &cur);
+  } else {
+    if (!chan_name_valid(target)) return mf_status_err(state, client, HUB_MODES_BAD_CHAN, target);
+    if (!hub_chan_live(state, target, cname, sizeof(cname)))
+      return mf_status_err(state, client, HUB_MODES_NOT_MANAGED, target);
+    hub_chanset_get(state, cname, &cur);
+  }
+  int nf = mf_field_count(payload);
+  reply_t r;
+  if (nf == 1) { /* the view */
+    reply_init(&r);
+    reply_ok(&r, "channel.settings");
+    reply_kv(&r, "name", net ? "default" : cname);
+    const char *eff = "+nt", *src = "built-in";
+    if (cur.modes[0]) {
+      eff = cur.modes;
+      src = net ? "net" : "chan";
+    } else if (!net) {
+      hub_chanset_t ns;
+      if (hub_netset_get(state, &ns) && ns.modes[0]) {
+        eff = ns.modes;
+        src = "net";
+      }
+    }
+    reply_kv(&r, "modes", cur.modes);
+    reply_kv(&r, "effective", eff);
+    reply_kv(&r, "source", src);
+    reply_kvi(&r, "ts", (long long)cur.ts);
+    mf_setting_rows(state, &r, net ? NULL : cname, false);
+    return send_reply(state, client, &r);
+  }
+  if (nf - 1 > MF_MAX_TOKENS)
+    return admin_err(state, client, "channel.usage", "too many settings in one line", NULL);
+  char work[C_SETTINGS_MAX + 64];
+  snprintf(work, sizeof(work), "%s", cur.settings);
+  mf_chg_t chg[MF_MAX_TOKENS];
+  int nchg = 0;
+  for (int i = 1; i < nf; i++) {
+    char tok[96], msg[200];
+    const char *code = "channel.bad_value";
+    if (!wire_field(payload, i, tok, sizeof(tok)) || !tok[0])
+      return admin_err(state, client, "channel.bad_value", "a setting is too long or empty", NULL);
+    const char *why = mf_edit(state, work, C_SETTINGS_MAX + 1, net, tok, &chg[nchg], &code, msg,
+                              sizeof(msg));
+    if (why) return admin_err(state, client, code, why,
+                              strcmp(code, "channel.moved") == 0
+                                  ? "channel mode <#chan> +k <key>"
+                                  : "channel set <#chan|default> shows the settings");
+    nchg++;
+  }
+  bool written = strcmp(work, cur.settings) != 0;
+  if (written) {
+    hub_modes_status_t st = net ? hub_netset_put(state, cur.modes, work)
+                                : hub_chanset_put(state, cname, cur.modes, work);
+    if (st != HUB_MODES_OK) return mf_status_err(state, client, st, cname);
+  }
+  reply_init(&r);
+  reply_ok(&r, "channel.set");
+  reply_kv(&r, "name", net ? "default" : cname);
+  reply_kvi(&r, "changes", nchg);
+  reply_kvb(&r, "written", written);
+  reply_kvi(&r, "bots", local_bot_count(state));
+  reply_kvi(&r, "peers", linked_peer_count(state));
+  if (written) mf_reply_old_hubs(state, &r);
+  for (int i = 0; i < nchg; i++) mf_chg_rec(&r, &chg[i], chg[i].name);
+  return send_reply(state, client, &r);
+}
+
+/* network set: "" | flood|<cmd|msg|ctcp>|<N:S|off|default> | ignoretime|<min|default> | sendq|<B:I|default> */
+static bool admin_net_set(hub_state_t *state, hub_client_t *client, const char *payload) {
+  hub_chanset_t cur;
+  hub_netset_get(state, &cur);
+  reply_t r;
+  if (!payload || !payload[0]) {
+    reply_init(&r);
+    reply_ok(&r, "network.settings");
+    reply_kvi(&r, "ts", (long long)cur.ts);
+    mf_setting_rows(state, &r, NULL, true);
+    return send_reply(state, client, &r);
+  }
+  char sub[16], type[8] = "", value[48], name[24], shown[24];
+  int nf = mf_field_count(payload);
+  if (!wire_field(payload, 0, sub, sizeof(sub)))
+    return admin_err(state, client, "network.usage", "unknown network setting", NULL);
+  if (strcmp(sub, "flood") == 0 && nf == 3) {
+    if (!wire_field(payload, 1, type, sizeof(type)) ||
+        !wire_field(payload, 2, value, sizeof(value)) ||
+        (strcmp(type, "cmd") && strcmp(type, "msg") && strcmp(type, "ctcp")))
+      return admin_err(state, client, "network.unknown_setting",
+                       "flood types are cmd, msg and ctcp", "network set flood <cmd|msg|ctcp> <N:S|off|default>");
+    snprintf(name, sizeof(name), "bflood %s", type);
+    snprintf(shown, sizeof(shown), "flood %s", type);
+  } else if (strcmp(sub, "ignoretime") == 0 && nf == 2) {
+    if (!wire_field(payload, 1, value, sizeof(value)))
+      return admin_err(state, client, "network.bad_value", "that value is too long", NULL);
+    snprintf(name, sizeof(name), "ignoretime");
+    snprintf(shown, sizeof(shown), "ignoretime");
+  } else if (strcmp(sub, "sendq") == 0 && nf == 2) {
+    if (!wire_field(payload, 1, value, sizeof(value)))
+      return admin_err(state, client, "network.bad_value", "that value is too long", NULL);
+    snprintf(name, sizeof(name), "sendq");
+    snprintf(shown, sizeof(shown), "sendq");
+  } else {
+    return admin_err(state, client, "network.unknown_setting",
+                     "network settings are flood <cmd|msg|ctcp>, ignoretime and sendq",
+                     "network set shows them");
+  }
+  const char *kind = hub_setting_kind(name);
+  bool reset = strcmp(value, "default") == 0;
+  char msg[160];
+  if (!reset) {
+    if (hub_setting_check(name, value, true) != HUB_MODES_OK)
+      return admin_err(state, client, "network.bad_value",
+                       mf_value_hint(shown, kind, msg, sizeof(msg)),
+                       strcmp(sub, "flood") == 0 ? "network set flood cmd 10:30"
+                       : strcmp(sub, "sendq") == 0 ? "network set sendq 10:100"
+                                                   : "network set ignoretime 10");
+    mf_canon(kind, value, sizeof(value));
+  }
+  char work[D_SETTINGS_MAX + 64];
+  snprintf(work, sizeof(work), "%s", cur.settings);
+  mf_chg_t chg;
+  memset(&chg, 0, sizeof(chg));
+  snprintf(chg.kind, sizeof(chg.kind), "%s", kind);
+  chg.old_src = mf_eff(state, work, true, name, chg.old, sizeof(chg.old));
+  if (hub_settings_set(work, D_SETTINGS_MAX + 1, name, reset ? NULL : value) != HUB_MODES_OK)
+    return mf_status_err(state, client, HUB_MODES_TOO_LONG, NULL);
+  chg.src = mf_eff(state, work, true, name, chg.val, sizeof(chg.val));
+  chg.reset = reset;
+  bool written = strcmp(work, cur.settings) != 0;
+  if (written) {
+    hub_modes_status_t st = hub_netset_put(state, cur.modes, work);
+    if (st != HUB_MODES_OK) return mf_status_err(state, client, st, NULL);
+  }
+  reply_init(&r);
+  reply_ok(&r, "network.set");
+  reply_kv(&r, "setting", shown);
+  reply_kv(&r, "kind", chg.kind);
+  reply_kv(&r, "old", chg.old);
+  reply_kv(&r, "old_src", mf_src_word(chg.old_src));
+  reply_kv(&r, "value", chg.val);
+  reply_kv(&r, "src", mf_src_word(chg.src));
+  reply_kvb(&r, "reset", reset);
+  reply_kvb(&r, "written", written);
+  reply_kvi(&r, "bots", local_bot_count(state));
+  reply_kvi(&r, "peers", linked_peer_count(state));
+  if (written) mf_reply_old_hubs(state, &r);
+  return send_reply(state, client, &r);
+}
+
+/* hub set ssh | hub set conn (CMD_ADMIN_SET_SSH, docs/modes.md §9.3, D35):
+ *   "" | conn                       view of the ssh / conn group (ok|hub.show)
+ *   <name>|<value|default>          ssh setting
+ *   conn|<name>|<value|default>     shared connection limit
+ * Local to this hub (.irchub.cnf, never synced).  A change reaches the console
+ * thread as a fresh snapshot and applies to the next connection. */
+static bool admin_set_ssh(hub_state_t *state, hub_client_t *client, const char *payload) {
+  char f0[40] = "", f1[40] = "", f2[64] = "";
+  int nf = payload && payload[0] ? mf_field_count(payload) : 0;
+  if (nf > 3 || (nf > 0 && !wire_field(payload, 0, f0, sizeof(f0))) ||
+      (nf > 1 && !wire_field(payload, 1, f1, sizeof(f1))) ||
+      (nf > 2 && !wire_field(payload, 2, f2, sizeof(f2))))
+    return admin_err(state, client, "hub.bad_value", "that setting line is malformed",
+                     "hub set ssh <name> <value|default>");
+  bool conn = nf >= 1 && strcmp(f0, "conn") == 0;
+  int group = conn ? HUB_CONN_CONN : HUB_CONN_SSH;
+  const char *gname = conn ? "conn" : "ssh";
+  reply_t r;
+
+  if (nf == 0 || (conn && nf == 1)) {
+    reply_init(&r);
+    reply_ok(&r, "hub.show");
+    reply_kv(&r, "group", gname);
+    for (int i = 0; i < hub_conn_cfg_count(group); i++) {
+      const char *nm = hub_conn_cfg_name(group, i);
+      char v[48], d[48], key[40];
+      hub_conn_cfg_get(&state->conn_cfg, group, nm, v, sizeof(v));
+      hub_conn_cfg_default(group, nm, d, sizeof(d));
+      reply_kv(&r, nm, v);
+      snprintf(key, sizeof(key), "%s_def", nm);
+      reply_kv(&r, key, d);
+    }
+    return send_reply(state, client, &r);
+  }
+
+  const char *name = conn ? f1 : f0, *value = conn ? f2 : f1;
+  if ((conn && nf != 3) || (!conn && nf != 2))
+    return admin_err(state, client, "hub.bad_value", "say a setting and its value",
+                     conn ? "hub set conn <perip|churn|authfail> <value|default>"
+                          : "hub set ssh <name> <value|default>");
+  char old[48], now[48], why[160];
+  if (!hub_conn_cfg_get(&state->conn_cfg, group, name, old, sizeof(old))) {
+    snprintf(why, sizeof(why), "unknown %s setting \"%.30s\"", gname, name);
+    return admin_err(state, client, "hub.unknown_setting", why,
+                     conn ? "perip, churn, authfail"
+                          : "preauth, preauthip, sessions, grace, authtries, idle, authfail, "
+                            "connect, block, cmdrate");
+  }
+  bool reset = strcmp(value, "default") == 0;
+  hub_conn_cfg_t next = state->conn_cfg;
+  if (hub_conn_cfg_set(&next, group, name, reset ? NULL : value, why, sizeof(why)) != HUB_CONN_OK)
+    return admin_err(state, client, "hub.bad_value", why, "hub set ssh shows the settings");
+  /* A new connect / churn limit the issuing admin's own address is already
+   * over would lock the console out: refuse it. */
+  {
+    time_t t = time(NULL);
+    bool loop = state->trust_loopback &&
+                (strcmp(client->ip, "127.0.0.1") == 0 || strcmp(client->ip, "::1") == 0);
+    int seen = 0, win = 0;
+    if (!loop && !conn && strcmp(name, "connect") == 0) {
+      const ssh_ip_t *e = hub_ssh_table_peek(state->ssh_ips, state->ssh_ip_count, client->ip);
+      win = next.connect_s;
+      if (e && t - e->win_start < win && e->conn_n > next.connect_n) seen = e->conn_n;
+    } else if (!loop && conn && strcmp(name, "churn") == 0) {
+      win = next.churn_s;
+      for (int i = 0; i < state->ip_limits_count; i++) {
+        const ip_rate_limit_t *e = &state->ip_limits[i];
+        if (strcmp(e->ip, client->ip) == 0 && t - e->churn_window_start < win &&
+            e->churn_count > next.churn_n)
+          seen = e->churn_count;
+      }
+    }
+    if (seen > 0) {
+      snprintf(why, sizeof(why), "your own address made %d connections in the last %d s, "
+               "over that limit", seen, win);
+      return admin_err(state, client, "hub.bad_value", why,
+                       "raise it, or wait for the window to pass");
+    }
+  }
+  hub_conn_cfg_get(&next, group, name, now, sizeof(now));
+  bool written = strcmp(old, now) != 0;
+  if (written) {
+    state->conn_cfg = next;
+    state->config_dirty = true;
+    hub_console_limits_changed(state);
+    hub_log_info("[CONFIG] %s %s %s -> %s by %s\n", gname, name, old, now, client->id);
+  }
+  reply_init(&r);
+  reply_ok(&r, "hub.set");
+  char shown[64];
+  snprintf(shown, sizeof(shown), "%s %s", gname, name);
+  reply_kv(&r, "setting", shown);
+  reply_kv(&r, "old", old);
+  reply_kv(&r, "value", now);
+  reply_kv(&r, "group", gname);
+  reply_kvb(&r, "reset", reset);
+  reply_kvb(&r, "written", written);
+  reply_kvb(&r, "restart", false);
+  return send_reply(state, client, &r);
+}
+
+/* ban: list|<#c|*|""> | add|<#c|*>|<mask>|<min|perm>|<sticky 0/1>|<reason> | del|<#c|*>|<mask> */
+static bool admin_ban(hub_state_t *state, hub_client_t *client, const char *payload) {
+  char sub[8], chan[MAX_CHAN] = "", cname[MAX_CHAN] = "*", mask[BAN_MASK_MAX + 8];
+  if (!payload || !wire_field(payload, 0, sub, sizeof(sub)))
+    return admin_err(state, client, "ban.usage", "ban list, add or del", "help ban");
+  int nf = mf_field_count(payload);
+  bool list = strcmp(sub, "list") == 0, add = strcmp(sub, "add") == 0,
+       del = strcmp(sub, "del") == 0;
+  if (!(list && nf <= 2) && !(add && nf >= 6) && !(del && nf == 3))
+    return admin_err(state, client, "ban.usage", "ban list, add or del", "help ban");
+  if (nf > 1 && !wire_field(payload, 1, chan, sizeof(chan)))
+    return mf_status_err(state, client, HUB_MODES_BAD_CHAN, chan);
+  bool global = strcmp(chan, "*") == 0;
+  if (!(list && !chan[0]) && !global) {
+    if (!chan_name_valid(chan)) return mf_status_err(state, client, HUB_MODES_BAD_CHAN, chan);
+    if (!list && !hub_chan_live(state, chan, cname, sizeof(cname)))
+      return mf_status_err(state, client, HUB_MODES_NOT_MANAGED, chan);
+    if (list) snprintf(cname, sizeof(cname), "%s", chan);
+  }
+  reply_t r;
+  if (list) {
+    hub_ban_t *b = malloc(sizeof(*b) * MF_BANS_LIST_MAX);
+    if (!b) return admin_err(state, client, "internal.oom", "out of memory", NULL);
+    int n = hub_ban_list(state, chan[0] ? cname : NULL, b, MF_BANS_LIST_MAX);
+    reply_init(&r);
+    reply_ok(&r, "ban.list");
+    reply_kv(&r, "chan", chan[0] ? cname : "");
+    reply_kvi(&r, "count", n);
+    reply_kvb(&r, "truncated", n >= MF_BANS_LIST_MAX);
+    for (int i = 0; i < n; i++) {
+      reply_rec(&r, "ban");
+      reply_kv(&r, "chan", b[i].chan);
+      reply_kv(&r, "mask", b[i].mask);
+      reply_kvi(&r, "expires", (long long)b[i].expires);
+      reply_kvb(&r, "sticky", strchr(b[i].flags, 's') != NULL);
+      reply_kv(&r, "setter", b[i].setter);
+      reply_kv(&r, "reason", b[i].reason);
+      reply_kvi(&r, "ts", (long long)b[i].ts);
+    }
+    free(b);
+    return send_reply(state, client, &r);
+  }
+  if (!wire_field(payload, 2, mask, sizeof(mask)))
+    return mf_status_err(state, client, HUB_MODES_BAD_MASK, NULL);
+  if (del) {
+    hub_modes_status_t st = hub_ban_del(state, global ? "*" : cname, mask);
+    if (st != HUB_MODES_OK) return mf_status_err(state, client, st, chan);
+    reply_init(&r);
+    reply_ok(&r, "ban.removed");
+    reply_kv(&r, "chan", global ? "*" : cname);
+    reply_kv(&r, "mask", mask);
+    reply_kvi(&r, "bots", local_bot_count(state));
+    reply_kvi(&r, "peers", linked_peer_count(state));
+    mf_reply_old_hubs(state, &r);
+    return send_reply(state, client, &r);
+  }
+  /* add */
+  char dur[16], sticky[4], reason[BAN_REASON_MAX + 8];
+  if (!wire_field(payload, 3, dur, sizeof(dur)) || !wire_field(payload, 4, sticky, sizeof(sticky)))
+    return mf_status_err(state, client, HUB_MODES_BAD_EXPIRY, NULL);
+  if (!wire_tail(payload, 5, reason, sizeof(reason)) || strchr(reason, '|'))
+    return mf_status_err(state, client, HUB_MODES_BAD_REASON, NULL);
+  time_t now = time(NULL), expires = 0;
+  if (strcmp(dur, "perm") != 0) {
+    unsigned long mins;
+    if (!hub_parse_uint(dur, (unsigned long)MF_BAN_MINUTES_MAX, &mins) || mins < 1)
+      return mf_status_err(state, client, HUB_MODES_BAD_EXPIRY, NULL);
+    expires = now + (time_t)mins * 60;
+  }
+  /* Whether this mask is already banned there (an update, not a new ban). */
+  bool existed = false;
+  {
+    hub_ban_t *b = malloc(sizeof(*b) * MF_BANS_CHAN_MAX);
+    if (!b) return admin_err(state, client, "internal.oom", "out of memory", NULL);
+    int n = hub_ban_list(state, global ? "*" : cname, b, MF_BANS_CHAN_MAX);
+    for (int i = 0; i < n; i++)
+      if (hub_ascii_ieq(b[i].mask, mask)) existed = true;
+    free(b);
+  }
+  char who[96];
+  hub_modes_status_t st = hub_ban_add(state, global ? "*" : cname, mask, expires,
+                                      strcmp(sticky, "1") == 0, mf_admin_name(client), reason,
+                                      who, sizeof(who));
+  if (st == HUB_MODES_PROTECTED) {
+    char msg[256];
+    snprintf(msg, sizeof(msg), "%.120s would also ban %.80s, who must never be banned", mask,
+             who);
+    reply_init(&r);
+    reply_err(&r, "ban.protected", msg, "use a narrower mask");
+    reply_kv(&r, "mask", mask);
+    reply_kv(&r, "who", who);
+    return send_reply(state, client, &r);
+  }
+  if (st != HUB_MODES_OK) return mf_status_err(state, client, st, chan);
+  reply_init(&r);
+  reply_ok(&r, "ban.added");
+  reply_kv(&r, "chan", global ? "*" : cname);
+  reply_kv(&r, "mask", mask);
+  reply_kvi(&r, "expires", (long long)expires);
+  reply_kvb(&r, "sticky", strcmp(sticky, "1") == 0);
+  reply_kv(&r, "reason", reason);
+  reply_kvb(&r, "existed", existed);
+  reply_kvi(&r, "bots", local_bot_count(state));
+  reply_kvi(&r, "peers", linked_peer_count(state));
+  mf_reply_old_hubs(state, &r);
+  return send_reply(state, client, &r);
+}
+
+/* While an upgrade holds the config still, only the changing forms of the
+ * four modes opcodes are refused; their views stay readable. */
+static bool mf_payload_mutates(int cmd, const char *payload) {
+  switch (cmd) {
+  case CMD_ADMIN_CHAN_MODE:
+  case CMD_ADMIN_CHAN_SET:
+    return payload && strchr(payload, '|') != NULL;
+  case CMD_ADMIN_BAN:
+    return !payload || strncmp(payload, "list", 4) != 0;
+  case CMD_ADMIN_NET_SET:
+    return payload && payload[0];
+  default:
+    return true;
+  }
+}
+
 /* payload is NUL-terminated for the text opcodes; payload_len is the byte
  * count the frame carried, for the binary ones (a log level of 0 or a log size
  * with a zero byte has strlen < its real length). */
@@ -4757,7 +5621,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
    * every mutator rather than a check inside each; queries and the opt-flag
    * command itself stay available (the latter is how a stuck freeze is
    * lifted by hand). */
-  if (hub_config_frozen(state) && hub_admin_cmd_mutates_config(cmd)) {
+  if (hub_config_frozen(state) && hub_admin_cmd_mutates_config(cmd) &&
+      mf_payload_mutates(cmd, payload)) {
     hub_log_warning("[UPGRADE] Refused admin command 0x%02x: config frozen\n", cmd);
     return admin_err(state, client, "config.frozen",
                      "the config is frozen while an upgrade runs",
@@ -5563,6 +6428,30 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       }
       reply_ok(&r, "channel.show");
       reply_kvi(&r, "bots_online", network_bots_online(state));
+      {
+        /* modes.md §5.1: the stored modes and where they come from, the
+         * settings the channel overrides, and its ban count */
+        hub_chanset_t cs, ns;
+        char cn[MAX_CHAN];
+        if (!hub_chan_live(state, payload, cn, sizeof(cn))) cn[0] = '\0';
+        if (!cn[0] || !hub_chanset_get(state, cn, &cs)) memset(&cs, 0, sizeof(cs));
+        hub_netset_get(state, &ns);
+        const char *eff = "+nt", *src = "built-in";
+        if (cs.modes[0]) {
+          eff = cs.modes;
+          src = "chan";
+        } else if (ns.modes[0]) {
+          eff = ns.modes;
+          src = "net";
+        }
+        reply_kv(&r, "want", eff);
+        reply_kv(&r, "want_src", src);
+        reply_kv(&r, "overrides", cs.settings);
+        hub_ban_t *bl = malloc(sizeof(*bl) * MF_BANS_CHAN_MAX);
+        int nb = bl && cn[0] ? hub_ban_list(state, cn, bl, MF_BANS_CHAN_MAX) : 0;
+        free(bl);
+        reply_kvi(&r, "bans", nb);
+      }
       reply_chan(&r, e);
       return send_reply(state, client, &r);
     }
@@ -5586,22 +6475,14 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   }
 
   case CMD_ADMIN_ADD_CHANNEL: {
-    /* "<#chan>|<key>" adds (or re-adds) a channel; "set|<#chan>|<setting>|
-     * <value>" changes one setting of a managed one (channel set).  A
-     * channel name never starts with "set", so the two cannot collide. */
+    /* "<#chan>|<key>" adds (or re-adds) a channel.  (The key as a setting
+     * moved to channel mode +k; channel set is CMD_ADMIN_CHAN_SET.) */
     if (!payload || !payload[0])
       return admin_err(state, client, "channel.usage", "say which channel",
                        "channel add <#chan> [key]");
-    bool set = strncmp(payload, "set|", 4) == 0;
-    char chan[128] = "", setting[32] = "", key[64] = "";
-    if (set) {
-      wire_field(payload, 1, chan, sizeof(chan));
-      wire_field(payload, 2, setting, sizeof(setting));
-      wire_tail(payload, 3, key, sizeof(key));
-    } else {
-      wire_field(payload, 0, chan, sizeof(chan));
-      wire_tail(payload, 1, key, sizeof(key));
-    }
+    char chan[128] = "", key[64] = "";
+    wire_field(payload, 0, chan, sizeof(chan));
+    wire_tail(payload, 1, key, sizeof(key));
     if (!chan_name_valid(chan))
       return admin_err(state, client, "channel.bad_name",
                        "a channel name starts with # or & and has no spaces, "
@@ -5614,30 +6495,15 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                          NULL);
     char old_key[64] = "";
     bool existed = chan_active_key(state, chan, old_key, sizeof(old_key));
-    if (set) {
-      if (!existed) {
-        snprintf(msg, sizeof(msg), "%.64s is not a managed channel", chan);
-        return admin_err(state, client, "channel.not_found", msg, "channel add");
-      }
-      if (strcmp(setting, "key") != 0) {
-        snprintf(msg, sizeof(msg), "unknown channel setting \"%.31s\"", setting);
-        return admin_err(state, client, "channel.unknown_setting", msg,
-                         "settings: key");
-      }
-    }
     chan_store(state, chan, key);
     reply_t r;
     reply_init(&r);
-    reply_ok(&r, set ? "channel.set" : "channel.added");
+    reply_ok(&r, "channel.added");
     reply_kv(&r, "name", chan);
-    if (set) {
-      reply_kv(&r, "setting", "key");
-      if (old_key[0]) reply_kv(&r, "old", old_key);
-      if (key[0]) reply_kv(&r, "value", key);
-    } else {
-      if (key[0]) reply_kv(&r, "key", key);
-      if (old_key[0]) reply_kv(&r, "old_key", old_key);
-      reply_kvb(&r, "existed", existed);
+    if (key[0]) reply_kv(&r, "key", key);
+    if (old_key[0]) reply_kv(&r, "old_key", old_key);
+    reply_kvb(&r, "existed", existed);
+    {
       char ml[4];
       chan_modes_letters(global_channel_modes(state, chan), ml);
       if (ml[0]) reply_kv(&r, "modes", ml);
@@ -5654,7 +6520,10 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     char old_key[64];
     bool existed = chan_active_key(state, payload, old_key, sizeof(old_key));
     secure_wipe(old_key, sizeof(old_key));
-    time_t now = hub_lww_next_ts(hub_storage_global_ts(state, "c", payload));
+    /* One stamp past the channel's c|, C| and every B| line, so the delete
+     * beats all of them: the settings and bans go with the channel. */
+    time_t now = hub_chan_del_stamp(state, payload);
+    hub_chan_cascade_del(state, payload, now, true);
     hub_storage_update_global_entry(state, "c", payload, "", "del", now);
     state->config_dirty = true;
     char sync_msg[256];
@@ -5727,6 +6596,17 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     reply_kvi(&r, "peers", linked_peer_count(state));
     return send_reply(state, client, &r);
   }
+
+  case CMD_ADMIN_CHAN_MODE:
+    return admin_chan_mode(state, client, payload);
+  case CMD_ADMIN_CHAN_SET:
+    return admin_chan_set(state, client, payload);
+  case CMD_ADMIN_BAN:
+    return admin_ban(state, client, payload);
+  case CMD_ADMIN_NET_SET:
+    return admin_net_set(state, client, payload);
+  case CMD_ADMIN_SET_SSH:
+    return admin_set_ssh(state, client, payload);
 
   case CMD_ADMIN_INVITE_USER: {
     char nick[64], channel[64];
@@ -6817,6 +7697,20 @@ static bool send_cmd_to_bot(hub_client_t *bot, uint8_t cmd,
   return ok;
 }
 
+/* A frame that acts on config the bot may not have yet (a `mode` job reads
+ * the C| modes and c| key the console has just stored): send the owed config
+ * push now, past the coalescing window, and queue the frame behind it in
+ * LANE_BULK -- send_cmd_to_bot writes straight to the socket and would
+ * overtake a config still waiting in the bot's queue. */
+static bool send_cmd_to_bot_after_config(hub_state_t *state, hub_client_t *bot,
+                                         uint8_t cmd, const char *payload) {
+  if (state->bot_config_pending) send_owed_bot_config(state, time(NULL));
+  if (!peer_has_pending_writes(bot)) return send_cmd_to_bot(bot, cmd, payload);
+  queued_msg_t *m = queued_msg_new(cmd, LANE_BULK, (const unsigned char *)payload,
+                                   payload ? (int)strlen(payload) : 0);
+  return m && peer_enqueue(bot, m);
+}
+
 static bool chan_kind_valid(const char *kind) {
   return strcmp(kind, "unban") == 0 || strcmp(kind, "invite") == 0 ||
          strcmp(kind, "key") == 0;
@@ -7245,9 +8139,14 @@ static bool ce_try_local(hub_state_t *state, chan_elect_t *e) {
     b->st = 't';
     hub_client_t *c = ce_bot(state, b->uuid);
     char act[MAX_MASK_LEN + 256];
-    snprintf(act, sizeof(act), "%s|%s|%s|%s|%s|%s", e->id, e->kind, e->channel,
-             e->requester, e->nick, e->hostmask);
-    if (!c || !send_cmd_to_bot(c, CMD_CHAN_DO, act)) {
+    bool mode = strcmp(e->kind, "mode") == 0;
+    if (mode)  /* the bot needs only eid|mode|channel */
+      snprintf(act, sizeof(act), "%s|%s|%s", e->id, e->kind, e->channel);
+    else
+      snprintf(act, sizeof(act), "%s|%s|%s|%s|%s|%s", e->id, e->kind, e->channel,
+               e->requester, e->nick, e->hostmask);
+    if (!c || !(mode ? send_cmd_to_bot_after_config(state, c, CMD_CHAN_DO, act)
+                     : send_cmd_to_bot(c, CMD_CHAN_DO, act))) {
       snprintf(b->reason, sizeof(b->reason), "unreachable");
       continue;
     }
@@ -7262,6 +8161,8 @@ static bool ce_try_local(hub_state_t *state, chan_elect_t *e) {
  * many were told. */
 static int ce_legacy_local(hub_state_t *state, chan_elect_t *e) {
   int told = 0;
+  /* "mode" is new in 2.4.5: an older bot has no old-style request for it. */
+  if (strcmp(e->kind, "mode") == 0) return 0;
   for (int i = 0; i < e->bot_n; i++) {
     if (e->bots[i].st != 'a') continue;
     hub_client_t *c = ce_bot(state, e->bots[i].uuid);
@@ -7306,6 +8207,7 @@ static const char *ce_kind_word(const char *kind) {
   return strcmp(kind, "op") == 0       ? "op"
          : strcmp(kind, "invite") == 0 ? "invite"
          : strcmp(kind, "unban") == 0  ? "unban"
+         : strcmp(kind, "mode") == 0   ? "mode"
                                        : "key";
 }
 
@@ -7321,7 +8223,12 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
     hubs++;
   }
   bool ok = strcmp(status, "ok") == 0, leg = strcmp(status, "legacy") == 0;
-  if (ok)
+  bool bitch = strcmp(status, "bitch") == 0;
+  if (bitch)
+    hub_log_info("[CHANREQ] %s %s on %s (id:%s): refused, not authorised and +bitch is on\n",
+                 ce_kind_word(e->kind), e->nick[0] ? e->nick : e->requester, e->channel,
+                 e->id);
+  else if (ok)
     hub_log_info("[CHANREQ] %s %s on %s (id:%s): done by %s on %s\n", ce_kind_word(e->kind),
                  e->nick[0] ? e->nick : e->requester, e->channel, e->id,
                  by_nick && by_nick[0] ? by_nick : by_uuid, hub_name);
@@ -7339,14 +8246,24 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
     hub_client_t *c = state->clients[i];
     if (c->internal && c->fd == e->admin_fd && c->conn_serial == e->admin_serial) admin = c;
   }
-  if (admin) {
+  if (admin && bitch) {
+    /* A bot answered fail|bitch: the nick is not authorised on a +bitch
+     * channel (D12).  Deterministic for that nick, so no other bot is tried. */
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "%.31s is not authorised on %.64s and +bitch is on", e->nick, e->channel);
+    char hint[160];
+    snprintf(hint, sizeof(hint),
+             "add the user as an operator, or channel set %.64s -bitch", e->channel);
+    admin_err(state, admin, "channel.not_authorised", msg, hint);
+  } else if (admin) {
     char code[24];
     snprintf(code, sizeof(code), "channel.%s", e->kind);
     if (ok || leg) {
       reply_t r;
       reply_init(&r);
       reply_ok(&r, code);
-      reply_kv(&r, "nick", e->nick);
+      if (e->nick[0] || strcmp(e->kind, "mode") != 0) reply_kv(&r, "nick", e->nick);
       reply_kv(&r, "chan", e->channel);
       if (ok) {
         reply_kv(&r, "by", by_nick && by_nick[0] ? by_nick : by_uuid);
@@ -7358,6 +8275,17 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
       }
       reply_kvi(&r, "asked", asked);
       reply_kvi(&r, "hubs", hubs);
+      if (strcmp(e->kind, "mode") == 0) {
+        char cn[MAX_CHAN];
+        if (hub_chan_live(state, e->channel, cn, sizeof(cn))) {
+          /* the stored string and the warnings ride the apply answer: it is
+           * the one reply channel mode gets */
+          char eff_chan[MAX_CHAN];
+          snprintf(eff_chan, sizeof(eff_chan), "%s", cn);
+          mf_mode_card_extra(state, &r, eff_chan);
+          mf_reply_old_hubs(state, &r);
+        }
+      }
       send_reply(state, admin, &r);
     } else {
       char msg[256], why[160];
@@ -7365,12 +8293,31 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
       /* Only our own bots' reasons travel; the other hubs send counts. */
       if (!why[0] && !(detail && detail[0]) && asked > 0)
         snprintf(why, sizeof(why), "none is in the channel and opped");
+      if (strcmp(e->kind, "mode") == 0)
+        snprintf(msg, sizeof(msg), "no bot could apply the modes of %s: %d bot%s asked on %d hub%s%s%s",
+                 e->channel, asked, asked == 1 ? "" : "s", hubs, hubs == 1 ? "" : "s",
+                 why[0] || (detail && detail[0]) ? "; " : "",
+                 why[0] ? why : (detail ? detail : ""));
+      else
       snprintf(msg, sizeof(msg), "no bot could %s %s on %s: %d bot%s asked on %d hub%s%s%s",
                ce_kind_word(e->kind), e->nick, e->channel, asked, asked == 1 ? "" : "s", hubs,
                hubs == 1 ? "" : "s", why[0] || (detail && detail[0]) ? "; " : "",
                why[0] ? why : (detail ? detail : ""));
-      admin_err(state, admin, "channel.nobody", msg,
-                "a bot must be in the channel and opped there");
+      if (strcmp(e->kind, "mode") == 0) {
+        /* the modes were stored before the election: say so, and warn about
+         * older hubs here too (D38) */
+        reply_t er;
+        reply_init(&er);
+        reply_err(&er, "channel.nobody", msg,
+                  "the modes are stored; a bot must be in the channel and opped there to "
+                  "apply them (channel mode again)");
+        reply_kvb(&er, "stored", true);
+        mf_reply_old_hubs(state, &er);
+        send_reply(state, admin, &er);
+      } else {
+        admin_err(state, admin, "channel.nobody", msg,
+                  "a bot must be in the channel and opped there");
+      }
     }
   }
   e->active = false;
@@ -7417,7 +8364,7 @@ static void ce_try_hub(hub_state_t *state, chan_elect_t *e) {
   int legacy = ce_legacy_local(state, e);
   for (int i = 0; i < e->hub_n; i++) {
     chan_elect_hub_t *h = &e->hubs[i];
-    if (h->silent <= 0) continue;
+    if (h->silent <= 0 || strcmp(e->kind, "mode") == 0) continue;
     hub_client_t *p = ce_peer(state, h->fd);
     char buf[160];
     snprintf(buf, sizeof(buf), "%s|%s|legacy", e->id, h->uuid);
@@ -7530,6 +8477,19 @@ static void process_chan_done(hub_state_t *state, hub_client_t *client,
     }
     return;
   }
+  /* fail|bitch: not authorised on a +bitch channel.  The answer is about the
+   * nick, not the bot, so it ends the election (D12). */
+  if (strcmp(status, "fail") == 0 && strcmp(clean, "bitch") == 0 &&
+      strcmp(e->kind, "op") == 0) {
+    if (e->origin)
+      ce_finish(state, e, "bitch", client->id, b ? b->nick : "", hub_display_name(state),
+                clean, 0);
+    else {
+      ce_done_up(state, e, client->id, b ? b->nick : "", "fail", clean);
+      e->phase = CE_ACKED;
+    }
+    return;
+  }
   if (b) roster_clean(b->reason, sizeof(b->reason), clean[0] ? clean : "failed");
   e->doing[0] = '\0';
   if (!ce_try_local(state, e)) ce_local_exhausted(state, e);
@@ -7544,7 +8504,7 @@ static void process_chan_elect_fwd(hub_state_t *state, hub_client_t *client,
       !wire_field(payload, 2, kind, sizeof(kind)) ||
       !wire_field(payload, 3, channel, sizeof(channel)) ||
       !wire_field(payload, 4, requester, sizeof(requester)) || !id[0] ||
-      (!chan_kind_valid(kind) && strcmp(kind, "op") != 0) ||
+      (!chan_kind_valid(kind) && strcmp(kind, "op") != 0 && strcmp(kind, "mode") != 0) ||
       (channel[0] != '#' && channel[0] != '&')) {
     hub_log_warning("[CHANREQ] Malformed CHAN_ELECT_FWD from peer fd=%d\n", client->fd);
     return;
@@ -7662,8 +8622,20 @@ static void process_chan_elect_done(hub_state_t *state, hub_client_t *client,
   roster_clean(cd, sizeof(cd), detail);
   if (strcmp(status, "ok") == 0)
     ce_finish(state, e, "ok", cb, ck, cn, cd, 0);
+  else if (strcmp(status, "fail") == 0 && strcmp(cd, "bitch") == 0 &&
+           strcmp(e->kind, "op") == 0)
+    ce_finish(state, e, "bitch", cb, ck, cn, cd, 0);
   else
     ce_try_hub(state, e);
+}
+
+/* Console entry point: apply a channel's stored modes once (kind "mode").
+ * One elected bot reads the stored C| modes and the c| key and sends the MODE
+ * line(s); the answer reaches `admin` when the election ends. */
+bool hub_chan_mode_apply(hub_state_t *state, const char *channel,
+                         const hub_client_t *admin) {
+  if (!channel || (channel[0] != '#' && channel[0] != '&')) return false;
+  return ce_start(state, "mode", channel, "ADMIN", "", "", admin);
 }
 
 /* A console disconnected: the elections it waits on still finish and log,
@@ -7814,6 +8786,9 @@ static bool console_admin_op(int cmd) {
   case CMD_ADMIN_LIST_CHANNELS:   case CMD_ADMIN_ADD_CHANNEL:
   case CMD_ADMIN_DEL_CHANNEL:     case CMD_ADMIN_OP_USER:
   case CMD_ADMIN_INVITE_USER:
+  case CMD_ADMIN_CHAN_MODE:       case CMD_ADMIN_CHAN_SET:
+  case CMD_ADMIN_BAN:             case CMD_ADMIN_NET_SET:
+  case CMD_ADMIN_SET_SSH:
   case CMD_ADMIN_UPGRADE_NET:     case CMD_ADMIN_UPGRADE_STATUS:
     return true;
   default:
@@ -7852,6 +8827,10 @@ static bool hub_admin_cmd_mutates_config(int cmd) {
   case CMD_ADMIN_DEL_USERMASK:
   case CMD_ADMIN_SET_PEER_PUBKEY:
   case CMD_ADMIN_SET_USERKEY:
+  case CMD_ADMIN_CHAN_MODE:   /* the changing forms only: mf_payload_mutates */
+  case CMD_ADMIN_CHAN_SET:
+  case CMD_ADMIN_BAN:
+  case CMD_ADMIN_NET_SET:
     return true;
   default:
     return false;
@@ -10624,6 +11603,10 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     process_chan_done(state, client, payload);
     break;
 
+  case CMD_CHAN_EVENT:
+    hub_chan_event_receive(state, client, payload);
+    break;
+
   case CMD_INVITE_REQUEST: {
     /* Payload: nick|#channel — broadcast to all other bots, forward to peers */
     char inv_nick[64], inv_chan[64];
@@ -11291,11 +12274,44 @@ int hub_console_tree_rows(hub_state_t *state, char *buf, int max_len) {
   return hub_build_tree(state, buf, max_len);
 }
 
-void hub_console_record_failed_auth(hub_state_t *state, const char *ip) {
-  record_failed_auth(state, ip);
+/* A refused SSH login (FAIL frame): counted in the SSH-only table (D26), so an
+ * admin's mistyped keys never block a bot or peer on the same address. */
+void hub_console_ssh_failed(hub_state_t *state, const char *ip) {
+  if (state->trust_loopback &&
+      (strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0)) return;
+  int blk = 0;
+  hub_ssh_table_failed(state->ssh_ips, &state->ssh_ip_count, &state->conn_cfg, ip,
+                       time(NULL), &blk);
+  if (blk > 0)
+    hub_log_warning("[AUTH_BLOCK] SSH from %s blocked for %d seconds (too many refused "
+                    "logins)\n", ip, blk);
 }
 
-void hub_console_note_login(hub_state_t *state, const char *name) {
+/* The connection from `ip` just sniffed as SSH: the console scope of the ACL
+ * (D27), then the SSH block and connect window.  False = close it. */
+bool hub_console_ssh_admit(hub_state_t *state, const char *ip) {
+  if (!hub_ip_acl_permits_console(state, ip)) {
+    hub_log_warning("[ACCESS_CONTROL] SSH from %s refused (console scope of the "
+                    "allow/deny lists)\n", ip);
+    return false;
+  }
+  if (state->trust_loopback &&
+      (strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0)) return true;
+  int blk = 0;
+  if (hub_ssh_table_connect(state->ssh_ips, &state->ssh_ip_count, &state->conn_cfg, ip,
+                            time(NULL), &blk))
+    return true;
+  if (blk > 0)
+    hub_log_warning("[RATE_LIMIT] SSH from %s connecting too fast; blocked for %d "
+                    "seconds\n", ip, blk);
+  else
+    hub_log_info("[RATE_LIMIT] SSH from %s refused (blocked)\n", ip);
+  return false;
+}
+
+void hub_console_note_login(hub_state_t *state, const char *name, const char *ip) {
+  if (!(state->trust_loopback && (strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0)))
+    hub_ssh_table_success(state->ssh_ips, &state->ssh_ip_count, ip, time(NULL));
   for (int i = 0; i < state->user_record_count; i++) {
     hub_user_record_t *u = &state->user_records[i];
     if (u->type == 'a' && u->is_active && strcmp(u->name, name) == 0) {

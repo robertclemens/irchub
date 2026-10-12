@@ -186,6 +186,14 @@ void hub_config_write(hub_state_t *state) {
   if (state->log_max_size > 0 && state->log_max_size != HUB_LOG_FILE_SIZE)
     SAFE_WRITE("log_size|%d\n", state->log_max_size);
 
+  /* hub set ssh / hub set conn: ssh|<name>|<value> and conn|<name>|<value>,
+   * only for values that differ from the built-ins. */
+  {
+    char cl[1024];
+    size_t cn = hub_conn_cfg_lines(&state->conn_cfg, cl, sizeof(cl));
+    if (cn != (size_t)-1 && cn > 0) SAFE_WRITE("%s", cl);
+  }
+
   // Write purge_days setting (only if enabled)
   if (state->purge_days_setting > 0) {
     SAFE_WRITE("purge_days|%d\n", state->purge_days_setting);
@@ -283,11 +291,11 @@ void hub_config_write(hub_state_t *state) {
 
   // Local IP access lists: w|<pattern>|<added> (allow), x|... (deny)
   for (int i = 0; i < state->ip_allow_count; i++)
-    SAFE_WRITE("w|%s|%ld\n", state->ip_allow[i].pattern,
-               (long)state->ip_allow[i].added);
+    SAFE_WRITE("%s|%s|%ld\n", state->ip_allow[i].console ? "wc" : "w",
+               state->ip_allow[i].pattern, (long)state->ip_allow[i].added);
   for (int i = 0; i < state->ip_deny_count; i++)
-    SAFE_WRITE("x|%s|%ld\n", state->ip_deny[i].pattern,
-               (long)state->ip_deny[i].added);
+    SAFE_WRITE("%s|%s|%ld\n", state->ip_deny[i].console ? "xc" : "x",
+               state->ip_deny[i].pattern, (long)state->ip_deny[i].added);
 
   // Write named admin/oper records (a| and o| lines) — every record: a name
   // added, deleted and added again has one record per incarnation (each its
@@ -441,7 +449,7 @@ void hub_config_write(hub_state_t *state) {
  * guessed at (the old matcher read "10.0.0.0/" as /0, i.e. every address).
  * False when the line should not stay in the file as written: dropped, a
  * duplicate, or not in canonical form. */
-static bool load_ip_acl_line(hub_state_t *state, char list, char *v) {
+static bool load_ip_acl_line(hub_state_t *state, char list, char *v, bool console) {
   const char *name = list == 'w' ? "allowlist" : "denylist";
   char *s_ts = strrchr(v, '|');
   if (!s_ts) {
@@ -464,6 +472,7 @@ static bool load_ip_acl_line(hub_state_t *state, char list, char *v) {
     return false;
   }
   e.added = (time_t)atoll(s_ts + 1);
+  e.console = console;
   ip_acl_add_t r = hub_ip_acl_add(state, list, &e);
   if (r == IP_ACL_FULL)
     hub_log_warning("[CONFIG] %s full (%d); dropping %s\n", name, MAX_IP_ACL_ENTRIES,
@@ -820,7 +829,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       // Older layout of the local IP lists: g|<w|x>|<pattern>|<ts>
       else if (strcmp(k, "g") == 0 &&
                (strncmp(v, "w|", 2) == 0 || strncmp(v, "x|", 2) == 0)) {
-        load_ip_acl_line(state, v[0], v + 2);
+        load_ip_acl_line(state, v[0], v + 2, false);
         cfg_acl_fixed++;  /* rewrite as w|/x| */
       }
       // NEW: Handle Global Entries (g|key|value|timestamp)
@@ -936,12 +945,29 @@ bool hub_config_load(hub_state_t *state, const char *password) {
             }
           }
         }
+      } else if (strcmp(k, "C") == 0 || strcmp(k, "D") == 0 || strcmp(k, "B") == 0) {
+        /* 2.4.5 records: key|value|ts.  The same ingest point as the wire, so a
+         * hand-edited or damaged line is dropped, not trusted.  Case variants
+         * of one channel / mask (from an older c|-style store) merge there,
+         * newest stamp wins. */
+        char *s_ts = strrchr(v, '|');
+        if (s_ts) {
+          *s_ts = 0;
+          hub_storage_put_record(state, k, v, (time_t)atoll(s_ts + 1));
+        }
       } else if (strcmp(k, "p") == 0) {
         /* Retired shared bot password: dropped (bots use public keys). */
         cfg_legacy_users++;
-      } else if (strcmp(k, "w") == 0 || strcmp(k, "x") == 0) {
-        if (!load_ip_acl_line(state, k[0], v))
+      } else if (strcmp(k, "w") == 0 || strcmp(k, "x") == 0 ||
+                 strcmp(k, "wc") == 0 || strcmp(k, "xc") == 0) {
+        if (!load_ip_acl_line(state, k[0], v, k[1] == 'c'))
           cfg_acl_fixed++;
+      } else if (strcmp(k, "ssh") == 0 || strcmp(k, "conn") == 0) {
+        /* an invalid line leaves the built-in: a damaged file never loosens
+         * a limit below its floor */
+        if (!hub_conn_cfg_load(&state->conn_cfg, k[0] == 's' ? HUB_CONN_SSH : HUB_CONN_CONN, v))
+          hub_log_warning("[CONFIG] Ignoring invalid %s setting '%.40s'\n", k, v);
+        hub_conn_cfg_fix(&state->conn_cfg);
       }
     }
     line = strtok_r(NULL, "\n", &saveptr);
