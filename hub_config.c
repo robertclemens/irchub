@@ -147,7 +147,7 @@ void hub_config_write(hub_state_t *state) {
   if (g_hub_config_readonly) return;
   int estimated_size = (int)(HUB_CONFIG_FIXED_MAX +
                              (size_t)state->bot_count * HUB_CONFIG_PER_BOT_MAX);
-  char *buffer = malloc(estimated_size);
+  char *buffer = malloc((size_t)estimated_size);
   if (!buffer)
     return;
 
@@ -158,7 +158,8 @@ void hub_config_write(hub_state_t *state) {
   do {                                                                         \
     if (!overflow) {                                                           \
       written =                                                                \
-          snprintf(buffer + offset, estimated_size - offset, __VA_ARGS__);     \
+          snprintf(buffer + offset, (size_t)(estimated_size - offset),         \
+                   __VA_ARGS__);                                               \
       if (written < 0 || written >= (estimated_size - offset)) {               \
         overflow = true;                                                       \
       } else {                                                                 \
@@ -333,7 +334,11 @@ void hub_config_write(hub_state_t *state) {
     if (b->uuid[0] == 0)
       continue;
 
-    SAFE_WRITE("b|%s|t|%ld\n", b->uuid, (long)b->last_sync_time);
+    /* t is the authorization stamp (bot approve / bot authorize); for a uuid
+     * authorized before it first connects it is the only line that keeps
+     * the record.  A bot added with its key never has one: no t|0 line. */
+    if (b->last_sync_time > 0)
+      SAFE_WRITE("b|%s|t|%ld\n", b->uuid, (long)b->last_sync_time);
 
     for (int j = 0; j < b->entry_count; j++) {
       // Special handling for "seen" and "t" - omit value field
@@ -366,7 +371,7 @@ void hub_config_write(hub_state_t *state) {
   if (RAND_bytes(salt, sizeof(salt)) != 1 ||
       RAND_bytes(iv,   sizeof(iv))   != 1) {
     hub_log_error("[HUB] RAND_bytes failed; aborting config write\n");
-    secure_wipe(buffer, offset);
+    secure_wipe(buffer, (size_t)offset);
     free(buffer);
     return;
   }
@@ -381,14 +386,14 @@ void hub_config_write(hub_state_t *state) {
   secure_wipe(plain_pass, sizeof(plain_pass));
   if (!pbkdf2_ok) {
     hub_log_error("[HUB] PBKDF2 failed\n");
-    secure_wipe(buffer, offset);
+    secure_wipe(buffer, (size_t)offset);
     free(buffer);
     return;
   }
 
-  unsigned char *ciphertext = malloc(offset + 16);
+  unsigned char *ciphertext = malloc((size_t)(offset + 16));
   if (!ciphertext) {
-    secure_wipe(buffer, offset);
+    secure_wipe(buffer, (size_t)offset);
     free(buffer);
     return;
   }
@@ -397,7 +402,7 @@ void hub_config_write(hub_state_t *state) {
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
   if (!ctx) {
     free(ciphertext);
-    secure_wipe(buffer, offset);
+    secure_wipe(buffer, (size_t)offset);
     free(buffer);
     return;
   }
@@ -412,7 +417,7 @@ void hub_config_write(hub_state_t *state) {
     secure_wipe(key, sizeof(key));
     secure_wipe(ciphertext, (size_t)offset + 16);
     free(ciphertext);
-    secure_wipe(buffer, offset);
+    secure_wipe(buffer, (size_t)offset);
     free(buffer);
     return;
   }
@@ -429,7 +434,7 @@ void hub_config_write(hub_state_t *state) {
     fwrite(salt, 1, SALT_SIZE, fp);
     fwrite(iv, 1, GCM_IV_LEN, fp);
     fwrite(tag, 1, GCM_TAG_LEN, fp);
-    fwrite(ciphertext, 1, cipher_len, fp);
+    fwrite(ciphertext, 1, (size_t)cipher_len, fp);
     fflush(fp);
     fsync(fileno(fp));
     fclose(fp);
@@ -438,9 +443,9 @@ void hub_config_write(hub_state_t *state) {
 
   // ADDED: Secure cleanup
   secure_wipe(key, sizeof(key));
-  secure_wipe(ciphertext, cipher_len);
+  secure_wipe(ciphertext, (size_t)cipher_len);
   free(ciphertext);
-  secure_wipe(buffer, offset);
+  secure_wipe(buffer, (size_t)offset);
   free(buffer);
 }
 
@@ -525,13 +530,13 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   }
 
   fseek(fp, SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN, SEEK_SET);
-  unsigned char *ciphertext = malloc(cipher_len);
+  unsigned char *ciphertext = malloc((size_t)cipher_len);
   if (!ciphertext) {
     fclose(fp);
     return false;
   }
 
-  if (fread(ciphertext, 1, cipher_len, fp) != (size_t)cipher_len) {
+  if (fread(ciphertext, 1, (size_t)cipher_len, fp) != (size_t)cipher_len) {
     hub_log_error("[HUB] Failed to read ciphertext\n");
     free(ciphertext);
     fclose(fp);
@@ -541,14 +546,14 @@ bool hub_config_load(hub_state_t *state, const char *password) {
 
   // FIXED: Use PBKDF2 instead of EVP_BytesToKey
   unsigned char key[32];
-  if (PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_SIZE,
+  if (PKCS5_PBKDF2_HMAC(password, (int)strlen(password), salt, SALT_SIZE,
                         PBKDF2_ITERATIONS, EVP_sha256(), 32, key) != 1) {
     hub_log_error("[HUB] PBKDF2 failed\n");
     free(ciphertext);
     return false;
   }
 
-  unsigned char *plaintext = malloc(cipher_len + 1);
+  unsigned char *plaintext = malloc((size_t)(cipher_len + 1));
   if (!plaintext) {
     secure_wipe(key, sizeof(key));
     free(ciphertext);
@@ -565,7 +570,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   }
 
   if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
-      EVP_DecryptUpdate(ctx, plaintext, &plain_len, ciphertext, cipher_len) != 1 ||
+      EVP_DecryptUpdate(ctx, plaintext, &plain_len, ciphertext, (int)cipher_len) != 1 ||
       EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag) != 1 ||
       EVP_DecryptFinal_ex(ctx, plaintext + plain_len, &len) <= 0) {
     hub_log_error("[HUB] Config decryption failed (wrong password or corrupted file)\n");
@@ -701,7 +706,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           hub_log_error("[HUB] Hub private key in config is not 64 bytes "
                   "(legacy RSA?). Re-run -setup with a Curve25519 key.\n");
         }
-        if (d) { secure_wipe(d, out); free(d); }
+        if (d) { secure_wipe(d, (size_t)out); free(d); }
       } else if (strcmp(k, "pub") == 0) {
         int out;
         unsigned char *d = base64_decode(v, &out);
@@ -1102,7 +1107,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
               u->type == 'a' ? "Admin" : "Oper", u->name);
   }
 
-  secure_wipe(plaintext, plain_len);
+  secure_wipe(plaintext, (size_t)plain_len);
   free(plaintext);
   return true;
 }

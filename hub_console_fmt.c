@@ -799,7 +799,7 @@ static void when_ago(const fmt_ctx_t *ctx, long long ts, char *out, size_t cap) 
   }
   fmt_when(ts, ctx->now, w, sizeof(w));
   fmt_span(ctx->now - ts, s, sizeof(s));
-  snprintf(out, cap, "%s %s %s", w, GL(G_DOT), s);
+  if (snprintf(out, cap, "%s %s %s", w, GL(G_DOT), s) < 0) out[0] = '\0';
 }
 
 static void span_since(const fmt_ctx_t *ctx, long long ts, char *out, size_t cap) {
@@ -857,7 +857,7 @@ static sortrow_t *collect(const creply_t *rep, const char *type, const char *nam
     if (strcmp(r->type, type)) continue;
     sortrow_t *s = &v[(*n)++];
     s->r = r;
-    s->on = on_key ? (int)rvb(r, on_key) : 0;
+    s->on = on_key && rvb(r, on_key) ? 1 : 0;
     s->name = rv(r, name_key) ? rv(r, name_key) : "";
     s->uuid = rv(r, "uuid") ? rv(r, "uuid") : "";
     s->idx = i;
@@ -1381,9 +1381,10 @@ static void render_peer_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
   sb_reset(&s);
   if (rv(r, "bots")) {
     sb_addf(&s, "%lld", rvi(r, "bots", 0));
-    if (rvs(r, "bots_list")) {
+    const char *bots_list = rvs(r, "bots_list");
+    if (bots_list) {
       sb_add(&s, " (");
-      for (const char *p = rv(r, "bots_list"); *p; p++) sb_add(&s, *p == ',' ? ", " : (char[2]){*p, 0});
+      for (const char *p = bots_list; *p; p++) sb_add(&s, *p == ',' ? ", " : (char[2]){*p, 0});
       sb_add(&s, ")");
     }
     fmt_card_line(ctx, out, L, "bots", s.p, RL_NORMAL);
@@ -2264,6 +2265,7 @@ static void render_channel_list(const fmt_ctx_t *ctx, const creply_t *rep, fline
 
 static const char *modes_source_phrase(const char *src);
 static void overrides_phrase(const char *ov, char *out, size_t cap);
+static bool settings_card(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out, int L);
 
 static void render_channel_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   const crec_t *c = NULL;
@@ -2284,9 +2286,11 @@ static void render_channel_show(const fmt_ctx_t *ctx, const creply_t *rep, fline
     if (rvs(c, "modes")) snprintf(v, sizeof(v), "+%s   (i and k as last reported by a bot)", rv(c, "modes"));
     else snprintf(v, sizeof(v), "not reported");
     fmt_card_line(ctx, out, L, "live modes", v, RL_NORMAL);
-    char ov[512];
-    overrides_phrase(rv(res, "overrides"), ov, sizeof(ov));
-    fmt_card_line(ctx, out, L, "settings", ov[0] ? ov : "all default", RL_NORMAL);
+    if (!settings_card(ctx, rep, out, L)) {
+      char ov[512];
+      overrides_phrase(rv(res, "overrides"), ov, sizeof(ov));
+      fmt_card_line(ctx, out, L, "settings", ov[0] ? ov : "all default", RL_NORMAL);
+    }
     snprintf(v, sizeof(v), "%lld", rvi(res, "bans", 0));
     fmt_card_line(ctx, out, L, "bans", v, RL_NORMAL);
   } else {
@@ -2383,6 +2387,67 @@ static void render_channel_change(const fmt_ctx_t *ctx, const creply_t *rep, fli
 static const char *const FLAG_SETTINGS[] = {
   "enforcemodes", "bitch", "protectops", "revenge", "stopnethack", "enforcebans",
   "dynamicbans", "dontkickops", "cycle", "dynamiclimit", NULL};
+
+/* What each setting does and its built-in value, as people read them: help
+ * channel set / help network set, the settings tables, channel show.  Names
+ * as those show them; the bot floods (net) are flood cmd|msg|ctcp, the
+ * words network set takes.  docs/modes.md §4, §8.1, §9.1. */
+static const struct {
+  const char *name, *def, *what;
+  bool        net;
+} SET_INFO[] = {
+  {"enforcemodes", "off", "put back any change away from the stored modes", false},
+  {"bitch", "off", "only authorised users and bots may hold ops", false},
+  {"protectops", "on", "re-op an authorised member someone deopped; lift bans on one", false},
+  {"revenge", "off", "deop whoever deops, kicks or bans an authorised member; again: kick + ban", false},
+  {"stopnethack", "off", "take back ops a netsplit rejoin gave to unauthorised members", false},
+  {"enforcebans", "off", "kick the unauthorised members a new ban matches", false},
+  {"dynamicbans", "on", "set a listed ban only while someone it matches is in the channel", false},
+  {"dontkickops", "on", "ops are never acted on for chan, ctcp, join and nick floods", false},
+  {"cycle", "on", "a bot alone in a channel with no ops parts and rejoins for ops", false},
+  {"dynamiclimit", "off", "keep +l at the member count plus limitgap", false},
+  {"bantime", "120 min", "how long an automatic ban (flood, revenge) lasts; 0 = permanent", false},
+  {"bantype", "2", "ban mask shape 0-9: 2 = *!*@host, 4 = *!*@*.host, 7 = nick!*@host", false},
+  {"banidle", "60 min", "dynamicbans: a listed ban with no match this long is lifted", false},
+  {"limitgap", "5", "dynamiclimit: free places above the member count", false},
+  {"limitdelay", "60 s", "dynamiclimit: time between limit changes", false},
+  {"flood chan", "15:60", "messages to the channel per host: kick, again: ban", false},
+  {"flood ctcp", "3:60", "CTCPs to the channel per host: kick, again: ban", false},
+  {"flood join", "5:60", "joins per host (join/part cycling): ban + kick", false},
+  {"flood nick", "5:60", "nick changes per host: kick, again: ban", false},
+  {"flood deop", "3:10", "deops by an unauthorised op: deop them, re-op the victims", false},
+  {"flood kick", "3:10", "kicks by an unauthorised op: deop them, again: kick + ban", false},
+  {"flood ban", "3:10", "bans by an unauthorised op: deop them, lift bans on authorised", false},
+  {"flood cmd", "10:30", "commands per user: extras dropped; 3x the rate ignores the user", true},
+  {"flood msg", "5:60", "other messages to a bot per host: the host is ignored", true},
+  {"flood ctcp", "3:60", "CTCPs to a bot per host: the host is ignored", true},
+  {"ignoretime", "10 min", "how long a flooding host or user stays ignored", true},
+  {"sendq", "10:100", "a bot's IRC output: B lines at once, then one every I ms", true},
+};
+#define NSETINFO ((int)(sizeof(SET_INFO) / sizeof(SET_INFO[0])))
+
+bool fmt_setting_info(int i, bool net, const char **name, const char **def,
+                      const char **what) {
+  int k = -1;
+  for (int j = 0; j < NSETINFO; j++)
+    if (SET_INFO[j].net == net && ++k == i) {
+      *name = SET_INFO[j].name;
+      *def = SET_INFO[j].def;
+      *what = SET_INFO[j].what;
+      return true;
+    }
+  return false;
+}
+
+static const char *setting_what(const char *name, bool net, const char **def) {
+  for (int j = 0; j < NSETINFO; j++)
+    if (SET_INFO[j].net == net && !strcmp(SET_INFO[j].name, name)) {
+      if (def) *def = SET_INFO[j].def;
+      return SET_INFO[j].what;
+    }
+  if (def) *def = NULL;
+  return NULL;
+}
 
 static bool is_flag_setting(const char *name) {
   for (int i = 0; FLAG_SETTINGS[i]; i++)
@@ -2503,16 +2568,18 @@ static void render_settings_table(const fmt_ctx_t *ctx, const creply_t *rep, fli
     snprintf(right, sizeof(right), "%d %s", overrides, net_target ? "changed" : "of its own");
   }
   fmt_title(ctx, out, title, right);
-  static const col_t cols[] = {{"SETTING", 'L', 1}, {"VALUE", 'L', 1}, {"FROM", 'L', 1}};
+  static const col_t cols[] = {{"SETTING", 'L', 1}, {"VALUE", 'L', 1}, {"FROM", 'L', 1},
+                               {"DEFAULT", 'L', 1}, {"WHAT IT DOES", 'L', 2}};
   tbl_t t;
-  tbl_init(&t, cols, 3, -1, 0, 0);
+  tbl_init(&t, cols, 5, -1, 0, 1);
   for (int i = 0; i < rep->n; i++) {
     const crec_t *c = &rep->r[i];
     if (strcmp(c->type, "setting")) continue;
     char val[48];
-    const char *name = rv(c, "name") ? rv(c, "name") : "?";
+    const char *name = rv(c, "name") ? rv(c, "name") : "?", *def = NULL;
+    const char *what = setting_what(name, network, &def);
     setting_value(name, rv(c, "kind"), rv(c, "value"), val, sizeof(val));
-    const char *cells[3] = {name, val, src_phrase(rv(c, "src"))};
+    const char *cells[5] = {name, val, src_phrase(rv(c, "src")), def, what};
     tbl_row(ctx, &t, RL_NORMAL, NULL, cells);
   }
   if (!rows) {
@@ -2678,6 +2745,54 @@ static void render_ban_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
 
 /* The settings a channel overrides ("bitch=1,flood join=5:60") as a person
  * would type them: +bitch, flood join 5:60. */
+/* channel show: every setting's value from its setting records, on lines
+ * (options on, options off, values, message floods, op floods), the
+ * channel's own marked '*',
+ * then whether it is all default.  False: no setting records (an older hub). */
+static bool settings_card(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out, int L) {
+  sb_t ln[5] = {{0}};
+  int own = 0, rows = 0;
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *c = &rep->r[i];
+    if (strcmp(c->type, "setting")) continue;
+    const char *name = rv(c, "name") ? rv(c, "name") : "?";
+    const char *src = rv(c, "src"), *mark = "";
+    if (src && !strcmp(src, "chan")) {
+      mark = "*";
+      own++;
+    }
+    rows++;
+    char val[48];
+    setting_value(name, rv(c, "kind"), rv(c, "value"), val, sizeof(val));
+    if (is_flag_setting(name)) {
+      bool on = !strcmp(val, "on");
+      sb_t *b = &ln[on ? 0 : 1];
+      sb_addf(b, "%s%c%s%s", b->len ? " " : "", on ? '+' : '-', name, mark);
+    } else if (!strncmp(name, "flood ", 6)) {
+      /* the message floods, then the op floods (deop kick ban) */
+      sb_t *b = &ln[strstr(" deop kick ban ", name + 5) ? 4 : 3];
+      if (b->len) sb_addf(b, " %s ", GL(G_DOT));
+      else sb_add(b, "flood ");
+      sb_addf(b, "%s %s%s", name + 6, val, mark);
+    } else {
+      if (ln[2].len) sb_addf(&ln[2], " %s ", GL(G_DOT));
+      sb_addf(&ln[2], "%s %s%s", name, val, mark);
+    }
+  }
+  if (rows) {
+    const char *label = "settings";
+    for (int k = 0; k < 5; k++) {
+      if (!ln[k].len) continue;
+      fmt_card_line(ctx, out, L, label, ln[k].p, RL_NORMAL);
+      label = "";
+    }
+    fmt_card_line(ctx, out, L, "", own ? "(* set on this channel, the rest default settings)"
+                                       : "(default settings)", RL_DIM);
+  }
+  for (int k = 0; k < 5; k++) sb_free(&ln[k]);
+  return rows > 0;
+}
+
 static void overrides_phrase(const char *ov, char *out, size_t cap) {
   size_t o = 0;
   out[0] = '\0';
@@ -2814,39 +2929,71 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
   tbl_free(&t);
 }
 
+/* Version order for the releases list: a leading v is ignored, digit runs
+ * compare as numbers, anything else byte by byte ("2.4.10" > "2.4.9"). */
+static int ver_cmp(const char *a, const char *b) {
+  if (*a == 'v' || *a == 'V') a++;
+  if (*b == 'v' || *b == 'V') b++;
+  while (*a || *b) {
+    if (isdigit((unsigned char)*a) && isdigit((unsigned char)*b)) {
+      while (*a == '0') a++;
+      while (*b == '0') b++;
+      size_t la = 0, lb = 0;
+      while (isdigit((unsigned char)a[la])) la++;
+      while (isdigit((unsigned char)b[lb])) lb++;
+      if (la != lb) return la < lb ? -1 : 1;
+      int c = strncmp(a, b, la);
+      if (c) return c < 0 ? -1 : 1;
+      a += la;
+      b += lb;
+    } else {
+      if (*a != *b) return (unsigned char)*a < (unsigned char)*b ? -1 : 1;
+      a++;
+      b++;
+    }
+  }
+  return 0;
+}
+
+/* Only the releases newer than the oldest version a node of that product
+ * runs: those are the ones a run can still move a node to.  The nodes list
+ * below shows what each node runs. */
 static void render_upg_releases(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   for (int prod = 0; prod < 2; prod++) {
     const char *p = prod == 0 ? "bot" : "hub";
     const char *base = rv(&rep->res, prod == 0 ? "bot_base" : "hub_base");
+    const char *oldest = NULL;
+    for (int k = 0; k < rep->n; k++) {
+      const crec_t *nd = &rep->r[k];
+      const char *kind = rv(nd, "kind") ? rv(nd, "kind") : "";
+      if (strcmp(nd->type, "node") || !rvs(nd, "ver") || (prod == 0) != !strcmp(kind, "bot")) continue;
+      if (!oldest || ver_cmp(rv(nd, "ver"), oldest) < 0) oldest = rv(nd, "ver");
+    }
     fmt_title(ctx, out, prod == 0 ? "Bot releases" : "Hub releases",
               base && *base ? base : prod == 0 ? "ircbot-releases (default base)" : "this hub's release base");
-    static const col_t cols[] = {{"VERSION", 'L', 1}, {"DATE", 'L', 1}, {"CODE", 'L', 1},
-                                 {"NODES ON IT", 'R', 1}};
+    static const col_t cols[] = {{"VERSION", 'L', 1}, {"DATE", 'L', 1}, {"CODE", 'L', 1}};
     tbl_t t;
-    tbl_init(&t, cols, 4, -1, 0, 0);
+    tbl_init(&t, cols, 3, -1, 0, 0);
+    int listed = 0;
     for (int i = 0; i < rep->n; i++) {
       const crec_t *r = &rep->r[i];
       if (strcmp(r->type, "rel") || !rv(r, "product") || strcmp(rv(r, "product"), p)) continue;
-      int on = 0;
-      for (int k = 0; k < rep->n; k++) {
-        const crec_t *nd = &rep->r[k];
-        if (strcmp(nd->type, "node") || !rv(nd, "ver") || !rv(r, "ver") ||
-            strcmp(rv(nd, "ver"), rv(r, "ver")))
-          continue;
-        const char *kind = rv(nd, "kind") ? rv(nd, "kind") : "";
-        if ((prod == 0) == !strcmp(kind, "bot")) on++;
-      }
-      char bases[32], cnt[16];
+      listed++;
+      if (oldest && rv(r, "ver") && ver_cmp(rv(r, "ver"), oldest) <= 0) continue;
+      char bases[32];
       snprintf(bases, sizeof(bases), "%s", rv(r, "bases") ? rv(r, "bases") : "");
       sb_t bb = {0};
       for (const char *q = bases; *q; q++) sb_add(&bb, *q == ',' ? ", " : (char[2]){*q, 0});
-      snprintf(cnt, sizeof(cnt), "%d", on);
-      const char *cells[4] = {rv(r, "ver"), rv(r, "date"), bb.p ? bb.p : "", on ? cnt : ""};
+      const char *cells[3] = {rv(r, "ver"), rv(r, "date"), bb.p ? bb.p : ""};
       tbl_row(ctx, &t, RL_NORMAL, NULL, cells);
       sb_free(&bb);
     }
     if (t.nr) tbl_render(ctx, out, &t);
+    else if (listed) line(out, RL_DIM, "  (none newer than %s, the oldest %s version running)", oldest, p);
     else line(out, RL_DIM, "  (no releases listed)");
+    if (t.nr && listed > t.nr)
+      line(out, RL_DIM, "  %d older release%s not shown (every %s runs %s or later)", listed - t.nr,
+           listed - t.nr == 1 ? "" : "s", p, oldest);
     tbl_free(&t);
     for (int i = 0; i < rep->n; i++) {
       const crec_t *r = &rep->r[i];
@@ -2887,7 +3034,7 @@ static void render_upg_releases(const fmt_ctx_t *ctx, const creply_t *rep, fline
   free(nodes);
   tbl_render(ctx, out, &t);
   tbl_free(&t);
-  line(out, RL_DIM, "  start a run: upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>]");
+  line(out, RL_DIM, "  start a run: upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>]");
 }
 
 static void render_upg_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
@@ -3177,7 +3324,6 @@ static int wrap_indent(const char *t, int W) {
   while (sp < n && t[sp] == ' ') sp++;
   int ind;
   if (sp - e >= 2 && sp < n) ind = width_n(t, sp);
-  else if (width_n(t + lead, e - lead) == 1) ind = (int)lead + 2;
   else ind = (int)lead + 2;
   if (ind > W / 2) ind = (int)lead + 2;
   return ind;

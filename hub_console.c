@@ -92,7 +92,7 @@ bool console_ctl_write(int fd, const char *text) {
       continue;
     }
     if (n < 0 && errno == EINTR) continue;
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    if (n < 0 && IO_WOULD_BLOCK(errno)) {
       struct pollfd p = {fd, POLLOUT, 0};
       if (poll(&p, 1, 1000) > 0) continue;
     }
@@ -203,6 +203,7 @@ typedef struct csess {
   ssh_channel   ch;
   struct ssh_server_callbacks_struct scb;
   struct ssh_channel_callbacks_struct ccb;
+  ssh_event     ev;               /* this session's own poll context */
   bool          in_event;
   char          ip[64];
   char          user[CONSOLE_NAME_MAX];
@@ -229,7 +230,7 @@ static bool g_running;
 static volatile sig_atomic_t g_stop;
 static int g_ctl = -1;          /* this thread's end of the control pair */
 static int g_wake[2] = {-1, -1};
-static ssh_event g_ev;
+static ssh_event g_ev;          /* control + wake fds only, never a session */
 static ssh_bind g_bind;
 static unsigned g_bind_gen;
 static csess_t *g_sessions;
@@ -242,6 +243,7 @@ static long long now_ms(void) {
   return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+static void ctl_log(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void ctl_log(int level, const char *fmt, ...) {
   char msg[600];
   int o = snprintf(msg, sizeof(msg), "LOG|%d|", level);
@@ -581,7 +583,7 @@ static int cb_core_fd(socket_t fd, int revents, void *ud) {
       sess_drop(x, "closed by the hub");
       break;
     }
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
+    if (IO_WOULD_BLOCK(errno) || errno == EINTR) break;
     sess_drop(x, "hub link error");
     break;
   }
@@ -617,7 +619,7 @@ static void sess_flush(csess_t *x) {
       cbuf_consume(co, (size_t)n);
       continue;
     }
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) break;
+    if (n < 0 && (IO_WOULD_BLOCK(errno) || errno == EINTR)) break;
     sess_drop(x, "hub link error");
     break;
   }
@@ -730,7 +732,18 @@ static void sess_new(int fd, const char *ip) {
     free(x);
     return;
   }
-  if (ssh_event_add_session(g_ev, x->s) == SSH_OK) x->in_event = true;
+  /* One event per session: libssh's own waits (ssh_handle_packets, behind
+   * channel writes and the like) poll the context the session sits in, and
+   * any error there, such as another client's EOF, would mark *this* session
+   * failed.  A shared context let one refused login kill a live console. */
+  x->ev = ssh_event_new();
+  if (!x->ev || ssh_event_add_session(x->ev, x->s) != SSH_OK) {
+    if (x->ev) ssh_event_free(x->ev);
+    ssh_free(x->s);
+    free(x);
+    return;
+  }
+  x->in_event = true;
   x->next = g_sessions;
   g_sessions = x;
 }
@@ -750,16 +763,17 @@ static void sess_free(csess_t *x) {
     ctl_log(LOG_WARNING, "[CONSOLE] %s@%s dropped before the console opened: %s",
             x->user, x->ip, why);
   if (x->core_fd >= 0) {
-    if (x->core_in_event) ssh_event_remove_fd(g_ev, x->core_fd);
+    if (x->core_in_event) ssh_event_remove_fd(x->ev, x->core_fd);
     close(x->core_fd);
   }
-  if (x->in_event) ssh_event_remove_session(g_ev, x->s);
+  if (x->in_event) ssh_event_remove_session(x->ev, x->s);
   if (x->ch) {
     ssh_channel_send_eof(x->ch);
     ssh_channel_close(x->ch);
   }
   ssh_disconnect(x->s);
   ssh_free(x->s);
+  if (x->ev) ssh_event_free(x->ev);
   ui_free(x->ui);
   free(x->core_in);
   secure_wipe(x, sizeof(*x));
@@ -778,7 +792,7 @@ static void sess_service(csess_t *x, long long t) {
     console_limits_get(&now_lim);
     if (count_consoles() > now_lim.sessions) {
       sess_drop(x, "too many consoles");
-    } else if (ssh_event_add_fd(g_ev, x->core_fd, POLLIN, cb_core_fd, x) == SSH_OK) {
+    } else if (ssh_event_add_fd(x->ev, x->core_fd, POLLIN, cb_core_fd, x) == SSH_OK) {
       x->core_in_event = true;
     }
   }
@@ -838,6 +852,46 @@ static int cb_wake(socket_t fd, int revents, void *ud) {
   return 0;
 }
 
+/* Wait (up to timeout_ms) for any of the thread's fds, then let each poll
+ * context, the control one and every session's own, handle what is ready. */
+static struct pollfd *g_pf;
+static size_t g_pf_cap;
+
+static void console_poll(int timeout_ms) {
+  struct pollfd *pf = g_pf;
+  size_t want = 2;
+  for (csess_t *x = g_sessions; x; x = x->next) want += 2;
+  if (want > g_pf_cap) {
+    struct pollfd *np = realloc(g_pf, want * sizeof(*np));
+    if (!np) {
+      /* no room to wait on everything: do not sleep, just service */
+      timeout_ms = 0;
+      want = 0;
+    } else {
+      g_pf = pf = np;
+      g_pf_cap = want;
+    }
+  }
+  nfds_t n = 0;
+  if (want) {
+    pf[n++] = (struct pollfd){.fd = g_ctl, .events = POLLIN};
+    pf[n++] = (struct pollfd){.fd = g_wake[0], .events = POLLIN};
+    for (csess_t *x = g_sessions; x; x = x->next) {
+      socket_t sfd = ssh_get_fd(x->s);
+      if (sfd != SSH_INVALID_SOCKET) {
+        short ev = POLLIN;
+        if (ssh_get_status(x->s) & SSH_WRITE_PENDING) ev |= POLLOUT;
+        pf[n++] = (struct pollfd){.fd = sfd, .events = ev};
+      }
+      if (x->core_in_event) pf[n++] = (struct pollfd){.fd = x->core_fd, .events = POLLIN};
+    }
+    (void)poll(pf, n, timeout_ms);
+  }
+  ssh_event_dopoll(g_ev, 0);
+  for (csess_t *x = g_sessions; x; x = x->next)
+    if (x->ev && !x->drop) ssh_event_dopoll(x->ev, 0);
+}
+
 static void *console_main(void *arg) {
   (void)arg;
   ssh_init();
@@ -851,7 +905,7 @@ static void *console_main(void *arg) {
   ssh_event_add_fd(g_ev, g_wake[0], POLLIN, cb_wake, NULL);
   rebuild_bind();
   while (!g_stop) {
-    ssh_event_dopoll(g_ev, 25);
+    console_poll(25);
     long long t = now_ms();
     for (csess_t *x = g_sessions; x; x = x->next) sess_service(x, t);
     for (csess_t **pp = &g_sessions; *pp;) {
@@ -874,6 +928,9 @@ static void *console_main(void *arg) {
   ssh_event_remove_fd(g_ev, g_wake[0]);
   ssh_event_free(g_ev);
   g_ev = NULL;
+  free(g_pf);
+  g_pf = NULL;
+  g_pf_cap = 0;
   if (g_bind) ssh_bind_free(g_bind);
   g_bind = NULL;
   ssh_finalize();

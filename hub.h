@@ -20,6 +20,21 @@
 #include <time.h>
 #include <unistd.h>
 
+/* A non-blocking call with nothing to do.  POSIX lets EAGAIN and EWOULDBLOCK
+ * differ; where they are one value (Linux) testing both trips -Wlogical-op. */
+#if EAGAIN == EWOULDBLOCK
+#define IO_WOULD_BLOCK(e) ((e) == EAGAIN)
+#else
+#define IO_WOULD_BLOCK(e) ((e) == EAGAIN || (e) == EWOULDBLOCK)
+#endif
+
+/* FD_ISSET for a descriptor already known to be >= 0.  musl does the macro's
+ * index math in unsigned long, which -Wsign-conversion reports at every call;
+ * the one conversion is spelled out here. */
+static inline bool fd_isset(int fd, const fd_set *set) {
+  return FD_ISSET((unsigned)fd, set) != 0;
+}
+
 #define HUB_CONFIG_FILE ".irchub.cnf"
 #define MAX_CLIENTS 100
 #define MAX_BOTS 100
@@ -130,7 +145,7 @@
  * the Makefile; -D-overridable so a release build can stamp its own version
  * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
 #ifndef HUB_VERSION
-#define HUB_VERSION "2.4.5"
+#define HUB_VERSION "2.4.6"
 #endif
 
 /* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
@@ -1543,7 +1558,7 @@ typedef struct {
 #define CONFIG_WRITE_DEBOUNCE_S 5
 
 // --- Prototypes ---
-void hub_log(const char *format, ...);
+void hub_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
 /* Send the owed full config push to every local bot (maintenance loop). */
 void hub_flush_bot_config(hub_state_t *state, time_t now);
 /* The running hub's state (hub_main.c): the level macros below read
@@ -1555,7 +1570,8 @@ extern hub_state_t *g_state;
  * line is formatted when either wants it; hub_log_at() then writes it to
  * each sink whose level is at least `level`.  A bare hub_log() counts as
  * LOG_ERROR: written at every level but LOG_NONE. */
-void hub_log_at(int level, const char *format, ...);
+void hub_log_at(int level, const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
 #define hub_log_on(lvl) \
     (g_state && (g_state->log_level >= (lvl) || g_state->console_log_level >= (lvl)))
 
@@ -2091,6 +2107,14 @@ void hub_console_link_free(hub_client_t *c);
 bool hub_console_log_ring_init(void);
 /* hub_log_at feeds every line at or under console_log_level in here. */
 void hub_console_log_append(int level, const char *line, size_t len);
+/* Snapshots the core takes of itself (hub_logic.c). */
+int  hub_console_tree_rows(hub_state_t *state, char *buf, int max_len);
+void hub_console_status_line(hub_state_t *state, const char *tree,
+                             char *out, size_t out_size);
+void hub_console_upg_line(hub_state_t *state, char *out, size_t out_size);
+void hub_console_ssh_failed(hub_state_t *state, const char *ip);
+bool hub_console_ssh_admit(hub_state_t *state, const char *ip);
+void hub_console_note_login(hub_state_t *state, const char *name, const char *ip);
 
 void hub_set_config_pass(hub_state_t *s, const char *pass);
 void hub_get_config_pass(const hub_state_t *s, char *out, size_t len);

@@ -157,14 +157,14 @@ static bool gen_combined(unsigned char priv[64], unsigned char pub[64]) {
   EVP_PKEY_CTX *ec = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
   EVP_PKEY_CTX *xc = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
   EVP_PKEY *ep = NULL, *xp = NULL;
-  size_t l = 32;
+  size_t l1 = 32, l2 = 32, l3 = 32, l4 = 32;
   bool ok =
       ec && EVP_PKEY_keygen_init(ec) > 0 && EVP_PKEY_keygen(ec, &ep) > 0 &&
-      EVP_PKEY_get_raw_private_key(ep, priv, &l) > 0 && l == 32 &&
-      (l = 32, EVP_PKEY_get_raw_public_key(ep, pub, &l) > 0) && l == 32 &&
+      EVP_PKEY_get_raw_private_key(ep, priv, &l1) > 0 && l1 == 32 &&
+      EVP_PKEY_get_raw_public_key(ep, pub, &l2) > 0 && l2 == 32 &&
       xc && EVP_PKEY_keygen_init(xc) > 0 && EVP_PKEY_keygen(xc, &xp) > 0 &&
-      (l = 32, EVP_PKEY_get_raw_private_key(xp, priv + 32, &l) > 0) && l == 32 &&
-      (l = 32, EVP_PKEY_get_raw_public_key(xp, pub + 32, &l) > 0) && l == 32;
+      EVP_PKEY_get_raw_private_key(xp, priv + 32, &l3) > 0 && l3 == 32 &&
+      EVP_PKEY_get_raw_public_key(xp, pub + 32, &l4) > 0 && l4 == 32;
   EVP_PKEY_free(ep);
   EVP_PKEY_free(xp);
   EVP_PKEY_CTX_free(ec);
@@ -180,9 +180,9 @@ static bool gen_combined(unsigned char priv[64], unsigned char pub[64]) {
 static bool derive_pub(const unsigned char priv[64], unsigned char pub[64]) {
   EVP_PKEY *ep = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, priv, 32);
   EVP_PKEY *xp = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, priv + 32, 32);
-  size_t l = 32;
-  bool ok = ep && xp && EVP_PKEY_get_raw_public_key(ep, pub, &l) > 0 && l == 32 &&
-            (l = 32, EVP_PKEY_get_raw_public_key(xp, pub + 32, &l) > 0) && l == 32;
+  size_t l1 = 32, l2 = 32;
+  bool ok = ep && xp && EVP_PKEY_get_raw_public_key(ep, pub, &l1) > 0 && l1 == 32 &&
+            EVP_PKEY_get_raw_public_key(xp, pub + 32, &l2) > 0 && l2 == 32;
   EVP_PKEY_free(ep);
   EVP_PKEY_free(xp);
   return ok;
@@ -334,7 +334,7 @@ typedef struct {
 /* The new passphrase for a key.  Returns its length, 0 for none, -1 to
  * abort.  buf must hold PASS_MAX + 1 bytes. */
 static int ask_new_passphrase(const pass_src_t *src, char *buf, size_t cap) {
-  int n;
+  int n = -1;
   if (src->none) return 0;
   if (src->file) {
     n = file_read_secret(src->file, buf, cap);

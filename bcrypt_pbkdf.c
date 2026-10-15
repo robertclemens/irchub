@@ -424,7 +424,7 @@ Blowfish_expand0state(blf_ctx *c, const uint8_t *key, uint16_t keybytes)
 	j = 0;
 	datal = 0x00000000;
 	datar = 0x00000000;
-	for (i = 0; i < BLF_N + 2; i += 2) {
+	for (i = 0; i < BLF_N + 2; i = (uint16_t)(i + 2)) {
 		Blowfish_encipher(c, &datal, &datar);
 
 		c->P[i] = datal;
@@ -432,7 +432,7 @@ Blowfish_expand0state(blf_ctx *c, const uint8_t *key, uint16_t keybytes)
 	}
 
 	for (i = 0; i < 4; i++) {
-		for (k = 0; k < 256; k += 2) {
+		for (k = 0; k < 256; k = (uint16_t)(k + 2)) {
 			Blowfish_encipher(c, &datal, &datar);
 
 			c->S[i][k] = datal;
@@ -463,7 +463,7 @@ Blowfish_expandstate(blf_ctx *c, const uint8_t *data, uint16_t databytes,
 	j = 0;
 	datal = 0x00000000;
 	datar = 0x00000000;
-	for (i = 0; i < BLF_N + 2; i += 2) {
+	for (i = 0; i < BLF_N + 2; i = (uint16_t)(i + 2)) {
 		datal ^= Blowfish_stream2word(data, databytes, &j);
 		datar ^= Blowfish_stream2word(data, databytes, &j);
 		Blowfish_encipher(c, &datal, &datar);
@@ -473,7 +473,7 @@ Blowfish_expandstate(blf_ctx *c, const uint8_t *data, uint16_t databytes,
 	}
 
 	for (i = 0; i < 4; i++) {
-		for (k = 0; k < 256; k += 2) {
+		for (k = 0; k < 256; k = (uint16_t)(k + 2)) {
 			datal ^= Blowfish_stream2word(data, databytes, &j);
 			datar ^= Blowfish_stream2word(data, databytes, &j);
 			Blowfish_encipher(c, &datal, &datar);
@@ -546,10 +546,22 @@ blf_enc(blf_ctx *c, uint32_t *data, uint16_t blocks)
 #define BCRYPT_BLOCKS 8
 #define BCRYPT_HASHSIZE (BCRYPT_BLOCKS * 4)
 
+/* Marks a char array that is deliberately not NUL-terminated, where the
+ * compiler knows the attribute (gcc 8+, clang 21+); a no-op elsewhere. */
+#if defined(__has_attribute)
+#if __has_attribute(nonstring)
+#define BCRYPT_NONSTRING __attribute__((nonstring))
+#endif
+#endif
+#ifndef BCRYPT_NONSTRING
+#define BCRYPT_NONSTRING
+#endif
+
 static void
 bcrypt_hash(blf_ctx *state, uint8_t *sha2pass, uint8_t *sha2salt, uint8_t *out)
 {
-	uint8_t ciphertext[BCRYPT_HASHSIZE] =
+	/* exactly BCRYPT_HASHSIZE bytes: the magic is not NUL-terminated */
+	uint8_t ciphertext[BCRYPT_HASHSIZE] BCRYPT_NONSTRING =
 	    "OxychromaticBlowfishSwatDynamite";
 	uint32_t cdata[BCRYPT_BLOCKS];
 	int i;
@@ -574,10 +586,10 @@ bcrypt_hash(blf_ctx *state, uint8_t *sha2pass, uint8_t *sha2salt, uint8_t *out)
 
 	/* copy out */
 	for (i = 0; i < BCRYPT_BLOCKS; i++) {
-		out[4 * i + 3] = (cdata[i] >> 24) & 0xff;
-		out[4 * i + 2] = (cdata[i] >> 16) & 0xff;
-		out[4 * i + 1] = (cdata[i] >> 8) & 0xff;
-		out[4 * i + 0] = cdata[i] & 0xff;
+		out[4 * i + 3] = (uint8_t)((cdata[i] >> 24) & 0xff);
+		out[4 * i + 2] = (uint8_t)((cdata[i] >> 16) & 0xff);
+		out[4 * i + 1] = (uint8_t)((cdata[i] >> 8) & 0xff);
+		out[4 * i + 0] = (uint8_t)(cdata[i] & 0xff);
 	}
 
 	/* zap */
@@ -628,10 +640,10 @@ bcrypt_pbkdf(const char *pass, size_t passlen, const uint8_t *salt, size_t saltl
 
 	/* generate key, sizeof(out) at a time */
 	for (count = 1; keylen > 0; count++) {
-		countsalt[saltlen + 0] = (count >> 24) & 0xff;
-		countsalt[saltlen + 1] = (count >> 16) & 0xff;
-		countsalt[saltlen + 2] = (count >> 8) & 0xff;
-		countsalt[saltlen + 3] = count & 0xff;
+		countsalt[saltlen + 0] = (uint8_t)((count >> 24) & 0xff);
+		countsalt[saltlen + 1] = (uint8_t)((count >> 16) & 0xff);
+		countsalt[saltlen + 2] = (uint8_t)((count >> 8) & 0xff);
+		countsalt[saltlen + 3] = (uint8_t)(count & 0xff);
 
 		/* first round, salt is salt */
 		if (EVP_Digest(countsalt, saltlen + 4, sha2salt, NULL,

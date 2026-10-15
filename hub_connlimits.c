@@ -55,11 +55,15 @@ static const cset_t SETS[] = {
 #undef O
 #define NSETS ((int)(sizeof(SETS) / sizeof(SETS[0])))
 
-static int *mem(hub_conn_cfg_t *c, const cset_t *s, int i) {
-  return (int *)((char *)c + s->off[i]);
+/* off[] holds offsetof() of int fields; memcpy reaches them without an
+ * aligning pointer cast. */
+static void mem_set(hub_conn_cfg_t *c, const cset_t *s, int i, int v) {
+  memcpy((char *)c + s->off[i], &v, sizeof(v));
 }
 static int memv(const hub_conn_cfg_t *c, const cset_t *s, int i) {
-  return *(const int *)((const char *)c + s->off[i]);
+  int v;
+  memcpy(&v, (const char *)c + s->off[i], sizeof(v));
+  return v;
 }
 static int nparts(const cset_t *s) { return s->kind == K_INT ? 1 : s->kind == K_RATE ? 2 : 3; }
 
@@ -73,7 +77,7 @@ static const cset_t *find_set(int group, const char *name) {
 void hub_conn_cfg_defaults(hub_conn_cfg_t *c) {
   memset(c, 0, sizeof(*c));
   for (int i = 0; i < NSETS; i++)
-    for (int k = 0; k < nparts(&SETS[i]); k++) *mem(c, &SETS[i], k) = SETS[i].def[k];
+    for (int k = 0; k < nparts(&SETS[i]); k++) mem_set(c, &SETS[i], k, SETS[i].def[k]);
 }
 
 int hub_conn_cfg_count(int group) {
@@ -173,7 +177,7 @@ hub_conn_set_t hub_conn_cfg_set(hub_conn_cfg_t *c, int group, const char *name,
       return HUB_CONN_BAD;
     }
   }
-  for (int k = 0; k < nparts(s); k++) *mem(c, s, k) = nv[k];
+  for (int k = 0; k < nparts(s); k++) mem_set(c, s, k, nv[k]);
   return HUB_CONN_OK;
 }
 

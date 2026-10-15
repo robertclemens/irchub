@@ -30,6 +30,7 @@ void cbuf_add(cbuf_t *b, const void *data, size_t n) {
 
 void cbuf_adds(cbuf_t *b, const char *s) { cbuf_add(b, s, strlen(s)); }
 
+static void cbuf_addf(cbuf_t *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void cbuf_addf(cbuf_t *b, const char *fmt, ...) {
   char tmp[512];
   va_list ap;
@@ -79,7 +80,7 @@ size_t console_utf8_len(const unsigned char *p, size_t n) {
 /* Code point of a valid sequence (console_utf8_len said len). */
 static unsigned utf8_cp(const unsigned char *p, size_t len) {
   if (len == 1) return p[0];
-  unsigned cp = p[0] & (len == 2 ? 0x1F : len == 3 ? 0x0F : 0x07);
+  unsigned cp = p[0] & (len == 2 ? 0x1Fu : len == 3 ? 0x0Fu : 0x07u);
   for (size_t i = 1; i < len; i++) cp = (cp << 6) | (p[i] & 0x3F);
   return cp;
 }
@@ -624,7 +625,7 @@ static const cmd_def_t CMDS[] = {
   {"ban", "del", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban del <#chan|*> <mask>", "remove a listed ban", NULL},
   {"upgrade", "status", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_NONE, 0, "", "upgrade status", "the upgrade run on this hub", NULL},
   {"upgrade", "releases", CMD_ADMIN_UPGRADE_STATUS, B_UPG_RELEASES, 0, 2, CF_NONE, 0, NULL, "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes", NULL},
-  {"upgrade", "start", CMD_ADMIN_UPGRADE_NET, B_UPG_START, 1, 4, CF_TYPE, PRE_UPG_START, NULL, "upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade", NULL},
+  {"upgrade", "start", CMD_ADMIN_UPGRADE_NET, B_UPG_START, 1, 4, CF_YN, PRE_UPG_START, NULL, "upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade (shows the plan, asks y/N)", NULL},
   {"upgrade", "abort", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_YN, 0, "abort", "upgrade abort", "stop the run and roll back", NULL},
   {"upgrade", "forget", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_YN, 0, "forget", "upgrade forget", "drop the roll-up plan on every hub", NULL},
   {"display", "show", 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "display show", "this session's display settings", NULL},
@@ -709,14 +710,14 @@ static const struct {
   {"network", "tree", NULL, "network tree"},
   {"network", "status", NULL, "network status"},
   {"network", "set",
-   "flood\tbot flood limits: cmd = commands per user, msg = other messages per host, "
-   "ctcp = CTCP per host\n"
-   "N:S|off|default\tmore than N events in S seconds trips it (N 1-1000, S 1-3600); off "
-   "disables it; default returns to the built-in\n"
-   "ignoretime\tminutes a flooding host stays ignored (1-1440); alone the command shows all\n"
-   "sendq\thow fast a bot may send lines to IRC: B:I lets B lines (1-100) out at once, then "
-   "one every I ms (0-10000, 0 = no delay); default is 10:100",
-   "network set\nnetwork set flood cmd 10:30\nnetwork set flood msg off\nnetwork set ignoretime 20\nnetwork set sendq 5:250"},
+   "(none)\tshows every bot network setting: its value, where it comes from, its default\n"
+   "flood <type>\tcmd, msg or ctcp (below), then N:S = more than N in S seconds trips it "
+   "(N 1-1000, S 1-3600), off = no limit, default = back to the built-in\n"
+   "ignoretime\tminutes (1-1440), or default\n"
+   "sendq\tB:I = B lines (1-100) at once, then one every I ms (0-10000, 0 = no delay), or "
+   "default\n"
+   "(scope)\tevery bot on every hub gets the same values; there is no per-bot setting",
+   "network set\nnetwork set flood cmd 10:30\nnetwork set flood msg off\nnetwork set ignoretime 20\nnetwork set sendq 5:250\nnetwork set sendq default"},
   {"hub", "show", NULL, "hub show"},
   {"hub", "set",
    "setting\tname, bindip, port, pubkey or autopurge; alone it shows them all. ssh and conn "
@@ -804,15 +805,16 @@ static const struct {
    "channel mode #ops -"},
   {"channel", "set",
    "#chan|default\tthe channel, or default for the network default every channel inherits; "
-   "alone it lists every setting and where its value comes from\n"
-   "+opt -opt\tturn an on/off option on or off: enforcemodes bitch protectops revenge "
-   "stopnethack enforcebans dynamicbans dontkickops cycle dynamiclimit\n"
-   "name value\tbantime (minutes, 0 = permanent), bantype (0-9), banidle (minutes), limitgap, "
-   "limitdelay (seconds); default removes the channel's own value\n"
-   "flood type\tchan ctcp join nick deop kick ban, then N:S (more than N in S seconds), off "
-   "or default",
+   "alone it lists every setting, its value, where it comes from and its default\n"
+   "+name -name\tturn an on/off option (below) on or off; several in one line\n"
+   "name value\ta valued setting (below) and its new value, or default to drop the "
+   "channel's own value and inherit again\n"
+   "flood type\tone of the channel floods (below), then N:S = more than N in S seconds from "
+   "one host trips it, off = no limit here, default = inherit\n"
+   "(who)\tonly unauthorised members are acted on, and only by an opped bot",
    "channel set #ops\nchannel set #ops +bitch +enforcemodes\nchannel set #ops bantime 60\n"
-   "channel set #ops flood join 10:60\nchannel set default -dynamicbans"},
+   "channel set #ops bantime default\nchannel set #ops flood join 10:60\n"
+   "channel set #ops flood chan off\nchannel set default -dynamicbans"},
   {"channel", "op", "#chan\tthe channel\nnick\tthe user's current nick on IRC",
    "channel op #ops alice"},
   {"channel", "invite", "#chan\tthe channel\nnick\tthe user's current nick on IRC",
@@ -835,14 +837,15 @@ static const struct {
    "hub=<base>\ta different release site for the hub builds (a URL)",
    "upgrade releases\nupgrade releases bot=https://example.net/ircbot"},
   {"upgrade", "start",
-   "botver\tthe bot version to move to, as upgrade releases lists it\n"
-   "hub=<ver>\talso move the hubs to this version (- = leave them)\n"
+   "bot=<ver>\tthe bot version to move to, as upgrade releases lists it (required)\n"
+   "hub=<ver>\talso move the hubs to this version (- or left out = leave them)\n"
    "nodes=<sel>\tonly these nodes: names or uuids, comma-separated; name=c or name=rs "
    "also switches that node's build (default: the whole network)\n"
    "botbase=<url>\ta different release site for the bot builds\n"
    "hubbase=<url>\ta different release site for the hub builds\n"
-   "(confirm)\tit shows the plan, then you type the bot version to start",
-   "upgrade start 2.4.5\nupgrade start 2.4.5 hub=2.4.4\nupgrade start 2.4.5 nodes=alpha,beta=rs"},
+   "(confirm)\tit shows the plan, then asks y/N to start",
+   "upgrade start bot=2.4.5\nupgrade start bot=2.4.5 hub=2.4.4\n"
+   "upgrade start bot=2.4.5 nodes=alpha,beta=rs"},
   {"upgrade", "abort", NULL, "upgrade abort"},
   {"upgrade", "forget", NULL, "upgrade forget"},
   {"display", "show", NULL, "display show"},
@@ -867,6 +870,8 @@ static const char *const LEVEL_WORD[] = {"none", "error", "warning", "info", "de
 /* ==========================================================================
  * Output helpers
  * ========================================================================== */
+static void audit(console_ui_t *ui, int level, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
 static void audit(console_ui_t *ui, int level, const char *fmt, ...) {
   if (ui->audit_n >= MAX_AUDIT) return;
   va_list ap;
@@ -1706,6 +1711,18 @@ static void help_command(const fmt_ctx_t *c, flines_t *f, const cmd_def_t *d) {
   } else {
     flines_add(f, RL_DIM, "   (no arguments)");
   }
+  /* channel set / network set: every setting, its built-in default and what
+   * it does (one table, hub_console_fmt.c, also behind the settings views) */
+  bool net_set = !strcmp(d->cmd, "network") && d->sub && !strcmp(d->sub, "set");
+  if (net_set || (!strcmp(d->cmd, "channel") && d->sub && !strcmp(d->sub, "set"))) {
+    flines_add(f, RL_NORMAL, "");
+    flines_add(f, RL_HEAD, " Settings: name, built-in default, what it does");
+    const char *n, *def, *what;
+    for (int i = 0; fmt_setting_info(i, net_set, &n, &def, &what); i++) {
+      usnprintf(line, sizeof(line), "   %-13s %-8s %s", n, def, what);
+      flines_add(f, RL_NORMAL, line);
+    }
+  }
   if (ex) {
     flines_add(f, RL_NORMAL, "");
     flines_add(f, RL_HEAD, strchr(ex, '\n') ? " Examples" : " Example");
@@ -2442,21 +2459,26 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
     break;
   }
   case B_UPG_START: {
-    const char *hubv = "", *nodes = "", *bb = "", *hb = "";
-    for (int i = 1; i < na; i++) {
+    const char *botv = "", *hubv = "", *nodes = "", *bb = "", *hb = "";
+    for (int i = 0; i < na; i++) {
       const char *v;
-      if ((v = kv_opt(a[i], "hub"))) hubv = strcmp(v, "-") ? v : "";
+      if ((v = kv_opt(a[i], "bot"))) botv = v;
+      else if ((v = kv_opt(a[i], "hub"))) hubv = strcmp(v, "-") ? v : "";
       else if ((v = kv_opt(a[i], "nodes"))) nodes = v;
       else if ((v = kv_opt(a[i], "botbase"))) bb = v;
       else if ((v = kv_opt(a[i], "hubbase"))) hb = v;
       else {
-        *why = "options: hub=<ver> nodes=<list> botbase=<url> hubbase=<url>";
+        *why = "options: bot=<ver> hub=<ver> nodes=<list> botbase=<url> hubbase=<url>";
         return false;
       }
     }
+    if (!*botv) {
+      *why = "say which bot version: bot=<ver> (upgrade releases lists them)";
+      return false;
+    }
     /* ver|variant|kind|min_from|base|hub_ver|hub_base|sel — variant, kind
      * and min_from are left to each node, as hub_admin always did. */
-    w = usnprintf(o, cap, "%s||||%s|%s|%s|%s", a[0], bb, hubv, *hubv ? hb : "", nodes);
+    w = usnprintf(o, cap, "%s||||%s|%s|%s|%s", botv, bb, hubv, *hubv ? hb : "", nodes);
     break;
   }
   }
@@ -2743,9 +2765,7 @@ static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text
       emit_flines(ui, &f);
       flines_free(&f);
     }
-    kind = CF_TYPE;
-    usnprintf(want, sizeof(want), "%s", bv);
-    usnprintf(q, sizeof(q), "Type %s to start the upgrade:", bv);
+    usnprintf(q, sizeof(q), "Start the upgrade? (y/N)");
     break;
   }
   default:
@@ -2892,9 +2912,10 @@ static void run_line(console_ui_t *ui, const char *line) {
     case PRE_UPG_START: {
       pop = CMD_ADMIN_UPGRADE_STATUS;
       const char *bb = "", *hb = "";
-      for (int i = argi + 1; i < ws.n; i++) {
+      for (int i = argi; i < ws.n; i++) {
         const char *v;
-        if ((v = kv_opt(ws.w[i], "hub"))) usnprintf(pc->extra[0], sizeof(pc->extra[0]), "%s", strcmp(v, "-") ? v : "");
+        if ((v = kv_opt(ws.w[i], "bot"))) usnprintf(pc->arg, sizeof(pc->arg), "%s", v);
+        else if ((v = kv_opt(ws.w[i], "hub"))) usnprintf(pc->extra[0], sizeof(pc->extra[0]), "%s", strcmp(v, "-") ? v : "");
         else if ((v = kv_opt(ws.w[i], "nodes"))) usnprintf(pc->extra[1], sizeof(pc->extra[1]), "%s", v);
         else if ((v = kv_opt(ws.w[i], "botbase"))) bb = v;
         else if ((v = kv_opt(ws.w[i], "hubbase"))) hb = v;
@@ -3085,7 +3106,7 @@ static const arg_comp_t ARG_COMP[] = {
   {"network", "set", 0, CK_WORDS, "flood ignoretime sendq"},
   {"network", "set", -1, CK_NETSET, NULL},
   {"upgrade", "releases", -1, CK_WORDS, "bot= hub="},
-  {"upgrade", "start", -1, CK_WORDS, "hub= nodes= botbase= hubbase="},
+  {"upgrade", "start", -1, CK_WORDS, "bot= hub= nodes= botbase= hubbase="},
   {"display", "view", 0, CK_WORDS, "1 2 3 4 5"},
   {"display", "format", 0, CK_WORDS, "pretty raw"},
   {"display", "width", 0, CK_WORDS, "auto"},
@@ -3974,7 +3995,10 @@ static void net_view(console_ui_t *ui, int W, int H, rowb_t *rows, int col0) {
   if (ui->net_sel >= n) ui->net_sel = n ? n - 1 : 0;
   int detail = n ? 5 : 0;
   int list_h = H - detail;
-  if (list_h < 1) list_h = H, detail = 0;
+  if (list_h < 1) {
+    list_h = H;
+    detail = 0;
+  }
   int top = 0;
   if (ui->net_sel >= list_h) top = ui->net_sel - list_h + 1;
   rb_sgr(&rows[0], "0;1");

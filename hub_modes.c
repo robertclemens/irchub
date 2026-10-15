@@ -199,7 +199,8 @@ hub_modes_status_t hub_settings_check(const char *settings, bool net_default,
                                       char *bad, size_t bad_cap) {
   if (bad && bad_cap) bad[0] = '\0';
   if (!settings) return HUB_MODES_OK;
-  size_t cap = net_default ? D_SETTINGS_MAX : C_SETTINGS_MAX;
+  size_t cap = C_SETTINGS_MAX;
+  if (net_default) cap = D_SETTINGS_MAX;
   if (strlen(settings) > cap) return HUB_MODES_TOO_LONG;
   check_ctx_t c = {net_default, bad, bad_cap, HUB_MODES_OK};
   settings_walk(settings, check_tok, &c);
@@ -582,7 +583,9 @@ hub_modes_status_t hub_ban_add(hub_state_t *state, const char *chan, const char 
 
   int idx = ban_find(state, cname, mask);
   bool exists = idx >= 0 && entry_live(&state->global_entries[idx]);
-  if (!exists && ban_count_live(state, cname) >= (global ? MAX_GLOBAL_BANS : MAX_BANS_PER_CHAN))
+  int ceiling = MAX_BANS_PER_CHAN;
+  if (global) ceiling = MAX_GLOBAL_BANS;
+  if (!exists && ban_count_live(state, cname) >= ceiling)
     return HUB_MODES_FULL;
 
   /* The setter is stored as one token: anything outside [A-Za-z0-9._-]

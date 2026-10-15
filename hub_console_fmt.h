@@ -109,6 +109,12 @@ typedef struct {
   const char *usage, *help, *args;
 } fmt_help_row_t;
 
+/* The i-th channel (net false) or bot network (net true) setting: its name
+ * as the tables show it, its built-in value and what it does.  False past
+ * the last. */
+bool   fmt_setting_info(int i, bool net, const char **name, const char **def,
+                        const char **what);
+
 /* Text helpers shared with hub_console_ui.c. */
 int    console_str_width(const char *s);
 /* %.*s precision for at most max bytes of s, never splitting a character. */

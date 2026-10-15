@@ -479,7 +479,7 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
       char stored_first[256];
       const char *pipe = strchr(b->entries[i].value, '|');
       if (pipe) {
-        size_t len = pipe - b->entries[i].value;
+        size_t len = (size_t)(pipe - b->entries[i].value);
         if (len >= sizeof(stored_first))
           len = sizeof(stored_first) - 1;
         memcpy(stored_first, b->entries[i].value, len);
@@ -611,7 +611,7 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
         strcmp(e->key, "o") == 0 || strcmp(e->key, "p") == 0) {
       continue;
     }
-    written = snprintf(buffer + offset, max_len - offset, "%s|%s|%ld\n", e->key,
+    written = snprintf(buffer + offset, (size_t)(max_len - offset), "%s|%s|%ld\n", e->key,
                        e->value, (long)e->timestamp);
     if (written < 0 || written >= (max_len - offset))
       break;
@@ -633,7 +633,7 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   // 1b. Add usermask records (new format: m| lines)
   for (int i = 0; i < state->mask_record_count; i++) {
     hub_mask_record_t *m = &state->mask_records[i];
-    written = snprintf(buffer + offset, max_len - offset,
+    written = snprintf(buffer + offset, (size_t)(max_len - offset),
                        "m|%s|%s|%s|%ld|%ld\n",
                        m->uuid, m->mask,
                        m->is_active ? "add" : "del",
@@ -645,7 +645,7 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   // 1b. Add purge_days setting (allows bots to validate purge policies)
   // Format: pd|<days>|<timestamp>
   time_t now = time(NULL);
-  written = snprintf(buffer + offset, max_len - offset, "pd|%d|%ld\n",
+  written = snprintf(buffer + offset, (size_t)(max_len - offset), "pd|%d|%ld\n",
                      state->purge_days_setting, (long)now);
   if (written > 0 && written < (max_len - offset)) {
     offset += written;
@@ -657,7 +657,7 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   // `now` — bots would take that as newest, drop 'h' and then refuse the
   // network's actual (older) value.
   if (state->opt_flags_ts > 0) {
-    written = snprintf(buffer + offset, max_len - offset, "O|%s|%lld\n",
+    written = snprintf(buffer + offset, (size_t)(max_len - offset), "O|%s|%lld\n",
                        state->opt_flags, (long long)state->opt_flags_ts);
     if (written > 0 && written < (max_len - offset)) {
       offset += written;
@@ -678,7 +678,7 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
             strcmp(e->key, "p") == 0) {
           continue;
         }
-        written = snprintf(buffer + offset, max_len - offset, "%s|%s|%ld\n",
+        written = snprintf(buffer + offset, (size_t)(max_len - offset), "%s|%s|%ld\n",
                            e->key, e->value, (long)e->timestamp);
         if (written < 0 || written >= (max_len - offset))
           break;
@@ -716,10 +716,10 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
       unsigned char raw[COMBINED_KEY_LEN];
       bool key_ok = pub && hub_crypto_pubkey_b64_decode(pub->value, raw);
       if (key_ok && (long)pub->timestamp > ts) ts = (long)pub->timestamp;
-      written = snprintf(buffer + offset, max_len - offset, "b|%s|%s|%s|%ld\n",
+      written = snprintf(buffer + offset, (size_t)(max_len - offset), "b|%s|%s|%s|%ld\n",
                          h->value, b->uuid, key_ok ? pub->value : "", ts);
     } else {
-      written = snprintf(buffer + offset, max_len - offset, "b|%s|%s|%ld\n",
+      written = snprintf(buffer + offset, (size_t)(max_len - offset), "b|%s|%s|%ld\n",
                          h->value, b->uuid, ts);
     }
     if (written < 0 || written >= (max_len - offset))
@@ -728,7 +728,7 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
     trusted_lines++;
   }
   if (proto_v2) {
-    written = snprintf(buffer + offset, max_len - offset, "T|%d\n",
+    written = snprintf(buffer + offset, (size_t)(max_len - offset), "T|%d\n",
                        trusted_lines);
     if (written > 0 && written < (max_len - offset))
       offset += written;
@@ -927,6 +927,12 @@ static int bans_live_in(const hub_state_t *state, const char *chan) {
   return state->global_ban_chan[gban_pos(state, chan)].live;
 }
 
+/* The live-ban ceiling for `chan` ("*" = the global list). */
+static int ban_ceiling(const char *chan) {
+  if (chan[0] == '*') return MAX_GLOBAL_BANS;
+  return MAX_BANS_PER_CHAN;
+}
+
 /* Drop the oldest tombstone of class `key` to make room.  One younger than
  * the purge horizon (7 days when purge is off) is never dropped: it may still
  * be the only thing that stops an old add coming back.  False if none. */
@@ -977,7 +983,7 @@ bool hub_storage_put_record(hub_state_t *state, const char *key, const char *val
       if (cl >= sizeof(chan)) return false;
       memcpy(chan, norm, cl);
       chan[cl] = '\0';
-      if (bans_live_in(state, chan) >= (chan[0] == '*' ? MAX_GLOBAL_BANS : MAX_BANS_PER_CHAN))
+      if (bans_live_in(state, chan) >= ban_ceiling(chan))
         return false;
     }
     bool was_active = entry_active(e);
@@ -993,7 +999,7 @@ bool hub_storage_put_record(hub_state_t *state, const char *key, const char *val
     if (cl >= sizeof(chan)) return false;
     memcpy(chan, value, cl);
     chan[cl] = '\0';
-    if (bans_live_in(state, chan) >= (chan[0] == '*' ? MAX_GLOBAL_BANS : MAX_BANS_PER_CHAN)) {
+    if (bans_live_in(state, chan) >= ban_ceiling(chan)) {
       hub_log_warning("[STORAGE] B| for %s REJECTED (ban ceiling)\n", chan);
       return false;
     }

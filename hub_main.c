@@ -25,7 +25,7 @@
 #include <limits.h>
 
 
-FILE *log_fp = NULL;
+static FILE *log_fp = NULL;
 hub_state_t *g_state = NULL;  // Global state pointer for use in hub_log() and other global functions
 
 /* Open HUB_LOG_FILE at 0600. open(O_CREAT,0600)+fdopen is used rather than
@@ -151,6 +151,8 @@ static void hub_log_file_write(const char *time_buf, const char *msg, size_t len
     fflush(log_fp);
 }
 
+static void hub_log_v(int level, const char *format, va_list ap)
+    __attribute__((format(printf, 2, 0)));
 static void hub_log_v(int level, const char *format, va_list ap) {
     /* Which sinks take a line at this level.  Before g_state exists (early
      * startup) only the file does, as it always did. */
@@ -314,7 +316,7 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
     secure_wipe(c->session_key, sizeof(c->session_key));
     secure_wipe(c->bot_eph_x25519_priv, sizeof(c->bot_eph_x25519_priv));
     c->bot_eph_priv_set = false;
-    if (c->recv_buf) secure_wipe(c->recv_buf, c->recv_len);
+    if (c->recv_buf) secure_wipe(c->recv_buf, (size_t)c->recv_len);
     /* Free per-peer outbound queues + in-flight ciphertext.  Done after the
      * fd is closed so no drain attempts can race. */
     peer_queue_destroy(c);
@@ -366,8 +368,8 @@ static int hub_seal_send(const unsigned char hub_x25519_pub[32],
     return 32 + enc_len + GCM_TAG_LEN;
 }
 
-void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
-                         const hub_peer_config_t *peer) {
+static void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
+                                const hub_peer_config_t *peer) {
     if (!state->hub_keys_loaded) {
         hub_log_error("[PEER] No Curve25519 keys loaded; cannot handshake\n");
         hub_disconnect_client(state, c);
@@ -449,9 +451,9 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
         return;
     }
 
-    uint32_t net_len = htonl(enc_len);
+    uint32_t net_len = htonl((uint32_t)enc_len);
     if (write(c->fd, &net_len, 4) != (ssize_t)4 ||
-        write(c->fd, enc, enc_len) != (ssize_t)enc_len) {
+        write(c->fd, enc, (size_t)enc_len) != (ssize_t)enc_len) {
         hub_log_warning("[PEER] Handshake write failed\n");
         hub_disconnect_client(state, c);
         return;
@@ -485,7 +487,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
             return;
         }
         hub_generate_sync_packet(state, full_sync, MAX_SYNC_PAYLOAD);
-        int sync_len = strlen(full_sync);
+        int sync_len = (int)strlen(full_sync);
         if (sync_len > 0) {
             queued_msg_t *sync_msg = queued_msg_new(CMD_PEER_SYNC, LANE_BULK,
                                                     (const unsigned char *)full_sync,
@@ -503,7 +505,7 @@ void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
     }
 }
 
-bool send_ping(hub_client_t *c) {
+static bool send_ping(hub_client_t *c) {
     unsigned char buffer[MAX_BUFFER];
     unsigned char plain[16];
     unsigned char tag[GCM_TAG_LEN];
@@ -516,12 +518,12 @@ bool send_ping(hub_client_t *c) {
     if (enc_len > 0) {
         memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
         int packet_len = enc_len + GCM_TAG_LEN;
-        uint32_t net_len = htonl(packet_len);
+        uint32_t net_len = htonl((uint32_t)packet_len);
         memcpy(buffer, &net_len, 4);
         
-        ssize_t sent = send(c->fd, buffer, 4 + packet_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+        ssize_t sent = send(c->fd, buffer, (size_t)(4 + packet_len), MSG_DONTWAIT | MSG_NOSIGNAL);
         if (sent != (ssize_t)(4 + packet_len)) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (IO_WOULD_BLOCK(errno)) {
                 return true; // peer send buffer full but connection alive; skip ping
             }
             return false;
@@ -530,7 +532,7 @@ bool send_ping(hub_client_t *c) {
     return true;
 }
 
-void hub_maintenance(hub_state_t *state) {
+static void hub_maintenance(hub_state_t *state) {
     time_t now = time(NULL);
     static time_t last_anti_entropy = 0;
     static time_t last_mesh_gossip  = 0;
@@ -730,7 +732,7 @@ void hub_maintenance(hub_state_t *state) {
     }
 }
 
-void hub_check_peers(hub_state_t *state) {
+static void hub_check_peers(hub_state_t *state) {
     static time_t last_check = 0;
     time_t now = time(NULL);
     
@@ -756,7 +758,7 @@ void hub_check_peers(hub_state_t *state) {
 
             struct sockaddr_in peer_addr;
             peer_addr.sin_family = AF_INET;
-            peer_addr.sin_port = htons(state->peers[i].port);
+            peer_addr.sin_port = htons((uint16_t)state->peers[i].port);
             inet_pton(AF_INET, state->peers[i].ip, &peer_addr.sin_addr);
 
             if (connect(sockfd, (struct sockaddr*)&peer_addr, sizeof(peer_addr)) == 0) {
@@ -929,7 +931,7 @@ static bool passfile_create(const char *path, const char *password) {
     }
 
     ok = (write(fd, salt,    SALT_SIZE)   == SALT_SIZE &&
-          write(fd, enc_buf, enc_len)     == enc_len   &&
+          write(fd, enc_buf, (size_t)enc_len)     == enc_len   &&
           write(fd, tag,     GCM_TAG_LEN) == GCM_TAG_LEN);
 
     if (!ok) perror("write .irchub.pass");
@@ -1220,8 +1222,8 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             if (!strchr(name_buf, '\n') && strlen(name_buf) == sizeof(name_buf) - 1) {
-                int ch;
-                while ((ch = getchar()) != '\n' && ch != EOF) {}
+                int drain;
+                while ((drain = getchar()) != '\n' && drain != EOF) {}
                 printf("Invalid name: longer than 63 characters.\n");
                 continue;
             }
@@ -1553,7 +1555,7 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(state.port);
+    addr.sin_port = htons((uint16_t)state.port);
 
     // Use bind_ip if set, otherwise default to 0.0.0.0
     if (state.bind_ip[0] && strcmp(state.bind_ip, "0.0.0.0") != 0) {
@@ -1647,12 +1649,12 @@ int main(int argc, char *argv[]) {
          * read pass (which can itself enqueue more outbound traffic). ---- */
         for (int i = 0; i < state.client_count; i++) {
             hub_client_t *c = state.clients[i];
-            if (c->fd > 0 && FD_ISSET(c->fd, &write_fds)) {
+            if (c->fd > 0 && fd_isset(c->fd, &write_fds)) {
                 peer_drain_writable(&state, c);
             }
         }
 
-        if (FD_ISSET(state.listen_fd, &read_fds)) {
+        if (fd_isset(state.listen_fd, &read_fds)) {
             struct sockaddr_in ca;
             socklen_t len = sizeof(ca);
             int new_fd = accept(state.listen_fd, (struct sockaddr*)&ca, &len);
@@ -1703,7 +1705,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (state.console_ctl_fd >= 0 && FD_ISSET(state.console_ctl_fd, &read_fds))
+        if (state.console_ctl_fd >= 0 && fd_isset(state.console_ctl_fd, &read_fds))
             hub_console_ctl_read(&state);
 
         /* First-bytes sniff.  Bot and peer frames start with a 4-byte length;
@@ -1725,8 +1727,7 @@ int main(int argc, char *argv[]) {
                         i--;
                     }
                 } else if (n == 0 ||
-                           (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-                            errno != EINTR)) {
+                           (n < 0 && !IO_WOULD_BLOCK(errno) && errno != EINTR)) {
                     hub_disconnect_client(&state, c);
                     i--;
                 } else if (now_ms >= c->sniff_deadline_ms) {
@@ -1740,11 +1741,11 @@ int main(int argc, char *argv[]) {
             
             if (c->fd <= 0 || c->sniff_pending) continue;
 
-            if (FD_ISSET(c->fd, &read_fds)) {
+            if (fd_isset(c->fd, &read_fds)) {
                 int space = c->recv_cap - c->recv_len;  /* D2: per-client cap */
 
                 if (space > 0) {
-                    int n = read(c->fd, c->recv_buf + c->recv_len, space);
+                    int n = (int)read(c->fd, c->recv_buf + c->recv_len, (size_t)space);
 
                     if (n <= 0) {
                         hub_disconnect_client(&state, c);

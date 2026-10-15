@@ -23,15 +23,6 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 
-/* Snapshots the core takes of itself (hub_logic.c). */
-int  hub_console_tree_rows(hub_state_t *state, char *buf, int max_len);
-void hub_console_status_line(hub_state_t *state, const char *tree,
-                             char *out, size_t out_size);
-void hub_console_upg_line(hub_state_t *state, char *out, size_t out_size);
-void hub_console_ssh_failed(hub_state_t *state, const char *ip);
-bool hub_console_ssh_admit(hub_state_t *state, const char *ip);
-void hub_console_note_login(hub_state_t *state, const char *name, const char *ip);
-
 struct hub_console_link {
   char          admin[CONSOLE_NAME_MAX];
   unsigned char ed_pub[32];      /* the key this console logged in with   */
@@ -469,7 +460,7 @@ void hub_console_drain(hub_state_t *state, hub_client_t *c) {
       l->outq_off += (size_t)s;
       continue;
     }
-    if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+    if (s < 0 && (IO_WOULD_BLOCK(errno) || errno == EINTR))
       return;
     hub_disconnect_client(state, c);
     return;

@@ -17,7 +17,7 @@ $(info [build] using CC=$(CC))
 PROJECT = irchub
 
 # Version
-VERSION = 2.4.5
+VERSION = 2.4.6
 
 # Directories
 SRC_DIR = .
@@ -44,7 +44,30 @@ KEYGEN_TARGET = $(BIN_DIR)/keygen
 UNAME_S := $(shell uname -s)
 
 # Base flags
-CFLAGS = -Wall -Wextra -Wpedantic -std=c11
+CFLAGS = -std=c11
+
+# Warnings.  release / production builds (and the release tooling, which runs
+# `make release`) get the standard set, WARN_STD.  debug builds and `make dev`
+# (= release + WARN=full) get the full development set, so no warning stays
+# hidden while testing; WARN=std|full overrides either way.  The tree must stay
+# warning-free under both.  The set is picked after the build mode (below).
+# Left out of the full set on purpose: -Wjump-misses-init (C++ compatibility
+# only) and -Wformat-truncation=2 (flags bounded snprintf whose result is
+# checked).
+WARN_STD    = -Wall -Wextra -Wpedantic
+WARN_COMMON = $(WARN_STD) -Wshadow -Wformat=2 -Wstrict-prototypes \
+              -Wmissing-prototypes -Wmissing-declarations -Wold-style-definition \
+              -Wnested-externs -Wbad-function-cast -Wcast-qual -Wcast-align \
+              -Wpointer-arith -Wwrite-strings -Wundef -Wnull-dereference \
+              -Wredundant-decls -Wvla -Wfloat-equal -Wdouble-promotion -Winit-self \
+              -Wconversion -Wsign-conversion
+# Checks only one compiler has (an unknown -W flag is itself a warning).
+WARN_GCC    = -Wformat-overflow=2 -Wformat-signedness -Wlogical-op -Wduplicated-cond \
+              -Wduplicated-branches -Wstringop-overflow=4 -Warray-bounds=2 \
+              -Walloc-zero -Wtrampolines
+WARN_CLANG  = -Wunreachable-code-aggressive -Wconditional-uninitialized \
+              -Wmissing-variable-declarations -Wcomma -Wloop-analysis -Wassign-enum \
+              -Wextra-semi
 
 ifeq ($(UNAME_S),Linux)
 # glibc + -std=c11 defines __STRICT_ANSI__ and hides POSIX symbols unless we
@@ -87,7 +110,9 @@ LIBSSH_CMAKE   = -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
                  -DWITH_PCAP=OFF -DWITH_EXAMPLES=OFF -DWITH_NACL=OFF -DWITH_GEX=OFF \
                  -DWITH_EXEC=OFF -DWITH_DEBUG_CALLTRACE=OFF -DWITH_SYMBOL_VERSIONING=OFF \
                  -DWITH_PKCS11_URI=OFF -DWITH_FIDO2=OFF -DUNIT_TESTING=OFF
-INCLUDES += -I$(LIBSSH_PREFIX)/include
+# -isystem: the pinned libssh headers are third-party code, outside the
+# warning set this tree is held to.
+INCLUDES += -isystem $(LIBSSH_PREFIX)/include
 HUB_LIBS = $(LIBSSH_LIB) $(LIBS)
 
 # Linker flags
@@ -128,12 +153,29 @@ ifeq ($(BUILD_MODE),production)
 	LDFLAGS += -flto=auto -s -pie -Wl,-z,relro -Wl,-z,now
 endif
 
+# Warning set (WARN_* above): full for debug, standard for release/production.
+ifeq ($(BUILD_MODE),debug)
+WARN ?= full
+else
+WARN ?= std
+endif
+ifeq ($(WARN),full)
+CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -qi clang && echo 1)
+ifeq ($(CC_IS_CLANG),1)
+CFLAGS += $(WARN_COMMON) $(WARN_CLANG)
+else
+CFLAGS += $(WARN_COMMON) $(WARN_GCC)
+endif
+else
+CFLAGS += $(WARN_STD)
+endif
+
 # ============================================================================
 # Targets
 # ============================================================================
 
 .PHONY: all clean distclean install uninstall help test valgrind \
-        directories debug release production check-openssl keygen libssh
+        directories debug release production dev check-openssl keygen libssh
 
 # Default target
 all: directories check-openssl $(HUB_TARGET) $(KEYGEN_TARGET)
@@ -231,6 +273,11 @@ release:
 
 production:
 	@$(MAKE) BUILD_MODE=production all
+
+# Development / test build: release optimisation under the full warning set
+# (-O2 is what the flow-based checks need; debug's -O0 hides some of them).
+dev:
+	@$(MAKE) BUILD_MODE=release WARN=full all
 
 # ============================================================================
 # Utility Tools
@@ -343,6 +390,7 @@ help:
 	@echo "  debug        - Build with debug symbols and sanitizers"
 	@echo "  release      - Build optimized release version"
 	@echo "  production   - Build maximum optimization for production"
+	@echo "  dev          - Release build under the full warning set (testing)"
 	@echo "  keygen       - Build the keypair generator (bin/keygen)"
 	@echo "  install      - Install to $(PREFIX)"
 	@echo "  uninstall    - Remove installed files"
@@ -357,6 +405,9 @@ help:
 	@echo "  debug        - Debug build with sanitizers (default)"
 	@echo "  release      - Optimized release build"
 	@echo "  production   - Maximum optimization"
+	@echo ""
+	@echo "Warnings: WARN=std (release/production default) or WARN=full"
+	@echo "  (debug default, and make dev); make clean when switching."
 	@echo ""
 	@echo "Examples:"
 	@echo "  make                    # Build release version"

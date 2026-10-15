@@ -40,17 +40,22 @@ char *base64_encode(const unsigned char *input, int length) {
 
 unsigned char *base64_decode(const char *input, int *out_len) {
     BIO *b64, *bmem;
-    int len = strlen(input);
-    unsigned char *buffer = (unsigned char *)malloc(len);
+    size_t slen = strlen(input);
+    if (slen == 0 || slen > INT_MAX) {
+        *out_len = 0;
+        return NULL;
+    }
+    int len = (int)slen;
+    unsigned char *buffer = (unsigned char *)malloc(slen);
     if (!buffer) {
         *out_len = 0;
         return NULL;
     }
-    memset(buffer, 0, len);
+    memset(buffer, 0, slen);
 
     b64 = BIO_new(BIO_f_base64());
     BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-    bmem = BIO_new_mem_buf((void *)input, len);
+    bmem = BIO_new_mem_buf(input, len);
     bmem = BIO_push(b64, bmem);
 
     *out_len = BIO_read(bmem, buffer, len);
@@ -72,8 +77,8 @@ void generate_uuid_v4(char *buffer, size_t len) {
         abort();
     }
 
-    b[6] = (b[6] & 0x0F) | 0x40;
-    b[8] = (b[8] & 0x3F) | 0x80;
+    b[6] = (unsigned char)((b[6] & 0x0F) | 0x40);
+    b[8] = (unsigned char)((b[8] & 0x3F) | 0x80);
 
     snprintf(buffer, len,
         "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
