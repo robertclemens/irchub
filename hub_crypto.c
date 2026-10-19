@@ -245,6 +245,16 @@ void hub_crypto_key_fingerprint(const unsigned char pub[64],
              h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
 }
 
+/* A bot's hl| fingerprint of a hub: hex of SHA-256 over its 32-byte Ed25519
+ * key, first 8 bytes (ircbot hub_client_hublist_line computes the same). */
+void hub_crypto_hl_fp(const unsigned char ed_pub[32], char out[HL_FP_LEN + 1]) {
+    unsigned char h[32];
+    unsigned int hl = 0;
+    out[0] = '\0';
+    if (EVP_Digest(ed_pub, 32, h, &hl, EVP_sha256(), NULL) != 1 || hl != 32) return;
+    for (int i = 0; i < HL_FP_LEN / 2; i++) snprintf(out + 2 * i, 3, "%02x", h[i]);
+}
+
 void hub_crypto_key_fingerprint_b64(const char *b64, char out[KEY_FP_LEN + 1]) {
     unsigned char pub[64];
     if (!b64 || !b64[0])

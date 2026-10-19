@@ -1,4 +1,7 @@
 #include "hub.h"
+#include <ctype.h>
+
+#include <strings.h>
 
 void hub_storage_init(void) {}
 
@@ -31,6 +34,30 @@ bool hub_ascii_ieq(const char *a, const char *b) {
   for (; *a && *b; a++, b++)
     if (afold((unsigned char)*a) != afold((unsigned char)*b)) return false;
   return *a == *b;
+}
+
+/* A bot's hl| value: up to HL_ENTRIES_MAX comma-separated "<addr>/<fp>",
+ * <addr> empty or 1..HL_ADDR_MAX bytes of [A-Za-z0-9.:_[]-], <fp> exactly
+ * HL_FP_LEN lowercase hex.  "" (a bot with no keyed hub) is valid. */
+bool hub_hublist_valid(const char *v) {
+  if (!v) return false;
+  if (!v[0]) return true;
+  int n = 0;
+  for (const char *p = v;;) {
+    if (++n > HL_ENTRIES_MAX) return false;
+    const char *slash = strchr(p, '/');
+    const char *end = strchr(p, ',');
+    if (!end) end = p + strlen(p);
+    if (!slash || slash > end || (size_t)(slash - p) > HL_ADDR_MAX ||
+        end - slash - 1 != HL_FP_LEN)
+      return false;
+    for (const char *q = p; q < slash; q++)
+      if (!isalnum((unsigned char)*q) && !strchr(".:_[]-", *q)) return false;
+    for (const char *q = slash + 1; q < end; q++)
+      if (!isdigit((unsigned char)*q) && (*q < 'a' || *q > 'f')) return false;
+    if (!*end) return true;
+    p = end + 1;
+  }
 }
 
 /* Record kinds that live in global_entries[] beside c|/m|/o|. */
@@ -317,9 +344,41 @@ static bool hostmask_literal(const char *h) {
 }
 
 // Core Logic: Add/Update Entry
+static bool storage_update_entry(hub_state_t *state, const char *uuid,
+                                 const char *key, const char *value,
+                                 const char *extra, const char *op, time_t ts);
+
+/* A revoked uuid never comes back: no record is created for it but its
+ * tombstone, and one that exists stays deleted.  A bot that becomes deleted
+ * with a key on file joins the revoke list (hub_revoke.c). */
 bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
                               const char *key, const char *value,
                               const char *extra, const char *op, time_t ts) {
+  bool per_bot = strcmp(key, "d") == 0 || strcmp(key, "pub") == 0 ||
+                 strcmp(key, "n") == 0 || strcmp(key, "h") == 0 ||
+                 strcmp(key, "t") == 0 || strcmp(key, "seen") == 0;
+  bot_config_t *b = NULL;
+  if (per_bot && hub_revoke_find(state, uuid)) {
+    for (int i = 0; i < state->bot_count && !b; i++)
+      if (strcmp(state->bots[i].uuid, uuid) == 0) b = &state->bots[i];
+    if (!b && strcmp(key, "d") != 0) return false;
+  }
+  bool ok = storage_update_entry(state, uuid, key, value, extra, op, ts);
+  if (!ok || !per_bot) return ok;
+  if (!b)
+    for (int i = 0; i < state->bot_count && !b; i++)
+      if (strcmp(state->bots[i].uuid, uuid) == 0) b = &state->bots[i];
+  if (!b) return ok;
+  if (hub_revoke_find(state, uuid)) b->is_active = false;
+  if (!b->is_active && (strcmp(key, "d") == 0 || strcmp(key, "pub") == 0 ||
+                        strcmp(key, "n") == 0))
+    hub_revoke_from_bot(state, b);
+  return ok;
+}
+
+static bool storage_update_entry(hub_state_t *state, const char *uuid,
+                                 const char *key, const char *value,
+                                 const char *extra, const char *op, time_t ts) {
 
   /* Retired password-era keys (docs/passwordless.md §3.3): the shared bot
    * password 'p' and the legacy global admin password 'a' are never stored
@@ -363,7 +422,8 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
    * is capped per key so a per-bot line can never approach value[1024]. */
   if (strcmp(key, "t") != 0 && strcmp(key, "n") != 0 &&
       strcmp(key, "h") != 0 && strcmp(key, "pub") != 0 &&
-      strcmp(key, "seen") != 0 && strcmp(key, "d") != 0) {
+      strcmp(key, "seen") != 0 && strcmp(key, "d") != 0 &&
+      strcmp(key, "hl") != 0) {
     hub_log_warning("[STORAGE] REJECTED per-bot key '%s' for %s (not in whitelist)\n",
             key, uuid);
     return false;
@@ -374,10 +434,15 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
     if      (strcmp(key, "h") == 0)   cap = MAX_MASK_LEN - 1;
     else if (strcmp(key, "n") == 0)   cap = MAX_NICK - 1;
     else if (strcmp(key, "pub") == 0) cap = COMBINED_KEY_B64;
+    else if (strcmp(key, "hl") == 0)  cap = HL_VALUE_MAX;
     else                              cap = 31; /* seen/d/t: short numerics */
     if (vlen > cap) {
       hub_log_warning("[STORAGE] REJECTED per-bot '%s' for %s: value too long "
               "(%zu > %zu)\n", key, uuid, vlen, cap);
+      return false;
+    }
+    if (strcmp(key, "hl") == 0 && !hub_hublist_valid(value)) {
+      hub_log_warning("[STORAGE] REJECTED per-bot 'hl' for %s: not a hub list\n", uuid);
       return false;
     }
   }
@@ -597,7 +662,13 @@ bool hub_storage_delete(hub_state_t *state, const char *uuid, time_t *ts_out) {
 // Does NOT include "b|uuid|" prefix for global items, preserving protocol
 // compatibility
 void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
-                              bool proto_v2, char *buffer, int max_len) {
+                              int bot_proto, char *buffer, int max_len) {
+  const bool proto_v2 = bot_proto >= BOT_PROTO_PASSWORDLESS;
+  /* Below BOT_PROTO_USER_FLAGS the bot does not know uf| / uc| (plan §3.2):
+   * users are re-stamped, a restricted one is a tombstone (a v2 bot, whose
+   * protocol we know) or left out (an older or not-yet-known one), and its
+   * masks and the access lines are not sent. */
+  const bool flags_ok = bot_proto >= BOT_PROTO_USER_FLAGS;
   int offset = 0;
   int written;
   buffer[0] = 0;
@@ -624,8 +695,10 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   //     command instead of reading the public key as a password.
   for (int i = 0; i < state->user_record_count; i++) {
     hub_user_record_t *u = &state->user_records[i];
-    written = hub_format_user_record(u, !proto_v2, buffer + offset,
-                                     (size_t)(max_len - offset));
+    written = flags_ok ? hub_format_user_record(u, !proto_v2, buffer + offset,
+                                                (size_t)(max_len - offset))
+                       : hub_format_user_for_old(state, u, !proto_v2, proto_v2,
+                                                 buffer + offset, (size_t)(max_len - offset));
     if (written < 0 || written >= (max_len - offset)) break;
     offset += written;
   }
@@ -633,6 +706,7 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   // 1b. Add usermask records (new format: m| lines)
   for (int i = 0; i < state->mask_record_count; i++) {
     hub_mask_record_t *m = &state->mask_records[i];
+    if (!flags_ok && !hub_access_from_old_ok(state, m->uuid)) continue;
     written = snprintf(buffer + offset, (size_t)(max_len - offset),
                        "m|%s|%s|%s|%ld|%ld\n",
                        m->uuid, m->mask,
@@ -641,6 +715,9 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
     if (written < 0 || written >= (max_len - offset)) break;
     offset += written;
   }
+
+  // 1b. Admin flags and oper channel bindings, after the users they name.
+  if (flags_ok) hub_access_append(state, buffer, max_len, &offset, NULL, NULL);
 
   // 1b. Add purge_days setting (allows bots to validate purge policies)
   // Format: pd|<days>|<timestamp>
@@ -1013,6 +1090,7 @@ bool hub_storage_put_record(hub_state_t *state, const char *key, const char *val
   snprintf(e->key, sizeof(e->key), "%s", key);
   snprintf(e->value, sizeof(e->value), "%s", value);
   e->timestamp = ts;
+  e->last_used = 0;
   hub_global_note_new(state, state->global_entry_count - 1);
   return true;
 }
@@ -1070,6 +1148,26 @@ int hub_chan_cascade_del(hub_state_t *state, const char *chan, time_t ts,
       n = snprintf(out, sizeof(out), "%s|%s|%ld\n", tag, nv, (long)ts);
       if (n > 0) off = (size_t)n;
     }
+  }
+  /* Oper bindings to the channel go too (user_flags plan U6), same stamp:
+   * every hub and bot applies the same cascade to the same c| del.  "*" is
+   * not a channel and stays. */
+  for (int i = 0; i < state->uchan_record_count; i++) {
+    hub_uchan_record_t *r = &state->uchan_records[i];
+    if (!r->is_active || strcmp(r->chan, "*") == 0 || strcasecmp(r->chan, chan) != 0) continue;
+    if (!hub_uchan_put(state, r->uuid, r->chan, false, ts)) continue;
+    changed++;
+    if (!announce) continue;
+    char l[UC_LINE_MAX];
+    int n = hub_format_uchan(r, l, sizeof(l));
+    if (n <= 0 || n >= (int)sizeof(l)) continue;
+    if ((size_t)n >= sizeof(out) - off) {
+      out[off] = '\0';
+      if (off) hub_broadcast_sync_to_peers(state, out, -1);
+      off = 0;
+    }
+    memcpy(out + off, l, (size_t)n + 1);
+    off += (size_t)n;
   }
   if (off) hub_broadcast_sync_to_peers(state, out, -1);
   if (changed) {

@@ -195,10 +195,20 @@ void hub_config_write(hub_state_t *state) {
     if (cn != (size_t)-1 && cn > 0) SAFE_WRITE("%s", cl);
   }
 
-  // Write purge_days setting (only if enabled)
+  /* purge_days| stays for a hub rolled back to before hs|; hs|autopurge
+   * carries the stamp the mesh merges on, and wins at load. */
   if (state->purge_days_setting > 0) {
     SAFE_WRITE("purge_days|%d\n", state->purge_days_setting);
   }
+  if (!overflow && !hub_gsetting_append(state, buffer, estimated_size, &offset))
+    overflow = true;
+  /* When the leader last ran the scheduled purge: a restart does not push it
+   * another day out. */
+  if (state->last_purge > 0)
+    SAFE_WRITE("purge_last|%lld\n", (long long)state->last_purge);
+  /* The revoke list: permanent, never purged. */
+  if (!overflow && !hub_revoke_append(state, buffer, estimated_size, &offset))
+    overflow = true;
 
   /* D3: persist the loopback-trust flag. Always written so the security
    * posture is explicit in the config file rather than implied by absence. */
@@ -288,6 +298,14 @@ void hub_config_write(hub_state_t *state) {
     SAFE_WRITE("%s|%s|%ld\n", gk,
                state->global_entries[i].value,
                (long)state->global_entries[i].timestamp);
+    /* A ban's last use (activity, outside the B| record): bu|chan|mask|ts */
+    if (gk[0] == 'B' && !gk[1] && state->global_entries[i].last_used > 0) {
+      const char *bv = state->global_entries[i].value;
+      const char *b1 = strchr(bv, '|'), *b2 = b1 ? strchr(b1 + 1, '|') : NULL;
+      if (b2)
+        SAFE_WRITE("bu|%.*s|%ld\n", (int)(b2 - bv), bv,
+                   (long)state->global_entries[i].last_used);
+    }
   }
 
   // Local IP access lists: w|<pattern>|<added> (allow), x|... (deny)
@@ -327,6 +345,21 @@ void hub_config_write(hub_state_t *state) {
                m->uuid, m->mask,
                m->is_active ? "add" : "del",
                (long)m->last_used, (long)m->timestamp);
+  }
+
+  // Admin flags (uf|) and oper channel bindings (uc|), after the users they
+  // name; hub_access_prune keeps them owned.
+  for (int i = 0; i < state->uflag_record_count && !overflow; i++) {
+    char l[UF_LINE_MAX];
+    int w = hub_format_uflag(&state->uflag_records[i], l, sizeof(l));
+    if (w <= 0 || w >= (int)sizeof(l)) { overflow = true; break; }
+    SAFE_WRITE("%s", l);
+  }
+  for (int i = 0; i < state->uchan_record_count && !overflow; i++) {
+    char l[UC_LINE_MAX];
+    int w = hub_format_uchan(&state->uchan_records[i], l, sizeof(l));
+    if (w <= 0 || w >= (int)sizeof(l)) { overflow = true; break; }
+    SAFE_WRITE("%s", l);
   }
 
   for (int i = 0; i < state->bot_count; i++) {
@@ -379,7 +412,6 @@ void hub_config_write(hub_state_t *state) {
   /* Decode XOR-obfuscated config password before use */
   char plain_pass[MAX_PASS];
   hub_get_config_pass(state, plain_pass, sizeof(plain_pass));
-  // FIXED: Proper PBKDF2 with 100,000 iterations
   int pbkdf2_ok = PKCS5_PBKDF2_HMAC(plain_pass, (int)strlen(plain_pass), salt,
                                       SALT_SIZE, PBKDF2_ITERATIONS, EVP_sha256(),
                                       32, key);
@@ -544,58 +576,57 @@ bool hub_config_load(hub_state_t *state, const char *password) {
   }
   fclose(fp);
 
-  // FIXED: Use PBKDF2 instead of EVP_BytesToKey
-  unsigned char key[32];
-  if (PKCS5_PBKDF2_HMAC(password, (int)strlen(password), salt, SALT_SIZE,
-                        PBKDF2_ITERATIONS, EVP_sha256(), 32, key) != 1) {
-    hub_log_error("[HUB] PBKDF2 failed\n");
-    free(ciphertext);
-    return false;
-  }
-
   unsigned char *plaintext = malloc((size_t)(cipher_len + 1));
   if (!plaintext) {
-    secure_wipe(key, sizeof(key));
     free(ciphertext);
     return false;
   }
 
-  int len, plain_len;
-  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) {
+  /* Current PBKDF2 count first, then the pre-2.5.0 count for a one-time
+   * migration: a legacy hit is rewritten under the current count below
+   * (never under -selftest, which must not touch the running build's file). */
+  int plain_len = -1;
+  bool kdf_legacy = false;
+  for (int kdf = 0; kdf < 2 && plain_len < 0; kdf++) {
+    unsigned char key[32];
+    if (PKCS5_PBKDF2_HMAC(password, (int)strlen(password), salt, SALT_SIZE,
+                          kdf == 0 ? PBKDF2_ITERATIONS : PBKDF2_ITERATIONS_LEGACY,
+                          EVP_sha256(), 32, key) != 1) {
+      hub_log_error("[HUB] PBKDF2 failed\n");
+      secure_wipe(key, sizeof(key));
+      break;
+    }
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (ctx) {
+      int pl = 0, fl = 0;
+      if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) == 1 &&
+          EVP_DecryptUpdate(ctx, plaintext, &pl, ciphertext, (int)cipher_len) == 1 &&
+          EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag) == 1 &&
+          EVP_DecryptFinal_ex(ctx, plaintext + pl, &fl) > 0) {
+        plain_len = pl + fl;
+        kdf_legacy = (kdf == 1);
+      } else {
+        /* Partial plaintext may have been written by EVP_DecryptUpdate before
+         * the GCM tag check failed. Wipe it so unverified data doesn't
+         * outlive its scope. */
+        secure_wipe(plaintext, (size_t)cipher_len + 1);
+      }
+      EVP_CIPHER_CTX_free(ctx);
+    }
     secure_wipe(key, sizeof(key));
-    free(ciphertext);
-    free(plaintext);
-    return false;
   }
-
-  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
-      EVP_DecryptUpdate(ctx, plaintext, &plain_len, ciphertext, (int)cipher_len) != 1 ||
-      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag) != 1 ||
-      EVP_DecryptFinal_ex(ctx, plaintext + plain_len, &len) <= 0) {
-    hub_log_error("[HUB] Config decryption failed (wrong password or corrupted file)\n");
-    EVP_CIPHER_CTX_free(ctx);
-    secure_wipe(key, sizeof(key));
-    /* Partial plaintext may have been written by EVP_DecryptUpdate before the
-     * GCM tag check failed. Wipe before freeing so unverified data doesn't
-     * outlive its scope. */
-    secure_wipe(plaintext, (size_t)cipher_len + 1);
-    free(ciphertext);
-    free(plaintext);
-    return false;
-  }
-
-  plain_len += len;
-  plaintext[plain_len] = 0;
-  EVP_CIPHER_CTX_free(ctx);
-
-  // Cleanup sensitive data
-  secure_wipe(key, sizeof(key));
   free(ciphertext);
+  if (plain_len < 0) {
+    hub_log_error("[HUB] Config decryption failed (wrong password or corrupted file)\n");
+    free(plaintext);
+    return false;
+  }
+  plaintext[plain_len] = 0;
 
   // Parse configuration
   state->bot_count = 0;
   state->peer_count = 0;
+  state->revoked_count = 0;
 
   char *saveptr;
   char *line = strtok_r((char *)plaintext, "\n", &saveptr);
@@ -640,8 +671,24 @@ bool hub_config_load(hub_state_t *state, const char *password) {
                                     : sz > HUB_LOG_SIZE_MAX ? HUB_LOG_SIZE_MAX
                                                             : sz);
       } else if (strcmp(k, "purge_days") == 0) {
-        state->purge_days_setting = atoi(v);
-        if (state->purge_days_setting < 0) state->purge_days_setting = 0;
+        /* Pre-hs| layout; an hs|autopurge line (stamped) wins over it. */
+        if (state->purge_days_ts == 0) {
+          state->purge_days_setting = atoi(v);
+          if (state->purge_days_setting < 0) state->purge_days_setting = 0;
+        }
+      } else if (strcmp(k, "hs") == 0) {
+        bool changed;
+        if (!hub_gsetting_ingest(state, v, &changed))
+          hub_log_warning("[CONFIG] Ignoring an hs| line this hub does not know\n");
+      } else if (strcmp(k, "purge_last") == 0) {
+        long long pl = strtoll(v, NULL, 10);
+        state->last_purge = pl > 0 ? (time_t)pl : 0;
+      } else if (strcmp(k, "rv") == 0) {
+        hub_revoked_t rv;
+        if (hub_revoke_parse(v, &rv))
+          hub_revoke_merge(state, &rv);
+        else
+          hub_log_warning("[CONFIG] Ignoring a malformed rv| line\n");
       } else if (strcmp(k, "trust_loopback") == 0) {
         /* D3: exempt 127.0.0.1/::1 from rate limiting only when explicitly set.
          * Absent key -> false (secure default; state is zeroed before load). */
@@ -933,6 +980,12 @@ bool hub_config_load(hub_state_t *state, const char *password) {
             state->mask_record_count++;
           }
         }
+      } else if (strcmp(k, "uf") == 0 || strcmp(k, "uc") == 0) {
+        /* Admin flags / oper channel bindings (hub_access.c).  Users load
+         * first in this file, but the check is not needed here: records of
+         * a user that never loads go with hub_access_prune below. */
+        if (!hub_access_ingest(state, k[1], v, false, NULL))
+          hub_log_warning("[CONFIG] Ignoring invalid %s line\n", k);
       } else if (strcmp(k, "c") == 0) {
         /* Channel entries: chan|key[|modes]|op|timestamp */
         char *s_ts = strrchr(v, '|');
@@ -959,6 +1012,17 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         if (s_ts) {
           *s_ts = 0;
           hub_storage_put_record(state, k, v, (time_t)atoll(s_ts + 1));
+        }
+      } else if (strcmp(k, "bu") == 0) {
+        /* bu|<#chan|*>|<mask>|<last_used>: a ban's last use, written right
+         * after its B| line (activity, outside LWW).  No live ban: dropped. */
+        char *p1 = strchr(v, '|'), *p2 = p1 ? strchr(p1 + 1, '|') : NULL;
+        if (p2 && !strchr(p2 + 1, '|')) {
+          *p1 = 0;
+          *p2 = 0;
+          time_t *slot = hub_ban_used_slot(state, v, p1 + 1);
+          long long lu = atoll(p2 + 1);
+          if (slot && lu > (long long)*slot) *slot = (time_t)lu;
         }
       } else if (strcmp(k, "p") == 0) {
         /* Retired shared bot password: dropped (bots use public keys). */
@@ -1040,6 +1104,10 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       }
     }
 
+    /* Flags and channel bindings follow the surviving uuid */
+    for (int r = 0; r < remap_count; r++)
+      hub_access_remap_uuid(state, uuid_remap[r][0], uuid_remap[r][1]);
+
     /* Remap, dedup, and drop orphaned masks */
     for (int i = 0; i < state->mask_record_count; i++) {
       hub_mask_record_t *m = &state->mask_records[i];
@@ -1090,12 +1158,31 @@ bool hub_config_load(hub_state_t *state, const char *password) {
              sizeof(hub_mask_record_t) * (size_t)dedup_mask_count);
       state->mask_record_count = dedup_mask_count;
       hub_config_write(state);
-    } else if (cfg_legacy_users > 0 || cfg_acl_fixed > 0) {
-      /* Rewrite once so the passwords / p| line, and IP-list lines that were
-       * dropped or canonicalised, leave the file for good. */
+    }
+    /* Drop flag / binding records with no user, then give every user that
+     * has none what they could do before flags (admins +a, opers *). */
+    int access_before = state->uflag_record_count + state->uchan_record_count;
+    hub_access_prune(state);
+    bool access_changed = state->uflag_record_count + state->uchan_record_count != access_before;
+    access_changed |= hub_access_migrate(state) > 0;
+    /* Deleted bots from before the revoke list join it. */
+    int rv_new = hub_revoke_migrate(state);
+    if (rv_new > 0) {
+      hub_log_info("[REVOKE] %d deleted bot(s) added to the revoke list\n", rv_new);
+      access_changed = true;
+    }
+    if (access_changed) {
+      hub_config_write(state);
+    } else if (cfg_legacy_users > 0 || cfg_acl_fixed > 0 || kdf_legacy) {
+      /* Rewrite once so the passwords / p| line, IP-list lines that were
+       * dropped or canonicalised, and a pre-2.5.0 PBKDF2 count leave the
+       * file for good. */
       hub_config_write(state);
     }
   }
+  if (kdf_legacy && !g_hub_config_readonly)
+    hub_log_info("[HUB] Config re-encrypted with PBKDF2 %dk (was %dk)\n",
+                 PBKDF2_ITERATIONS / 1000, PBKDF2_ITERATIONS_LEGACY / 1000);
   if (cfg_legacy_users > 0)
     hub_log_info("[HUB] Config migrated to passwordless records (%d legacy "
             "line(s)); passwords dropped\n", cfg_legacy_users);

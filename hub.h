@@ -59,15 +59,26 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define GCM_IV_LEN 12
 #define GCM_TAG_LEN 16
 #define HEADER_SIZE 4
-#define MAX_PENDING_BOTS 10
 #define MAX_PENDING_OP_REQUESTS 500
-#define PBKDF2_ITERATIONS 100000 // For config-file key derivation
+/* PBKDF2-HMAC-SHA256 rounds for the .irchub.cnf and .irchub.pass keys.
+ * 2.5.0 raised them from 100k (PBKDF2_ITERATIONS_LEGACY, OWASP's 2023 figure
+ * is 600k).  A file still under the legacy count is read and rewritten once
+ * (hub_config_load / passfile_load); releases after 2.5.0 carry min_from
+ * 2.5.0 so no node skips that rewrite. */
+#define PBKDF2_ITERATIONS 600000
+#define PBKDF2_ITERATIONS_LEGACY 100000
 /* Passwordless (docs/passwordless.md).  Admins/opers/bots authenticate with
  * their Curve25519 combined keys only; the config-file password is the one
  * password left.  A bot advertises protocol BOT_PROTO_PASSWORDLESS as "v|2"
  * in its CMD_CONFIG_PUSH; until a connection has done so it is sent legacy
  * record shapes with an empty password slot (old bots then fail closed). */
 #define BOT_PROTO_PASSWORDLESS 2
+/* A bot that knows admin flags and oper channel bindings (uf| / uc|) says
+ * "v|3"; below that it is an older node (user_flags plan §3.2).  Mirrored in
+ * ircbot/bot.h (BOT_PROTO_VERSION). */
+#define BOT_PROTO_USER_FLAGS 3
+/* Oldest hub that stores uf| / uc|; older peers get the downgraded sync. */
+#define USER_FLAGS_MIN_HUB "2.4.7"
 #define KEY_FP_LEN 19              /* "ab12:cd34:ef56:7890" */
 #define HUB_PID_FILE ".irchub.pid"
 #define HUB_PASS_FILE ".irchub.pass"
@@ -145,7 +156,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * the Makefile; -D-overridable so a release build can stamp its own version
  * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
 #ifndef HUB_VERSION
-#define HUB_VERSION "2.4.6"
+#define HUB_VERSION "2.5.0"
 #endif
 
 /* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
@@ -193,9 +204,18 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 /* Retained previous binary/config, kept (not deleted) after an upgrade so
  * CMD_UPGRADE_ABORT can put this hub back. */
 #define HUB_UPGRADE_PREV_SUFFIX ".prev"
+#define HUB_PASS_PREV_FILE HUB_PASS_FILE HUB_UPGRADE_PREV_SUFFIX /* the pre-2.5.0 pass kept for a rollback */
 /* The upgrade script's startup watchdog: how long the new build's daemon has
  * to be up and alive before the script keeps it (see write_upgrade_script). */
 #define UPGRADE_WATCH_SECS 20
+/* A pre-2.5.0 HUB_PASS_FILE found on the start a hub-driven upgrade made is
+ * rewritten at PBKDF2_ITERATIONS this long after that start: past the old
+ * build's watchdog, which restores <exe>.prev and the config but not this
+ * file.  The old copy stays as HUB_PASS_PREV_FILE until the next ordinary
+ * start, for this process's own hub_update_rollback() to put back. */
+#define UPGRADE_PASS_REWRITE_SECS 120
+_Static_assert(UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS,
+               "the pass rewrite must wait out the old build's watchdog");
 /* The generated installer, written 0700 and exec'd once the old process has
  * let go of its pid lock. */
 #define HUB_UPGRADE_SCRIPT "hub_upgrade.sh"
@@ -239,12 +259,14 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 
 #define CMD_ADMIN_AUTH 0x10
 #define CMD_ADMIN_LIST_FULL 0x11
-#define CMD_ADMIN_ADD 0x12
+/* 0x12 / 0x16 / 0x17 (ADD / GET_PENDING / APPROVE) are retired with bot
+ * pending/approve/authorize: bot add is the only way in.  Never reuse. */
+#define CMD_ADMIN_ADD 0x12 // RETIRED
 #define CMD_ADMIN_DEL 0x13
 #define CMD_ADMIN_REGEN_KEYS 0x14
 #define CMD_ADMIN_LIST_SUMMARY 0x15
-#define CMD_ADMIN_GET_PENDING 0x16
-#define CMD_ADMIN_APPROVE 0x17
+#define CMD_ADMIN_GET_PENDING 0x16 // RETIRED
+#define CMD_ADMIN_APPROVE 0x17 // RETIRED
 #define CMD_ADMIN_ADD_PEER 0x18
 #define CMD_ADMIN_LIST_PEERS 0x19
 #define CMD_ADMIN_DEL_PEER 0x1A
@@ -327,7 +349,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * volatile runtime facts: parking them in the LWW config would persist them to
  * disk, replicate them with tombstones, drag them through the purge policy and
  * leave a dead hub's bots reading "online, uptime 40d" forever.  They also do
- * not belong in the per-bot ingest whitelist {t,n,h,pub,seen,d} -- that bound
+ * not belong in the per-bot ingest whitelist {t,n,h,pub,seen,d,hl} -- that bound
  * is what makes the payload ceilings above provable, and it stays untouched.
  *
  * So presence rides its own gossip: every hub reports the bots currently
@@ -411,6 +433,42 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define CMD_ADMIN_NET_SET   0x79
 #define CMD_ADMIN_SET_SSH   0x7A
 #define CMD_CHAN_EVENT      0x7B
+/* Admin flags / oper channel bindings from the console (user_flags plan §4.1):
+ *   CMD_ADMIN_USER_ACCESS console->hub  flags|<name>|<+x-y|letters>
+ *                                       chan|add|<name>|<#chan|*>
+ *                                       chan|del|<name>|<#chan|*>
+ * Answers user.flags / user.chan.  Internal (console only), never on the
+ * network; the number is reserved in ircbot/bot.h. */
+#define CMD_ADMIN_USER_ACCESS 0x7C
+/* A person's channel request from a bot (user_flags plan §5):
+ *   CMD_USER_CHAN_REQUEST bot->hub  rid|kind|#chan|user_uuid|nick|nick!user@host
+ *   CMD_USER_CHAN_RESULT  hub->bot  rid|ok|detail  or  rid|fail|detail
+ * kind = op / invite / unban.  The bot sends it when it cannot act itself;
+ * the hub re-checks the user's rights (admin +c, or oper bound to the
+ * channel) and runs the channel-request election with the person as the
+ * target.  Mirrored in ircbot/bot.h. */
+#define CMD_USER_CHAN_REQUEST 0x7D
+#define CMD_USER_CHAN_RESULT  0x7E
+/* Revoked bots (docs/plans/2026-10-17_bot_revoke_plan.md).  A deleted bot's
+ * uuid and key stay on a permanent revoke list; when it connects it is told
+ * to wipe its config and exit:
+ *   CMD_BOT_RETIRE       hub->bot  empty; in session a sealed frame, in the
+ *                                  handshake the 1-byte sealed ACK is 0x7F
+ *   CMD_BOT_RETIRE_ACK   bot->hub  "1" config wiped, "0" wipe failed
+ *   CMD_ADMIN_LIST_REVOKED console->hub  bot revoked
+ * Mirrored in ircbot/bot.h. */
+#define CMD_BOT_RETIRE        0x7F
+#define CMD_BOT_RETIRE_ACK    0x80
+#define CMD_ADMIN_LIST_REVOKED 0x81
+/* hub del's preview (docs/plans/2026-10-18_hub_del_refs_plan.md): console ->
+ * hub "<uuid|name>"; the reply names the hubs that link to it and the bots
+ * whose hl| list holds it. */
+#define CMD_ADMIN_PEER_REFS    0x82
+#define MAX_REVOKED           1024 /* revoke list ceiling; oldest dropped past it */
+#define RETIRE_GRACE_SEC      10   /* s an online bot gets to answer CMD_BOT_RETIRE */
+#define USER_CHAN_RID_MAX     32   /* rid bytes, [A-Za-z0-9-]              */
+#define USER_CHAN_REQ_WINDOW  60   /* s, per bot connection                */
+#define USER_CHAN_REQ_MAX     20   /* requests per window, the rest dropped */
 #define CHAN_EVENT_TARGET_MAX     120
 #define CHAN_EVENT_DETAIL_MAX     160
 #define CHAN_EVENT_WINDOW         60
@@ -507,11 +565,17 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * max(stored, ts) and forwards to its other peers only the lines that raised
  * its value, so a flood dies out without a seen-set.  PEER_SYNC / CONFIG_PUSH
  * max-merge the same fields as a repair path (anti-entropy).
+ * A ban's last use (a bot saw an unauthorised member match a listed,
+ * non-sticky ban) cannot ride its B| line, whose last field before the stamp
+ * is the op: it lives beside the record (config_entry_t.last_used), is saved
+ * as a bu| line in the cnf, and a hub repairs a peer by sending all of them
+ * as CMD_ACTIVITY right after the link's initial sync (hub_activity_send_bans).
  * Mirrors ircbot/bot.h, irchub.rs + ircbot.rs consts.rs.
  *
  *   CMD_ACTIVITY        bot -> hub, hub <-> hub.  Lines:
  *                         a|<user_uuid>|<ts>          (admin or oper)
  *                         m|<user_uuid>|<mask>|<ts>
+ *                         B|<#chan|*>|<mask>|<ts>     (a listed ban's last use)
  *   CMD_ACTIVITY_QUERY  bot -> hub: <req_id>|users   or
  *                                   <req_id>|masks|<user_uuid or *>
  *                       ("masks" answers that user's a| line too)
@@ -533,7 +597,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * connection that is already authenticated (hub_client_t.internal): plaintext
  * frames len(4, big-endian) || op(1) || payload.  CMD_CONSOLE is the one
  * opcode that exists only there -- console -> core "sub|<topics>" /
- * "get|tree" / "get|status", core -> console "<topic>|<data>" events.  It
+ * "get|tree" / "get|log", core -> console "<topic>|<data>" events.  It
  * never appears on the network; a bot or peer sending it is ignored like any
  * other opcode it has no business sending.  Mirrors irchub.rs consts.rs. */
 #define CMD_CONSOLE        0x6C
@@ -638,6 +702,15 @@ typedef struct {
 
 #define MAX_HUB_USER_RECORDS 40   // max combined admin + oper records
 #define MAX_HUB_USER_MASKS   200  // max total usermask records across all users
+/* Admin flags and oper channel bindings (user_flags plan §3.1).  The letters
+ * in their canonical order: a full, b bots, c channels, h hub, o opers,
+ * u upgrades.  Mirrored in ircbot/bot.h. */
+#define USER_FLAG_LETTERS    "abchou"
+#define USER_FLAGS_MAX       6
+#define MAX_HUB_USER_FLAGS   MAX_HUB_USER_RECORDS  /* one uf| per user record */
+#define MAX_HUB_CHAN_BINDS   400  /* uc| records, live and tombstones */
+/* The stamp hub_access_migrate writes: older than any real record. */
+#define USER_ACCESS_MIGRATE_TS 1
 
 /* ==========================================================================
  * Bulk-payload ceilings (Change 5) — hard upper bounds on generated config /
@@ -646,18 +719,37 @@ typedef struct {
  * the bytes actually sent (payloads carry only real records at real sizes).
  *
  * These are true hard bounds because ingest is bounded: per-bot state is
- * restricted to the whitelist {t,n,h,pub,seen,d} with per-key value caps in
+ * restricted to the whitelist {t,n,h,pub,seen,d,hl} with per-key value caps in
  * hub_storage_update_entry, so a bot has at most BOT_SYNC_FIELDS entries whose
  * lines never approach value[1024].  Keep this shared contract identical with
  * ircbot/bot.h (MAX_CONFIG_PAYLOAD).
  * ========================================================================== */
-#define BOT_SYNC_FIELDS   8      /* {t,n,h,pub,seen,d} = 6, +slack */
+#define BOT_SYNC_FIELDS   8      /* {t,n,h,pub,seen,d,hl} = 7, +slack; hl has its own HL_LINE_MAX */
 #define GLOBAL_LINE_MAX   1088   /* config_entry_t: key[32]+value[1024]+ts+seps */
 #define BOT_FIELD_LINE    320    /* per-bot line: capped value (<=MAX_MASK_LEN) */
 #define USER_LINE_MAX     384    /* a|/o|: uuid+name+COMBINED_KEY_B64 (+legacy slot) */
 #define MASK_LINE_MAX     352    /* m|: uuid+MAX_MASK_LEN */
 #define BLINE_MAX         448    /* b|<mask>|<uuid>|<pubkey>|<ts> trusted-bot line */
 #define PEER_LINE_MAX     256    /* peer|/opt| sync lines */
+#define UF_LINE_MAX       96     /* uf|<uuid>|<flags>|<ts> */
+#define UC_LINE_MAX       160    /* uc|<uuid>|<chan>|add/del|<ts> */
+#define RV_LINE_MAX       256    /* rv|uuid|pub|pub_ts|nick|wiped|del_ts */
+#define HS_LINE_MAX       96     /* hs|<name>|<value>|<ts> */
+#define HUB_GSETTINGS_MAX 8      /* hs| settings the registry may hold */
+/* hl|<addr>/<fp>,...: the hubs a bot dials, pushed by the bot, stored as its
+ * per-bot entry "hl" (never sent to bots).  <fp> = hex of SHA-256(the hub's
+ * Ed25519 key)[0..8].  Mirrors ircbot's bot.h. */
+#define HL_ADDR_MAX       80
+#define HL_FP_LEN         16
+#define HL_ENTRIES_MAX    10     /* ircbot MAX_SERVERS */
+#define HL_VALUE_MAX      (HL_ENTRIES_MAX * (HL_ADDR_MAX + 1 + HL_FP_LEN + 1))
+#define HL_LINE_MAX       (HL_VALUE_MAX + 64)  /* b|<uuid>|hl|<value>|<ts> */
+/* What rv| and hs| add to a bulk payload at their caps. */
+#define REVOKE_RECORDS_MAX \
+  ( MAX_REVOKED * RV_LINE_MAX + HUB_GSETTINGS_MAX * HS_LINE_MAX )
+/* What uf| and uc| add to a bulk payload at their caps. */
+#define USER_ACCESS_RECORDS_MAX \
+  ( MAX_HUB_USER_FLAGS * UF_LINE_MAX + MAX_HUB_CHAN_BINDS * UC_LINE_MAX )
 #define PAYLOAD_SLACK     8192
 
 /* ---- Modes / settings / bans records (docs/modes.md §2, 2.4.5) ----------
@@ -684,6 +776,8 @@ typedef struct {
 #define C_LINE_MAX          704
 #define D_LINE_MAX          640
 #define B_LINE_MAX          448
+/* bu|<#chan|*>|<mask>|<last_used>: a ban's last use, cnf only (activity). */
+#define BU_LINE_MAX         (MAX_CHAN + BAN_MASK_MAX + 32)
 /* global_entries[]: the old c/m/o rows (MAX_BOT_ENTRIES), then C, D, B. */
 #define MAX_GLOBAL_ENTRIES \
   ( MAX_BOT_ENTRIES + MAX_CHANNELS + 1 + MAX_BANS_TOTAL )
@@ -707,6 +801,7 @@ typedef struct { int rep; int live; } global_ban_slot_t;
   ( MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
     MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
     MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
+    USER_ACCESS_RECORDS_MAX                + \
     BOT_SYNC_FIELDS      * BOT_FIELD_LINE  + \
     MAX_BOTS             * BLINE_MAX       + \
     MODES_RECORDS_MAX                          + \
@@ -718,9 +813,12 @@ typedef struct { int rep; int live; } global_ban_slot_t;
   ( MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
     MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
     MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
+    USER_ACCESS_RECORDS_MAX                + \
     MAX_BOTS * BOT_SYNC_FIELDS * BOT_FIELD_LINE + \
+    MAX_BOTS             * HL_LINE_MAX     + \
     MAX_PEERS            * PEER_LINE_MAX   + \
     MODES_RECORDS_MAX                          + \
+    REVOKE_RECORDS_MAX                         + \
     PAYLOAD_SLACK )
 
 /* hub_config_write() buffer: every serialized section at its bound, with the
@@ -736,7 +834,10 @@ typedef struct { int rep; int live; } global_ban_slot_t;
     (size_t)MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
     (size_t)MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
     (size_t)MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
+    (size_t)USER_ACCESS_RECORDS_MAX                + \
     (size_t)MODES_RECORDS_MAX                      + \
+    (size_t)REVOKE_RECORDS_MAX                     + \
+    (size_t)MAX_BANS_TOTAL       * BU_LINE_MAX     + \
     (size_t)2 * MAX_IP_ACL_ENTRIES * IP_ACL_LINE_MAX + \
     (size_t)MAX_PEERS            * 512 )
 #define HUB_CONFIG_PER_BOT_MAX ((size_t)MAX_BOT_ENTRIES * 1100)
@@ -822,6 +923,7 @@ typedef struct {
   char key[32];
   char value[1024];
   time_t timestamp;
+  time_t last_used;   /* B| only: last ban match, max-merged outside LWW */
 } config_entry_t;
 
 typedef struct {
@@ -848,6 +950,28 @@ typedef struct {
   time_t timestamp;
 } hub_mask_record_t;
 
+/* Admin flags (docs/plans/2026-10-16_user_flags_plan.md §3.1):
+ *   uf|<user_uuid>|<flags>|<ts>
+ * One per user uuid, LWW (newer stamp; a tie keeps the fewer rights -- see
+ * hub_uflags_accepts).  flags: letters of USER_FLAG_LETTERS in that order,
+ * each once; "" = none.  No record = no flags (fail closed, R3). */
+typedef struct {
+  char   uuid[37];
+  char   flags[USER_FLAGS_MAX + 1];
+  time_t timestamp;
+} hub_uflag_record_t;
+
+/* Oper channel binding (§3.1):
+ *   uc|<user_uuid>|<#chan|*>|add/del|<ts>
+ * LWW per (uuid, channel), channel compared case-insensitively; a same-second
+ * delete wins.  "*" = every channel.  No live binding = no access (R3). */
+typedef struct {
+  char   uuid[37];
+  char   chan[MAX_CHAN];
+  bool   is_active;
+  time_t timestamp;
+} hub_uchan_record_t;
+
 typedef struct {
   char uuid[64];
   config_entry_t entries[MAX_BOT_ENTRIES];
@@ -856,13 +980,16 @@ typedef struct {
   time_t last_sync_time;
 } bot_config_t;
 
+/* One revoked bot: rv|<uuid>|<pub>|<pub_ts>|<nick>|<wiped_ts>|<del_ts>.
+ * Union-merged across hubs (hub_revoke_merge), never purged. */
 typedef struct {
-  char uuid[64];
-  char nick[32];
-  char ip[64];
-  time_t last_attempt;
-  int attempts;            // connection attempts while pending (console)
-} pending_bot_t;
+  char uuid[37];
+  char pub[COMBINED_KEY_B64 + 1];
+  time_t pub_ts;
+  char nick[MAX_NICK];
+  time_t wiped_ts;         /* last time it connected and wiped itself (0 = never) */
+  time_t del_ts;
+} hub_revoked_t;
 
 typedef struct {
   char request_id[64];     // Unique ID for this request
@@ -898,7 +1025,7 @@ typedef struct {
   char kind;            /* 'b' bot, 'h' peer hub, 's' this hub           */
   char via[64];         /* peer hub a remote bot is reached through, else "" */
   int  fd;              /* the connection it was reached on, -1 if gone  */
-  char cur_version[ROSTER_VERSION_MAX + 1];
+  char cur_version[ROSTER_VERSION_MAX + 1]; /* what it ran when the run found it (status "from"; never moved to the target) */
   char variant[8];      /* "c" / "rs"                                    */
   /* The variant a selective run asked for THIS node ("name=c"), "" = the
    * run's own.  Sent in its PREPARE and COMMIT. */
@@ -1158,7 +1285,8 @@ typedef enum {
   BOT_AUTH_UUID_RECEIVED,
   BOT_AUTH_CHALLENGE_SENT,
   BOT_AUTH_SIGNATURE_RECEIVED,
-  BOT_AUTH_COMPLETE
+  BOT_AUTH_COMPLETE,
+  BOT_AUTH_QUARANTINE   /* revoked bot proved its key, told to retire */
 } bot_auth_state_t;
 
 typedef struct {
@@ -1172,6 +1300,14 @@ typedef struct {
   time_t last_pong_sent;
   time_t connected_at;             // D4: when the socket was accepted/created
   bool inbound;                    // accepted on the listener (subject to the IP lists)
+  /* bot del of this connected bot: CMD_BOT_RETIRE sent at retire_sent; every
+   * other frame from it is dropped, and it is closed on CMD_BOT_RETIRE_ACK or
+   * after RETIRE_GRACE_SEC. */
+  bool retiring;
+  time_t retire_sent;
+  /* Its uuid is on the revoke list: the handshake checks the revoke list's
+   * key and ends in BOT_AUTH_QUARANTINE (CMD_BOT_RETIRE as the ACK). */
+  bool quarantine;
   /* An SSH console's socketpair end (docs/console.md): an admin connection
    * the console thread already authenticated.  Plaintext frames, no pings,
    * no CLIENT_TIMEOUT (the console has its own idle timeout). */
@@ -1197,6 +1333,9 @@ typedef struct {
   time_t chan_ev_window;
   int    chan_ev_count;
   int    chan_ev_dropped;
+  /* CMD_USER_CHAN_REQUEST rate limit for this connection */
+  time_t uchan_req_window;
+  int    uchan_req_count;
   unsigned char *recv_buf;         // D2: heap; PREAUTH_BUF_SIZE then MAX_BUFFER
   int           recv_cap;          // D2: allocated capacity of recv_buf
   bot_auth_state_t bot_auth_state;
@@ -1301,6 +1440,11 @@ typedef struct {
   chan_elect_hub_t hubs[MAX_MESH_HUBS];
   int    hub_n;
   char   doing[64];                      /* bot (CE_LOCAL_DO) or hub uuid  */
+  /* a person's request from a bot (CMD_USER_CHAN_REQUEST): the answer goes
+   * back to that connection as CMD_USER_CHAN_RESULT; reply_fd -1 = none */
+  int    reply_fd;
+  uint64_t reply_serial;
+  char   reply_rid[USER_CHAN_RID_MAX + 1];
 } chan_elect_t;
 
 /* One bot's live presence, as reported by the hub it is connected to.  Purely
@@ -1424,13 +1568,16 @@ typedef struct {
   int user_record_count;
   hub_mask_record_t mask_records[MAX_HUB_USER_MASKS];
   int mask_record_count;
+  hub_uflag_record_t uflag_records[MAX_HUB_USER_FLAGS];
+  int uflag_record_count;
+  hub_uchan_record_t uchan_records[MAX_HUB_CHAN_BINDS];
+  int uchan_record_count;
 
   hub_peer_config_t peers[MAX_PEERS];
   int peer_count;
 
-  pending_bot_t pending[MAX_PENDING_BOTS];
-  int pending_head;
-  int pending_count;
+  hub_revoked_t revoked[MAX_REVOKED];  /* permanent: never purged */
+  int revoked_count;
 
   pending_op_request_t pending_op_requests[MAX_PENDING_OP_REQUESTS];
   pending_chan_request_t pending_chan_requests[MAX_PENDING_CHAN_REQUESTS];
@@ -1462,6 +1609,11 @@ typedef struct {
   char   follow_bot_variant[8];
   char   follow_sel[MAX_UPGRADE_SELECT * 72];
   bool   follow_self_ready;  /* this hub itself can take the followed run */
+  /* UPGRADE_PASS_REWRITE_SECS: when the deferred pass rewrite is due (0 =
+   * none), and whether this process saved HUB_PASS_PREV_FILE —
+   * hub_update_rollback() restores it only then, never a stale copy. */
+  time_t pass_rewrite_due;
+  bool   pass_prev_saved;
   time_t follow_prepared;
   /* Nodes below this hub in the followed run's fan-out tree (its own peers'
    * subtrees).  Rebuilt for every run; see upgrade_route_t. */
@@ -1489,6 +1641,7 @@ typedef struct {
   int            ssh_ip_count;
 
   int purge_days_setting;  // Days threshold for tombstone purge (0 = disabled)
+  time_t purge_days_ts;    // hs|autopurge stamp (LWW across hubs)
   bool trust_loopback;     // D3: if true, 127.0.0.1/::1 bypass rate limiting
                            //     (default false — secure by default)
   int pid_fd;  // File descriptor for PID file lock
@@ -1514,7 +1667,7 @@ typedef struct {
 
   /* Debounced config write: set dirty flag instead of writing immediately.
    * hub_maintenance flushes at most once every CONFIG_WRITE_DEBOUNCE_S seconds.
-   * This prevents N PBKDF2(100K) calls when N peer syncs arrive in a burst. */
+   * This prevents N PBKDF2 calls when N peer syncs arrive in a burst. */
   bool config_dirty;
   /* A full config push to every local bot is owed (see
    * hub_flush_bot_config): set by every change bots must see, sent at most
@@ -1549,6 +1702,15 @@ typedef struct {
   long long    roster_gen;         /* last generation this hub gossiped     */
   uint32_t     gossip_link_mask;   /* peers linked at the last gossip (bit p) */
   time_t       resync_due_at;      /* ask peers for a sync then (0 = none)  */
+
+  /* Maintenance clocks of hub_maintenance() / hub_check_peers() (last run;
+   * 0 = not yet).  CMD_ADMIN_STATS shows the countdowns. */
+  time_t       last_anti_entropy;
+  time_t       last_mesh_gossip;
+  time_t       last_client_scan;
+  time_t       last_ip_cleanup;
+  time_t       last_purge;
+  time_t       last_peer_check;
 
   /* SSH console (hub_console_core.c): the core's end of the control
    * socketpair to the console thread, -1 when the console is not running. */
@@ -1587,10 +1749,6 @@ void hub_log_at(int level, const char *format, ...)
     do { if (hub_log_on(LOG_INFO)) hub_log_at(LOG_INFO, "[INFO] " __VA_ARGS__); } while(0)
 #define hub_log_debug(...) \
     do { if (hub_log_on(LOG_DEBUG)) hub_log_at(LOG_DEBUG, "[DEBUG] " __VA_ARGS__); } while(0)
-/* Periodic runtime counters. Carries its own [STATUS] tag but is gated at the
- * LOG_INFO level, so it disappears together with the rest of the INFO traffic. */
-#define hub_log_status(...) \
-    do { if (hub_log_on(LOG_INFO)) hub_log_at(LOG_INFO, "[STATUS] " __VA_ARGS__); } while(0)
 
 bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);
@@ -1680,6 +1838,7 @@ void hub_crypto_key_fingerprint(const unsigned char pub[64],
                                 char out[KEY_FP_LEN + 1]);
 /* Fingerprint of an 88-char key string, or "(no key)"/"(bad key)". */
 void hub_crypto_key_fingerprint_b64(const char *b64, char out[KEY_FP_LEN + 1]);
+void hub_crypto_hl_fp(const unsigned char ed_pub[32], char out[HL_FP_LEN + 1]);
 
 // AES-GCM
 int aes_gcm_decrypt(const unsigned char *input, int input_len,
@@ -1806,6 +1965,7 @@ typedef struct {
   char   setter[BAN_SETTER_MAX];        /* admin name or bot uuid          */
   char   reason[BAN_REASON_MAX + 1];
   time_t ts;
+  time_t last_used;                     /* last match a bot reported, 0 = never */
 } hub_ban_t;
 
 /* ASCII case-insensitive equality (channel names, ban masks; D39). */
@@ -1900,6 +2060,8 @@ hub_modes_status_t hub_ban_del(hub_state_t *state, const char *chan, const char 
 /* Live bans of `chan` ("*" = global only, NULL = all), oldest first, up to
  * `max`; returns how many were written. */
 int hub_ban_list(const hub_state_t *state, const char *chan, hub_ban_t *out, int max);
+/* The last-used slot of the live ban (chan, mask), NULL when there is none. */
+time_t *hub_ban_used_slot(hub_state_t *state, const char *chan, const char *mask);
 /* A ban a bot pushed (B| line body without the tag, and its stamp): accepted
  * only under the contract's bot rules; the caller forwards on true. */
 bool hub_ban_bot_write(hub_state_t *state, const char *bot_uuid, const char *value,
@@ -1910,6 +2072,7 @@ void hub_bans_sweep(hub_state_t *state, time_t now);
  * D| and B| -- for the console warning.  Hubs whose version is not known yet
  * are not listed.  Returns the count (<= max). */
 int hub_old_hubs(const hub_state_t *state, char names[][64], int max);
+int hub_old_hubs_for(const hub_state_t *state, char names[][64], int max, const char *min_ver);
 /* CMD_CHAN_EVENT from an authenticated bot (validate, rate-limit, log). */
 void hub_chan_event_receive(hub_state_t *state, hub_client_t *client, const char *payload);
 /* Start the apply-once election (kind "mode") for `channel` on behalf of
@@ -1923,11 +2086,51 @@ bool hub_chan_mode_apply(hub_state_t *state, const char *channel,
  * False when the uuid is unknown or already deleted; *ts_out = the stamp. */
 bool hub_storage_delete(hub_state_t *state, const char *uuid, time_t *ts_out);
 
+/* hub_access.c — admin flags (uf|) and oper channel bindings (uc|),
+ * docs/plans/2026-10-16_user_flags_plan.md */
+bool hub_uflags_canon(const char *in, char *out, size_t cap);
+bool hub_uflags_edit(const char *cur, const char *spec, char *out, size_t cap);
+bool hub_uflags_accepts(time_t in_ts, const char *in, time_t cur_ts, const char *cur);
+bool hub_uchan_name_ok(const char *chan);
+hub_uflag_record_t *hub_uflag_find(hub_state_t *state, const char *uuid);
+hub_uchan_record_t *hub_uchan_find(hub_state_t *state, const char *uuid, const char *chan);
+bool hub_uflag_put(hub_state_t *state, const char *uuid, const char *flags, time_t ts);
+bool hub_uchan_put(hub_state_t *state, const char *uuid, const char *chan, bool active,
+                   time_t ts);
+const char *hub_user_flags(hub_state_t *state, const char *uuid);
+bool hub_user_has_flag(hub_state_t *state, const char *uuid, char flag);
+bool hub_user_chan_ok(hub_state_t *state, const char *uuid, const char *chan);
+int hub_user_chan_count(hub_state_t *state, const char *uuid, bool *global);
+bool hub_user_restricted(hub_state_t *state, const hub_user_record_t *u);
+int hub_format_uflag(const hub_uflag_record_t *r, char *buf, size_t cap);
+int hub_format_uchan(const hub_uchan_record_t *r, char *buf, size_t cap);
+bool hub_access_ingest(hub_state_t *state, char kind, const char *body, bool need_user,
+                       bool *changed);
+int hub_access_migrate(hub_state_t *state);
+void hub_access_remap_uuid(hub_state_t *state, const char *from, const char *to);
+void hub_access_prune(hub_state_t *state);
+int hub_access_purge(hub_state_t *state, time_t cutoff);
+bool hub_access_append(hub_state_t *state, char *buf, int cap, int *off,
+                       bool (*keep)(hub_state_t *, const char *uuid, void *), void *arg);
+time_t hub_access_user_ts(hub_state_t *state, const hub_user_record_t *u);
+int hub_format_user_for_old(hub_state_t *state, const hub_user_record_t *u, bool legacy_v1,
+                            bool tomb, char *buf, size_t cap);
+bool hub_access_from_old_ok(hub_state_t *state, const char *uuid);
+char *hub_access_downgrade(hub_state_t *state, const char *payload, bool tomb);
+void hub_user_chans(hub_state_t *state, const char *uuid, char *out, size_t cap);
+time_t hub_access_next_ts(hub_state_t *state, const char *uuid);
+int hub_access_chan_change(hub_state_t *state, const char *uuid, bool add, const char *chan,
+                           char *out, size_t cap);
+/* hub_logic.c: one sync payload onto peer c's queue, downgraded for a peer
+ * that does not know uf| / uc| (every sync to a peer goes through it). */
+void hub_peer_enqueue_sync(hub_state_t *state, hub_client_t *c, uint8_t op, lane_t lane,
+                           const char *payload, const char *coalesce, uint64_t seq);
+
 void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len);
 /* proto_v2: the receiving connection advertised v|2 (new a|/o|/b| shapes);
  * false sends the fail-closed legacy shapes. */
 void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
-                              bool proto_v2, char *buffer, int max_len);
+                              int bot_proto, char *buffer, int max_len);
 void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
                                  int exclude_fd);
 
@@ -1935,6 +2138,24 @@ void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
 // tombs (may be NULL) gets one tomb|kind|id|name|ts record per tombstone.
 struct reply;
 int hub_execute_purge(hub_state_t *state, time_t cutoff, struct reply *tombs);
+
+/* hub_revoke.c: the permanent revoke list (rv|) and mesh-wide settings (hs|) */
+hub_revoked_t *hub_revoke_find(hub_state_t *state, const char *uuid);
+bool hub_revoke_merge(hub_state_t *state, const hub_revoked_t *in);
+bool hub_revoke_parse(const char *rest, hub_revoked_t *out);
+int  hub_revoke_format(const hub_revoked_t *r, char *buf, size_t cap);
+bool hub_revoke_append(hub_state_t *state, char *buf, int max_len, int *off);
+bool hub_revoke_from_bot(hub_state_t *state, const bot_config_t *b);
+int  hub_revoke_migrate(hub_state_t *state);
+int  hub_retire_revoked_bots(hub_state_t *state);
+/* A bot's hl| hub list is well formed (hub_storage.c). */
+bool hub_hublist_valid(const char *v);
+bool hub_revoke_mark_wiped(hub_state_t *state, const char *uuid, time_t now, char *line,
+                           size_t cap);
+int  hub_gsetting_format(hub_state_t *state, const char *name, char *buf, size_t cap);
+bool hub_gsetting_set(hub_state_t *state, const char *name, int value);
+bool hub_gsetting_ingest(hub_state_t *state, const char *rest, bool *changed);
+bool hub_gsetting_append(hub_state_t *state, char *buf, int max_len, int *off);
 
 /* Send PURGE|<cutoff>|<id> to every peer hub, under a fresh random id that
  * this hub records as seen.  False (nothing sent) if no id could be drawn. */
@@ -1969,6 +2190,9 @@ void hub_upgrade_tick(hub_state_t *state, time_t now);
  * upgrade's restart; the marker is read and removed exactly once, so whichever
  * peer link comes up first carries the answer. */
 void hub_upgrade_report_pending(hub_state_t *state, hub_client_t *peer);
+/* Queue every known ban last-use to a freshly linked peer as CMD_ACTIVITY
+ * B| lines, on the bulk lane behind the initial sync (repair path). */
+void hub_activity_send_bans(hub_state_t *state, hub_client_t *peer);
 
 /* ---- The hub's own self-update (hub_update.c) ---------------------------
  * The hub side of the network upgrade: what a node needs in order to *be*

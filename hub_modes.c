@@ -515,7 +515,7 @@ hub_modes_status_t hub_ban_protected(const hub_state_t *state, const char *mask,
         u = &state->user_records[k];
         break;
       }
-    if (!u || !u->is_active || !glob_overlap(mask, m->mask)) continue;
+    if (!u || !u->is_active || !hostmask_overlap(mask, m->mask)) continue;
     if (who && who_cap) snprintf(who, who_cap, "user %s", u->name);
     return HUB_MODES_PROTECTED;
   }
@@ -655,10 +655,17 @@ int hub_ban_list(const hub_state_t *state, const char *chan, hub_ban_t *out, int
     entry_field(e, 4, b->setter, sizeof(b->setter));
     ban_reason(e, b->reason, sizeof(b->reason));
     b->ts = e->timestamp;
+    b->last_used = e->last_used;
     n++;
   }
   if (n > 1) qsort(out, (size_t)n, sizeof(out[0]), ban_cmp_ts);
   return n;
+}
+
+time_t *hub_ban_used_slot(hub_state_t *state, const char *chan, const char *mask) {
+  int i = ban_find(state, chan, mask);
+  if (i < 0 || !entry_live(&state->global_entries[i])) return NULL;
+  return &state->global_entries[i].last_used;
 }
 
 /* Effective bantime of `chan` in minutes (0 = permanent). */
@@ -790,11 +797,16 @@ void hub_bans_sweep(hub_state_t *state, time_t now) {
 /* ---- older hubs (D38) ----------------------------------------------------- */
 
 int hub_old_hubs(const hub_state_t *state, char names[][64], int max) {
+  return hub_old_hubs_for(state, names, max, MODES_MIN_HUB);
+}
+
+/* The hubs in the mesh map older than min_ver (or of unknown version). */
+int hub_old_hubs_for(const hub_state_t *state, char names[][64], int max, const char *min_ver) {
   int n = 0;
   for (int i = 0; i < state->mesh_hub_count && n < max; i++) {
     const mesh_hub_t *m = &state->mesh_hubs[i];
     if (state->hub_uuid[0] && strcmp(m->uuid, state->hub_uuid) == 0) continue;
-    if (m->version[0] && hub_update_version_cmp(m->version, MODES_MIN_HUB) >= 0) continue;
+    if (m->version[0] && hub_update_version_cmp(m->version, min_ver) >= 0) continue;
     snprintf(names[n++], 64, "%s", m->name[0] ? m->name : m->uuid);
   }
   /* A linked peer that never sent a roster at all is older still. */

@@ -104,7 +104,7 @@ void creply_parse(const char *text, size_t len, creply_t *out) {
   memset(out, 0, sizeof(*out));
   size_t end = len;
   while (end > 0 && (text[end - 1] == '\n' || text[end - 1] == '\r')) end--;
-  bool first = true, rows = false, status = false;
+  bool first = true, rows = false;
   for (size_t i = 0; i < end;) {
     size_t j = i;
     while (j < end && text[j] != '\n') j++;
@@ -125,7 +125,6 @@ void creply_parse(const char *text, size_t len, creply_t *out) {
         }
         if (!out->code) out->code = dupn("", 0);
         rows = !strcmp(out->code, "network.tree");
-        status = !strcmp(out->code, "network.status");
         i = j + 1;
         continue;
       }
@@ -134,14 +133,6 @@ void creply_parse(const char *text, size_t len, creply_t *out) {
     crec_t *nr = realloc(out->r, sizeof(crec_t) * (size_t)(out->n + 1));
     if (!nr) break;
     out->r = nr;
-    if (status) {
-      /* key=value lines become fields of the result record */
-      const char *eq = memchr(text + i, '=', n);
-      if (eq) rec_add(&out->res, clean_dup(text + i, (size_t)(eq - (text + i))),
-                      clean_dup(eq + 1, n - (size_t)(eq - (text + i)) - 1));
-      i = j + 1;
-      continue;
-    }
     parse_rec(text + i, n, &out->r[out->n], !rows);
     out->n++;
     i = j + 1;
@@ -447,7 +438,7 @@ static const char *level_name(long long l) {
   return l >= 0 && l <= 4 ? LEVEL_NAME[l] : "?";
 }
 
-/* "1 peer hub" / "3 peer hubs" */
+/* "1 hub link" / "3 hub links" */
 static void plural(char *out, size_t cap, long long n, const char *one, const char *many) {
   snprintf(out, cap, "%lld %s", n, n == 1 ? one : many);
 }
@@ -779,14 +770,14 @@ static void tbl_render(const fmt_ctx_t *ctx, flines_t *out, const tbl_t *t) {
  * Shared value phrases
  * ========================================================================== */
 static void peers_phrase(char *out, size_t cap, long long peers) {
-  if (peers <= 0) snprintf(out, cap, "no peer hub is linked now; peers catch up on their next sync");
-  else snprintf(out, cap, "synced to %lld peer hub%s", peers, peers == 1 ? "" : "s");
+  if (peers <= 0) snprintf(out, cap, "no other hub is linked now; they catch up on their next sync");
+  else snprintf(out, cap, "synced to %lld other hub%s", peers, peers == 1 ? "" : "s");
 }
 
 static void sync_push_phrase(char *out, size_t cap, long long peers, long long bots) {
   char p[96];
-  if (peers <= 0) snprintf(p, sizeof(p), "no peer hub linked");
-  else snprintf(p, sizeof(p), "synced to %lld peer hub%s", peers, peers == 1 ? "" : "s");
+  if (peers <= 0) snprintf(p, sizeof(p), "no other hub linked");
+  else snprintf(p, sizeof(p), "synced to %lld other hub%s", peers, peers == 1 ? "" : "s");
   snprintf(out, cap, "%s; pushed to %lld bot%s", p, bots, bots == 1 ? "" : "s");
 }
 
@@ -880,7 +871,7 @@ static void render_bot_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
   int n = 0;
   sortrow_t *v = collect(rep, "bot", "nick", "online", &n);
   if (!n) {
-    empty_note(out, "no bots registered", "bot add <nick> <uuid> <key>, or approve one from bot pending");
+    empty_note(out, "no bots registered", "bot add <nick> <uuid> <key>");
     free(v);
     return;
   }
@@ -942,7 +933,7 @@ static void render_bot_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
       vcnt[j - 1] = tc;
     }
   sb_t b = {0};
-  sb_addf(&b, "  online %lld %s offline %lld %s on this hub %d %s via peers %d", online,
+  sb_addf(&b, "  online %lld %s offline %lld %s on this hub %d %s via other hubs %d", online,
           GL(G_DOT), total - online, GL(G_DOT), here, GL(G_DOT), via);
   for (int i = 0; i < nv; i++) sb_addf(&b, " %s %s %s%d", GL(G_DOT), vers[i], GL(G_TIMES), vcnt[i]);
   if (cc) sb_addf(&b, " %s c %d", GL(G_DOT), cc);
@@ -1060,40 +1051,35 @@ static void render_bot_summary(const fmt_ctx_t *ctx, const creply_t *rep, flines
   free(v);
 }
 
-static void render_bot_pending(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+static void render_bot_revoked(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   char right[48];
-  snprintf(right, sizeof(right), "%lld waiting", rvi(&rep->res, "count", 0));
-  fmt_title(ctx, out, "Pending bots", right);
-  static const col_t cols[] = {{"#", 'R', 1}, {"UUID", 'L', 1}, {"FROM", 'L', 1},
-                               {"TRIES", 'R', 1}, {"LAST TRY", 'L', 1}};
+  snprintf(right, sizeof(right), "%lld of %lld", rvi(&rep->res, "count", 0),
+           rvi(&rep->res, "max", 0));
+  fmt_title(ctx, out, "Revoked bots", right);
+  static const col_t cols[] = {{"NICK", 'L', 1}, {"UUID", 'L', 1}, {"DELETED", 'L', 1},
+                               {"WIPED", 'L', 1}};
   tbl_t t;
-  tbl_init(&t, cols, 5, -1, 1, 1);
+  tbl_init(&t, cols, 4, -1, 1, 1);
   for (int i = 0; i < rep->n; i++) {
     const crec_t *r = &rep->r[i];
-    if (strcmp(r->type, "pending")) continue;
-    char nn[16], tries[16], last[48], s[32];
-    snprintf(nn, sizeof(nn), "%lld", rvi(r, "n", 0));
-    snprintf(tries, sizeof(tries), "%lld", rvi(r, "tries", 0));
-    long long ts = rvi(r, "last", 0);
-    if (ts > 0) {
-      fmt_span(ctx->now - ts, s, sizeof(s));
-      snprintf(last, sizeof(last), "%s ago", s);
-    } else {
-      snprintf(last, sizeof(last), "%s", GL(G_DASH));
-    }
-    const char *cells[5] = {nn, rv(r, "uuid"), rv(r, "ip"), tries, last};
+    if (strcmp(r->type, "revoked")) continue;
+    char del[48], wiped[48];
+    fmt_when(rvi(r, "deleted", 0), ctx->now, del, sizeof(del));
+    if (rvi(r, "wiped", 0) > 0) fmt_when(rvi(r, "wiped", 0), ctx->now, wiped, sizeof(wiped));
+    else snprintf(wiped, sizeof(wiped), "%s", GL(G_DASH));
+    const char *cells[4] = {rvs(r, "nick") ? rv(r, "nick") : GL(G_DASH), rv(r, "uuid"), del,
+                            wiped};
     tbl_row(ctx, &t, RL_NORMAL, NULL, cells);
   }
   if (!t.nr) {
-    empty_note(out, "no bots waiting for approval", NULL);
+    empty_note(out, "no deleted bots", NULL);
     tbl_free(&t);
     return;
   }
   tbl_render(ctx, out, &t);
   tbl_free(&t);
   rule_line(ctx, out);
-  line(out, RL_DIM, "  approve one: bot approve <#|uuid>   (the # changes as bots come and go %s the uuid does not)",
-       GL(G_DASH));
+  line(out, RL_DIM, "  one that ever connects to any hub is told to wipe its config and exit");
 }
 
 /* ==========================================================================
@@ -1124,18 +1110,193 @@ static void peer_link(const fmt_ctx_t *ctx, const crec_t *r, char *out, size_t c
   }
 }
 
+/* hub del's preview (peer.refs): the hub, the hubs that link to it, the bots
+ * whose hub list holds it, and what to run where.  hub_console_ui.c asks the
+ * question after it. */
+static void render_peer_refs(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  const crec_t *t = NULL;
+  for (int i = 0; i < rep->n && !t; i++)
+    if (!strcmp(rep->r[i].type, "peer")) t = &rep->r[i];
+  if (!t) return;
+  const char *tn = peer_name(t);
+  char title[160], v[160];
+  snprintf(title, sizeof(title), "Hub %s", tn);
+  snprintf(v, sizeof(v), "%s link %s", GL(rvb(t, "up") ? G_ON : G_ERR), rvb(t, "up") ? "up" : "down");
+  fmt_title(ctx, out, title, v);
+  const int L = 8;
+  fmt_card_line(ctx, out, L, "uuid", rvs(t, "uuid") ? rv(t, "uuid") : GL(G_DASH), RL_NORMAL);
+  addr_of(t, v, sizeof(v));
+  fmt_card_line(ctx, out, L, "address", v, RL_NORMAL);
+  fmt_card_line(ctx, out, L, "key", rvs(t, "fp") ? rv(t, "fp") : "(no key)", RL_NORMAL);
+
+  int hrefs = 0, hunrep = 0, brefs = 0, bunrep = 0;
+  for (int i = 0; i < rep->n; i++) {
+    const char *ty = rep->r[i].type;
+    if (!strcmp(ty, "hubref") && !rvb(&rep->r[i], "self")) hrefs++;
+    else if (!strcmp(ty, "hubunrep")) hunrep++;
+    else if (!strcmp(ty, "botref")) brefs++;
+    else if (!strcmp(ty, "botunrep")) bunrep++;
+  }
+  line(out, RL_NORMAL, "%s", "");
+  if (!hrefs && !hunrep && !brefs && !bunrep) {
+    line(out, RL_NORMAL, "  No other hub links to %s and no bot lists it.", tn);
+    return;
+  }
+
+  /* hubs */
+  snprintf(title, sizeof(title), "Hubs that link to %s", tn);
+  snprintf(v, sizeof(v), "%d of %lld hubs", hrefs + 1, rvi(&rep->res, "hubs", 0));
+  if (hunrep) {
+    size_t o = strlen(v);
+    snprintf(v + o, sizeof(v) - o, " %s %d not reported", GL(G_DOT), hunrep);
+  }
+  fmt_title(ctx, out, title, v);
+  static const col_t hcols[] = {{"HUB", 'L', 1}, {"LINK", 'L', 1}, {"TO DO", 'L', 2}};
+  tbl_t ht;
+  tbl_init(&ht, hcols, 3, -1, 0, 2);
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *r = &rep->r[i];
+    if (strcmp(r->type, "hubref")) continue;
+    bool up = rvs(r, "state") && !strcmp(rv(r, "state"), "up");
+    char lk[32], todo[256];
+    snprintf(lk, sizeof(lk), "%s %s", GL(up ? G_ON : G_ERR), up ? "up" : "down");
+    if (rvb(r, "self"))
+      snprintf(todo, sizeof(todo), "this hub: unlinked when you answer y");
+    else
+      snprintf(todo, sizeof(todo), "hub del %s on %s%s", tn, rv(r, "name") ? rv(r, "name") : "?",
+               up ? "" : " (link configured, down now)");
+    const char *cells[3] = {rv(r, "name"), lk, todo};
+    tbl_row(ctx, &ht, up ? RL_NORMAL : RL_WARN, NULL, cells);
+  }
+  tbl_render(ctx, out, &ht);
+  tbl_free(&ht);
+  if (hunrep) {
+    sb_t s = {0};
+    for (int i = 0; i < rep->n; i++)
+      if (!strcmp(rep->r[i].type, "hubunrep"))
+        sb_addf(&s, "%s%s", s.len ? ", " : "", rv(&rep->r[i], "name") ? rv(&rep->r[i], "name") : "?");
+    line(out, RL_DIM, "  not reported: %s (their links never reached this hub)", s.p);
+    sb_free(&s);
+  }
+
+  /* bots */
+  line(out, RL_NORMAL, "%s", "");
+  snprintf(title, sizeof(title), "Bots that list %s", tn);
+  snprintf(v, sizeof(v), "%d of %lld bots", brefs, rvi(&rep->res, "bots", 0));
+  if (bunrep) {
+    size_t o = strlen(v);
+    snprintf(v + o, sizeof(v) - o, " %s %d not reported", GL(G_DOT), bunrep);
+  }
+  fmt_title(ctx, out, title, v);
+  static const col_t bcols[] = {{"BOT", 'L', 1}, {"NOW", 'L', 1}, {"ITS OTHER HUBS", 'L', 2},
+                                {"TO DO", 'L', 2}};
+  tbl_t bt;
+  tbl_init(&bt, bcols, 4, -1, 0, 2);
+  bool unknown = false;
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *r = &rep->r[i];
+    if (strcmp(r->type, "botref")) continue;
+    char now[96], todo[160], sp[32];
+    if (rvs(r, "on")) {
+      snprintf(now, sizeof(now), "%s on %s", GL(G_ON), rv(r, "on_name") ? rv(r, "on_name") : "?");
+    } else if (rvi(r, "seen", 0) > 0) {
+      fmt_span(ctx->now - rvi(r, "seen", 0), sp, sizeof(sp));
+      snprintf(now, sizeof(now), "%s offline %s", GL(G_OFF), sp);
+    } else {
+      snprintf(now, sizeof(now), "%s offline", GL(G_OFF));
+    }
+    sb_t o = {0};
+    const char *ol = rv(r, "others");
+    if (!ol) ol = "";
+    for (const char *p = ol; *p;) {
+      const char *e = strchr(p, ',');
+      size_t n = e ? (size_t)(e - p) : strlen(p);
+      if (*p == '?') {
+        sb_addf(&o, "%s%.*s (?)", o.len ? " " : "", (int)(n - 1), p + 1);
+        unknown = true;
+      } else {
+        sb_addf(&o, "%s%.*s", o.len ? " " : "", (int)n, p);
+      }
+      p = e ? e + 1 : p + n;
+    }
+    bool stranded = !ol[0];
+    if (stranded)
+      snprintf(todo, sizeof(todo), "%s add another hub first (+hub)", GL(G_ERR));
+    else
+      snprintf(todo, sizeof(todo), "-hub %s", rvs(r, "addr") ? rv(r, "addr") : "<its address for it>");
+    const char *cells[4] = {rvs(r, "nick") ? rv(r, "nick") : rv(r, "uuid"), now,
+                            stranded ? "none" : o.p, todo};
+    tbl_row(ctx, &bt, stranded ? RL_WARN : RL_NORMAL, NULL, cells);
+    sb_free(&o);
+  }
+  if (bt.nr) tbl_render(ctx, out, &bt);
+  else line(out, RL_NORMAL, "  (no bot lists it)");
+  tbl_free(&bt);
+  if (bunrep) {
+    sb_t s = {0};
+    for (int i = 0; i < rep->n; i++) {
+      const crec_t *r = &rep->r[i];
+      if (strcmp(r->type, "botunrep")) continue;
+      sb_addf(&s, "%s%s", s.len ? ", " : "",
+              rvs(r, "nick") ? rv(r, "nick") : rv(r, "uuid") ? rv(r, "uuid") : "?");
+    }
+    line(out, RL_DIM, "  not reported: %s (no hub list from them: an older build, or not "
+         "connected since)", s.p);
+    sb_free(&s);
+  }
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *r = &rep->r[i];
+    if (strcmp(r->type, "botref")) continue;
+    const char *nk = rvs(r, "nick") ? rv(r, "nick") : rv(r, "uuid") ? rv(r, "uuid") : "?";
+    if (!rvs(r, "others")) {
+      line(out, RL_WARN, "  %s %s lists no other hub: without %s it cannot connect at all.",
+           GL(G_WARN), nk, tn);
+    } else if (rvs(r, "on_uuid") && rvs(t, "uuid") && !strcmp(rv(r, "on_uuid"), rv(t, "uuid"))) {
+      const char *ol = rv(r, "others");
+      if (!ol) ol = "";
+      sb_t o = {0};
+      int cnt = 0, k = 0;
+      for (const char *p = ol; *p; p++) cnt += *p == ',';
+      cnt++;
+      for (const char *p = ol; *p;) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        k++;
+        const char *sep = k == 1 ? "" : k == cnt ? " or " : ", ";
+        if (*p == '?') sb_addf(&o, "%s%.*s", sep, (int)(n - 1), p + 1);
+        else sb_addf(&o, "%s%.*s", sep, (int)n, p);
+        p = e ? e + 1 : p + n;
+      }
+      line(out, RL_WARN, "  %s %s is on %s now: after its -hub it moves to %s.", GL(G_WARN), nk, tn,
+           o.p);
+      sb_free(&o);
+    }
+  }
+  if (unknown) line(out, RL_DIM, "  (?) a hub this hub has no key for, shown by the address the bot uses");
+}
+
 /* A hub's short name for a matrix column: the first 5 characters. */
-static void short5(const char *name, char *out, size_t cap) {
-  size_t o = 0, i = 0, n = strlen(name);
-  int chars = 0;
-  while (i < n && chars < 5 && o + 4 < cap) {
+/* A mesh column head: the first `head` and the last `tail` characters of
+ * `name`, or all of it when it has no more than head + tail. */
+static void mesh_head(const char *name, int head, int tail, char *out, size_t cap) {
+  size_t n = strlen(name), o = 0;
+  int nc = 0;
+  for (size_t i = 0; i < n; nc++) {
+    unsigned cp;
+    int w;
+    i += console_next_char(name + i, n - i, &cp, &w);
+  }
+  if (nc <= head + tail) head = nc;
+  int c = 0;
+  for (size_t i = 0; i < n; c++) {
     unsigned cp;
     int w;
     size_t l = console_next_char(name + i, n - i, &cp, &w);
-    memcpy(out + o, name + i, l);
-    o += l;
+    if ((c < head || c >= nc - tail) && o + l < cap) {
+      memcpy(out + o, name + i, l);
+      o += l;
+    }
     i += l;
-    chars++;
   }
   out[o] = '\0';
 }
@@ -1171,19 +1332,61 @@ static void render_mesh(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out
     nn++;
   }
   if (nn < 2) return;
+  /* Column heads: the first 5 characters of each name ("hub-" dropped: it
+   * says nothing).  Names whose heads clash get their start plus their end,
+   * with the shortest end that tells that group apart ("tnhub1".."tnhub5"
+   * -> "tnhu1".."tnhu5"); if no end does, the group is numbered in list
+   * order. */
+  const char *nm[64];
+  char base[64][32];
+  bool clash[64];
+  bool any = false;
   for (int i = 0; i < nn; i++) {
-    /* a leading "hub-" says nothing in a column head */
-    const char *nm = nodes[i].name;
-    if (!strncasecmp(nm, "hub-", 4) && nm[4]) nm += 4;
-    short5(nm, nodes[i].shrt, sizeof(nodes[i].shrt));
-    int dup = 0;
-    for (int k = 0; k < i; k++) dup += !strcmp(nodes[k].shrt, nodes[i].shrt);
-    if (dup) {
-      size_t l = strlen(nodes[i].shrt);
-      if (l > 0 && l + 2 < sizeof(nodes[i].shrt)) {
-        nodes[i].shrt[l - (l >= 5 ? 1 : 0)] = '\0';
-        size_t l2 = strlen(nodes[i].shrt);
-        snprintf(nodes[i].shrt + l2, sizeof(nodes[i].shrt) - l2, "%d", dup + 1);
+    nm[i] = nodes[i].name;
+    if (!strncasecmp(nm[i], "hub-", 4) && nm[i][4]) nm[i] += 4;
+    mesh_head(nm[i], 5, 0, base[i], sizeof(base[i]));
+  }
+  for (int i = 0; i < nn; i++) {
+    clash[i] = false;
+    for (int j = 0; j < nn; j++) clash[i] |= j != i && !strcmp(base[i], base[j]);
+    any |= clash[i];
+    memcpy(nodes[i].shrt, base[i], sizeof(nodes[i].shrt));
+  }
+  if (any) {
+    char cand[64][32];
+    bool done[64] = {false};
+    for (int i = 0; i < nn; i++) {
+      if (!clash[i] || done[i]) continue;
+      /* the group of names whose heads are base[i] */
+      bool grp[64];
+      for (int j = 0; j < nn; j++) grp[j] = clash[j] && !strcmp(base[j], base[i]);
+      int k;
+      for (k = 1; k <= 4; k++) {
+        for (int j = 0; j < nn; j++)
+          if (grp[j]) mesh_head(nm[j], 5 - k, k, cand[j], sizeof(cand[j]));
+        bool ok = true;
+        for (int j = 0; j < nn && ok; j++) {
+          if (!grp[j]) continue;
+          for (int m = 0; m < nn && ok; m++) {
+            if (m == j) continue;
+            if (grp[m]) ok = strcmp(cand[j], cand[m]) != 0;
+            else if (!clash[m]) ok = strcmp(cand[j], base[m]) != 0;
+          }
+        }
+        if (ok) break;
+      }
+      int ord = 0;
+      for (int j = 0; j < nn; j++) {
+        if (!grp[j]) continue;
+        done[j] = true;
+        ord++;
+        if (k <= 4) {
+          memcpy(nodes[j].shrt, cand[j], sizeof(nodes[j].shrt));
+          continue;
+        }
+        char h[20]; /* at most 4 characters of 4 bytes */
+        mesh_head(base[j], ord < 10 ? 4 : 3, 0, h, sizeof(h));
+        snprintf(nodes[j].shrt, sizeof(nodes[j].shrt), "%s%d", h, ord);
       }
     }
   }
@@ -1201,13 +1404,17 @@ static void render_mesh(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out
   int nw = 0;
   for (int i = 0; i < nn; i++)
     if (console_str_width(nodes[i].name) > nw) nw = console_str_width(nodes[i].name);
-  int cw = 6;
+  /* Whole names head the columns when they fit (each glyph centred under
+   * its name); the short heads only when the terminal is too narrow. */
+  int fw = nw + 2 > 6 ? nw + 2 : 6;
+  bool full = 3 + nw + 2 + fw * nn <= ctx->width;
+  int cw = full ? fw : 6;
   sb_t b = {0};
   if (3 + nw + 2 + cw * nn <= ctx->width) {
     sb_pad(&b, 3 + nw + 2);
     for (int i = 0; i < nn; i++) {
       int x = b.w;
-      sb_add(&b, nodes[i].shrt);
+      sb_add(&b, full ? nodes[i].name : nodes[i].shrt);
       sb_pad(&b, x + cw);
     }
     sb_emit(&b, out, RL_HEAD);
@@ -1217,7 +1424,8 @@ static void render_mesh(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out
       sb_pad(&b, 3 + nw + 2);
       for (int c = 0; c < nn; c++) {
         int x = b.w;
-        sb_pad(&b, x + 2);
+        int w = console_str_width(nodes[c].name);
+        sb_pad(&b, x + (full && w > 0 ? (w - 1) / 2 : 2));
         sb_add(&b, a == c ? GL(G_DOT) : cell[a][c] == 1 ? GL(G_ON)
                    : cell[a][c] == 2 ? GL(G_ERR) : GL(G_UNKNOWN));
         sb_pad(&b, x + cw);
@@ -1231,18 +1439,18 @@ static void render_mesh(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out
       sb_add(&b, "   ");
       sb_add(&b, nodes[a].name);
       sb_pad(&b, 3 + nw + 2);
-      bool any = false;
+      bool listed = false;
       for (int pass = 1; pass <= 2; pass++) {
         bool first = true;
         for (int c = 0; c < nn; c++) {
           if (c == a || cell[a][c] != pass) continue;
-          sb_addf(&b, "%s%s", first ? (pass == 1 ? "up: " : (any ? "  down: " : "down: ")) : " ",
+          sb_addf(&b, "%s%s", first ? (pass == 1 ? "up: " : (listed ? "  down: " : "down: ")) : " ",
                   nodes[c].shrt);
           first = false;
-          any = true;
+          listed = true;
         }
       }
-      if (!any) sb_add(&b, "(not reported)");
+      if (!listed) sb_add(&b, "(not reported)");
       sb_emit(&b, out, RL_NORMAL);
     }
   }
@@ -1254,7 +1462,7 @@ static void render_peer_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
   char right[96];
   snprintf(right, sizeof(right), "%lld configured %s %lld up %s %lld down", conf, GL(G_DOT), up,
            GL(G_DOT), conf - up);
-  fmt_title(ctx, out, "Peer hubs", right);
+  fmt_title(ctx, out, "Linked hubs", right);
   static const col_t cols[] = {
     {"#", 'R', 1}, {"NAME", 'L', 1}, {"ADDRESS", 'L', 1}, {"UUID", 'L', 2}, {"CODE", 'L', 2},
     {"VERSION", 'L', 2}, {"UPTIME", 'L', 2}, {"BOTS", 'R', 1}, {"LINK", 'L', 1},
@@ -1280,8 +1488,8 @@ static void render_peer_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
     tbl_row(ctx, &t, rvb(r, "up") ? RL_NORMAL : RL_WARN, rvb(r, "up") ? "up" : "down", cells);
   }
   if (!t.nr) {
-    empty_note(out, "no peer hubs configured: this hub runs alone",
-               "peer add <ip> <port> <uuid> <name|-> <key>");
+    empty_note(out, "no other hubs linked: this hub runs alone",
+               "hub add <ip> <port> <uuid> <name|-> <key>");
   } else {
     tbl_render(ctx, out, &t);
   }
@@ -1339,7 +1547,7 @@ static void render_peer_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
     if (!strcmp(rep->r[i].type, "peer")) r = &rep->r[i];
   if (!r) return;
   char title[96], link[96], v[512], a[48], b[48];
-  snprintf(title, sizeof(title), "Peer %s", peer_name(r));
+  snprintf(title, sizeof(title), "Hub %s", peer_name(r));
   peer_link(ctx, r, link, sizeof(link));
   fmt_title(ctx, out, title, link);
   const int L = 12;
@@ -1398,7 +1606,7 @@ static void render_peer_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
     sb_addf(&s, "%s %s", rvs(l, "b_name") ? rv(l, "b_name") : rv(l, "b") ? rv(l, "b") : "?",
             lu ? GL(G_ON) : GL(G_ERR));
   }
-  fmt_card_line(ctx, out, L, "its peers", s.len ? s.p : "(not reported)", RL_NORMAL);
+  fmt_card_line(ctx, out, L, "its links", s.len ? s.p : "(not reported)", RL_NORMAL);
   sb_free(&s);
   static const char *const known[] = {"n", "uuid", "name", "ip", "port", "remote_ip", "up",
                                       "since", "base", "ver", "started", "bots", "fp",
@@ -1435,7 +1643,7 @@ static void render_hub_show(const fmt_ctx_t *ctx, const crec_t *h, flines_t *out
   snprintf(v, sizeof(v), "ssh-ed25519 %s", rvs(h, "ssh_fp") ? rv(h, "ssh_fp") : "?");
   fmt_card_line(ctx, out, L, "ssh host key", v, RL_NORMAL);
   snprintf(v, sizeof(v), "%lld / %lld up", rvi(h, "peers_up", 0), rvi(h, "peers", 0));
-  fmt_card_line(ctx, out, L, "peers", v, RL_NORMAL);
+  fmt_card_line(ctx, out, L, "hubs", v, RL_NORMAL);
   snprintf(v, sizeof(v), "%lld here %s %lld / %lld on the network", rvi(h, "bots_here", 0),
            GL(G_DOT), rvi(h, "bots_online", 0), rvi(h, "bots", 0));
   fmt_card_line(ctx, out, L, "bots", v, RL_NORMAL);
@@ -1447,7 +1655,7 @@ static void render_hub_show(const fmt_ctx_t *ctx, const crec_t *h, flines_t *out
   snprintf(v, sizeof(v), "file %s (limit %s) %s console %s", level_name(rvi(h, "log_file", 0)), b,
            GL(G_DOT), level_name(rvi(h, "log_console", 0)));
   fmt_card_line(ctx, out, L, "log", v, RL_NORMAL);
-  snprintf(v, sizeof(v), "peers: peer add %s <key>   %s   bots: +hub host:port <key>",
+  snprintf(v, sizeof(v), "hubs: hub add %s <key>   %s   bots: +hub host:port <key>",
            GL(G_ELL), GL(G_DOT));
   fmt_card_line(ctx, out, L, "give to", v, RL_DIM);
   static const char *const known[] = {"name", "uuid", "ver", "base", "started", "bind_ip", "port",
@@ -1494,7 +1702,7 @@ static const struct {
   {"ssh", "connect", "new SSH connections per address, N:S, then blocked"},
   {"ssh", "block", "seconds blocked; doubles per repeat within 24 h, up to 24 h (30-86400)"},
   {"ssh", "cmdrate", "console commands per session, N:S; more are queued, not dropped"},
-  {"conn", "perip", "connections at once from one address, bots, peers and SSH (2-64)"},
+  {"conn", "perip", "connections at once from one address, bots, hubs and SSH (2-64)"},
   {"conn", "churn", "new connections per address, N:S[:B], then blocked B seconds"},
   {"conn", "authfail", "failed logins per address, N:S[:B], then blocked B seconds"},
 };
@@ -1570,14 +1778,16 @@ static void render_hub_set(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *
              rvb(r, "restart") ? "   (restart needed)" : "");
   }
   fmt_ok(ctx, what, subj, out);
-  if (!strcmp(setting, "name")) effect(ctx, out, "peers learn the new name with the next mesh gossip (now)");
+  if (!strcmp(setting, "name")) effect(ctx, out, "other hubs learn the new name with the next mesh gossip (now)");
+  if (!strcmp(setting, "autopurge"))
+    effect(ctx, out, "every hub uses it; the hub with the lowest uuid runs the purge");
   if (rvb(r, "restart")) {
     snprintf(ph, sizeof(ph), "takes effect when the hub restarts; it listens on %s:%s until then",
              rv(r, "listen_ip") ? rv(r, "listen_ip") : "?",
              rv(r, "listen_port") ? rv(r, "listen_port") : "?");
     effect(ctx, out, ph);
     if (!strcmp(setting, "port")) {
-      snprintf(ph, sizeof(ph), "after the restart, admins connect with ssh -p %s; peers and bots must use :%s",
+      snprintf(ph, sizeof(ph), "after the restart, admins connect with ssh -p %s; other hubs and bots must use :%s",
                val, val);
       effect(ctx, out, ph);
     }
@@ -1604,12 +1814,12 @@ static void render_hub_rekeyed(const fmt_ctx_t *ctx, const creply_t *rep, flines
   fmt_card_line(ctx, out, L, "saved to", rvs(r, "file") ? rv(r, "file") : "(not written)",
                 rvs(r, "file") ? RL_NORMAL : RL_WARN);
   char p[48], b[48];
-  plural(p, sizeof(p), rvi(r, "peers", 0), "peer link", "peer links");
+  plural(p, sizeof(p), rvi(r, "peers", 0), "hub link", "hub links");
   plural(b, sizeof(b), rvi(r, "bots", 0), "bot", "bots");
   snprintf(v, sizeof(v), "%s, %s", p, b);
   fmt_card_line(ctx, out, L, "dropped", v, RL_NORMAL);
   line(out, RL_HEAD, " Next steps");
-  line(out, RL_NORMAL, "  1. on each peer hub:   peer set %s key <new key>",
+  line(out, RL_NORMAL, "  1. on each other hub:  hub set %s key <new key>",
        rvs(r, "uuid") ? rv(r, "uuid") : "<this hub's uuid>");
   line(out, RL_NORMAL, "  2. on each bot here:   -hub %s:%lld  then  +hub %s:%lld <new key>",
        rv(r, "name") ? rv(r, "name") : "hub", rvi(r, "port", 0),
@@ -1654,10 +1864,10 @@ static void render_tomb_purged(const fmt_ctx_t *ctx, const creply_t *rep, flines
   char p[96];
   long long peers = rvi(r, "peers", 0);
   if (peers > 0)
-    snprintf(p, sizeof(p), "purge sent to %lld peer hub%s (they purge on their own)", peers,
+    snprintf(p, sizeof(p), "purge sent to %lld other hub%s (they purge on their own)", peers,
              peers == 1 ? "" : "s");
   else
-    snprintf(p, sizeof(p), "no peer hub is linked now to send the purge to");
+    snprintf(p, sizeof(p), "no other hub is linked now to send the purge to");
   effect(ctx, out, p);
 }
 
@@ -1709,7 +1919,7 @@ static const char *const OPNAME[256] = {
  [0x71] = "CMD_CHAN_ELECT_FWD", [0x72] = "CMD_CHAN_ELECT_ACK", [0x73] = "CMD_CHAN_ELECT_DO",
  [0x74] = "CMD_CHAN_ELECT_DONE", [0x75] = "CMD_ADMIN_INVITE_USER",
  [0x76] = "CMD_ADMIN_CHAN_MODE", [0x77] = "CMD_ADMIN_CHAN_SET", [0x78] = "CMD_ADMIN_BAN",
- [0x79] = "CMD_ADMIN_NET_SET", [0x7A] = "CMD_ADMIN_SET_SSH", [0x7B] = "CMD_CHAN_EVENT",
+ [0x79] = "CMD_ADMIN_NET_SET", [0x7A] = "CMD_ADMIN_SET_SSH", [0x7B] = "CMD_CHAN_EVENT", [0x7C] = "CMD_ADMIN_USER_ACCESS", [0x7D] = "CMD_USER_CHAN_REQUEST", [0x7E] = "CMD_USER_CHAN_RESULT", [0x7F] = "CMD_BOT_RETIRE", [0x80] = "CMD_BOT_RETIRE_ACK", [0x81] = "CMD_ADMIN_LIST_REVOKED", [0x82] = "CMD_ADMIN_PEER_REFS",
 };
 
 static unsigned long long rvu(const crec_t *r, const char *k) {
@@ -1724,16 +1934,52 @@ static void count_kv(sb_t *b, const char *label, unsigned long long n, int col) 
   sb_addf(b, "%s  %s", label, c);
 }
 
+/* The maintenance countdowns of a stats reply ("timer" records). */
+static void render_timers(const fmt_ctx_t *ctx, const creply_t *rep, const crec_t *ld,
+                          flines_t *out) {
+  static const struct { const char *k, *label; } NAMES[] = {
+      {"gossip", "mesh gossip"},      {"entropy", "anti-entropy sync"},
+      {"scan", "client scan"},        {"ipclean", "ip limit cleanup"},
+      {"peers", "hub reconnect"},     {"purge", "tombstone purge"}};
+  static const col_t cols[] = {{"JOB", 'L', 1}, {"EVERY", 'R', 1}, {"NEXT RUN", 'R', 1}};
+  tbl_t t;
+  tbl_init(&t, cols, 3, -1, 1, 1);
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *r = &rep->r[i];
+    if (strcmp(r->type, "timer")) continue;
+    const char *k = rv(r, "name") ? rv(r, "name") : "?", *label = k;
+    for (size_t j = 0; j < sizeof(NAMES) / sizeof(NAMES[0]); j++)
+      if (!strcmp(NAMES[j].k, k)) label = NAMES[j].label;
+    char every[48], in[48];
+    fmt_dur3(rvi(r, "every", 0), every, sizeof(every));
+    const char *iv = rv(r, "in");
+    if (iv && !strcmp(iv, "off")) snprintf(in, sizeof(in), "off");
+    else fmt_dur3(rvi(r, "in", 0), in, sizeof(in));
+    const char *cells[3] = {label, every, in};
+    tbl_row(ctx, &t, RL_NORMAL, NULL, cells);
+  }
+  if (!t.nr) {
+    tbl_free(&t);
+    return;
+  }
+  flines_add(out, RL_NORMAL, "");
+  fmt_title(ctx, out, "Maintenance timers",
+            ld ? (rvi(ld, "dirty", 0) ? "config unsaved" : "config saved") : NULL);
+  tbl_render(ctx, out, &t);
+  tbl_free(&t);
+}
+
 static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   char right[96], up[48];
   fmt_dur3(rvi(&rep->res, "up", 0), up, sizeof(up));
   snprintf(right, sizeof(right), "%s %s up %s", ctx->hubname && *ctx->hubname ? ctx->hubname : "hub",
            GL(G_DOT), up);
   fmt_title(ctx, out, "Hub statistics", right);
-  const crec_t *cfg = NULL, *sy = NULL;
+  const crec_t *cfg = NULL, *sy = NULL, *ld = NULL;
   for (int i = 0; i < rep->n; i++) {
     if (!strcmp(rep->r[i].type, "cfg")) cfg = &rep->r[i];
     if (!strcmp(rep->r[i].type, "sync")) sy = &rep->r[i];
+    if (!strcmp(rep->r[i].type, "load")) ld = &rep->r[i];
   }
   sb_t b = {0};
   if (cfg) {
@@ -1744,14 +1990,23 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
     sb_emit(&b, out, RL_NORMAL);
   }
   if (sy) {
-    line(out, RL_HEAD, " Sync frames from peers");
+    line(out, RL_HEAD, " Sync frames from other hubs");
     count_kv(&b, "  frames", rvu(sy, "frames"), 0);
     count_kv(&b, "no-op", rvu(sy, "noop"), 24);
     count_kv(&b, "records", rvu(sy, "records"), 40);
     count_kv(&b, "applied", rvu(sy, "applied"), 60);
     sb_emit(&b, out, RL_NORMAL);
   }
+  if (ld) {
+    line(out, RL_HEAD, " Connections");
+    count_kv(&b, "  total", rvu(ld, "clients"), 0);
+    count_kv(&b, "bots", rvu(ld, "bots"), 24);
+    count_kv(&b, "hubs", rvu(ld, "peers"), 40);
+    count_kv(&b, "authing", rvu(ld, "authing"), 60);
+    sb_emit(&b, out, RL_NORMAL);
+  }
   sb_free(&b);
+  render_timers(ctx, rep, ld, out);
   flines_add(out, RL_NORMAL, "");
   fmt_title(ctx, out, "Traffic by message", "sorted by bytes");
   int n = 0;
@@ -1966,7 +2221,7 @@ static void render_acl_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
            rv(r, "pattern") ? rv(r, "pattern") : "?", c, sz == 1 ? "" : "es");
   fmt_ok(ctx, what, subj, out);
   effect(ctx, out, "local to this hub (the lists are not synced)");
-  if (cscope) effect(ctx, out, "console scope: applies to SSH logins only, bots and peers are not affected");
+  if (cscope) effect(ctx, out, "console scope: applies to SSH logins only, bots and other hubs are not affected");
   if (rvb(r, "first"))
     warn(ctx, out, cscope ? "the console allow list was empty: from now on only listed addresses can open the console"
                           : "the allow list was empty: from now on only listed addresses can connect");
@@ -2046,6 +2301,42 @@ static void user_seen(const fmt_ctx_t *ctx, const crec_t *u, bool with_ip, char 
   when_ago(ctx, rvi(u, "seen", 0), out, cap);
 }
 
+/* An admin's flags or an oper's channels for the user tables (plan U9). */
+static void user_access(const fmt_ctx_t *ctx, const crec_t *u, char *out, size_t cap) {
+  if (rv(u, "flags")) snprintf(out, cap, "%s%s", rvs(u, "flags") ? "+" : "",
+                               rvs(u, "flags") ? rv(u, "flags") : "(none)");
+  else if (rv(u, "chans")) snprintf(out, cap, "%s", rvs(u, "chans") ? rv(u, "chans") : "(none)");
+  else snprintf(out, cap, "%s", GL(G_DASH));
+}
+
+/* old_hubs= on a user change: hubs that do not know flags / channels. */
+static void user_old_hubs_warn(const fmt_ctx_t *ctx, const crec_t *r, flines_t *out) {
+  const char *h = rvs(r, "old_hubs");
+  if (!h) return;
+  char m[512];
+  snprintf(m, sizeof(m),
+           "older hubs do not know flags or channels: %s %s they and their bots do not get "
+           "this user until upgraded to 2.4.7",
+           h, GL(G_DASH));
+  warn(ctx, out, m);
+}
+
+/* "+chu" -> "channels, opers, upgrades"; "a" -> "full admin". */
+static void flags_words(const char *flags, char *out, size_t cap) {
+  static const struct { char f; const char *w; } W[] = {
+    {'a', "full admin"}, {'b', "bots"}, {'c', "channels"}, {'h', "hub"}, {'o', "opers"},
+    {'u', "upgrades"}};
+  size_t o = 0;
+  out[0] = '\0';
+  for (const char *p = flags ? flags : ""; *p; p++)
+    for (size_t i = 0; i < sizeof(W) / sizeof(W[0]); i++)
+      if (W[i].f == *p && o + 1 < cap) {
+        int w = snprintf(out + o, cap - o, "%s%s", o ? ", " : "", W[i].w);
+        if (w > 0) o += (size_t)w < cap - o ? (size_t)w : cap - o - 1;
+      }
+  if (!out[0]) snprintf(out, cap, "no flags: views only");
+}
+
 static void render_user_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   const crec_t *r = &rep->res;
   char title[48], right[96];
@@ -2055,20 +2346,22 @@ static void render_user_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
   snprintf(right, sizeof(right), "%lld admin%s %s %lld oper%s %s %lld mask%s", a, a == 1 ? "" : "s",
            GL(G_DOT), o, o == 1 ? "" : "s", GL(G_DOT), m, m == 1 ? "" : "s");
   fmt_title(ctx, out, title, right);
-  static const col_t cols[] = {{"ROLE", 'L', 1}, {"NAME", 'L', 1}, {"KEY", 'L', 1},
-                               {"LAST SEEN", 'L', 1}, {"MASKS", 'R', 1}, {"CONSOLES", 'R', 1}};
+  static const col_t cols[] = {{"ROLE", 'L', 1}, {"NAME", 'L', 1}, {"ACCESS", 'L', 1},
+                               {"KEY", 'L', 1}, {"LAST SEEN", 'L', 1}, {"MASKS", 'R', 1},
+                               {"CONSOLES", 'R', 1}};
   tbl_t t;
-  tbl_init(&t, cols, 6, -1, 1, 1);
+  tbl_init(&t, cols, 7, -1, 1, 1);
   for (int i = 0; i < rep->n; i++) {
     const crec_t *u = &rep->r[i];
     if (strcmp(u->type, "user")) continue;
-    char seen[96], masks[16], cons[16];
+    char seen[96], masks[16], cons[16], acc[512];
+    user_access(ctx, u, acc, sizeof(acc));
     user_seen(ctx, u, false, seen, sizeof(seen));
     snprintf(masks, sizeof(masks), "%lld", rvi(u, "masks", 0));
     if (rv(u, "sessions")) snprintf(cons, sizeof(cons), "%lld", rvi(u, "sessions", 0));
     else cons[0] = '\0';
-    const char *cells[6] = {rv(u, "role"), rv(u, "name"), rvs(u, "fp") ? rv(u, "fp") : "(no key)",
-                            seen, masks, cons};
+    const char *cells[7] = {rv(u, "role"), rv(u, "name"), acc,
+                            rvs(u, "fp") ? rv(u, "fp") : "(no key)", seen, masks, cons};
     tbl_row(ctx, &t, RL_NORMAL, rv(u, "role"), cells);
   }
   if (!t.nr) {
@@ -2079,7 +2372,8 @@ static void render_user_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
   tbl_render(ctx, out, &t);
   tbl_free(&t);
   rule_line(ctx, out);
-  line(out, RL_DIM, "  user show <name> for masks and their last use");
+  line(out, RL_DIM, "  user show <name> for masks and their last use %s ACCESS: an admin's flags, an oper's channels",
+       GL(G_DOT));
 }
 
 static void render_user_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
@@ -2093,6 +2387,18 @@ static void render_user_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
     snprintf(title, sizeof(title), "User %s", rv(u, "name") ? rv(u, "name") : "?");
     fmt_title(ctx, out, title, rv(u, "role"));
     const int L = 10;
+    if (rv(u, "flags")) {
+      char fw[96];
+      flags_words(rv(u, "flags"), fw, sizeof(fw));
+      snprintf(v, sizeof(v), "%s%s  (%s)", rvs(u, "flags") ? "+" : "",
+               rvs(u, "flags") ? rv(u, "flags") : "(none)", fw);
+      fmt_card_line(ctx, out, L, "flags", v, rvs(u, "flags") ? RL_NORMAL : RL_WARN);
+    } else if (rv(u, "chans")) {
+      if (!rvs(u, "chans")) snprintf(v, sizeof(v), "(none: no channel access)");
+      else if (!strcmp(rv(u, "chans"), "*")) snprintf(v, sizeof(v), "* (every channel)");
+      else snprintf(v, sizeof(v), "%s", rv(u, "chans"));
+      fmt_card_line(ctx, out, L, "channels", v, rvs(u, "chans") ? RL_NORMAL : RL_WARN);
+    }
     fmt_card_line(ctx, out, L, "key", rvs(u, "fp") ? rv(u, "fp") : "(no key)", RL_NORMAL);
     user_seen(ctx, u, true, v, sizeof(v));
     fmt_card_line(ctx, out, L, "last seen", v, RL_NORMAL);
@@ -2101,7 +2407,8 @@ static void render_user_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
       snprintf(v, sizeof(v), "%lld open session%s", s, s == 1 ? "" : "s");
       fmt_card_line(ctx, out, L, "console", v, RL_NORMAL);
     }
-    static const char *const known[] = {"name", "role", "fp", "seen", "masks", "sessions", NULL};
+    static const char *const known[] = {"name", "role", "fp", "seen", "masks", "sessions",
+                                        "flags", "chans", NULL};
     unknown_keys(ctx, out, u, known, L);
     static const col_t cols[] = {{"MASK", 'L', 1}, {"LAST USED", 'L', 1}};
     tbl_t t;
@@ -2134,7 +2441,16 @@ static void render_user_change(const fmt_ctx_t *ctx, const creply_t *rep, flines
     fmt_ok(ctx, "User added", subj, out);
     res_kv(out, "key", rvs(r, "fp") ? rv(r, "fp") : "?");
     res_kv(out, "mask", rvs(r, "mask") ? rv(r, "mask") : "?");
+    if (rv(r, "flags")) {
+      char fw[160];
+      flags_words(rv(r, "flags"), fw, sizeof(fw));
+      snprintf(subj, sizeof(subj), "+%s  (%s)", rv(r, "flags"), fw);
+      res_kv(out, "flags", subj);
+    }
+    if (rvs(r, "chans")) res_kv(out, "channels", !strcmp(rv(r, "chans"), "*") ? "* (every channel)"
+                                                                         : rv(r, "chans"));
     effect(ctx, out, ph);
+    user_old_hubs_warn(ctx, r, out);
     if (rv(r, "role") && !strcmp(rv(r, "role"), "admin")) {
       snprintf(subj, sizeof(subj), "%s logs in with: ssh -i <their>_ed25519 -p %lld %s@<this hub>", name,
                rvi(r, "port", 0), name);
@@ -2164,6 +2480,30 @@ static void render_user_change(const fmt_ctx_t *ctx, const creply_t *rep, flines
       snprintf(subj, sizeof(subj), "%lld open console session%s closed", s, s == 1 ? "" : "s");
       effect(ctx, out, subj);
     }
+  } else if (!strcmp(code, "user.flags")) {
+    snprintf(what, sizeof(what), "User %s", name);
+    snprintf(subj, sizeof(subj), "flags   +%s %s +%s", rvs(r, "old") ? rv(r, "old") : "",
+             GL(G_ARROW), rvs(r, "flags") ? rv(r, "flags") : "");
+    fmt_ok(ctx, what, subj, out);
+    char fw[160];
+    flags_words(rv(r, "flags"), fw, sizeof(fw));
+    snprintf(subj, sizeof(subj), "now: %s", fw);
+    res_kv(out, "can", subj);
+    if (!rvb(r, "written")) effect(ctx, out, "no change: they already had those flags");
+    else effect(ctx, out, ph);
+    user_old_hubs_warn(ctx, r, out);
+  } else if (!strcmp(code, "user.chan")) {
+    snprintf(what, sizeof(what), "User %s", name);
+    bool add = rv(r, "action") && !strcmp(rv(r, "action"), "add");
+    const char *ch = rv(r, "chan") ? rv(r, "chan") : "?";
+    if (!strcmp(ch, "*")) snprintf(subj, sizeof(subj), "%s", add ? "every channel (*)" : "every channel removed");
+    else snprintf(subj, sizeof(subj), "channel %s   %s", add ? "added" : "removed", ch);
+    fmt_ok(ctx, what, subj, out);
+    res_kv(out, "channels", !rvs(r, "chans") ? "(none: no channel access)"
+                            : !strcmp(rv(r, "chans"), "*") ? "* (every channel)" : rv(r, "chans"));
+    if (!rvb(r, "written")) effect(ctx, out, "no change: they already had that");
+    else effect(ctx, out, ph);
+    user_old_hubs_warn(ctx, r, out);
   } else {
     bool add = !strcmp(code, "user.mask_added");
     long long m = rvi(r, "masks", 0);
@@ -2314,8 +2654,8 @@ static void render_channel_change(const fmt_ctx_t *ctx, const creply_t *rep, fli
   char subj[256], ph[160];
   long long bots = rvi(r, "bots", 0), peers = rvi(r, "peers", 0);
   char pp[96];
-  if (peers > 0) snprintf(pp, sizeof(pp), "synced to %lld peer hub%s", peers, peers == 1 ? "" : "s");
-  else snprintf(pp, sizeof(pp), "no peer hub linked");
+  if (peers > 0) snprintf(pp, sizeof(pp), "synced to %lld other hub%s", peers, peers == 1 ? "" : "s");
+  else snprintf(pp, sizeof(pp), "no other hub linked");
   if (!strcmp(code, "channel.added")) {
     if (rvb(r, "existed")) {
       snprintf(subj, sizeof(subj), "%s   key %s %s %s", name, rvs(r, "old_key") ? rv(r, "old_key") : "(none)",
@@ -2368,10 +2708,10 @@ static void render_channel_change(const fmt_ctx_t *ctx, const creply_t *rep, fli
     fmt_ok(ctx, inv ? "Invite request sent" : "Op request sent", subj, out);
     long long local = rvi(r, "local", 0);
     if (local > 0)
-      snprintf(ph, sizeof(ph), "%lld bot%s on this hub asked; forwarded to %lld peer hub%s", local,
+      snprintf(ph, sizeof(ph), "%lld bot%s on this hub asked; forwarded to %lld other hub%s", local,
                local == 1 ? "" : "s", peers, peers == 1 ? "" : "s");
     else
-      snprintf(ph, sizeof(ph), "no bots on this hub; forwarded to %lld peer hub%s", peers, peers == 1 ? "" : "s");
+      snprintf(ph, sizeof(ph), "no bots on this hub; forwarded to %lld other hub%s", peers, peers == 1 ? "" : "s");
     effect(ctx, out, ph);
     snprintf(ph, sizeof(ph), "a bot that is opped on %s %s", rv(r, "chan") ? rv(r, "chan") : "?",
              inv ? "will invite them" : "and sees them will op them");
@@ -2497,8 +2837,8 @@ static void old_hubs_warn(const fmt_ctx_t *ctx, const crec_t *r, flines_t *out) 
 static void push_effects(const fmt_ctx_t *ctx, const crec_t *r, flines_t *out) {
   char ph[160], pp[96];
   long long bots = rvi(r, "bots", 0), peers = rvi(r, "peers", 0);
-  if (peers > 0) snprintf(pp, sizeof(pp), "synced to %lld peer hub%s", peers, peers == 1 ? "" : "s");
-  else snprintf(pp, sizeof(pp), "no peer hub linked");
+  if (peers > 0) snprintf(pp, sizeof(pp), "synced to %lld other hub%s", peers, peers == 1 ? "" : "s");
+  else snprintf(pp, sizeof(pp), "no other hub linked");
   snprintf(ph, sizeof(ph), "pushed to %lld bot%s; %s", bots, bots == 1 ? "" : "s", pp);
   effect(ctx, out, ph);
 }
@@ -2561,7 +2901,7 @@ static void render_settings_table(const fmt_ctx_t *ctx, const creply_t *rep, fli
     if (s && !strcmp(s, net_target || network ? "net" : "chan")) overrides++;
   }
   if (network) {
-    snprintf(title, sizeof(title), "Bot floods");
+    snprintf(title, sizeof(title), "Bot settings");
     snprintf(right, sizeof(right), "network-wide %s %d changed", GL(G_DOT), overrides);
   } else {
     snprintf(title, sizeof(title), "Settings %s", rv(r, "name") ? rv(r, "name") : "?");
@@ -2594,7 +2934,7 @@ static void render_settings_table(const fmt_ctx_t *ctx, const creply_t *rep, fli
   if (network) {
     line(out, RL_DIM, "  cmd counts per user, msg and ctcp per host; a flooding host is ignored for ignoretime");
     line(out, RL_DIM, "  sendq paces what a bot says: B lines at once, then one every I ms (I 0 = no delay)");
-    hint(out, "network set flood <cmd|msg|ctcp> <N:S|off|default> · network set ignoretime <min|default> · network set sendq <B:I|default>");
+    hint(out, "bot set flood <cmd|msg|ctcp> <N:S|off|default> · bot set ignoretime <min|default> · bot set sendq <B:I|default>");
   } else {
     const char *eff = rv(r, "effective");
     snprintf(v, sizeof(v), "  modes %s (%s)", eff ? eff : "?", modes_source_phrase(rv(r, "source")));
@@ -2612,7 +2952,7 @@ static void render_settings_change(const fmt_ctx_t *ctx, const creply_t *rep, fl
   bool net_target = !network && !strcmp(name, "default");
   char what[96], subj[160], ph[200], a[48], b[48];
   if (network) {
-    snprintf(what, sizeof(what), "Bot floods");
+    snprintf(what, sizeof(what), "Bot settings");
     const char *st = rv(r, "setting") ? rv(r, "setting") : "?";
     setting_value(st, rv(r, "kind"), rv(r, "old"), a, sizeof(a));
     setting_value(st, rv(r, "kind"), rv(r, "value"), b, sizeof(b));
@@ -2700,17 +3040,21 @@ static void render_ban_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
   }
   qsort(rows, (size_t)nr, sizeof(*rows), ban_row_cmp);
   static const col_t cols[] = {{"CHANNEL", 'L', 1}, {"MASK", 'L', 1}, {"EXPIRES", 'L', 1},
-                               {"STICKY", 'L', 2}, {"BY", 'L', 2}, {"REASON", 'L', 2},
-                               {"ADDED", 'L', 2}};
+                               {"LAST USED", 'L', 1}, {"STICKY", 'L', 2}, {"BY", 'L', 2},
+                               {"REASON", 'L', 2}, {"ADDED", 'L', 2}};
   tbl_t t;
-  tbl_init(&t, cols, 7, -1, 1, 1);
+  tbl_init(&t, cols, 8, -1, 1, 1);
   for (int i = 0; i < nr; i++) {
     const crec_t *c = rows[i];
-    char ex[96], when[64];
+    char ex[96], when[64], used[64];
     ban_expiry(ctx, rvi(c, "expires", 0), ex, sizeof(ex));
     when_ago(ctx, rvi(c, "ts", 0), when, sizeof(when));
-    const char *cells[7] = {rv(c, "chan"), rv(c, "mask"), ex, rvb(c, "sticky") ? "yes" : "no",
-                            rv(c, "setter"), rv(c, "reason"), when};
+    /* a sticky ban is always on the channel: no match is ever seen */
+    if (rvb(c, "sticky")) snprintf(used, sizeof(used), "always");
+    else when_ago(ctx, rvi(c, "used", 0), used, sizeof(used));
+    const char *cells[8] = {rv(c, "chan"), rv(c, "mask"), ex, used,
+                            rvb(c, "sticky") ? "yes" : "no", rv(c, "setter"), rv(c, "reason"),
+                            when};
     tbl_row(ctx, &t, RL_NORMAL, NULL, cells);
   }
   tbl_render(ctx, out, &t);
@@ -3052,7 +3396,7 @@ static void render_upg_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
     if (sel > 0)
       snprintf(ph, sizeof(ph), "%lld selected node%s; progress: upgrade status, or Alt+4", sel, sel == 1 ? "" : "s");
     else
-      snprintf(ph, sizeof(ph), "%lld bot%s and %lld peer hub%s asked to prepare, this hub last; progress: upgrade status, or Alt+4",
+      snprintf(ph, sizeof(ph), "%lld bot%s and %lld other hub%s asked to prepare, this hub last; progress: upgrade status, or Alt+4",
                rvi(r, "bots", 0), rvi(r, "bots", 0) == 1 ? "" : "s", rvi(r, "peers", 0),
                rvi(r, "peers", 0) == 1 ? "" : "s");
     effect(ctx, out, ph);
@@ -3064,7 +3408,7 @@ static void render_upg_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
     fmt_ok(ctx, what, subj, out);
   } else {
     long long peers = rvi(r, "peers", 0);
-    snprintf(ph, sizeof(ph), "told %lld peer hub%s to drop theirs", peers, peers == 1 ? "" : "s");
+    snprintf(ph, sizeof(ph), "told %lld other hub%s to drop theirs", peers, peers == 1 ? "" : "s");
     if (rvb(r, "had")) {
       snprintf(subj, sizeof(subj), "bots %s %s", GL(G_ARROW), rv(r, "bot_ver") ? rv(r, "bot_ver") : "?");
       fmt_ok(ctx, "Roll-up plan forgotten", subj, out);
@@ -3155,29 +3499,6 @@ static void render_network_tree(const fmt_ctx_t *ctx, const creply_t *rep, fline
   tbl_free(&d);
 }
 
-static void render_network_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
-  const crec_t *r = &rep->res;
-  char right[96];
-  snprintf(right, sizeof(right), "seen from %s", rv(r, "name") ? rv(r, "name") : "?");
-  fmt_title(ctx, out, "Network status", right);
-  const int L = 8;
-  char v[96];
-  snprintf(v, sizeof(v), "%s up", rv(r, "peers") ? rv(r, "peers") : "?");
-  fmt_card_line(ctx, out, L, "peers", v, RL_NORMAL);
-  snprintf(v, sizeof(v), "%s online", rv(r, "bots") ? rv(r, "bots") : "?");
-  fmt_card_line(ctx, out, L, "bots", v, RL_NORMAL);
-  const char *upg = rv(r, "upg");
-  bool run = upg && strcmp(upg, "-") && *upg;
-  fmt_card_line(ctx, out, L, "upgrade", run ? upg : GL(G_DASH), run ? RL_WARN : RL_NORMAL);
-  fmt_card_line(ctx, out, L, "frozen", rvb(r, "frozen") ? "yes" : "no", rvb(r, "frozen") ? RL_WARN : RL_NORMAL);
-  fmt_card_line(ctx, out, L, "roll-up", rvb(r, "rollup") ? "yes" : "no", RL_NORMAL);
-  fmt_card_line(ctx, out, L, "split", rvb(r, "split") ? "yes (a hub is unreachable)" : "no (the mesh is one piece)",
-                rvb(r, "split") ? RL_WARN : RL_NORMAL);
-  snprintf(v, sizeof(v), "file %s %s console %s", level_name(rvi(r, "loglevel", 0)), GL(G_DOT),
-           level_name(rvi(r, "consolelevel", 0)));
-  fmt_card_line(ctx, out, L, "log", v, RL_NORMAL);
-}
-
 /* ==========================================================================
  * Results of bot / peer changes
  * ========================================================================== */
@@ -3187,38 +3508,22 @@ static void render_bot_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
   const char *uuid = rv(r, "uuid") ? rv(r, "uuid") : "?";
   char subj[256], ph[256];
   peers_phrase(ph, sizeof(ph), rvi(r, "peers", 0));
-  if (!strcmp(code, "bot.approved")) {
-    if (rvs(r, "ip")) snprintf(subj, sizeof(subj), "%s  (was pending #%lld, from %s)", uuid, rvi(r, "n", 0), rv(r, "ip"));
-    else snprintf(subj, sizeof(subj), "%s", uuid);
-    fmt_ok(ctx, "Bot approved", subj, out);
-    char p2[300];
-    snprintf(p2, sizeof(p2), "authorization %s", ph);
-    effect(ctx, out, rvi(r, "peers", 0) > 0 ? p2 : ph);
-    effect(ctx, out, "the bot is let in on its next connection attempt");
-  } else if (!strcmp(code, "bot.authorized")) {
-    fmt_ok(ctx, "Bot authorized", uuid, out);
-    effect(ctx, out, ph);
-    if (!rvb(r, "registered"))
-      effect(ctx, out, "not yet registered: it still needs bot add, or it registers itself on first connect");
-  } else if (!strcmp(code, "bot.added")) {
+  if (!strcmp(code, "bot.added")) {
     snprintf(subj, sizeof(subj), "%s  %s", rv(r, "nick") ? rv(r, "nick") : "?", uuid);
     fmt_ok(ctx, "Bot registered", subj, out);
     res_kv(out, "key", rvs(r, "fp") ? rv(r, "fp") : "?");
-    effect(ctx, out, "saved to this hub's config; peers learn it on the next sync");
+    effect(ctx, out, "saved to this hub's config; other hubs learn it on the next sync");
     res_kv(out, "next", "start the bot; it shows up in bot list when it connects");
   } else if (!strcmp(code, "bot.deleted")) {
     if (rvs(r, "nick")) snprintf(subj, sizeof(subj), "%s  %s", rv(r, "nick"), uuid);
     else snprintf(subj, sizeof(subj), "%s", uuid);
     fmt_ok(ctx, "Bot deleted", subj, out);
-    if (rvb(r, "was_online")) effect(ctx, out, "disconnected from this hub");
+    if (rvb(r, "was_online")) effect(ctx, out, "connected here: told to wipe its config and exit");
     long long peers = rvi(r, "peers", 0), bots = rvi(r, "bots", 0);
-    snprintf(ph, sizeof(ph), "tombstone synced to %lld peer hub%s; %lld bot%s told to drop it from their trusted list",
+    snprintf(ph, sizeof(ph), "synced to %lld other hub%s (one it is connected to does the same); %lld bot%s told to drop it from their trusted list",
              peers, peers == 1 ? "" : "s", bots, bots == 1 ? "" : "s");
     effect(ctx, out, ph);
-    long long d = rvi(r, "purge_days", 0);
-    if (d > 0) snprintf(ph, sizeof(ph), "the tombstone is kept %lld days (hub set autopurge), then purged", d);
-    else snprintf(ph, sizeof(ph), "the tombstone stays until hub purge (autopurge is off)");
-    effect(ctx, out, ph);
+    effect(ctx, out, "revoked for good: if it ever connects to any hub it is told to wipe its config and exit (bot revoked)");
   } else if (!strcmp(code, "bot.kicked")) {
     char s[32];
     fmt_span(ctx->now - rvi(r, "since", ctx->now), s, sizeof(s));
@@ -3240,7 +3545,7 @@ static void render_bot_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
     }
     line(out, RL_NORMAL, "   1. in your IRC client, send %s the sealed command:  rekey", nick);
     line(out, RL_NORMAL, "   2. the bot makes a new key pair, sends its new public key here and reconnects");
-    line(out, RL_NORMAL, "   3. peers pick up the new key with the next sync %s nothing else to do", GL(G_DASH));
+    line(out, RL_NORMAL, "   3. other hubs pick up the new key with the next sync %s nothing else to do", GL(G_DASH));
     fmt_card_line(ctx, out, 12, "current key", rvs(r, "fp") ? rv(r, "fp") : "(no key)", RL_NORMAL);
   }
 }
@@ -3251,20 +3556,21 @@ static void render_peer_change(const fmt_ctx_t *ctx, const creply_t *rep, flines
   addr_of(r, addr, sizeof(addr));
   if (!strcmp(rep->code, "peer.added")) {
     snprintf(subj, sizeof(subj), "%s  %s  (#%lld)", peer_name(r), addr, rvi(r, "n", 0));
-    fmt_ok(ctx, "Peer added", subj, out);
+    fmt_ok(ctx, "Hub added", subj, out);
     res_kv(out, "uuid", rvs(r, "uuid") ? rv(r, "uuid") : GL(G_DASH));
     res_kv(out, "key", rvs(r, "fp") ? rv(r, "fp") : "?");
-    snprintf(subj, sizeof(subj), "this hub dials it now; peer list shows the link once %s has added this hub too",
+    snprintf(subj, sizeof(subj), "this hub dials it now; hub list shows the link once %s has added this hub too",
              peer_name(r));
     effect(ctx, out, subj);
   } else if (!strcmp(rep->code, "peer.removed")) {
     snprintf(subj, sizeof(subj), "%s  %s", peer_name(r), addr);
-    fmt_ok(ctx, "Peer removed", subj, out);
+    fmt_ok(ctx, "Hub unlinked", subj, out);
     effect(ctx, out, rvb(r, "was_up") ? "link closed" : "it was down; there was no link to close");
-    effect(ctx, out, "bots and peers it carried reach the mesh through the other hubs");
+    effect(ctx, out, "bots and hubs it carried reach the mesh through the other hubs");
+    effect(ctx, out, "on this hub only: run hub del on the other hubs, -hub on the bots that list it");
   } else if (!strcmp(rep->code, "peer.set")) {
     char what[96];
-    snprintf(what, sizeof(what), "Peer %s", peer_name(r));
+    snprintf(what, sizeof(what), "Hub %s", peer_name(r));
     snprintf(subj, sizeof(subj), "%s   %s %s %s", rv(r, "setting") ? rv(r, "setting") : "?",
              rvs(r, "old") ? rv(r, "old") : "(none)", GL(G_ARROW), rvs(r, "value") ? rv(r, "value") : "?");
     fmt_ok(ctx, what, subj, out);
@@ -3281,7 +3587,7 @@ static void render_peer_change(const fmt_ctx_t *ctx, const creply_t *rep, flines
       sb_add(b, peer_name(p));
     }
     char what[96];
-    snprintf(what, sizeof(what), "Full sync sent to %lld peer hub%s", peers, peers == 1 ? "" : "s");
+    snprintf(what, sizeof(what), "Full sync sent to %lld other hub%s", peers, peers == 1 ? "" : "s");
     fmt_ok(ctx, what, names.p, out);
     char sz[32], c[32];
     fmt_bytes((unsigned long long)rvi(r, "bytes", 0), sz, sizeof(sz));
@@ -3423,10 +3729,11 @@ void fmt_reply(const fmt_ctx_t *ctx, const creply_t *rep, const char *words, fli
   else if (!strcmp(c, "bot.list")) render_bot_list(ctx, rep, out);
   else if (!strcmp(c, "bot.show")) render_bot_show(ctx, rep, out);
   else if (!strcmp(c, "bot.summary")) render_bot_summary(ctx, rep, out);
-  else if (!strcmp(c, "bot.pending")) render_bot_pending(ctx, rep, out);
+  else if (!strcmp(c, "bot.revoked")) render_bot_revoked(ctx, rep, out);
   else if (!strncmp(c, "bot.", 4)) render_bot_change(ctx, rep, out);
   else if (!strcmp(c, "peer.list")) render_peer_list(ctx, rep, out);
   else if (!strcmp(c, "peer.show")) render_peer_show(ctx, rep, out);
+  else if (!strcmp(c, "peer.refs")) render_peer_refs(ctx, rep, out);
   else if (!strncmp(c, "peer.", 5) || !strcmp(c, "mesh.synced")) render_peer_change(ctx, rep, out);
   else if (!strcmp(c, "hub.show")) render_hub_show(ctx, &rep->res, out);
   else if (!strcmp(c, "hub.set")) render_hub_set(ctx, rep, out);
@@ -3456,7 +3763,6 @@ void fmt_reply(const fmt_ctx_t *ctx, const creply_t *rep, const char *words, fli
   else if (!strcmp(c, "upg.releases")) render_upg_releases(ctx, rep, out);
   else if (!strncmp(c, "upg.", 4)) render_upg_change(ctx, rep, out);
   else if (!strcmp(c, "network.tree")) render_network_tree(ctx, rep, out);
-  else if (!strcmp(c, "network.status")) render_network_status(ctx, rep, out);
   else render_generic(ctx, rep, out);
   fmt_wrap(out, ctx->width);
 }

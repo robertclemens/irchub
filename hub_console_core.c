@@ -36,6 +36,9 @@ struct hub_console_link {
   char          upg_last[256];
   unsigned char tree_hash[32];
   bool          tree_sent;
+  /* the admin's flags as last sent in a "me" event (user_flags plan R4) */
+  char          me_last[USER_FLAGS_MAX + 1];
+  bool          me_sent;
 };
 
 /* ---- Log ring ----------------------------------------------------------- */
@@ -500,6 +503,7 @@ static void console_subscribe(struct hub_console_link *l, const char *topics) {
   l->status_last[0] = '\0';
   l->upg_last[0] = '\0';
   l->tree_sent = false;
+  l->me_sent = false;
   g_snap_now = true;
   if (want_log >= 0 && l->log_level < 0) {
     l->log_next = !replay ? g_log_next
@@ -518,38 +522,26 @@ bool hub_console_frame(hub_state_t *state, hub_client_t *c, uint8_t op,
     console_subscribe(l, payload + 4);
     return true;   /* no reply: a subscription is not a command */
   }
-  /* get|tree and get|status: the result line, then the rows / key=value
-   * lines exactly as the events carry them (docs/console.md §3.4). */
-  if (strcmp(payload, "get|tree") == 0 || strcmp(payload, "get|status") == 0) {
+  /* get|tree: the result line, then the rows exactly as the tree event
+   * carries them (docs/console.md §3.4). */
+  if (strcmp(payload, "get|tree") == 0) {
     char *rows = malloc(MAX_TREE_PAYLOAD);
     if (!rows) {
       static const char OOM[] = "err|internal.oom|msg=out of memory";
       return hub_console_send(c, CONSOLE_REPLY, OOM, sizeof(OOM) - 1);
     }
     hub_console_tree_rows(state, rows, MAX_TREE_PAYLOAD);
-    bool ok;
-    if (payload[4] == 't') {
-      size_t rl = strlen(rows);
-      while (rl > 0 && rows[rl - 1] == '\n') rows[--rl] = '\0';
-      char *out = malloc(rl + 32);
-      if (!out) {
-        free(rows);
-        static const char OOM[] = "err|internal.oom|msg=out of memory";
-        return hub_console_send(c, CONSOLE_REPLY, OOM, sizeof(OOM) - 1);
-      }
-      int n = snprintf(out, rl + 32, "ok|network.tree%s%s", rl ? "\n" : "", rows);
-      ok = hub_console_send(c, CONSOLE_REPLY, out, (size_t)n);
-      free(out);
-    } else {
-      char line[256], out[512];
-      hub_console_status_line(state, rows, line, sizeof(line));
-      /* one key=value per line */
-      size_t o = (size_t)snprintf(out, sizeof(out), "ok|network.status\n");
-      for (const char *p = line; *p && o + 2 < sizeof(out); p++)
-        out[o++] = (*p == '|') ? '\n' : *p;
-      out[o] = '\0';
-      ok = hub_console_send(c, CONSOLE_REPLY, out, o);
+    size_t rl = strlen(rows);
+    while (rl > 0 && rows[rl - 1] == '\n') rows[--rl] = '\0';
+    char *out = malloc(rl + 32);
+    if (!out) {
+      free(rows);
+      static const char OOM[] = "err|internal.oom|msg=out of memory";
+      return hub_console_send(c, CONSOLE_REPLY, OOM, sizeof(OOM) - 1);
     }
+    int n = snprintf(out, rl + 32, "ok|network.tree%s%s", rl ? "\n" : "", rows);
+    bool ok = hub_console_send(c, CONSOLE_REPLY, out, (size_t)n);
+    free(out);
     free(rows);
     return ok;
   }
@@ -661,6 +653,20 @@ void hub_console_tick(hub_state_t *state) {
       if (l->sub_upg && upg[0] && strcmp(upg, l->upg_last) != 0) {
         snprintf(l->upg_last, sizeof(l->upg_last), "%s", upg);
         send_event(c, "upg", upg);
+      }
+    }
+    /* "me|flags=<letters>": this admin's flags, once a subscription is in
+     * and whenever they change, so the console refuses early (R4) */
+    if (l->sub_status || l->sub_tree || l->sub_upg) {
+      const hub_user_record_t *me = admin_by_name(state, l->admin);
+      const char *f = me ? hub_user_flags(state, me->uuid) : "";
+      if (!l->me_sent || strcmp(f, l->me_last) != 0) {
+        char ev[16];
+        snprintf(ev, sizeof(ev), "flags=%s", f);
+        if (send_event(c, "me", ev)) {
+          snprintf(l->me_last, sizeof(l->me_last), "%s", f);
+          l->me_sent = true;
+        }
       }
     }
     push_log(c);

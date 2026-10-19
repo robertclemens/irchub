@@ -393,7 +393,7 @@ static const char *const VIEW_NAME[V_COUNT] = {"console", "log", "network",
                                                "upgrades", "stats"};
 
 /* y/N, type an exact word, or type a number that becomes the payload */
-typedef enum { CF_NONE = 0, CF_YN, CF_TYPE, CF_PICK } confirm_t;
+typedef enum { CF_NONE = 0, CF_YN, CF_TYPE } confirm_t;
 
 /* What a request in flight was for: replies come back in order. */
 enum { RQ_USER = 0, RQ_PRE, RQ_VIEW_UPG, RQ_VIEW_STATS };
@@ -452,6 +452,11 @@ struct console_ui {
   bool line_mode, ascii;
   int  cols, rows;
   char admin[CONSOLE_NAME_MAX], ip[64], hubname[64];
+  /* this admin's flags, from the core's "me" event (user_flags plan R4):
+   * a command the flags do not cover is refused here, before any y/N; the
+   * hub checks again.  have_flags false = not told yet, no check. */
+  char flags[USER_FLAGS_MAX + 1];
+  bool have_flags;
   cbuf_t term, core;
 
   /* input line */
@@ -482,7 +487,6 @@ struct console_ui {
   confirm_t confirming;
   int  confirm_seq;
   char confirm_want[128];
-  int  confirm_pick_max;
   uint8_t confirm_op;
   unsigned char confirm_payload[1024];
   size_t confirm_len;
@@ -550,10 +554,10 @@ struct console_ui {
  * Command table (docs/console.md §2): <noun> <verb> [args] (D15)
  * ========================================================================== */
 enum bk {
-  B_NONE, B_ARG, B_PIPE, B_PEER_ADD, B_PEER_DEL, B_PEER_SET, B_CHAN_ADD, B_CHAN_SET,
+  B_NONE, B_ARG, B_PIPE, B_PEER_ADD, B_HUB_SHOW, B_CHAN_ADD, B_CHAN_SET,
   B_CHAN_OP, B_OPT_SET, B_LOG_SET, B_PURGE, B_HUB_SET, B_ACL, B_USER_LIST,
   B_USER_ADD, B_USER_SET, B_USER_MASK, B_UPG_RELEASES, B_UPG_START, B_FIXED, B_LOCAL,
-  B_CHAN_MODES, B_BAN, B_NET_SET
+  B_CHAN_MODES, B_BAN, B_NET_SET, B_USER_CHAN
 };
 
 typedef struct {
@@ -575,27 +579,22 @@ static const cmd_def_t CMDS[] = {
   {"bot", "list", CMD_ADMIN_LIST_FULL, B_NONE, 0, 0, CF_NONE, 0, NULL, "bot list", "every registered bot: state, hub, version, last seen", NULL},
   {"bot", "show", CMD_ADMIN_LIST_FULL, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot show <uuid|nick>", "one bot in detail", NULL},
   {"bot", "summary", CMD_ADMIN_LIST_SUMMARY, B_NONE, 0, 0, CF_NONE, 0, NULL, "bot summary", "every bot's nick and uuid", NULL},
-  {"bot", "pending", CMD_ADMIN_GET_PENDING, B_NONE, 0, 0, CF_NONE, 0, NULL, "bot pending", "bots that tried to connect but are not authorized", NULL},
-  {"bot", "approve", CMD_ADMIN_APPROVE, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot approve <#|uuid>", "approve a pending bot; # is the number from bot pending", NULL},
-  {"bot", "authorize", CMD_ADMIN_ADD, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot authorize <uuid>", "authorize a uuid before the bot first connects", NULL},
-  {"bot", "add", CMD_ADMIN_CREATE_BOT, B_PIPE, 3, 0, CF_NONE, 0, NULL, "bot add <nick> <uuid> <key>", "register a bot from the identity its -setup printed", "key: the 88-char base64 public key"},
-  {"bot", "del", CMD_ADMIN_DEL, B_ARG, 1, 0, CF_YN, PRE_BOT_DEL, NULL, "bot del <uuid>", "delete a bot everywhere (asks y/N; disconnects it)", NULL},
-  {"bot", "kick", CMD_ADMIN_DISCONNECT_BOT, B_ARG, 1, 0, CF_YN, PRE_BOT_KICK, NULL, "bot kick <uuid>", "drop its connection to this hub (asks y/N; it reconnects)", NULL},
+  {"bot", "revoked", CMD_ADMIN_LIST_REVOKED, B_NONE, 0, 0, CF_NONE, 0, NULL, "bot revoked", "deleted bots: told to wipe their config if they ever connect", NULL},
+  {"bot", "add", CMD_ADMIN_CREATE_BOT, B_PIPE, 3, 0, CF_NONE, 0, NULL, "bot add <nick> <uuid> <key>", "register a bot from the identity its -setup printed", "uuid and key: run ./ircbot -id on the bot's host"},
+  {"bot", "del", CMD_ADMIN_DEL, B_ARG, 1, 0, CF_YN, PRE_BOT_DEL, NULL, "bot del <uuid|nick>", "delete a bot everywhere for good (asks y/N; wipes its config and stops it)", NULL},
+  {"bot", "kick", CMD_ADMIN_DISCONNECT_BOT, B_ARG, 1, 0, CF_YN, PRE_BOT_KICK, NULL, "bot kick <uuid|nick>", "drop its connection to this hub (asks y/N; it reconnects)", NULL},
   {"bot", "rekey", CMD_ADMIN_REKEY_BOT, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot rekey <uuid>", "how to rekey a bot (only the bot can)", NULL},
-  {"peer", "list", CMD_ADMIN_LIST_PEERS, B_NONE, 0, 0, CF_NONE, 0, NULL, "peer list", "peer hubs, the mesh links and their health", NULL},
-  {"peer", "show", CMD_ADMIN_LIST_PEERS, B_ARG, 1, 0, CF_NONE, 0, NULL, "peer show <#|uuid|name>", "one peer hub in detail", NULL},
-  {"peer", "add", CMD_ADMIN_ADD_PEER, B_PEER_ADD, 5, 0, CF_NONE, 0, NULL, "peer add <ip> <port> <uuid> <name|-> <key>", "add a peer hub", "key: the 88-char key from that hub's hub show"},
-  {"peer", "del", CMD_ADMIN_DEL_PEER, B_PEER_DEL, 0, 1, CF_TYPE, PRE_PEER_DEL, NULL, "peer del [#]", "remove a peer hub (types its number to confirm)", NULL},
-  {"peer", "set", CMD_ADMIN_SET_PEER_PUBKEY, B_PEER_SET, 3, 0, CF_NONE, 0, NULL, "peer set <#|uuid|name> key <key>", "replace a peer's key (the link comes back with it)", NULL},
-  {"peer", "sync", CMD_ADMIN_SYNC_MESH, B_NONE, 0, 0, CF_NONE, 0, NULL, "peer sync", "send a full sync to every peer", NULL},
-  {"network", "tree", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|tree", "network tree", "every hub and bot as a tree", NULL},
-  {"network", "status", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|status", "network status", "the mesh-wide status (what the status bar shows)", NULL},
-  {"network", "set", CMD_ADMIN_NET_SET, B_NET_SET, 0, 3, CF_NONE, 0, NULL, "network set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default>]", "show the bot network settings, or change one (every bot gets it)", NULL},
-  {"hub", "show", CMD_ADMIN_GET_PUBKEY, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub show", "this hub: identity, key, listener, counts", NULL},
-  {"hub", "set", 0, B_HUB_SET, 0, 3, CF_NONE, 0, NULL, "hub set <setting> <value> | hub set ssh|conn [<name> <value|default>]", "name, bindip, port, pubkey or autopurge; ssh and conn: this hub's connection limits (alone: the table)", NULL},
-  {"hub", "stats", CMD_ADMIN_STATS, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub stats", "traffic counters since the hub started", NULL},
-  {"hub", "rekey", CMD_ADMIN_REGEN_KEYS, B_NONE, 0, 0, CF_TYPE, 0, NULL, "hub rekey", "new hub keypair; every peer and bot must re-learn it", NULL},
-  {"hub", "purge", CMD_ADMIN_PURGE_TOMBSTONES, B_PURGE, 1, 0, CF_YN, 0, NULL, "hub purge <now|days>", "purge tombstones now, or those older than <days>", NULL},
+  {"bot", "tree", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|tree", "bot tree", "every hub and bot as a tree", NULL},
+  {"bot", "set", CMD_ADMIN_NET_SET, B_NET_SET, 0, 3, CF_NONE, 0, NULL, "bot set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default>]", "show the bot settings, or change one (every bot gets it)", NULL},
+  {"hub", "show", CMD_ADMIN_GET_PUBKEY, B_HUB_SHOW, 0, 1, CF_NONE, 0, NULL, "hub show [#|uuid|name]", "this hub (identity, key, listener, counts), or one linked hub in detail", NULL},
+  {"hub", "list", CMD_ADMIN_LIST_PEERS, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub list", "the other hubs, the mesh links and their health", NULL},
+  {"hub", "add", CMD_ADMIN_ADD_PEER, B_PEER_ADD, 5, 0, CF_NONE, 0, NULL, "hub add <ip> <port> <uuid> <name|-> <key>", "link another hub", "uuid and key: hub show or ./irchub -id on that hub"},
+  {"hub", "del", CMD_ADMIN_DEL_PEER, B_ARG, 1, 0, CF_YN, PRE_PEER_DEL, NULL, "hub del <uuid|name>", "unlink a hub from this hub only (shows which hubs and bots still list it; asks y/N)", NULL},
+  {"hub", "set", 0, B_HUB_SET, 0, 3, CF_NONE, 0, NULL, "hub set <setting> <value> | hub set ssh|conn [<name> <value|default>] | hub set <#|uuid|name> key <key>", "name, bindip, port, pubkey or autopurge; ssh and conn: this hub's connection limits (alone: the table); <hub> key: replace a linked hub's key", NULL},
+  {"hub", "sync", CMD_ADMIN_SYNC_MESH, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub sync", "send a full sync to every linked hub", NULL},
+  {"hub", "stats", CMD_ADMIN_STATS, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub stats", "traffic, connections and maintenance timers", NULL},
+  {"hub", "rekey", CMD_ADMIN_REGEN_KEYS, B_NONE, 0, 0, CF_TYPE, 0, NULL, "hub rekey", "new hub keypair; every other hub and bot must re-learn it", NULL},
+  {"hub", "purge", CMD_ADMIN_PURGE_TOMBSTONES, B_PURGE, 1, 0, CF_YN, 0, NULL, "hub purge <now|days>", "purge tombstones now, or those older than <days> (daily: hub set autopurge)", NULL},
   {"log", "show", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|log", "log show", "log levels, sizes and this session's log", NULL},
   {"log", "set", 0, B_LOG_SET, 2, 0, CF_NONE, 0, NULL, "log set file|console|size <value>", "the file or console ring level, or the file size limit", "level: none error warning info debug or 0-4 · size: <MB>, <n>k or <n>b, at most 1024 MB"},
   {"log", "on", 0, B_LOCAL, 0, 1, CF_NONE, 0, NULL, "log on [level]", "line mode: stream hub log lines", NULL},
@@ -608,9 +607,10 @@ static const cmd_def_t CMDS[] = {
   {"option", "set", CMD_ADMIN_SET_OPT_FLAGS, B_OPT_SET, 1, 0, CF_YN, PRE_OPT, NULL, "option set <flags|->", "set the network option flags (- clears)", NULL},
   {"user", "list", 0, B_USER_LIST, 0, 1, CF_NONE, 0, NULL, "user list [admin|oper]", "every user (or one role): key, last seen, masks", NULL},
   {"user", "show", CMD_ADMIN_MATCH, B_ARG, 1, 0, CF_NONE, 0, NULL, "user show <name|*>", "one user (or all) with masks and their last use", NULL},
-  {"user", "add", 0, B_USER_ADD, 4, 0, CF_NONE, 0, NULL, "user add admin|oper <name> <key> <mask>", "add an admin or an oper", "key: their 88-char public key · mask: nick!user@host"},
+  {"user", "add", 0, B_USER_ADD, 5, 0, CF_NONE, 0, NULL, "user add admin|oper <name> <key> <mask> <flags|channels>", "add an admin (with flags) or an oper (with channels)", "admin flags: +a full, or b c h o u · oper channels: * or #a,#b"},
   {"user", "del", CMD_ADMIN_DEL_ADMIN, B_ARG, 1, 0, CF_YN, PRE_USER_DEL, NULL, "user del <name>", "remove a user and their masks", NULL},
-  {"user", "set", CMD_ADMIN_SET_USERKEY, B_USER_SET, 3, 0, CF_YN, PRE_USER_KEY, NULL, "user set <name> key <key>", "replace a user's key (asks y/N)", NULL},
+  {"user", "set", CMD_ADMIN_SET_USERKEY, B_USER_SET, 3, 0, CF_YN, PRE_USER_KEY, NULL, "user set <name> key <key> | user set <name> flags <+x-y>", "replace a user's key (asks y/N), or an admin's flags", NULL},
+  {"user", "chan", CMD_ADMIN_USER_ACCESS, B_USER_CHAN, 3, 0, CF_NONE, 0, NULL, "user chan add|del <name> <#chan|*>", "give an oper a channel (or * = every channel), or take it away", NULL},
   {"user", "mask", 0, B_USER_MASK, 3, 0, CF_NONE, 0, NULL, "user mask add|del <name> <mask>", "add or remove a usermask (del asks y/N)", NULL},
   {"channel", "list", CMD_ADMIN_LIST_CHANNELS, B_NONE, 0, 0, CF_NONE, 0, NULL, "channel list", "every managed channel with its settings", NULL},
   {"channel", "show", CMD_ADMIN_LIST_CHANNELS, B_ARG, 1, 0, CF_NONE, 0, NULL, "channel show <#chan>", "one channel in detail", NULL},
@@ -634,7 +634,7 @@ static const cmd_def_t CMDS[] = {
   {"display", "ascii", 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "display ascii", "plain ASCII glyphs for this session (again: Unicode)", NULL},
   {"display", "format", 0, B_LOCAL, 1, 0, CF_NONE, 0, NULL, "display format pretty|raw", "laid-out output, or the records as the hub sends them", NULL},
   {"display", "width", 0, B_LOCAL, 1, 0, CF_NONE, 0, NULL, "display width <60-250|auto>", "line mode: the output width", NULL},
-  {"display", "events", 0, B_LOCAL, 1, 0, CF_NONE, 0, NULL, "display events on|off", "line mode: a line for each peer, bot and upgrade change", NULL},
+  {"display", "events", 0, B_LOCAL, 1, 0, CF_NONE, 0, NULL, "display events on|off", "line mode: a line for each hub, bot and upgrade change", NULL},
   {"display", "clear", 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "display clear", "full screen: clear the current view", NULL},
 };
 #define NCMDS ((int)(sizeof(CMDS) / sizeof(CMDS[0])))
@@ -643,8 +643,7 @@ static const cmd_def_t CMDS[] = {
 static const struct {
   const char *name, *what;
 } GROUPS[] = {
-  {"bot", "registered bots"},      {"peer", "peer hubs"},
-  {"network", "the whole mesh"},   {"hub", "this hub"},
+  {"bot", "registered bots"},      {"hub", "this hub and the hubs it links to"},
   {"log", "the hub log"},          {"acl", "IP allow / deny lists"},
   {"option", "network option flags"}, {"user", "admins and opers"},
   {"channel", "managed channels"}, {"ban", "listed bans"},
@@ -652,6 +651,55 @@ static const struct {
   {"display", "this session's screen"},
 };
 #define NGROUPS ((int)(sizeof(GROUPS) / sizeof(GROUPS[0])))
+
+/* The admin flag a command needs to change something (user_flags plan §2):
+ * shown by help, checked before a request goes out (ui_flag_needed; the hub
+ * checks every request again).  "a/o": +a for an admin, +o for an oper. */
+static const struct {
+  const char *cmd, *sub, *flag;
+} CMD_FLAGS[] = {
+  {"bot", "add", "b"},
+  {"bot", "del", "b"},     {"bot", "kick", "b"},      {"bot", "rekey", "b"},
+  {"bot", "set", "b"},
+  {"hub", "add", "h"},     {"hub", "del", "h"},       {"hub", "set", "h"},
+  {"hub", "sync", "h"},    {"hub", "rekey", "h"},     {"hub", "purge", "h"},
+  {"log", "set", "h"},     {"acl", "add", "h"},       {"acl", "del", "h"},
+  {"option", "set", "a"},
+  {"user", "add", "a/o"},  {"user", "del", "a/o"},    {"user", "set", "a/o"},
+  {"user", "mask", "a/o"}, {"user", "chan", "o"},
+  {"channel", "add", "c"}, {"channel", "del", "c"},   {"channel", "mode", "c"},
+  {"channel", "set", "c"}, {"channel", "op", "c"},    {"channel", "invite", "c"},
+  {"ban", "add", "c"},     {"ban", "del", "c"},
+  {"upgrade", "start", "u"}, {"upgrade", "abort", "u"}, {"upgrade", "forget", "u"},
+};
+#define NCMDFLAGS ((int)(sizeof(CMD_FLAGS) / sizeof(CMD_FLAGS[0])))
+
+static const char *cmd_flag(const cmd_def_t *d) {
+  for (int i = 0; d->sub && i < NCMDFLAGS; i++)
+    if (!strcmp(CMD_FLAGS[i].cmd, d->cmd) && !strcmp(CMD_FLAGS[i].sub, d->sub))
+      return CMD_FLAGS[i].flag;
+  return NULL;
+}
+
+/* The commands with a view form that needs no flag. */
+static bool cmd_flag_dual(const cmd_def_t *d) {
+  return d->sub && ((!strcmp(d->cmd, "bot") && !strcmp(d->sub, "set")) ||
+                    (!strcmp(d->cmd, "hub") && !strcmp(d->sub, "set")) ||
+                    (!strcmp(d->cmd, "channel") &&
+                     (!strcmp(d->sub, "mode") || !strcmp(d->sub, "set"))));
+}
+
+static const char *flag_word(char f) {
+  switch (f) {
+  case 'a': return "full admin";
+  case 'b': return "bots";
+  case 'c': return "channels";
+  case 'h': return "hub";
+  case 'o': return "opers";
+  case 'u': return "upgrades";
+  default:  return "?";
+  }
+}
 
 /* help <group> <command> (§2.2): each argument, then examples that run as
  * typed.  args: "name\ttext" lines; examples: one per line. */
@@ -661,7 +709,7 @@ static const struct {
   const char *cmd, *sub, *args, *examples;
 } CMD_HELP[] = {
   {"help", NULL,
-   "group\tone of: bot peer network hub log acl option user channel ban upgrade display\n"
+   "group\tone of: bot hub log acl option user channel ban upgrade display\n"
    "command\tone of that group's commands: its arguments and an example\n"
    "?\ttyped in place of help it does the same",
    "help\nhelp bot\nhelp bot add\n? upgrade start"},
@@ -670,55 +718,53 @@ static const struct {
   {"bot", "show", "uuid|nick\tthe bot's uuid or its current nick (Tab completes both)",
    "bot show alpha\nbot show " EX_UUID},
   {"bot", "summary", NULL, "bot summary"},
-  {"bot", "pending", NULL, "bot pending"},
-  {"bot", "approve",
-   "#|uuid\tthe number bot pending shows in its # column, or the pending bot's uuid",
-   "bot approve 1\nbot approve " EX_UUID},
-  {"bot", "authorize", "uuid\tthe uuid of a bot that has not connected yet",
-   "bot authorize " EX_UUID},
+  {"bot", "revoked", NULL, "bot revoked"},
   {"bot", "add",
    "nick\tthe bot's IRC nick\n"
-   "uuid\tthe uuid the bot's -setup printed\n"
-   "key\tthe 88-character base64 public key the bot's -setup printed",
+   "uuid\tthe bot's uuid.  Where to get it: on the bot's host, in its directory, run "
+   "./ircbot -id (it asks for the config password unless .ircbot.pass is there); it "
+   "prints the uuid, the key and this whole bot add line.  -setup printed the same two "
+   "values when the bot was made\n"
+   "key\tthe bot's 88-character base64 public key, from the same ./ircbot -id",
    "bot add alpha " EX_UUID " " EX_KEY},
-  {"bot", "del", "uuid\tthe bot's uuid (Tab completes); asks y/N, then disconnects it",
-   "bot del " EX_UUID},
-  {"bot", "kick", "uuid\ta connected bot's uuid (Tab completes); asks y/N; it reconnects",
-   "bot kick " EX_UUID},
+  {"bot", "del", "uuid|nick\tthe bot's uuid or its nick (Tab completes both); asks y/N.  The "
+   "bot is told to wipe its config and exit, now if it is connected, else whenever it next "
+   "connects to any hub; its uuid can never be added again",
+   "bot del alpha\nbot del " EX_UUID},
+  {"bot", "kick", "uuid|nick\ta connected bot's uuid or its nick (Tab completes both); asks y/N; "
+   "it reconnects",
+   "bot kick alpha\nbot kick " EX_UUID},
   {"bot", "rekey", "uuid\tthe bot's uuid; prints how to rekey it on its host",
    "bot rekey " EX_UUID},
-  {"peer", "list", NULL, "peer list"},
-  {"peer", "show", "#|uuid|name\tthe number peer list shows, the hub's uuid, or its name",
-   "peer show 1\npeer show east"},
-  {"peer", "add",
-   "ip\tthe peer hub's address (no ':', so an IPv4 address or a host name)\n"
-   "port\tits listening port, 1-65535\n"
-   "uuid\tits uuid, from hub show on that hub\n"
-   "name|-\ta name for it, or - to learn its name from the peer\n"
-   "key\tthe 88-character public key from hub show on that hub",
-   "peer add 203.0.113.7 6697 " EX_UUID " east " EX_KEY "\n"
-   "peer add 203.0.113.7 6697 " EX_UUID " - " EX_KEY},
-  {"peer", "del", "#\tthe number peer list shows; alone it lists the peers to pick from; "
-   "you type the number again to confirm",
-   "peer del\npeer del 2"},
-  {"peer", "set",
-   "#|uuid|name\tthe peer: its number in peer list, its uuid, or its name\n"
-   "key\tthe setting; key is the only one\n"
-   "key\tthe new 88-character public key from hub show on that hub",
-   "peer set east key " EX_KEY},
-  {"peer", "sync", NULL, "peer sync"},
-  {"network", "tree", NULL, "network tree"},
-  {"network", "status", NULL, "network status"},
-  {"network", "set",
-   "(none)\tshows every bot network setting: its value, where it comes from, its default\n"
+  {"bot", "tree", NULL, "bot tree"},
+  {"bot", "set",
+   "(none)\tshows every bot setting: its value, where it comes from, its default\n"
    "flood <type>\tcmd, msg or ctcp (below), then N:S = more than N in S seconds trips it "
    "(N 1-1000, S 1-3600), off = no limit, default = back to the built-in\n"
    "ignoretime\tminutes (1-1440), or default\n"
    "sendq\tB:I = B lines (1-100) at once, then one every I ms (0-10000, 0 = no delay), or "
    "default\n"
    "(scope)\tevery bot on every hub gets the same values; there is no per-bot setting",
-   "network set\nnetwork set flood cmd 10:30\nnetwork set flood msg off\nnetwork set ignoretime 20\nnetwork set sendq 5:250\nnetwork set sendq default"},
-  {"hub", "show", NULL, "hub show"},
+   "bot set\nbot set flood cmd 10:30\nbot set flood msg off\nbot set ignoretime 20\nbot set sendq 5:250\nbot set sendq default"},
+  {"hub", "show", "#|uuid|name\talone: this hub; else a linked hub by the number hub list "
+   "shows, its uuid, or its name",
+   "hub show\nhub show 1\nhub show east"},
+  {"hub", "list", NULL, "hub list"},
+  {"hub", "add",
+   "ip\tthe other hub's address (no ':', so an IPv4 address or a host name)\n"
+   "port\tits listening port, 1-65535\n"
+   "uuid\tits uuid.  Where to get it: hub show in that hub's console, or ./irchub -id in "
+   "that hub's directory on its host (it asks for the config password unless .irchub.pass "
+   "is there); -id also prints this whole hub add line\n"
+   "name|-\ta name for it, or - to learn its name from that hub\n"
+   "key\tits 88-character public key, from the same hub show or ./irchub -id.  Its "
+   "hub_public.b64 is only -setup's copy and goes stale after a hub rekey there",
+   "hub add 203.0.113.7 6697 " EX_UUID " east " EX_KEY "\n"
+   "hub add 203.0.113.7 6697 " EX_UUID " - " EX_KEY},
+  {"hub", "del", "uuid|name\tthe hub's uuid or name, as hub list shows it. It is unlinked on this "
+   "hub only: first you see which other hubs link to it and which bots list it, with what "
+   "to run on each (hub del there, -hub on the bot)",
+   "hub del east\nhub del " EX_UUID},
   {"hub", "set",
    "setting\tname, bindip, port, pubkey or autopurge; alone it shows them all. ssh and conn "
    "are this hub's connection limits: hub set ssh | hub set conn show them; ssh <name> "
@@ -728,16 +774,20 @@ static const struct {
    "connection\n"
    "value\tname: this hub's name · bindip: the address it listens on · port: 1-65535 · "
    "pubkey: the key its private key derives (a new key is hub rekey) · "
-   "autopurge: days to keep tombstones, 0 = off",
+   "autopurge: days to keep tombstones, 0 = off\n"
+   "#|uuid|name key\ta linked hub (its number in hub list, its uuid, or its name), then "
+   "key and its new 88-character public key: hub show or ./irchub -id on that hub",
    "hub set\nhub set name west\nhub set port 6697\nhub set autopurge 30\nhub set ssh\n"
    "hub set ssh preauth 16\nhub set ssh authfail 3:3600\nhub set conn perip 8\n"
-   "hub set conn churn 30:10:30"},
+   "hub set conn churn 30:10:30\nhub set east key " EX_KEY},
+  {"hub", "sync", NULL, "hub sync"},
   {"hub", "stats", NULL, "hub stats"},
-  {"hub", "rekey", "(confirm)\tyou type this hub's name to go ahead; every peer and bot "
+  {"hub", "rekey", "(confirm)\tyou type this hub's name to go ahead; every other hub and bot "
    "must then learn the new key",
    "hub rekey"},
   {"hub", "purge", "now|days\tnow purges every tombstone; a number purges those older "
-   "than that many days (asks y/N)",
+   "than that many days (asks y/N).  To purge on a schedule: hub set autopurge <days>, "
+   "checked daily on every hub.  Deleted bots stay on bot revoked either way",
    "hub purge now\nhub purge 30"},
   {"log", "show", NULL, "log show"},
   {"log", "set",
@@ -751,13 +801,13 @@ static const struct {
   {"log", "off", NULL, "log off"},
   {"log", "filter", "text|clear\tthe rest of the line is the text a log view line must "
    "contain (any case); clear drops the filter",
-   "log filter UPGRADE\nlog filter peer east\nlog filter clear"},
+   "log filter UPGRADE\nlog filter east\nlog filter clear"},
   {"acl", "list", NULL, "acl list"},
   {"acl", "add",
    "allow|deny\twhich list\n"
    "ip[/n]\tan IPv4 or IPv6 address, or a network as address/prefix\n"
    "console\toptional scope word: the entry applies only once the connection says SSH "
-   "(bots and peers are not affected); without it the entry applies to everything",
+   "(bots and other hubs are not affected); without it the entry applies to everything",
    "acl add allow 203.0.113.0/24\nacl add deny 198.51.100.9\nacl add allow 203.0.113.7 console"},
   {"acl", "del",
    "allow|deny\twhich list\n"
@@ -775,15 +825,31 @@ static const struct {
    "admin|oper\tthe role\n"
    "name\tthe user's name\n"
    "key\ttheir 88-character public key (keygen's <stamp>_<name>.public.b64)\n"
-   "mask\ta first usermask, nick!user@host (* and ? match)",
-   "user add oper alice " EX_KEY " alice!*@*.example.net"},
+   "mask\ta first usermask, nick!user@host (* and ? match)\n"
+   "flags\tan admin: +a for a full admin (every command), or the letters of what they may "
+   "change: b bots, c channels, h hub, o opers, u upgrades (+chu); every admin may log in "
+   "and view everything\n"
+   "channels\tan oper: * for every channel, or the channels, comma-separated (#ircbot,#dev); "
+   "on each they may op, invite, unban, key",
+   "user add admin robert " EX_KEY " robert!*@* +a\n"
+   "user add admin dana " EX_KEY " dana!*@* +chu\n"
+   "user add oper alice " EX_KEY " alice!*@*.example.net *\n"
+   "user add oper alice " EX_KEY " alice!*@*.example.net #ircbot"},
   {"user", "del", "name\tthe user, either role; their masks go too (an admin: type the "
    "name to confirm; an oper: y/N)", "user del alice"},
   {"user", "set",
    "name\tthe user\n"
-   "key\tthe setting; key is the only one\n"
-   "key\ttheir new 88-character public key (asks y/N)",
-   "user set alice key " EX_KEY},
+   "key|flags\tthe setting: key (anyone's; your own needs no flag) or flags (an admin's, "
+   "needs +a)\n"
+   "value\tkey: their new 88-character public key (asks y/N) · flags: +c-u adds and removes, "
+   "chu or +a replaces them all",
+   "user set alice key " EX_KEY "\nuser set dana flags +b-u\nuser set dana flags +a"},
+  {"user", "chan",
+   "add|del\tgive the channel, or take it away\n"
+   "name\tthe oper\n"
+   "#chan|*\ta channel, or * for every channel; * and channels exclude each other (add * "
+   "drops the channels, add #c drops *), del * takes everything away",
+   "user chan add alice #ops\nuser chan del alice #dev\nuser chan add alice *\nuser chan del alice *"},
   {"user", "mask",
    "add|del\tadd a mask, or remove one (del asks y/N)\n"
    "name\tthe user\n"
@@ -859,7 +925,7 @@ static const struct {
   {"display", "width", "60-250|auto\tthe columns to lay output out for; auto follows the "
    "terminal",
    "display width 100\ndisplay width auto"},
-  {"display", "events", "on|off\ta line for each peer, bot and upgrade change",
+  {"display", "events", "on|off\ta line for each hub, bot and upgrade change",
    "display events on"},
   {"display", "clear", NULL, "display clear"},
 };
@@ -1264,7 +1330,7 @@ static void local_ok(console_ui_t *ui, const char *what, const char *subject,
 
 static void send_request(console_ui_t *ui, uint8_t op, const void *payload,
                          size_t len, const pending_rq_t *rq);
-static void ask_confirm(console_ui_t *ui, confirm_t kind, const char *want, int pick_max,
+static void ask_confirm(console_ui_t *ui, confirm_t kind, const char *want,
                         const char *question);
 static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text, size_t len);
 
@@ -1384,13 +1450,13 @@ static void tree_events(console_ui_t *ui, const char *old, const char *cur) {
   char slog[128];
   ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
   char line[256];
-  /* peers up/down */
+  /* other hubs up/down */
   for (int j = 0; j < nb; j++) {
     if (b[j].type != 'H' || b[j].depth < 1) continue;
     for (int i = 0; i < na; i++) {
       if (a[i].type != 'H' || strcmp(a[i].uuid, b[j].uuid) || strcmp(a[i].name, b[j].name)) continue;
       if (a[i].online != b[j].online) {
-        usnprintf(line, sizeof(line), "%s peer %s %s", fmt_glyph(&c, b[j].online ? G_ON : G_WARN),
+        usnprintf(line, sizeof(line), "%s hub %s %s", fmt_glyph(&c, b[j].online ? G_ON : G_WARN),
                   b[j].name, b[j].online ? "is up" : "went down");
         human_event(ui, line, b[j].online ? RL_DIM : RL_WARN);
       }
@@ -1445,7 +1511,7 @@ static void greet_status(console_ui_t *ui) {
   ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
   char l1[256], l2[64];
   const char *dot = fmt_glyph(&c, G_DOT);
-  usnprintf(l1, sizeof(l1), " peers %d/%d up %s bots %d/%d online %s log file %s, console %s",
+  usnprintf(l1, sizeof(l1), " hubs %d/%d up %s bots %d/%d online %s log file %s, console %s",
             ui->st.peers_up, ui->st.peers_total, dot, ui->st.bots_on, ui->st.bots_total, dot,
             ui->st.loglevel >= 0 && ui->st.loglevel <= 4 ? LEVEL_WORD[ui->st.loglevel] : "?",
             ui->st.consolelevel >= 0 && ui->st.consolelevel <= 4 ? LEVEL_WORD[ui->st.consolelevel] : "?");
@@ -1472,6 +1538,19 @@ static void on_event(console_ui_t *ui, const char *payload, size_t len,
   memcpy(topic, payload, tl);
   topic[tl] = '\0';
 
+  if (!strcmp(topic, "me")) {
+    /* "flags=<letters>": only letters of USER_FLAG_LETTERS are kept */
+    if (dl > 6 && !memcmp(data, "flags=", 6)) {
+      size_t o = 0;
+      for (size_t i = 6; i < dl && o < USER_FLAGS_MAX; i++)
+        if (data[i] && strchr(USER_FLAG_LETTERS, data[i])) ui->flags[o++] = data[i];
+      ui->flags[o] = '\0';
+    } else {
+      ui->flags[0] = '\0';
+    }
+    ui->have_flags = true;
+    return;
+  }
   if (!strcmp(topic, "status")) {
     char *clean = malloc(dl + 1);
     if (!clean) return;
@@ -1678,6 +1757,16 @@ static void help_command(const fmt_ctx_t *c, flines_t *f, const cmd_def_t *d) {
   flines_add(f, RL_NORMAL, line);
   usnprintf(line, sizeof(line), "   %s", d->help);
   flines_add(f, RL_DIM, line);
+  /* the admin flag it needs (plan §2) */
+  const char *fl = cmd_flag(d);
+  if (fl && !strcmp(fl, "a/o"))
+    usnprintf(line, sizeof(line), "   needs +a for an admin, +o for an oper%s",
+              !strcmp(d->sub, "set") ? " (your own key: none)" : "");
+  else if (fl && cmd_flag_dual(d))
+    usnprintf(line, sizeof(line), "   changing needs +%s (%s); viewing needs none", fl, flag_word(fl[0]));
+  else if (fl)
+    usnprintf(line, sizeof(line), "   needs +%s (%s)", fl, flag_word(fl[0]));
+  if (fl) flines_add(f, RL_DIM, line);
   /* "name<TAB>text" lines as a two-column list; a long name puts its text
    * on the next line */
   if (args) {
@@ -1711,9 +1800,9 @@ static void help_command(const fmt_ctx_t *c, flines_t *f, const cmd_def_t *d) {
   } else {
     flines_add(f, RL_DIM, "   (no arguments)");
   }
-  /* channel set / network set: every setting, its built-in default and what
+  /* channel set / bot set: every setting, its built-in default and what
    * it does (one table, hub_console_fmt.c, also behind the settings views) */
-  bool net_set = !strcmp(d->cmd, "network") && d->sub && !strcmp(d->sub, "set");
+  bool net_set = !strcmp(d->cmd, "bot") && d->sub && !strcmp(d->sub, "set");
   if (net_set || (!strcmp(d->cmd, "channel") && d->sub && !strcmp(d->sub, "set"))) {
     flines_add(f, RL_NORMAL, "");
     flines_add(f, RL_HEAD, " Settings: name, built-in default, what it does");
@@ -1795,13 +1884,19 @@ static void show_help(console_ui_t *ui, const char *topic, const cmd_def_t *one)
     for (int i = 0; i < NCMDS; i++) {
       if (strcasecmp(CMDS[i].cmd, topic)) continue;
       int w = console_str_width(CMDS[i].usage);
-      if (w <= uw && 1 + uw + 2 + console_str_width(CMDS[i].help) <= c.width) {
-        usnprintf(line, sizeof(line), " %s%*s  %s", CMDS[i].usage, uw - w, "", CMDS[i].help);
+      /* the help text, then the flag it needs: [+c], [+a|+o] */
+      char hx[320];
+      const char *fl = cmd_flag(&CMDS[i]);
+      if (fl && !strcmp(fl, "a/o")) usnprintf(hx, sizeof(hx), "%s  [+a|+o]", CMDS[i].help);
+      else if (fl) usnprintf(hx, sizeof(hx), "%s  [+%s]", CMDS[i].help, fl);
+      else usnprintf(hx, sizeof(hx), "%s", CMDS[i].help);
+      if (w <= uw && 1 + uw + 2 + console_str_width(hx) <= c.width) {
+        usnprintf(line, sizeof(line), " %s%*s  %s", CMDS[i].usage, uw - w, "", hx);
         flines_add(&f, RL_NORMAL, line);
       } else {
         usnprintf(line, sizeof(line), " %s", CMDS[i].usage);
         flines_add(&f, RL_NORMAL, line);
-        usnprintf(line, sizeof(line), " %*s  %s", uw, "", CMDS[i].help);
+        usnprintf(line, sizeof(line), " %*s  %s", uw, "", hx);
         flines_add(&f, RL_NORMAL, line);
       }
       if (CMDS[i].args) {
@@ -2127,25 +2222,14 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       }
     w = usnprintf(o, cap, "%s:%s:%s:%s:%s", a[0], a[1], a[2], strcmp(a[3], "-") ? a[3] : "", a[4]);
     break;
-  case B_PEER_DEL:
-    if (na > 0 && !all_digits(a[0])) {
-      *why = "a peer is removed by its number in peer list";
-      *hint = "peer del [#]";
-      return false;
+  case B_HUB_SHOW:
+    /* alone: this hub; with an argument: that linked hub */
+    if (na == 0) {
+      *outlen = 0;
+      return true;
     }
-    w = usnprintf(o, cap, "%s", na > 0 ? a[0] : "");
-    break;
-  case B_PEER_SET:
-    if (strcasecmp(a[1], "key")) {
-      *why = "unknown peer setting";
-      *hint = "settings: key";
-      return false;
-    }
-    if (strchr(a[0], ':') || strchr(a[2], ':')) {
-      *why = "':' is not allowed in an argument here";
-      return false;
-    }
-    w = usnprintf(o, cap, "%s:%s", a[0], a[2]);
+    *op = CMD_ADMIN_LIST_PEERS;
+    w = usnprintf(o, cap, "%s", a[0]);
     break;
   case B_CHAN_ADD:
     w = usnprintf(o, cap, "%s|%s", a[0], na > 1 ? a[1] : "");
@@ -2263,7 +2347,7 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
     } else if (!strcasecmp(a[0], "sendq") && na == 2) {
       w = usnprintf(o, cap, "sendq|%s", a[1]);
     } else {
-      *why = "network set flood <cmd|msg|ctcp> <N:S|off|default>, ignoretime <min|default>, or sendq <B:I|default>";
+      *why = "bot set flood <cmd|msg|ctcp> <N:S|off|default>, ignoretime <min|default>, or sendq <B:I|default>";
       return false;
     }
     for (char *t = o; *t; t++) *t = (char)tolower((unsigned char)*t);
@@ -2354,6 +2438,16 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       for (char *t = o; *t; t++) *t = (char)tolower((unsigned char)*t);
       break;
     }
+    if (na == 3 && !strcasecmp(a[1], "key")) {
+      /* hub set <#|uuid|name> key <key>: a linked hub's key */
+      if (strchr(a[0], ':') || strchr(a[2], ':')) {
+        *why = "':' is not allowed in an argument here";
+        return false;
+      }
+      *op = CMD_ADMIN_SET_PEER_PUBKEY;
+      w = usnprintf(o, cap, "%s:%s", a[0], a[2]);
+      break;
+    }
     if (na > 2) {
       *why = "hub set takes a setting and one value";
       return false;
@@ -2369,7 +2463,7 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       static char m[96];
       usnprintf(m, sizeof(m), "unknown hub setting \"%.*s\"", uprec(a[0], 40), a[0]);
       *why = m;
-      *hint = "name, bindip, port, pubkey, autopurge, ssh, conn";
+      *hint = "name, bindip, port, pubkey, autopurge, ssh, conn, or <hub> key <key>";
       return false;
     }
     if (na < 2) {
@@ -2420,15 +2514,28 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       *why = "role is admin or oper";
       return false;
     }
-    w = usnprintf(o, cap, "%s|%s|%s", a[1], a[2], a[3]);
+    w = usnprintf(o, cap, "%s|%s|%s|%s", a[1], a[2], a[3], a[4]);
     break;
   case B_USER_SET:
+    if (!strcasecmp(a[1], "flags")) {
+      *op = CMD_ADMIN_USER_ACCESS;
+      *confirm = CF_NONE;
+      w = usnprintf(o, cap, "flags|%s|%s", a[0], a[2]);
+      break;
+    }
     if (strcasecmp(a[1], "key")) {
       *why = "unknown user setting";
-      *hint = "settings: key";
+      *hint = "settings: key, flags";
       return false;
     }
     w = usnprintf(o, cap, "%s|%s", a[0], a[2]);
+    break;
+  case B_USER_CHAN:
+    if (strcasecmp(a[0], "add") && strcasecmp(a[0], "del")) {
+      *why = "say add or del";
+      return false;
+    }
+    w = usnprintf(o, cap, "chan|%s|%s|%s", !strcasecmp(a[0], "add") ? "add" : "del", a[1], a[2]);
     break;
   case B_USER_MASK:
     if (!strcasecmp(a[0], "add")) {
@@ -2492,11 +2599,10 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
 
 /* Enter a confirmation: the question as [confirm #N] (line mode) or a
  * highlighted line, and the next input line answers it. */
-static void ask_confirm(console_ui_t *ui, confirm_t kind, const char *want, int pick_max,
+static void ask_confirm(console_ui_t *ui, confirm_t kind, const char *want,
                         const char *question) {
   ui->confirming = kind;
   usnprintf(ui->confirm_want, sizeof(ui->confirm_want), "%s", want ? want : "");
-  ui->confirm_pick_max = pick_max;
   if (ui->line_mode) {
     char m[CONSOLE_INPUT_MAX];
     usnprintf(m, sizeof(m), "[confirm #%d] %s", ui->confirm_seq, question);
@@ -2561,7 +2667,6 @@ static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text
   char q[CONSOLE_INPUT_MAX - 64];
   confirm_t kind = CF_YN;
   char want[128] = "";
-  int pick = 0;
   const crec_t *r0 = NULL;
   for (int i = 0; i < rep.n && !r0; i++) r0 = &rep.r[i];
   stage_confirm(ui, rq->seq, pc->op, pc->payload, pc->len, &pc->rq);
@@ -2581,14 +2686,19 @@ static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text
     const char *id = b && rv(b, "uuid") ? rv(b, "uuid") : pc->arg;
     usnprintf(u8, sizeof(u8), "%.*s%s", uprec(id, 8), id,
               fmt_glyph(&c, G_ELL));
+    /* a nick was typed: the request names the bot by the uuid it resolved to */
+    if (b && rvs(b, "uuid") && strlen(rv(b, "uuid")) < sizeof(ui->confirm_payload)) {
+      ui->confirm_len = strlen(rv(b, "uuid"));
+      memcpy(ui->confirm_payload, rv(b, "uuid"), ui->confirm_len);
+    }
     if (pc->pre == PRE_BOT_DEL) {
       if (local)
-        usnprintf(q, sizeof(q), "Delete bot %s (%s)? It is online on this hub and will be disconnected. (y/N)", nick, u8);
+        usnprintf(q, sizeof(q), "Delete bot %s (%s) for good? It is online on this hub: it wipes its config and exits. (y/N)", nick, u8);
       else if (on)
-        usnprintf(q, sizeof(q), "Delete bot %s (%s)? It is online on %s and is dropped everywhere. (y/N)", nick, u8,
+        usnprintf(q, sizeof(q), "Delete bot %s (%s) for good? It is online on %s: it wipes its config and exits. (y/N)", nick, u8,
                   rvs(b, "hub_name") ? rv(b, "hub_name") : "another hub");
       else
-        usnprintf(q, sizeof(q), "Delete bot %s (%s)? It is offline. (y/N)", nick, u8);
+        usnprintf(q, sizeof(q), "Delete bot %s (%s) for good? It is offline: it wipes its config if it ever connects. (y/N)", nick, u8);
     } else if (!local) {
       ok = false;
       fail_code = "bot.not_local";
@@ -2602,73 +2712,45 @@ static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text
     break;
   }
   case PRE_PEER_DEL: {
-    int n = 0;
-    const crec_t *hit = NULL;
+    /* hub del: the hub, who else still knows it, then the question */
+    const crec_t *t = NULL;
+    int others = 0, nb = 0;
     for (int i = 0; i < rep.n; i++) {
-      if (strcmp(rep.r[i].type, "peer")) continue;
-      n++;
-      if (pc->arg[0] && rvi(&rep.r[i], "n", 0) == atoll(pc->arg)) hit = &rep.r[i];
+      const crec_t *r = &rep.r[i];
+      if (!t && !strcmp(r->type, "peer")) t = r;
+      else if (!strcmp(r->type, "hubref") && !rvb(r, "self")) others++;
+      else if (!strcmp(r->type, "botref")) nb++;
     }
-    if (!n) {
+    if (!t) {
       ok = false;
-      fail_code = "peer.none";
-      usnprintf(fail_msg, sizeof(fail_msg), "no peer hubs are configured");
-      usnprintf(fail_hint, sizeof(fail_hint), "peer list");
+      fail_code = "peer.not_found";
+      usnprintf(fail_msg, sizeof(fail_msg), "no hub %s: none with that uuid or name", pc->arg);
+      usnprintf(fail_hint, sizeof(fail_hint), "hub list");
       break;
     }
-    if (pc->arg[0]) {
-      if (!hit) {
-        ok = false;
-        fail_code = "peer.not_found";
-        usnprintf(fail_msg, sizeof(fail_msg), "no peer #%s (%d configured)", pc->arg, n);
-        usnprintf(fail_hint, sizeof(fail_hint), "peer list");
-        break;
-      }
-      kind = CF_TYPE;
-      usnprintf(want, sizeof(want), "%s", pc->arg);
-      usnprintf(q, sizeof(q), "Type %s to remove peer %s (%s:%lld):", pc->arg,
-                rvs(hit, "name") ? rv(hit, "name") : rv(hit, "ip") ? rv(hit, "ip") : "?",
-                rv(hit, "ip") ? rv(hit, "ip") : "?", rvi(hit, "port", 0));
+    show_reply(ui, text, len, rq->words, FMT_MODE_NORMAL, false);
+    const char *nm = rvs(t, "name") ? rv(t, "name") : rvs(t, "ip") ? rv(t, "ip") : pc->arg;
+    char id[96];
+    if (rvs(t, "uuid")) usnprintf(id, sizeof(id), "%.8s", rv(t, "uuid"));
+    else usnprintf(id, sizeof(id), "%s:%lld", rv(t, "ip") ? rv(t, "ip") : "?", rvi(t, "port", 0));
+    /* a name was typed: the request names the hub by the uuid it resolved to */
+    if (rvs(t, "uuid") && strlen(rv(t, "uuid")) < sizeof(ui->confirm_payload)) {
+      ui->confirm_len = strlen(rv(t, "uuid"));
+      memcpy(ui->confirm_payload, rv(t, "uuid"), ui->confirm_len);
+    }
+    if (!others && !nb) {
+      usnprintf(q, sizeof(q), "Unlink %s (%s)? No other hub links to it and no bot lists it. (y/N)",
+                nm, id);
     } else {
-      /* no number: the configured peers, then the number is the answer */
-      if (ui->raw) {
-        show_reply(ui, text, len, rq->words, FMT_MODE_NORMAL, false);
-      } else {
-        flines_t f = {0};
-        char right[48];
-        usnprintf(right, sizeof(right), "%d configured", n);
-        fmt_title(&c, &f, "Peer hubs", right);
-        int nw = 4, aw = 7;
-        for (int i = 0; i < rep.n; i++) {
-          const crec_t *p = &rep.r[i];
-          if (strcmp(p->type, "peer")) continue;
-          char ad[96];
-          usnprintf(ad, sizeof(ad), "%s:%lld", rv(p, "ip") ? rv(p, "ip") : "?", rvi(p, "port", 0));
-          const char *nm = rvs(p, "name") ? rv(p, "name") : fmt_glyph(&c, G_DASH);
-          if (console_str_width(nm) > nw) nw = console_str_width(nm);
-          if (console_str_width(ad) > aw) aw = console_str_width(ad);
-        }
-        char l[512];
-        usnprintf(l, sizeof(l), "   #  %-*s  %-*s  LINK", nw, "NAME", aw, "ADDRESS");
-        flines_add(&f, RL_HEAD, l);
-        for (int i = 0; i < rep.n; i++) {
-          const crec_t *p = &rep.r[i];
-          if (strcmp(p->type, "peer")) continue;
-          char ad[96];
-          usnprintf(ad, sizeof(ad), "%s:%lld", rv(p, "ip") ? rv(p, "ip") : "?", rvi(p, "port", 0));
-          const char *nm = rvs(p, "name") ? rv(p, "name") : fmt_glyph(&c, G_DASH);
-          bool up = rvb(p, "up");
-          usnprintf(l, sizeof(l), "  %2lld  %s%*s  %s%*s  %s %s", rvi(p, "n", 0), nm,
-                    nw - console_str_width(nm), "", ad, aw - console_str_width(ad), "",
-                    fmt_glyph(&c, up ? G_ON : G_ERR), up ? "up" : "down");
-          flines_add(&f, up ? RL_NORMAL : RL_WARN, l);
-        }
-        emit_flines(ui, &f);
-        flines_free(&f);
-      }
-      kind = CF_PICK;
-      pick = n;
-      usnprintf(q, sizeof(q), "Type the number of the peer to remove:");
+      char who[96];
+      if (others && nb)
+        usnprintf(who, sizeof(who), "%d more hub%s and %d bot%s", others, others == 1 ? "" : "s", nb,
+                  nb == 1 ? "" : "s");
+      else if (others)
+        usnprintf(who, sizeof(who), "%d more hub%s", others, others == 1 ? "" : "s");
+      else
+        usnprintf(who, sizeof(who), "%d bot%s", nb, nb == 1 ? "" : "s");
+      usnprintf(q, sizeof(q), "Unlink %s (%s) from this hub only? %s still list it. (y/N)", nm, id, who);
     }
     break;
   }
@@ -2779,9 +2861,31 @@ static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text
     command_done(ui, true);
     return;
   }
-  ask_confirm(ui, kind, want, pick, q);
+  ask_confirm(ui, kind, want, q);
   /* lines typed ahead answer it; then the prompt */
   command_done(ui, true);
+}
+
+/* The flag this command line needs, as far as the console can tell (the hub
+ * knows a target user's role; those are left to it).  0 = none. */
+static char ui_flag_needed(const cmd_def_t *c, const words_t *ws, int argi) {
+  int na = ws->n - argi;
+  const char *a0 = na > 0 ? ws->w[argi] : "", *a1 = na > 1 ? ws->w[argi + 1] : "";
+  if (!c->sub) return 0;
+  if (!strcmp(c->cmd, "user")) {
+    if (!strcmp(c->sub, "add"))
+      return !strcasecmp(a0, "admin") ? 'a' : !strcasecmp(a0, "oper") ? 'o' : 0;
+    if (!strcmp(c->sub, "set")) return !strcasecmp(a1, "flags") ? 'a' : 0;
+    if (!strcmp(c->sub, "chan")) return 'o';
+    return 0;
+  }
+  if (!strcmp(c->cmd, "bot") && !strcmp(c->sub, "set")) return na > 0 ? 'b' : 0;
+  if (!strcmp(c->cmd, "hub") && !strcmp(c->sub, "set"))
+    return na == 0 || (na == 1 && (!strcasecmp(a0, "ssh") || !strcasecmp(a0, "conn"))) ? 0 : 'h';
+  if (!strcmp(c->cmd, "channel") && (!strcmp(c->sub, "mode") || !strcmp(c->sub, "set")))
+    return na > 1 ? 'c' : 0;
+  const char *f = cmd_flag(c);
+  return f && !f[1] ? f[0] : 0;
 }
 
 static void run_line(console_ui_t *ui, const char *line) {
@@ -2863,6 +2967,16 @@ static void run_line(console_ui_t *ui, const char *line) {
     refuse(ui, seq, "cmd.bad_arg", why ? why : "bad arguments", hint);
     return;
   }
+  /* plan R4: refused here, before any read or y/N, when this admin's flags
+   * (the core's "me" event) do not cover it; the hub checks again */
+  char need = ui_flag_needed(c, &ws, argi);
+  if (need && ui->have_flags && !strchr(ui->flags, 'a') && !strchr(ui->flags, need)) {
+    char m[64];
+    usnprintf(m, sizeof(m), "this needs +%c (%s)", need, flag_word(need));
+    refuse(ui, seq, "user.no_flag", m,
+           need == 'a' ? "ask a full admin (+a)" : "ask a full admin (+a) for the flag");
+    return;
+  }
 
   pending_rq_t rq;
   memset(&rq, 0, sizeof(rq));
@@ -2898,7 +3012,8 @@ static void run_line(console_ui_t *ui, const char *line) {
       usnprintf(pp, sizeof(pp), "%s", a1);
       break;
     case PRE_PEER_DEL:
-      pop = CMD_ADMIN_LIST_PEERS;
+      pop = CMD_ADMIN_PEER_REFS;
+      usnprintf(pp, sizeof(pp), "%s", a1);
       break;
     case PRE_OPT:
       pop = CMD_ADMIN_GET_OPT_FLAGS;
@@ -2944,15 +3059,15 @@ static void run_line(console_ui_t *ui, const char *line) {
     char l1[160];
     usnprintf(l1, sizeof(l1), "hub rekey makes a new identity for %s.", hn);
     const char *lines[3] = {l1,
-                            "Every peer and bot link drops now; each peer runs peer set <uuid> key, each bot +hub with the new key.",
+                            "Every hub and bot link drops now; each other hub runs hub set <uuid> key, each bot +hub with the new key.",
                             "Back up .irchub.cnf first: the old key is overwritten."};
     warn_lines(ui, lines, 3);
     kind = CF_TYPE;
     usnprintf(want, sizeof(want), "%s", hn);
     usnprintf(q, sizeof(q), "Type %s to go ahead:", hn);
   } else if (op == CMD_ADMIN_PURGE_TOMBSTONES) {
-    if (!strcasecmp(a1, "now")) usnprintf(q, sizeof(q), "Purge every tombstone now, here and on all peers? (y/N)");
-    else usnprintf(q, sizeof(q), "Purge tombstones older than %s days, here and on all peers? (y/N)", a1);
+    if (!strcasecmp(a1, "now")) usnprintf(q, sizeof(q), "Purge every tombstone now, here and on all other hubs? (y/N)");
+    else usnprintf(q, sizeof(q), "Purge tombstones older than %s days, here and on all other hubs? (y/N)", a1);
   } else if (op == CMD_ADMIN_DEL_ALLOWLIST || op == CMD_ADMIN_DEL_DENYLIST) {
     usnprintf(q, sizeof(q), "Remove %s from the %s list? (y/N)", a2,
               op == CMD_ADMIN_DEL_ALLOWLIST ? "allow" : "deny");
@@ -2971,7 +3086,7 @@ static void run_line(console_ui_t *ui, const char *line) {
   } else {
     usnprintf(q, sizeof(q), "Really %s? (y/N)", words);
   }
-  ask_confirm(ui, kind, want, 0, q);
+  ask_confirm(ui, kind, want, q);
 }
 
 static void confirm_answer(console_ui_t *ui, const char *answer, bool cancelled) {
@@ -2981,10 +3096,6 @@ static void confirm_answer(console_ui_t *ui, const char *answer, bool cancelled)
   if (ok) {
     if (kind == CF_YN) {
       ok = !strcasecmp(answer, "y") || !strcasecmp(answer, "yes");
-    } else if (kind == CF_PICK) {
-      ok = all_digits(answer) && atoi(answer) >= 1 && atoi(answer) <= ui->confirm_pick_max;
-      if (ok) ui->confirm_len = (size_t)usnprintf((char *)ui->confirm_payload,
-                                                  sizeof(ui->confirm_payload), "%d", atoi(answer));
     } else {
       ok = !strcmp(answer, ui->confirm_want);
     }
@@ -3076,12 +3187,12 @@ typedef struct {
 static const arg_comp_t ARG_COMP[] = {
   {"help", NULL, 0, CK_GROUP, NULL},
   {"bot", "show", 0, CK_BOT_NICK, NULL},
-  {"bot", "del", 0, CK_BOT, NULL},
+  {"bot", "del", 0, CK_BOT_NICK, NULL},
   {"bot", "kick", 0, CK_BOT_ON, NULL},
   {"bot", "rekey", 0, CK_BOT, NULL},
-  {"peer", "show", 0, CK_HUB_NAME, NULL},
-  {"peer", "set", 0, CK_HUB_NAME, NULL},
-  {"peer", "set", 1, CK_WORDS, "key"},
+  {"bot", "set", 0, CK_WORDS, "flood ignoretime sendq"},
+  {"bot", "set", -1, CK_NETSET, NULL},
+  {"hub", "show", 0, CK_HUB_NAME, NULL},
   {"hub", "set", -1, CK_HUBSET, NULL},
   {"hub", "purge", 0, CK_WORDS, "now"},
   {"log", "set", 0, CK_WORDS, "file console size"},
@@ -3094,7 +3205,8 @@ static const arg_comp_t ARG_COMP[] = {
   {"acl", "del", 2, CK_WORDS, "console"},
   {"user", "list", 0, CK_WORDS, "admin oper"},
   {"user", "add", 0, CK_WORDS, "admin oper"},
-  {"user", "set", 1, CK_WORDS, "key"},
+  {"user", "set", 1, CK_WORDS, "key flags"},
+  {"user", "chan", 0, CK_WORDS, "add del"},
   {"user", "mask", 0, CK_WORDS, "add del"},
   {"channel", "set", 0, CK_WORDS, "default"},
   {"channel", "set", -1, CK_CHSET, NULL},
@@ -3103,8 +3215,6 @@ static const arg_comp_t ARG_COMP[] = {
   {"ban", "add", 2, CK_WORDS, "perm sticky"},
   {"ban", "add", 3, CK_WORDS, "sticky"},
   {"ban", "del", 0, CK_WORDS, "*"},
-  {"network", "set", 0, CK_WORDS, "flood ignoretime sendq"},
-  {"network", "set", -1, CK_NETSET, NULL},
   {"upgrade", "releases", -1, CK_WORDS, "bot= hub="},
   {"upgrade", "start", -1, CK_WORDS, "bot= hub= nodes= botbase= hubbase="},
   {"display", "view", 0, CK_WORDS, "1 2 3 4 5"},
@@ -3139,12 +3249,16 @@ static const char *netset_words(const char *p1, const char *p2) {
   return "";
 }
 
-/* hub set <setting> | ssh <name> <value> | conn <name> <value> */
+/* hub set <setting> | ssh <name> <value> | conn <name> <value> | <hub> key <key> */
 static const char *hubset_words(int pos, const char *p1, const char *p2) {
   if (pos == 0) return "name bindip port pubkey autopurge ssh conn";
   if (pos == 1 && !strcasecmp(p1, "ssh"))
     return "preauth preauthip sessions grace authtries idle authfail connect block cmdrate";
   if (pos == 1 && !strcasecmp(p1, "conn")) return "perip churn authfail";
+  static const char *const own[] = {"name", "bindip", "port", "pubkey", "autopurge"};
+  bool is_own = false;
+  for (size_t i = 0; i < sizeof(own) / sizeof(own[0]); i++) is_own |= !strcasecmp(p1, own[i]);
+  if (pos == 1 && !is_own) return "key";
   if (pos == 2 && (!strcasecmp(p2, "ssh") || !strcasecmp(p2, "conn"))) return "default";
   return "";
 }
@@ -3228,7 +3342,7 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
     }
     return n;
   }
-  /* uuids (and for show / peer set, names) from the tree rows:
+  /* uuids (and for show / kick / del / hub show, names) from the tree rows:
    * H|depth|name|uuid|..., B|depth|nick|uuid|..., D|nick|uuid|... (offline) */
   for (const char *p = ui->tree; p && *p && n < max && *pooln < 128;) {
     const char *nl = strchr(p, '\n');
@@ -3250,7 +3364,7 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
       } else if ((ac->kind == CK_BOT || ac->kind == CK_BOT_ON || ac->kind == CK_BOT_NICK) &&
                  ty == 'B' && nf >= 4) {
         cand[0] = f[3];
-        if (ac->kind == CK_BOT_NICK) cand[1] = f[2];
+        if (ac->kind != CK_BOT) cand[1] = f[2];
       } else if ((ac->kind == CK_BOT || ac->kind == CK_BOT_NICK) && ty == 'D' && nf >= 3) {
         cand[0] = f[2];
         if (ac->kind == CK_BOT_NICK) cand[1] = f[1];
@@ -4054,7 +4168,7 @@ static void status_bar(console_ui_t *ui, rowb_t *r, long long now_ms, bool pane_
   const char *hn = ui->hubname[0] ? ui->hubname : "hub";
   SEG(1, SGR_STATUS, "%s %.*s %.*s", clk, uprec(hn, 40), hn, uprec(ui->admin, 40), ui->admin);
   if (ui->st.have) {
-    SEG(2, SGR_STATUS, "peers %d/%d", ui->st.peers_up, ui->st.peers_total);
+    SEG(2, SGR_STATUS, "hubs %d/%d", ui->st.peers_up, ui->st.peers_total);
     SEG(2, SGR_STATUS, "bots %d/%d", ui->st.bots_on, ui->st.bots_total);
     if (strcmp(ui->st.upg, "-")) SEG(3, SGR_WARNBG, "UPG %s", ui->st.upg);
     if (ui->st.frozen) SEG(3, SGR_ALERT, "FROZEN");

@@ -205,16 +205,28 @@ bool hub_update_rollback(hub_state_t *state, const char *reason) {
           reason ? reason : "the upgrade was aborted");
   /* Config first: if the restart races us, the old binary must not come up
    * against a config only the newer build understands. */
-  if (access(prev_cfg, R_OK) == 0 && rename(prev_cfg, HUB_CONFIG_FILE) != 0)
+  bool cfg_restored = false;
+  if (access(prev_cfg, R_OK) == 0) {
+    cfg_restored = (rename(prev_cfg, HUB_CONFIG_FILE) == 0);
+    if (!cfg_restored)
+      hub_log_error("[UPGRADE] Could not restore %s; keeping the current one\n",
+              prev_cfg);
+  }
+  /* The pre-2.5.0 pass file, only if this process rewrote it (the old build
+   * cannot read the new one). */
+  if (state->pass_prev_saved && rename(HUB_PASS_PREV_FILE, HUB_PASS_FILE) != 0)
     hub_log_error("[UPGRADE] Could not restore %s; keeping the current one\n",
-            prev_cfg);
+            HUB_PASS_PREV_FILE);
   if (rename(prev_exe, state->executable_path) != 0) {
     hub_log_error("[UPGRADE] Could not restore %s\n", prev_exe);
     return false;
   }
   remove(HUB_UPGRADE_MARKER_FILE);
 
-  hub_config_write(state);
+  /* Not over a restored config: it is the retained build's own file, and
+   * this build would write it in its format (2.5.0+: a PBKDF2 count older
+   * builds cannot read).  What changed since comes back from the peers. */
+  if (!cfg_restored) hub_config_write(state);
   if (state->pid_fd >= 0) close(state->pid_fd);
   remove(HUB_PID_FILE);
   sleep(1);

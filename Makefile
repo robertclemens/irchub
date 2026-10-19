@@ -17,7 +17,7 @@ $(info [build] using CC=$(CC))
 PROJECT = irchub
 
 # Version
-VERSION = 2.4.6
+VERSION = 2.4.7
 
 # Directories
 SRC_DIR = .
@@ -27,7 +27,7 @@ OBJ_DIR = $(BUILD_DIR)/obj
 
 # Source files
 # One line: tools (the testnet) read this variable with a single-line match.
-HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_modes.c hub_connlimits.c glob_overlap.c hub_update.c hub_reply.c hub_console.c hub_console_ui.c hub_console_fmt.c hub_console_core.c
+HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_access.c hub_revoke.c hub_modes.c hub_connlimits.c glob_overlap.c hub_update.c hub_reply.c hub_console.c hub_console_ui.c hub_console_fmt.c hub_console_core.c
 
 # Object files
 HUB_OBJECTS = $(HUB_SOURCES:%.c=$(OBJ_DIR)/%.o)

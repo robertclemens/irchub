@@ -487,22 +487,11 @@ static void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
             return;
         }
         hub_generate_sync_packet(state, full_sync, MAX_SYNC_PAYLOAD);
-        int sync_len = (int)strlen(full_sync);
-        if (sync_len > 0) {
-            queued_msg_t *sync_msg = queued_msg_new(CMD_PEER_SYNC, LANE_BULK,
-                                                    (const unsigned char *)full_sync,
-                                                    sync_len);
-            if (sync_msg) {
-                queued_msg_set_coalesce(sync_msg, state->hub_uuid,
-                                        hub_next_lamport_seq(state),
-                                        "handshake_sync");
-                if (!peer_enqueue(c, sync_msg)) {
-                    hub_log_warning("[PEER] Could not queue initial sync to %s\n", c->ip);
-                }
-            }
-        }
+        hub_peer_enqueue_sync(state, c, CMD_PEER_SYNC, LANE_BULK, full_sync, "handshake_sync",
+                              hub_next_lamport_seq(state));
         free(full_sync);
     }
+    hub_activity_send_bans(state, c);
 }
 
 static bool send_ping(hub_client_t *c) {
@@ -532,19 +521,14 @@ static bool send_ping(hub_client_t *c) {
     return true;
 }
 
+static void passfile_upgrade_tick(hub_state_t *state, time_t now);
+
 static void hub_maintenance(hub_state_t *state) {
     time_t now = time(NULL);
-    static time_t last_anti_entropy = 0;
-    static time_t last_mesh_gossip  = 0;
-    static time_t last_client_scan  = 0;
-    static time_t last_ip_cleanup   = 0;
-    static time_t last_purge        = 0;
-    static time_t last_status_dump  = 0;
 
-    if (last_mesh_gossip == 0) last_mesh_gossip = now;
-    if (last_client_scan == 0) last_client_scan = now;
-    if (last_ip_cleanup  == 0) last_ip_cleanup  = now;
-    if (last_status_dump == 0) last_status_dump = now;
+    if (state->last_mesh_gossip == 0) state->last_mesh_gossip = now;
+    if (state->last_client_scan == 0) state->last_client_scan = now;
+    if (state->last_ip_cleanup  == 0) state->last_ip_cleanup  = now;
 
     /* Bot presence: gossip our own bots to the peers, expire entries nobody
      * refreshed, and push the tree to bots when it changed.  All volatile —
@@ -553,6 +537,7 @@ static void hub_maintenance(hub_state_t *state) {
 
     /* Rolling network upgrade: one step per tick (no-op unless running). */
     hub_upgrade_tick(state, now);
+    passfile_upgrade_tick(state, now);
 
     /* Channel-request elections: probe windows and hand-off timeouts. */
     hub_chan_elect_tick(state, now);
@@ -565,22 +550,21 @@ static void hub_maintenance(hub_state_t *state) {
 
     /* Mesh state gossip: every 5 min as heartbeat, or immediately when peer
      * topology changes (connect/disconnect sets mesh_state_dirty). */
-    if (state->mesh_state_dirty || (now - last_mesh_gossip > 300)) {
-        last_mesh_gossip = now;
+    if (state->mesh_state_dirty || (now - state->last_mesh_gossip > 300)) {
+        state->last_mesh_gossip = now;
         state->mesh_state_dirty = false;
         if (state->peer_count > 0)
             hub_broadcast_mesh_state(state);
     }
 
     /* Anti-entropy: stagger first fire 30–90 s, then every MESH_ANTI_ENTROPY_INTERVAL */
-    if (last_anti_entropy == 0) {
+    if (state->last_anti_entropy == 0) {
         unsigned int jitter = 30 + (unsigned int)(rand() % 61);
-        last_anti_entropy = now - (time_t)(MESH_ANTI_ENTROPY_INTERVAL - jitter);
+        state->last_anti_entropy = now - (time_t)(MESH_ANTI_ENTROPY_INTERVAL - jitter);
     }
-    if (now - last_anti_entropy > MESH_ANTI_ENTROPY_INTERVAL) {
-        last_anti_entropy = now;
+    if (now - state->last_anti_entropy > MESH_ANTI_ENTROPY_INTERVAL) {
+        state->last_anti_entropy = now;
         if (state->peer_count > 0) {
-            hub_log_debug("[MESH] Running periodic anti-entropy sync...\n");
             /* Heap, sized to the sync ceiling: a 16 KB buffer truncated
              * anti-entropy the same way it truncated the startup sync. */
             char *full_sync = malloc(MAX_SYNC_PAYLOAD);
@@ -620,16 +604,17 @@ static void hub_maintenance(hub_state_t *state) {
     }
 
     /* IP rate-limit cleanup: every 5 minutes */
-    if (now - last_ip_cleanup > 300) {
+    if (now - state->last_ip_cleanup > 300) {
         cleanup_old_ip_limits(state);
-        last_ip_cleanup = now;
+        state->last_ip_cleanup = now;
     }
 
     /* Scheduled tombstone purge: daily, leader only */
     if (state->purge_days_setting > 0) {
-        if (last_purge == 0) last_purge = now;
-        if (now - last_purge > 86400) {
-            last_purge = now;
+        if (state->last_purge == 0) state->last_purge = now;
+        if (now - state->last_purge > 86400) {
+            state->last_purge = now;
+            state->config_dirty = true;   /* purge_last|: a restart keeps the day */
             if (hub_should_initiate_scheduled_purge(state)) {
                 hub_log_info("[HUB] Running scheduled purge (older than %d days)\n",
                         state->purge_days_setting);
@@ -646,8 +631,8 @@ static void hub_maintenance(hub_state_t *state) {
 
     /* Client timeout/ping scan: every 5 s (was every 250 ms — no need to scan
      * 50+ clients 4x/sec when the ping window is 60 s and timeout is 180 s). */
-    if (now - last_client_scan >= 5) {
-        last_client_scan = now;
+    if (now - state->last_client_scan >= 5) {
+        state->last_client_scan = now;
         for (int i = 0; i < state->client_count; i++) {
             hub_client_t *c = state->clients[i];
             /* An SSH console has no pings: the console thread owns its idle
@@ -666,8 +651,20 @@ static void hub_maintenance(hub_state_t *state) {
              * are exempt. */
             if (!c->authenticated && c->type != CLIENT_HUB &&
                 (now - c->connected_at) > PREAUTH_TIMEOUT_SEC) {
-                hub_log_warning("[HUB] Pre-auth timeout for %s (%lds, no handshake) — "
-                        "dropping\n", c->ip, (long)(now - c->connected_at));
+                if (c->bot_auth_state == BOT_AUTH_QUARANTINE)
+                    hub_log_info("[REVOKE] Revoked bot %s did not answer the wipe (an "
+                                 "older build?); closed\n", c->id);
+                else
+                    hub_log_warning("[HUB] Pre-auth timeout for %s (%lds, no handshake) — "
+                            "dropping\n", c->ip, (long)(now - c->connected_at));
+                hub_disconnect_client(state, c);
+                i--;
+                continue;
+            }
+            /* A deleted bot told CMD_BOT_RETIRE that never answered. */
+            if (c->retiring && (now - c->retire_sent) > RETIRE_GRACE_SEC) {
+                hub_log_info("[REVOKE] Deleted bot %s did not answer the wipe; closed\n",
+                             c->id);
                 hub_disconnect_client(state, c);
                 i--;
                 continue;
@@ -682,62 +679,13 @@ static void hub_maintenance(hub_state_t *state) {
             }
         }
     }
-
-    /* Periodic status dump: every 60 s at INFO level.
-     * One line showing all timer countdowns and current load so idle churn
-     * is visible without having to stare at top/perf. */
-    if (now - last_status_dump >= 60) {
-        last_status_dump = now;
-
-        int bot_count = 0, peer_count = 0, authing_count = 0;
-        for (int i = 0; i < state->client_count; i++) {
-            hub_client_t *c = state->clients[i];
-            if (c->type == CLIENT_BOT && c->authenticated)       bot_count++;
-            else if (c->type == CLIENT_HUB && c->authenticated)  peer_count++;
-            else                                                  authing_count++;
-        }
-
-        time_t gossip_in    = 300 - (now - last_mesh_gossip);
-        time_t entropy_in   = MESH_ANTI_ENTROPY_INTERVAL - (now - last_anti_entropy);
-        time_t scan_in      = 5 - (now - last_client_scan);
-        time_t ipcln_in     = 300 - (now - last_ip_cleanup);
-        time_t purge_in     = (state->purge_days_setting > 0 && last_purge > 0)
-                                ? (86400 - (now - last_purge)) : -1;
-        time_t peer_chk_in  = PEER_RECONNECT_INTERVAL; /* approximate */
-
-        if (gossip_in  < 0) gossip_in  = 0;
-        if (entropy_in < 0) entropy_in = 0;
-        if (scan_in    < 0) scan_in    = 0;
-        if (ipcln_in   < 0) ipcln_in   = 0;
-
-        if (purge_in >= 0) {
-            hub_log_status("clients=%d(bots=%d peers=%d authing=%d) "
-                    "dirty=%d "
-                    "gossip_in=%lds entropy_in=%lds scan_in=%lds "
-                    "ipcln_in=%lds peer_chk_in=%lds purge_in=%lds\n",
-                    state->client_count, bot_count, peer_count, authing_count,
-                    state->config_dirty,
-                    (long)gossip_in, (long)entropy_in, (long)scan_in,
-                    (long)ipcln_in, (long)peer_chk_in, (long)purge_in);
-        } else {
-            hub_log_status("clients=%d(bots=%d peers=%d authing=%d) "
-                    "dirty=%d "
-                    "gossip_in=%lds entropy_in=%lds scan_in=%lds "
-                    "ipcln_in=%lds peer_chk_in=%lds purge=off\n",
-                    state->client_count, bot_count, peer_count, authing_count,
-                    state->config_dirty,
-                    (long)gossip_in, (long)entropy_in, (long)scan_in,
-                    (long)ipcln_in, (long)peer_chk_in);
-        }
-    }
 }
 
 static void hub_check_peers(hub_state_t *state) {
-    static time_t last_check = 0;
     time_t now = time(NULL);
-    
-    if (now - last_check < PEER_RECONNECT_INTERVAL) return;
-    last_check = now;
+
+    if (now - state->last_peer_check < PEER_RECONNECT_INTERVAL) return;
+    state->last_peer_check = now;
 
     for (int i = 0; i < state->peer_count; i++) {
         if (!state->peers[i].connected) {
@@ -831,14 +779,18 @@ static void passfile_build_context(char *buf, size_t len) {
 }
 
 static bool passfile_derive_key(const char *ctx, const unsigned char *salt,
-                                unsigned char *key) {
+                                int iterations, unsigned char *key) {
     return PKCS5_PBKDF2_HMAC(ctx, (int)strlen(ctx), salt, SALT_SIZE,
-                             PBKDF2_ITERATIONS, EVP_sha256(), 32, key) == 1;
+                             iterations, EVP_sha256(), 32, key) == 1;
 }
 
-static bool passfile_load(const char *path, char *out_pass, size_t out_len) {
+/* *legacy is set when the file only opened under PBKDF2_ITERATIONS_LEGACY
+ * (written before 2.5.0); main() then rewrites it under the current count. */
+static bool passfile_load(const char *path, char *out_pass, size_t out_len,
+                          bool *legacy) {
     struct stat st;
     bool ok = false;
+    if (legacy) *legacy = false;
     if (stat(path, &st) != 0) return false;
     if (st.st_uid != getuid()) {
         fprintf(stderr, "[WARN] .irchub.pass: wrong owner, ignoring.\n");
@@ -864,12 +816,18 @@ static bool passfile_load(const char *path, char *out_pass, size_t out_len) {
     unsigned char key[32];
     char ctx[256];
     passfile_build_context(ctx, sizeof(ctx));
-    if (!passfile_derive_key(ctx, salt, key)) goto done;
     mlock(out_pass, out_len);
     unsigned char *plain = malloc((size_t)enc_len);
     if (!plain) goto done;
     mlock(plain, (size_t)enc_len);
-    int dec_len = aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
+    int dec_len = -1;
+    if (passfile_derive_key(ctx, salt, PBKDF2_ITERATIONS, key))
+        dec_len = aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
+    if (dec_len <= 0 &&
+        passfile_derive_key(ctx, salt, PBKDF2_ITERATIONS_LEGACY, key)) {
+        dec_len = aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
+        if (dec_len > 0 && legacy) *legacy = true;
+    }
     if (dec_len > 0 && (size_t)dec_len < out_len) {
         plain[dec_len] = 0;
         memcpy(out_pass, plain, (size_t)dec_len + 1);
@@ -905,7 +863,7 @@ static bool passfile_create(const char *path, const char *password) {
     }
 
     passfile_build_context(ctx, sizeof(ctx));
-    if (!passfile_derive_key(ctx, salt, key)) {
+    if (!passfile_derive_key(ctx, salt, PBKDF2_ITERATIONS, key)) {
         fprintf(stderr, "Key derivation failed.\n");
         goto done;
     }
@@ -923,11 +881,17 @@ static bool passfile_create(const char *path, const char *password) {
         goto done;
     }
 
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    /* Written beside it and renamed over it, so a rewrite (-p, or the
+     * PBKDF2 migration at start) never leaves a half-written pass file. */
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) {
+        free(enc_buf); goto done;
+    }
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) { perror("open"); free(enc_buf); goto done; }
 
     if (fchmod(fd, 0600) != 0) {
-        perror("fchmod"); close(fd); free(enc_buf); goto done;
+        perror("fchmod"); close(fd); remove(tmp); free(enc_buf); goto done;
     }
 
     ok = (write(fd, salt,    SALT_SIZE)   == SALT_SIZE &&
@@ -935,13 +899,44 @@ static bool passfile_create(const char *path, const char *password) {
           write(fd, tag,     GCM_TAG_LEN) == GCM_TAG_LEN);
 
     if (!ok) perror("write .irchub.pass");
-    close(fd);
+    if (close(fd) != 0) ok = false;
+    if (ok && rename(tmp, path) != 0) { perror("rename .irchub.pass"); ok = false; }
+    if (!ok) remove(tmp);
     free(enc_buf);
 
 done:
     secure_wipe(key, sizeof(key));
     secure_wipe(ctx, sizeof(ctx));
     return ok;
+}
+
+/* The deferred rewrite of a pre-2.5.0 pass file on an upgrade start (see
+ * UPGRADE_PASS_REWRITE_SECS).  The old file is hard-linked to
+ * HUB_PASS_PREV_FILE first; passfile_create() renames a new one over
+ * HUB_PASS_FILE, so the link keeps the old bytes and mode.  One attempt: on
+ * failure the file stays readable as it is and the next ordinary start
+ * rewrites it. */
+static void passfile_upgrade_tick(hub_state_t *state, time_t now) {
+    if (!state->pass_rewrite_due || now < state->pass_rewrite_due) return;
+    state->pass_rewrite_due = 0;
+    char pass[MAX_PASS];
+    hub_get_config_pass(state, pass, sizeof(pass));
+    remove(HUB_PASS_PREV_FILE);
+    if (!pass[0] || link(HUB_PASS_FILE, HUB_PASS_PREV_FILE) != 0) {
+        hub_log_warning("[HUB] %s kept at PBKDF2 %dk: could not keep a copy "
+                        "for rollback\n", HUB_PASS_FILE,
+                        PBKDF2_ITERATIONS_LEGACY / 1000);
+    } else if (passfile_create(HUB_PASS_FILE, pass)) {
+        state->pass_prev_saved = true;
+        hub_log_info("[HUB] %s rewritten with PBKDF2 %dk (old copy in %s until the "
+                     "next ordinary start)\n", HUB_PASS_FILE,
+                     PBKDF2_ITERATIONS / 1000, HUB_PASS_PREV_FILE);
+    } else {
+        remove(HUB_PASS_PREV_FILE);
+        hub_log_warning("[HUB] %s kept at PBKDF2 %dk: rewrite failed\n",
+                        HUB_PASS_FILE, PBKDF2_ITERATIONS_LEGACY / 1000);
+    }
+    secure_wipe(pass, sizeof(pass));
 }
 
 /* Process hardening: keep secrets out of anything that lands on disk.
@@ -1080,6 +1075,60 @@ static bool setup_read_pubkey(const char *who, char out[COMBINED_KEY_B64 + 1]) {
     }
 }
 
+/* -id: print this hub's name, uuid, public key and fingerprints — what
+ * another hub's `hub add` and a bot's -setup / +hub need — from the config
+ * (the key lives there; hub_public.b64 is only -setup's copy), and exit.
+ * Read-only: no daemon, no PID lock, no config rewrite. */
+static int run_identity(hub_state_t *state, char *password) {
+    g_hub_config_readonly = true;
+    hub_set_config_pass(state, password);
+    bool ok = hub_config_load(state, password);
+    secure_wipe(password, MAX_PASS);
+    OPENSSL_cleanse(state->config_pass, sizeof(state->config_pass));
+    /* The public key is derived from the private key, not taken from the
+     * stored pub| copy: that is what peers and bots must pin. */
+    unsigned char priv64[64], pub64[64];
+    memcpy(priv64, state->hub_ed25519_priv, 32);
+    memcpy(priv64 + 32, state->hub_x25519_priv, 32);
+    bool derived = ok && state->hub_keys_loaded &&
+                   hub_crypto_combined_pub_from_priv(priv64, pub64);
+    secure_wipe(priv64, sizeof(priv64));
+    OPENSSL_cleanse(state->hub_ed25519_priv, sizeof(state->hub_ed25519_priv));
+    OPENSSL_cleanse(state->hub_x25519_priv, sizeof(state->hub_x25519_priv));
+    if (!ok) {
+        fprintf(stderr, "Cannot load %s (wrong password?).\n", HUB_CONFIG_FILE);
+        return 1;
+    }
+    if (!derived || !state->hub_uuid[0]) {
+        fprintf(stderr, "%s has no hub key or uuid; re-run -setup.\n", HUB_CONFIG_FILE);
+        return 1;
+    }
+    if (memcmp(pub64, state->hub_ed25519_pub, 32) != 0 ||
+        memcmp(pub64 + 32, state->hub_x25519_pub, 32) != 0)
+        fprintf(stderr, "Note: the stored public key does not match the private key; "
+                        "the key below is the right one (console: hub set pubkey).\n");
+    char *pub_b64 = base64_encode(pub64, 64);
+    if (!pub_b64) return 1;
+    char fp[KEY_FP_LEN + 1], ssh_fp[80];
+    hub_crypto_key_fingerprint(pub64, fp);
+    console_ssh_fingerprint(pub64, ssh_fp, sizeof(ssh_fp));
+    /* bind_ip is what the mesh is told to dial; a wildcard tells nobody. */
+    bool wild = !state->bind_ip[0] || strcmp(state->bind_ip, "0.0.0.0") == 0;
+    const char *ip = wild ? "<this-hub's-address>" : state->bind_ip;
+    const char *name = state->hub_friendly_name[0] ? state->hub_friendly_name : "-";
+    printf("Hub name:        %s\n", name);
+    printf("Hub UUID:        %s\n", state->hub_uuid);
+    printf("Hub public key:  %s\n", pub_b64);
+    printf("Key fingerprint: %s\n", fp);
+    printf("SSH host key:    ssh-ed25519 %s\n", ssh_fp);
+    printf("Listening:       %s:%d\n", wild ? "0.0.0.0" : state->bind_ip, state->port);
+    printf("Other hubs:      hub add %s %d %s %s %s\n", ip, state->port,
+           state->hub_uuid, name, pub_b64);
+    printf("Bots:            +hub %s:%d %s\n", ip, state->port, pub_b64);
+    free(pub_b64);
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     harden_process();
 
@@ -1100,9 +1149,11 @@ int main(int argc, char *argv[]) {
     bool setup_mode = false;
     bool passfile_mode = false;
     bool selftest_mode = false;
+    bool identity_mode = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-setup") == 0) setup_mode = true;
         if (strcmp(argv[i], "-p")     == 0) passfile_mode = true;
+        if (strcmp(argv[i], "-id")    == 0) identity_mode = true;
         /* -checkupdate [variant]: verify the release channel and exit; needs
          * no config, no password and no PID lock. */
         if (strcmp(argv[i], "-checkupdate") == 0)
@@ -1167,7 +1218,7 @@ int main(int argc, char *argv[]) {
         }
         char pw[MAX_PASS];
         memset(pw, 0, sizeof(pw));
-        if (!passfile_load(HUB_PASS_FILE, pw, sizeof(pw)) || !pw[0]) {
+        if (!passfile_load(HUB_PASS_FILE, pw, sizeof(pw), NULL) || !pw[0]) {
             secure_wipe(pw, sizeof(pw));
             printf("selftest: FAIL cannot read %s\n", HUB_PASS_FILE);
             return 1;
@@ -1232,7 +1283,7 @@ int main(int argc, char *argv[]) {
                 memcpy(state.hub_friendly_name, name_buf, strlen(name_buf) + 1);
                 break;
             }
-            printf("Invalid name: it is written into config lines and peer "
+            printf("Invalid name: it is written into config lines and hub "
                    "handshakes, so 1-63 letters, digits, '.', '_' or '-'.\n");
         }
 
@@ -1290,8 +1341,8 @@ int main(int argc, char *argv[]) {
                 printf("    │ Save this public key + this hub's UUID.         │\n");
                 printf("    │   - Bots adding this hub will need both         │\n");
                 printf("    │     (ircbot -setup prompts for UUID + pubkey).  │\n");
-                printf("    │   - Peer hubs adding this hub will need the     │\n");
-                printf("    │     UUID + ip:port + pubkey (console: peer add).│\n");
+                printf("    │   - Other hubs adding this hub will need the    │\n");
+                printf("    │     UUID + ip:port + pubkey (console: hub add). │\n");
                 printf("    │ The hub's PRIVATE key never leaves this machine │\n");
                 printf("    │ (stored encrypted inside .irchub.cnf).          │\n");
                 printf("    └─────────────────────────────────────────────────┘\n");
@@ -1305,6 +1356,7 @@ int main(int argc, char *argv[]) {
                 printf("[+] SSH console host key: ssh-ed25519 %s\n", sshfp);
                 printf("    Admins check it on first connect (keygen --ssh-fingerprint\n");
                 printf("    hub_public.b64 prints the same line).\n");
+                printf("[+] ./irchub -id prints this hub's uuid and keys again at any time.\n");
             }
         }
         (void)ch;
@@ -1443,10 +1495,12 @@ int main(int argc, char *argv[]) {
      * Load into a temporary buffer first; XOR-protect into state after load. */
     char _hub_plain_pass[MAX_PASS];
     memset(_hub_plain_pass, 0, sizeof(_hub_plain_pass));
+    bool pass_legacy = false;
     {
         /* 1. Machine-bound password file */
         if (!_hub_plain_pass[0])
-            passfile_load(HUB_PASS_FILE, _hub_plain_pass, sizeof(_hub_plain_pass));
+            passfile_load(HUB_PASS_FILE, _hub_plain_pass, sizeof(_hub_plain_pass),
+                          &pass_legacy);
 
         /* 2. Interactive prompt — only reached if no passfile */
         if (!_hub_plain_pass[0]) {
@@ -1458,6 +1512,30 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (identity_mode) return run_identity(&state, _hub_plain_pass);
+
+    /* A pre-2.5.0 pass file moves to the current PBKDF2 count on an ordinary
+     * start.  On the start a hub-driven upgrade made (its marker is still
+     * here) it waits UPGRADE_PASS_REWRITE_SECS, until the old build's watchdog
+     * is done with this process, and keeps the old copy for a rollback (see
+     * passfile_upgrade_tick).  An ordinary start drops any such copy left by
+     * an earlier run: a rollback is only ever for the process that made it. */
+    bool upgrade_start = (access(HUB_UPGRADE_MARKER_FILE, F_OK) == 0);
+    if (!upgrade_start) remove(HUB_PASS_PREV_FILE);
+    if (pass_legacy) {
+        if (upgrade_start)
+            printf("%s: rewritten with PBKDF2 %dk in %ds (upgrade in progress)\n",
+                   HUB_PASS_FILE, PBKDF2_ITERATIONS / 1000,
+                   UPGRADE_PASS_REWRITE_SECS);
+        else if (passfile_create(HUB_PASS_FILE, _hub_plain_pass))
+            printf("%s: rewritten with PBKDF2 %dk\n", HUB_PASS_FILE,
+                   PBKDF2_ITERATIONS / 1000);
+        else
+            fprintf(stderr, "%s: could not rewrite with PBKDF2 %dk; still readable "
+                    "as it is\n", HUB_PASS_FILE, PBKDF2_ITERATIONS / 1000);
+    }
+
+    fflush(stdout); /* or the buffered lines are written again by the fork */
     daemonize();
 
     /* Seed rand() after the double-fork so each hub process gets a different
@@ -1514,6 +1592,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     secure_wipe(_hub_plain_pass, sizeof(_hub_plain_pass));
+    if (pass_legacy && upgrade_start)
+        state.pass_rewrite_due = time(NULL) + UPGRADE_PASS_REWRITE_SECS;
 
     /* Ensure next_lamport_seq is above the time-based floor even on first
      * boot (when no lamport_seq key exists in config).  The config loader
@@ -1542,9 +1622,9 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < state.peer_count; i++)
             if (!state.peers[i].has_pubkey) peerless++;
         if (peerless > 0) {
-            hub_log_warning("[HUB] %d peer(s) lack a Curve25519 pubkey and "
-                    "will be refused on connect. Re-add them with their "
-                    "hub_public.b64 in the admin console (peer add / peer setkey).\n",
+            hub_log_warning("[HUB] %d linked hub(s) lack a Curve25519 pubkey and "
+                    "will be refused on connect. Re-add them with the key ./irchub -id "
+                    "prints on that hub (console: hub add / hub set <hub> key).\n",
                     peerless);
         }
     }
