@@ -794,33 +794,6 @@ void hub_bans_sweep(hub_state_t *state, time_t now) {
   }
 }
 
-/* ---- older hubs (D38) ----------------------------------------------------- */
-
-int hub_old_hubs(const hub_state_t *state, char names[][64], int max) {
-  return hub_old_hubs_for(state, names, max, MODES_MIN_HUB);
-}
-
-/* The hubs in the mesh map older than min_ver (or of unknown version). */
-int hub_old_hubs_for(const hub_state_t *state, char names[][64], int max, const char *min_ver) {
-  int n = 0;
-  for (int i = 0; i < state->mesh_hub_count && n < max; i++) {
-    const mesh_hub_t *m = &state->mesh_hubs[i];
-    if (state->hub_uuid[0] && strcmp(m->uuid, state->hub_uuid) == 0) continue;
-    if (m->version[0] && hub_update_version_cmp(m->version, min_ver) >= 0) continue;
-    snprintf(names[n++], 64, "%s", m->name[0] ? m->name : m->uuid);
-  }
-  /* A linked peer that never sent a roster at all is older still. */
-  for (int i = 0; i < state->peer_count && n < max; i++) {
-    const hub_peer_config_t *p = &state->peers[i];
-    if (!p->connected || p->remote_version[0]) continue;
-    bool listed = false;
-    for (int k = 0; k < state->mesh_hub_count; k++)
-      if (strcmp(state->mesh_hubs[k].uuid, p->uuid) == 0) listed = true;
-    if (!listed) snprintf(names[n++], 64, "%s", p->friendly_name[0] ? p->friendly_name : p->uuid);
-  }
-  return n;
-}
-
 /* ---- CMD_CHAN_EVENT (D42) --------------------------------------------------- */
 
 static bool event_action_ok(const char *a) {

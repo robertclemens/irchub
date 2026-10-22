@@ -434,7 +434,7 @@ typedef struct {
   unsigned char payload[1024];
   size_t        len;
   char          arg[256];      /* the object: uuid, #, name, flags        */
-  char          extra[4][256]; /* upgrade start: hub=, nodes=, botbase=, hubbase= */
+  char          extra[2][256]; /* upgrade start: hub=, nodes= */
   pending_rq_t  rq;
 } pend_cmd_t;
 
@@ -624,8 +624,8 @@ static const cmd_def_t CMDS[] = {
   {"ban", "add", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; the bots set it on the channel (never on a bot or user)", NULL},
   {"ban", "del", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban del <#chan|*> <mask>", "remove a listed ban", NULL},
   {"upgrade", "status", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_NONE, 0, "", "upgrade status", "the upgrade run on this hub", NULL},
-  {"upgrade", "releases", CMD_ADMIN_UPGRADE_STATUS, B_UPG_RELEASES, 0, 2, CF_NONE, 0, NULL, "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes", NULL},
-  {"upgrade", "start", CMD_ADMIN_UPGRADE_NET, B_UPG_START, 1, 4, CF_YN, PRE_UPG_START, NULL, "upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade (shows the plan, asks y/N)", NULL},
+  {"upgrade", "releases", CMD_ADMIN_UPGRADE_STATUS, B_UPG_RELEASES, 0, 0, CF_NONE, 0, NULL, "upgrade releases", "releases both products offer, and the nodes", NULL},
+  {"upgrade", "start", CMD_ADMIN_UPGRADE_NET, B_UPG_START, 1, 4, CF_YN, PRE_UPG_START, NULL, "upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>]", "start a rolling network upgrade (shows the plan, asks y/N)", NULL},
   {"upgrade", "abort", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_YN, 0, "abort", "upgrade abort", "stop the run and roll back", NULL},
   {"upgrade", "forget", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_YN, 0, "forget", "upgrade forget", "drop the roll-up plan on every hub", NULL},
   {"display", "show", 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "display show", "this session's display settings", NULL},
@@ -898,17 +898,12 @@ static const struct {
   {"ban", "del", "#chan|*\tas listed by ban list\nmask\tthe mask exactly as ban list shows it",
    "ban del #ops *!*@203.0.113.7"},
   {"upgrade", "status", NULL, "upgrade status"},
-  {"upgrade", "releases",
-   "bot=<base>\ta different release site for the bot builds (a URL)\n"
-   "hub=<base>\ta different release site for the hub builds (a URL)",
-   "upgrade releases\nupgrade releases bot=https://example.net/ircbot"},
+  {"upgrade", "releases", NULL, "upgrade releases"},
   {"upgrade", "start",
    "bot=<ver>\tthe bot version to move to, as upgrade releases lists it (required)\n"
    "hub=<ver>\talso move the hubs to this version (- or left out = leave them)\n"
    "nodes=<sel>\tonly these nodes: names or uuids, comma-separated; name=c or name=rs "
    "also switches that node's build (default: the whole network)\n"
-   "botbase=<url>\ta different release site for the bot builds\n"
-   "hubbase=<url>\ta different release site for the hub builds\n"
    "(confirm)\tit shows the plan, then asks y/N to start",
    "upgrade start bot=2.4.5\nupgrade start bot=2.4.5 hub=2.4.4\n"
    "upgrade start bot=2.4.5 nodes=alpha,beta=rs"},
@@ -2550,32 +2545,18 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
     }
     w = usnprintf(o, cap, "%s|%s", a[1], a[2]);
     break;
-  case B_UPG_RELEASES: {
-    const char *bot = "", *hub = "";
-    for (int i = 0; i < na; i++) {
-      const char *v;
-      if ((v = kv_opt(a[i], "bot"))) bot = v;
-      else if ((v = kv_opt(a[i], "hub"))) hub = v;
-      else {
-        *why = "options: bot=<base> hub=<base>";
-        return false;
-      }
-    }
-    w = (*bot || *hub) ? usnprintf(o, cap, "releases|%s|%s", bot, hub)
-                       : usnprintf(o, cap, "releases");
+  case B_UPG_RELEASES:
+    w = usnprintf(o, cap, "releases");
     break;
-  }
   case B_UPG_START: {
-    const char *botv = "", *hubv = "", *nodes = "", *bb = "", *hb = "";
+    const char *botv = "", *hubv = "", *nodes = "";
     for (int i = 0; i < na; i++) {
       const char *v;
       if ((v = kv_opt(a[i], "bot"))) botv = v;
       else if ((v = kv_opt(a[i], "hub"))) hubv = strcmp(v, "-") ? v : "";
       else if ((v = kv_opt(a[i], "nodes"))) nodes = v;
-      else if ((v = kv_opt(a[i], "botbase"))) bb = v;
-      else if ((v = kv_opt(a[i], "hubbase"))) hb = v;
       else {
-        *why = "options: bot=<ver> hub=<ver> nodes=<list> botbase=<url> hubbase=<url>";
+        *why = "options: bot=<ver> hub=<ver> nodes=<list>";
         return false;
       }
     }
@@ -2584,8 +2565,10 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       return false;
     }
     /* ver|variant|kind|min_from|base|hub_ver|hub_base|sel — variant, kind
-     * and min_from are left to each node, as hub_admin always did. */
-    w = usnprintf(o, cap, "%s||||%s|%s|%s|%s", botv, bb, hubv, *hubv ? hb : "", nodes);
+     * and min_from are left to each node, as hub_admin always did.  The two
+     * base slots stay empty: every node fetches from its own compiled-in
+     * release root, the only one its pinned key can verify. */
+    w = usnprintf(o, cap, "%s|||||%s||%s", botv, hubv, nodes);
     break;
   }
   }
@@ -2642,6 +2625,27 @@ static const char *opt_meaning(char f) {
   return f == 'h' ? "hub-only mutation" : f == 'F' ? "config frozen" : "unknown flag";
 }
 
+/* "2.4.8 → 2.5.0 → 2.5.1" from a releases "path" record; returns the number
+ * of steps (0 when there is no record). */
+static int upg_path_text(const crec_t *p, const char *arrow, char *out, size_t cap) {
+  out[0] = '\0';
+  const char *st = p ? rv(p, "steps") : NULL;
+  if (!st || !*st) return 0;
+  size_t o = 0;
+  int n = 0, w = usnprintf(out, cap, "%s", rv(p, "from") ? rv(p, "from") : "");
+  if (w > 0) o = (size_t)w;
+  char work[256];
+  usnprintf(work, sizeof(work), "%s", st);
+  char *save = NULL;
+  for (char *t = strtok_r(work, ",", &save); t && o < cap; t = strtok_r(NULL, ",", &save)) {
+    w = usnprintf(out + o, cap - o, "%s%s %s", o ? " " : "", arrow, t);
+    if (w < 0) break;
+    o += (size_t)w;
+    n++;
+  }
+  return n;
+}
+
 /* A pre-read came back: the question names the object, or the command ends
  * here with what the read found (D2). */
 static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text, size_t len) {
@@ -2663,7 +2667,7 @@ static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text
   fmt_ctx_t c;
   char slog[128];
   ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
-  const char *dot = fmt_glyph(&c, G_DOT), *arrow = fmt_glyph(&c, G_ARROW);
+  const char *arrow = fmt_glyph(&c, G_ARROW);
   char q[CONSOLE_INPUT_MAX - 64];
   confirm_t kind = CF_YN;
   char want[128] = "";
@@ -2818,11 +2822,18 @@ static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text
     break;
   }
   case PRE_UPG_START: {
-    /* the plan card: how many nodes already run the target (D2) */
+    /* the plan card: how many nodes already run the target (D2), and the
+     * steps the hub would take to get there */
     const char *bv = pc->arg, *hv = pc->extra[0];
+    const crec_t *bpath = NULL, *hpath = NULL;
     int b_on = 0, b_to = 0, h_on = 0, h_to = 0;
     for (int i = 0; i < rep.n; i++) {
       const crec_t *nd = &rep.r[i];
+      if (!strcmp(nd->type, "path")) {
+        if (rv(nd, "product") && !strcmp(rv(nd, "product"), "hub")) hpath = nd;
+        else bpath = nd;
+        continue;
+      }
       if (strcmp(nd->type, "node")) continue;
       bool bot = rv(nd, "kind") && !strcmp(rv(nd, "kind"), "bot");
       const char *ver = rv(nd, "ver") ? rv(nd, "ver") : "";
@@ -2834,16 +2845,27 @@ static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text
     if (!ui->raw) {
       flines_t f = {0};
       fmt_title(&c, &f, "Upgrade plan", NULL);
-      char v[512];
-      usnprintf(v, sizeof(v), "%s %s   (%d already on it, %d to upgrade)", arrow, bv, b_on, b_to);
+      char v[512], pb[256], ph[256];
+      int nb = upg_path_text(bpath, arrow, pb, sizeof(pb));
+      int nh = hv[0] ? upg_path_text(hpath, arrow, ph, sizeof(ph)) : 0;
+      if (nb > 1) usnprintf(v, sizeof(v), "%s   (%d already on it, %d to upgrade)", pb, b_on, b_to);
+      else usnprintf(v, sizeof(v), "%s %s   (%d already on it, %d to upgrade)", arrow, bv, b_on, b_to);
       fmt_card_line(&c, &f, 6, "bots", v, RL_NORMAL);
-      if (hv[0]) usnprintf(v, sizeof(v), "%s %s   (%d already on it, %d to upgrade)", arrow, hv, h_on, h_to);
+      if (hv[0] && nh > 1) usnprintf(v, sizeof(v), "%s   (%d already on it, %d to upgrade)", ph, h_on, h_to);
+      else if (hv[0]) usnprintf(v, sizeof(v), "%s %s   (%d already on it, %d to upgrade)", arrow, hv, h_on, h_to);
       else usnprintf(v, sizeof(v), "stay where they are");
       fmt_card_line(&c, &f, 6, "hubs", v, RL_NORMAL);
       fmt_card_line(&c, &f, 6, "nodes", pc->extra[1][0] ? pc->extra[1] : "whole network", RL_NORMAL);
-      usnprintf(v, sizeof(v), "bots: %s %s hubs: %s", pc->extra[2][0] ? pc->extra[2] : "default", dot,
-                pc->extra[3][0] ? pc->extra[3] : "default");
-      fmt_card_line(&c, &f, 6, "bases", v, RL_NORMAL);
+      int steps = nb > nh ? nb : nh;
+      if (steps > 1) {
+        usnprintf(v, sizeof(v), "%d, one full run each; every node finishes a step before the next", steps);
+        fmt_card_line(&c, &f, 6, "steps", v, RL_NORMAL);
+        fmt_card_line(&c, &f, 6, "", "upgrade abort stops the rest and rolls back only the step running", RL_DIM);
+      }
+      if (bpath && rvs(bpath, "err")) {
+        usnprintf(v, sizeof(v), "no path: %s", rv(bpath, "err"));
+        fmt_card_line(&c, &f, 6, "", v, RL_WARN);
+      }
       emit_flines(ui, &f);
       flines_free(&f);
     }
@@ -3026,19 +3048,14 @@ static void run_line(console_ui_t *ui, const char *line) {
       break;
     case PRE_UPG_START: {
       pop = CMD_ADMIN_UPGRADE_STATUS;
-      const char *bb = "", *hb = "";
       for (int i = argi; i < ws.n; i++) {
         const char *v;
         if ((v = kv_opt(ws.w[i], "bot"))) usnprintf(pc->arg, sizeof(pc->arg), "%s", v);
         else if ((v = kv_opt(ws.w[i], "hub"))) usnprintf(pc->extra[0], sizeof(pc->extra[0]), "%s", strcmp(v, "-") ? v : "");
         else if ((v = kv_opt(ws.w[i], "nodes"))) usnprintf(pc->extra[1], sizeof(pc->extra[1]), "%s", v);
-        else if ((v = kv_opt(ws.w[i], "botbase"))) bb = v;
-        else if ((v = kv_opt(ws.w[i], "hubbase"))) hb = v;
       }
-      usnprintf(pc->extra[2], sizeof(pc->extra[2]), "%s", bb);
-      usnprintf(pc->extra[3], sizeof(pc->extra[3]), "%s", hb);
-      if (*bb || *hb) usnprintf(pp, sizeof(pp), "releases|%s|%s", bb, hb);
-      else usnprintf(pp, sizeof(pp), "releases");
+      /* with the targets, the hub also answers the path the run would take */
+      usnprintf(pp, sizeof(pp), "releases|%s|%s|%s", pc->arg, pc->extra[0], pc->extra[1]);
       break;
     }
     }
@@ -3215,8 +3232,7 @@ static const arg_comp_t ARG_COMP[] = {
   {"ban", "add", 2, CK_WORDS, "perm sticky"},
   {"ban", "add", 3, CK_WORDS, "sticky"},
   {"ban", "del", 0, CK_WORDS, "*"},
-  {"upgrade", "releases", -1, CK_WORDS, "bot= hub="},
-  {"upgrade", "start", -1, CK_WORDS, "bot= hub= nodes= botbase= hubbase="},
+  {"upgrade", "start", -1, CK_WORDS, "bot= hub= nodes="},
   {"display", "view", 0, CK_WORDS, "1 2 3 4 5"},
   {"display", "format", 0, CK_WORDS, "pretty raw"},
   {"display", "width", 0, CK_WORDS, "auto"},

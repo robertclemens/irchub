@@ -521,8 +521,6 @@ static bool send_ping(hub_client_t *c) {
     return true;
 }
 
-static void passfile_upgrade_tick(hub_state_t *state, time_t now);
-
 static void hub_maintenance(hub_state_t *state) {
     time_t now = time(NULL);
 
@@ -537,7 +535,6 @@ static void hub_maintenance(hub_state_t *state) {
 
     /* Rolling network upgrade: one step per tick (no-op unless running). */
     hub_upgrade_tick(state, now);
-    passfile_upgrade_tick(state, now);
 
     /* Channel-request elections: probe windows and hand-off timeouts. */
     hub_chan_elect_tick(state, now);
@@ -784,13 +781,9 @@ static bool passfile_derive_key(const char *ctx, const unsigned char *salt,
                              iterations, EVP_sha256(), 32, key) == 1;
 }
 
-/* *legacy is set when the file only opened under PBKDF2_ITERATIONS_LEGACY
- * (written before 2.5.0); main() then rewrites it under the current count. */
-static bool passfile_load(const char *path, char *out_pass, size_t out_len,
-                          bool *legacy) {
+static bool passfile_load(const char *path, char *out_pass, size_t out_len) {
     struct stat st;
     bool ok = false;
-    if (legacy) *legacy = false;
     if (stat(path, &st) != 0) return false;
     if (st.st_uid != getuid()) {
         fprintf(stderr, "[WARN] .irchub.pass: wrong owner, ignoring.\n");
@@ -823,18 +816,14 @@ static bool passfile_load(const char *path, char *out_pass, size_t out_len,
     int dec_len = -1;
     if (passfile_derive_key(ctx, salt, PBKDF2_ITERATIONS, key))
         dec_len = aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
-    if (dec_len <= 0 &&
-        passfile_derive_key(ctx, salt, PBKDF2_ITERATIONS_LEGACY, key)) {
-        dec_len = aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
-        if (dec_len > 0 && legacy) *legacy = true;
-    }
     if (dec_len > 0 && (size_t)dec_len < out_len) {
         plain[dec_len] = 0;
         memcpy(out_pass, plain, (size_t)dec_len + 1);
         ok = true;
     } else {
         fprintf(stderr, "[WARN] .irchub.pass: decryption failed "
-                        "(wrong machine or tampered file), falling through.\n");
+                        "(wrong machine, tampered, or written before 2.5.0), "
+                        "falling through.\n");
     }
     secure_wipe(plain, (size_t)enc_len);
     munlock(plain, (size_t)enc_len);
@@ -881,8 +870,8 @@ static bool passfile_create(const char *path, const char *password) {
         goto done;
     }
 
-    /* Written beside it and renamed over it, so a rewrite (-p, or the
-     * PBKDF2 migration at start) never leaves a half-written pass file. */
+    /* Written beside it and renamed over it, so a rewrite (-p) never leaves
+     * a half-written pass file. */
     char tmp[PATH_MAX];
     if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) {
         free(enc_buf); goto done;
@@ -908,35 +897,6 @@ done:
     secure_wipe(key, sizeof(key));
     secure_wipe(ctx, sizeof(ctx));
     return ok;
-}
-
-/* The deferred rewrite of a pre-2.5.0 pass file on an upgrade start (see
- * UPGRADE_PASS_REWRITE_SECS).  The old file is hard-linked to
- * HUB_PASS_PREV_FILE first; passfile_create() renames a new one over
- * HUB_PASS_FILE, so the link keeps the old bytes and mode.  One attempt: on
- * failure the file stays readable as it is and the next ordinary start
- * rewrites it. */
-static void passfile_upgrade_tick(hub_state_t *state, time_t now) {
-    if (!state->pass_rewrite_due || now < state->pass_rewrite_due) return;
-    state->pass_rewrite_due = 0;
-    char pass[MAX_PASS];
-    hub_get_config_pass(state, pass, sizeof(pass));
-    remove(HUB_PASS_PREV_FILE);
-    if (!pass[0] || link(HUB_PASS_FILE, HUB_PASS_PREV_FILE) != 0) {
-        hub_log_warning("[HUB] %s kept at PBKDF2 %dk: could not keep a copy "
-                        "for rollback\n", HUB_PASS_FILE,
-                        PBKDF2_ITERATIONS_LEGACY / 1000);
-    } else if (passfile_create(HUB_PASS_FILE, pass)) {
-        state->pass_prev_saved = true;
-        hub_log_info("[HUB] %s rewritten with PBKDF2 %dk (old copy in %s until the "
-                     "next ordinary start)\n", HUB_PASS_FILE,
-                     PBKDF2_ITERATIONS / 1000, HUB_PASS_PREV_FILE);
-    } else {
-        remove(HUB_PASS_PREV_FILE);
-        hub_log_warning("[HUB] %s kept at PBKDF2 %dk: rewrite failed\n",
-                        HUB_PASS_FILE, PBKDF2_ITERATIONS_LEGACY / 1000);
-    }
-    secure_wipe(pass, sizeof(pass));
 }
 
 /* Process hardening: keep secrets out of anything that lands on disk.
@@ -1218,9 +1178,13 @@ int main(int argc, char *argv[]) {
         }
         char pw[MAX_PASS];
         memset(pw, 0, sizeof(pw));
-        if (!passfile_load(HUB_PASS_FILE, pw, sizeof(pw), NULL) || !pw[0]) {
+        if (!passfile_load(HUB_PASS_FILE, pw, sizeof(pw)) || !pw[0]) {
+            /* 2.5.1 reads only the 600k key; a pass file 2.5.0 never got to
+             * rewrite is refused here so the upgrade reports it instead of
+             * leaving a hub that cannot start. */
             secure_wipe(pw, sizeof(pw));
-            printf("selftest: FAIL cannot read %s\n", HUB_PASS_FILE);
+            printf("selftest: FAIL cannot read %s (written before 2.5.0? restart "
+                   "once on 2.5.0, or rewrite it with -p)\n", HUB_PASS_FILE);
             return 1;
         }
         g_hub_config_readonly = true;
@@ -1495,12 +1459,10 @@ int main(int argc, char *argv[]) {
      * Load into a temporary buffer first; XOR-protect into state after load. */
     char _hub_plain_pass[MAX_PASS];
     memset(_hub_plain_pass, 0, sizeof(_hub_plain_pass));
-    bool pass_legacy = false;
     {
         /* 1. Machine-bound password file */
         if (!_hub_plain_pass[0])
-            passfile_load(HUB_PASS_FILE, _hub_plain_pass, sizeof(_hub_plain_pass),
-                          &pass_legacy);
+            passfile_load(HUB_PASS_FILE, _hub_plain_pass, sizeof(_hub_plain_pass));
 
         /* 2. Interactive prompt — only reached if no passfile */
         if (!_hub_plain_pass[0]) {
@@ -1514,26 +1476,9 @@ int main(int argc, char *argv[]) {
 
     if (identity_mode) return run_identity(&state, _hub_plain_pass);
 
-    /* A pre-2.5.0 pass file moves to the current PBKDF2 count on an ordinary
-     * start.  On the start a hub-driven upgrade made (its marker is still
-     * here) it waits UPGRADE_PASS_REWRITE_SECS, until the old build's watchdog
-     * is done with this process, and keeps the old copy for a rollback (see
-     * passfile_upgrade_tick).  An ordinary start drops any such copy left by
-     * an earlier run: a rollback is only ever for the process that made it. */
-    bool upgrade_start = (access(HUB_UPGRADE_MARKER_FILE, F_OK) == 0);
-    if (!upgrade_start) remove(HUB_PASS_PREV_FILE);
-    if (pass_legacy) {
-        if (upgrade_start)
-            printf("%s: rewritten with PBKDF2 %dk in %ds (upgrade in progress)\n",
-                   HUB_PASS_FILE, PBKDF2_ITERATIONS / 1000,
-                   UPGRADE_PASS_REWRITE_SECS);
-        else if (passfile_create(HUB_PASS_FILE, _hub_plain_pass))
-            printf("%s: rewritten with PBKDF2 %dk\n", HUB_PASS_FILE,
-                   PBKDF2_ITERATIONS / 1000);
-        else
-            fprintf(stderr, "%s: could not rewrite with PBKDF2 %dk; still readable "
-                    "as it is\n", HUB_PASS_FILE, PBKDF2_ITERATIONS / 1000);
-    }
+    /* The pre-2.5.0 pass file 2.5.0 kept for its own rollback: nothing reads
+     * it any more. */
+    remove(HUB_PASS_PREV_FILE);
 
     fflush(stdout); /* or the buffered lines are written again by the fork */
     daemonize();
@@ -1592,8 +1537,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     secure_wipe(_hub_plain_pass, sizeof(_hub_plain_pass));
-    if (pass_legacy && upgrade_start)
-        state.pass_rewrite_due = time(NULL) + UPGRADE_PASS_REWRITE_SECS;
 
     /* Ensure next_lamport_seq is above the time-based floor even on first
      * boot (when no lamport_seq key exists in config).  The config loader

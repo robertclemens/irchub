@@ -60,25 +60,21 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define GCM_TAG_LEN 16
 #define HEADER_SIZE 4
 #define MAX_PENDING_OP_REQUESTS 500
-/* PBKDF2-HMAC-SHA256 rounds for the .irchub.cnf and .irchub.pass keys.
- * 2.5.0 raised them from 100k (PBKDF2_ITERATIONS_LEGACY, OWASP's 2023 figure
- * is 600k).  A file still under the legacy count is read and rewritten once
- * (hub_config_load / passfile_load); releases after 2.5.0 carry min_from
- * 2.5.0 so no node skips that rewrite. */
+/* PBKDF2-HMAC-SHA256 rounds for the .irchub.cnf and .irchub.pass keys
+ * (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; releases
+ * after it carry min_from 2.5.0, so only this count is read. */
 #define PBKDF2_ITERATIONS 600000
-#define PBKDF2_ITERATIONS_LEGACY 100000
-/* Passwordless (docs/passwordless.md).  Admins/opers/bots authenticate with
- * their Curve25519 combined keys only; the config-file password is the one
- * password left.  A bot advertises protocol BOT_PROTO_PASSWORDLESS as "v|2"
- * in its CMD_CONFIG_PUSH; until a connection has done so it is sent legacy
- * record shapes with an empty password slot (old bots then fail closed). */
-#define BOT_PROTO_PASSWORDLESS 2
 /* A bot that knows admin flags and oper channel bindings (uf| / uc|) says
- * "v|3"; below that it is an older node (user_flags plan §3.2).  Mirrored in
- * ircbot/bot.h (BOT_PROTO_VERSION). */
+ * "v|3" at the head of its full CMD_CONFIG_PUSH (docs/passwordless.md §3.4);
+ * a push whose v| is below that is refused (record-only pushes carry no v|
+ * and are taken).  Mirrored in ircbot/bot.h
+ * (BOT_PROTO_VERSION). */
 #define BOT_PROTO_USER_FLAGS 3
-/* Oldest hub that stores uf| / uc|; older peers get the downgraded sync. */
-#define USER_FLAGS_MIN_HUB "2.4.7"
+/* The oldest bot or hub this hub links with (2.5.1 plan D1 / D4): a bot's
+ * CMD_BOT_PRESENCE or a direct peer's roster header below it drops the link
+ * with a "upgrade it by hand" line.  2.5.0 moved every file to PBKDF2 600k,
+ * which is all 2.5.1 reads. */
+#define MESH_MIN_VERSION "2.5.0"
 #define KEY_FP_LEN 19              /* "ab12:cd34:ef56:7890" */
 #define HUB_PID_FILE ".irchub.pid"
 #define HUB_PASS_FILE ".irchub.pass"
@@ -137,8 +133,8 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define BOT_CONFIG_PUSH_COALESCE 1
 #define MAX_RECENT_PURGES 64
 #define PURGE_DEDUP_WINDOW 3600          // seconds an id'd purge is remembered
-#define PURGE_DEDUP_WINDOW_LEGACY 60     // seconds an id-less purge is remembered
 #define PURGE_ID_HEX 16                  // PURGE|<cutoff>|<id>: 8 random bytes, hex
+#define PURGE_FLOOR_HOLD 600             // s a purge refuses re-creating older tombstones
 
 // OP_FORWARD_REQUEST deduplication — prevents packet storms
 #define OP_FORWARD_TTL_SECONDS 60        // Drop forwarded OP requests older than 60s
@@ -156,13 +152,16 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * the Makefile; -D-overridable so a release build can stamp its own version
  * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
 #ifndef HUB_VERSION
-#define HUB_VERSION "2.5.0"
+#define HUB_VERSION "2.5.1"
 #endif
 
 /* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
  * ircbot's BOT_UPDATE_PUBKEY_B64: one key signs both repos.  All of these are
- * -D-overridable (the testnet injects a throwaway signing key), and at RUNTIME
- * IRCHUB_UPDATE_BASE repoints the updater at a local irchub-releases tree.
+ * -D-overridable.  A run never names a base: every node reads its own root,
+ * the only one its pinned key can verify, so a different release site means
+ * a different build.  Only a -DIRC_TEST_HOOKS build (the testnet's) reads the
+ * IRCHUB_UPDATE_BASE / _PUBKEY / IRCHUB_BOT_RELEASE_BASE env overrides; see
+ * hub_update.c.
  * An empty pubkey DISABLES hub updates (fail-closed).
  *
  * HUB_UPDATE_BASE is the tree ROOT; one variant subdirectory below it holds
@@ -204,18 +203,10 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 /* Retained previous binary/config, kept (not deleted) after an upgrade so
  * CMD_UPGRADE_ABORT can put this hub back. */
 #define HUB_UPGRADE_PREV_SUFFIX ".prev"
-#define HUB_PASS_PREV_FILE HUB_PASS_FILE HUB_UPGRADE_PREV_SUFFIX /* the pre-2.5.0 pass kept for a rollback */
+#define HUB_PASS_PREV_FILE HUB_PASS_FILE HUB_UPGRADE_PREV_SUFFIX /* 2.5.0's rollback copy: removed at start */
 /* The upgrade script's startup watchdog: how long the new build's daemon has
  * to be up and alive before the script keeps it (see write_upgrade_script). */
 #define UPGRADE_WATCH_SECS 20
-/* A pre-2.5.0 HUB_PASS_FILE found on the start a hub-driven upgrade made is
- * rewritten at PBKDF2_ITERATIONS this long after that start: past the old
- * build's watchdog, which restores <exe>.prev and the config but not this
- * file.  The old copy stays as HUB_PASS_PREV_FILE until the next ordinary
- * start, for this process's own hub_update_rollback() to put back. */
-#define UPGRADE_PASS_REWRITE_SECS 120
-_Static_assert(UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS,
-               "the pass rewrite must wait out the old build's watchdog");
 /* The generated installer, written 0700 and exec'd once the old process has
  * let go of its pid lock. */
 #define HUB_UPGRADE_SCRIPT "hub_upgrade.sh"
@@ -388,17 +379,19 @@ _Static_assert(UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS,
  * origin floods the question to the mesh (ELECT_FWD), each hub probes its own
  * bots and answers ELECT_ACK back along the path, and the origin hands it to
  * one hub with a ready bot (ELECT_DO -> ELECT_DONE, along the same path).
- * Bots that never answer a probe predate it: when nobody is ready they get
- * the old CMD_OP_GRANT / CMD_CHAN_ACTION.  A mesh holding any hub older than
- * CHAN_ELECT_MIN_HUB keeps the old ask-everyone path.  Mirrors ircbot/bot.h
- * and irchub.rs consts.rs.
+ * A bot that has not answered when CHAN_ELECT_PROBE_WAIT runs out counts as
+ * a no ("no answer"): every bot the mesh admits answers probes, so it is
+ * never sent a blind old-style CMD_OP_GRANT / CMD_CHAN_ACTION (that skipped
+ * +bitch).  Mirrors ircbot/bot.h and irchub.rs consts.rs.
  *   PROBE      hub->bot  eid|kind|channel
  *   PROBE_ACK  bot->hub  eid|1| or eid|0|reason
  *   DO         hub->bot  eid|kind|channel|requester|nick|hostmask
  *   DONE       bot->hub  eid|ok|detail or eid|fail|detail
  *   ELECT_FWD  hub->hub  eid|origin_hub|kind|channel|requester|nick|hostmask|origin_ts
- *   ELECT_ACK  hub->hub  eid|hub_uuid|hub_name|asked|ready|silent
- *   ELECT_DO   hub->hub  eid|hub_uuid|elect or eid|hub_uuid|legacy
+ *   ELECT_ACK  hub->hub  eid|hub_uuid|hub_name|asked|ready|silent (silent: 0
+ *              from 2.5.1; a 2.5.0 hub's count is read and ignored)
+ *   ELECT_DO   hub->hub  eid|hub_uuid|elect (a 2.5.0 origin's "legacy" is
+ *              ignored)
  *   ELECT_DONE hub->hub  eid|hub_uuid|hub_name|bot_uuid|bot_nick|status|detail
  * kind = op / invite / unban / key; requester = a bot uuid, or ADMIN. */
 #define CMD_CHAN_PROBE       0x6D
@@ -479,9 +472,8 @@ _Static_assert(UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS,
  * line(s) that move the live modes there.  DONE ok|detail, or fail|reason; a
  * `channel op` to a nick that is not authorised on a +bitch channel answers
  * fail|bitch, which the origin turns into channel.not_authorised. */
-#define CHAN_ELECT_MIN_HUB    "2.4.5" /* every hub in the mesh map at least */
-#define CHAN_ELECT_PROBE_WAIT 2   /* s: local bots' answers                 */
-#define CHAN_ELECT_MESH_WAIT  4   /* s: other hubs' answers, after the flood */
+#define CHAN_ELECT_PROBE_WAIT 3   /* s: local bots' answers (whole seconds: >= 2 s) */
+#define CHAN_ELECT_MESH_WAIT  5   /* s: other hubs' answers (their probe wait + 2) */
 #define CHAN_ELECT_DO_WAIT    5   /* s: one bot's DONE                      */
 #define CHAN_ELECT_HUB_WAIT   12  /* s: one hub's ELECT_DONE (it may retry)  */
 #define CHAN_ELECT_TTL        40  /* s: hard end of any election            */
@@ -649,24 +641,13 @@ _Static_assert(UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS,
 /* A selective run (CMD_ADMIN_UPGRADE_NET's 8th field) names at most this many
  * nodes; an empty selection is the whole network. */
 #define MAX_UPGRADE_SELECT 16
-/* Selective runs need every hub they cross to understand the peer PREPARE's
- * `sel` field: an older follower would PREPARE all its bots and adopt the
- * run's target as its roll-up plan, walking bots nobody selected up to it. */
-#define UPGRADE_SELECT_MIN_HUB "2.4.3"
 /* Releases listed by the admin console "releases" query, per product. */
 #define MAX_UPGRADE_RELEASES 24
-/* ircbot builds from this version on hold their "ok" RESULT until they are
- * back on IRC and re-opped where they were, so the driver waits for it
- * instead of taking a presence on the target as done (the next wave would
- * otherwise leave a channel before this bot holds ops in it again). */
-#define UPGRADE_OPS_GATE_MIN_BOT "2.4.5"
 /* A bot back on the target that never sends its ready report is taken as
  * done after this long (it runs; its channels are its own business). */
 #define UPGRADE_OPS_GRACE 240
-/* The staged new binary's -selftest must finish within this many seconds,
- * and irchub knows -selftest from this version on. */
+/* The staged new binary's -selftest must finish within this many seconds. */
 #define UPGRADE_SELFTEST_SECS 15
-#define UPGRADE_SELFTEST_MIN_HUB "2.4.3"
 
 /* ---- Offline roll-up (upgrade plan, Task 7) ----------------------------
  * A node that was down, or homed elsewhere, when a run went through comes
@@ -685,6 +666,42 @@ _Static_assert(UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS,
  * regardless -- a bot down for a day is likely coming back, one down for
  * months is not, and its admin can still run an upgrade by hand. */
 #define ROLLUP_PLAN_TTL    (7 * 86400)
+
+/* ---- Multi-step upgrades (2.5.1) ---------------------------------------
+ * A target a node cannot jump to directly (it sits below the release's
+ * min_from) is reached through the intermediate releases the manifests name.
+ * The hub an admin starts the upgrade on plans the whole path up front and
+ * drives it as a sequence of ordinary runs, one per step, every node
+ * finishing a step before any starts the next.  The plan is persisted in
+ * this hub's own .irchub.cnf (an `uplan|` line) because the hub restarts
+ * onto each step itself. */
+#define MAX_UPGRADE_STEPS    16    /* longer paths are refused at start     */
+#define UPGRADE_PLAN_SETTLE  60    /* seconds between steps, and after boot */
+#define UPGRADE_PLAN_TTL     86400 /* a plan with no progress for this long is dropped */
+/* An `upgrade abort` is re-sent to every peer link that comes up for this
+ * long, so a planner restarting onto a step when it was typed still gets it. */
+#define UPGRADE_CANCEL_HOLD  600
+
+typedef struct {
+  bool   active;
+  char   bot_target[64];      /* the final targets the admin asked for     */
+  char   hub_target[64];      /* "" = hubs are not moved                   */
+  char   variant[8];
+  char   kind[8];
+  char   sel[MAX_UPGRADE_SELECT * 80]; /* the admin's selection, as typed  */
+  char   bot_from[64];        /* the oldest bot / hub when it was planned  */
+  char   hub_from[64];
+  char   bot_path[MAX_UPGRADE_STEPS][64];
+  int    bot_steps;
+  char   hub_path[MAX_UPGRADE_STEPS][64];
+  int    hub_steps;
+  int    step;                /* 0-based: the step running, or next        */
+  char   run_id[64];          /* the run driving `step`; "" = none yet     */
+  time_t started;
+  time_t progressed;          /* last step started or finished            */
+  time_t next_at;             /* volatile: when the next step may start    */
+  char   summary[192];        /* why it ended (kept after it stops)        */
+} upgrade_plan_t;
 
 typedef struct {
   char request_id[64];
@@ -724,10 +741,10 @@ typedef struct {
  * lines never approach value[1024].  Keep this shared contract identical with
  * ircbot/bot.h (MAX_CONFIG_PAYLOAD).
  * ========================================================================== */
-#define BOT_SYNC_FIELDS   8      /* {t,n,h,pub,seen,d,hl} = 7, +slack; hl has its own HL_LINE_MAX */
-#define GLOBAL_LINE_MAX   1088   /* config_entry_t: key[32]+value[1024]+ts+seps */
+#define BOT_SYNC_FIELDS   8      /* {t,n,h,pub,seen,d,hl} = 7, +slack; hl has its own HK_LINE_MAX */
+#define GLOBAK_LINE_MAX   1088   /* config_entry_t: key[32]+value[1024]+ts+seps */
 #define BOT_FIELD_LINE    320    /* per-bot line: capped value (<=MAX_MASK_LEN) */
-#define USER_LINE_MAX     384    /* a|/o|: uuid+name+COMBINED_KEY_B64 (+legacy slot) */
+#define USER_LINE_MAX     384    /* a|/o|: uuid+name+COMBINED_KEY_B64+stamps */
 #define MASK_LINE_MAX     352    /* m|: uuid+MAX_MASK_LEN */
 #define BLINE_MAX         448    /* b|<mask>|<uuid>|<pubkey>|<ts> trusted-bot line */
 #define PEER_LINE_MAX     256    /* peer|/opt| sync lines */
@@ -743,7 +760,7 @@ typedef struct {
 #define HL_FP_LEN         16
 #define HL_ENTRIES_MAX    10     /* ircbot MAX_SERVERS */
 #define HL_VALUE_MAX      (HL_ENTRIES_MAX * (HL_ADDR_MAX + 1 + HL_FP_LEN + 1))
-#define HL_LINE_MAX       (HL_VALUE_MAX + 64)  /* b|<uuid>|hl|<value>|<ts> */
+#define HK_LINE_MAX       (HL_VALUE_MAX + 64)  /* b|<uuid>|hl|<value>|<ts> */
 /* What rv| and hs| add to a bulk payload at their caps. */
 #define REVOKE_RECORDS_MAX \
   ( MAX_REVOKED * RV_LINE_MAX + HUB_GSETTINGS_MAX * HS_LINE_MAX )
@@ -776,6 +793,11 @@ typedef struct {
 #define C_LINE_MAX          704
 #define D_LINE_MAX          640
 #define B_LINE_MAX          448
+/* K|<#chan>|<key>|<modes>|<ts>: what the bots saw on IRC (learned key, M_K /
+ * M_I bits).  Never existence: kept only while the channel's c| is add, one
+ * per channel, dropped with it (docs/plans/2026-10-20_learned_state_purge_plan.md). */
+#define K_LINE_MAX          (2 + MAX_CHAN + MAX_KEY + 32)
+#define K_MODES_MASK        (64 | 128)   /* M_K | M_I */
 /* bu|<#chan|*>|<mask>|<last_used>: a ban's last use, cnf only (activity). */
 #define BU_LINE_MAX         (MAX_CHAN + BAN_MASK_MAX + 32)
 /* global_entries[]: the old c/m/o rows (MAX_BOT_ENTRIES), then C, D, B. */
@@ -786,19 +808,18 @@ typedef struct {
 typedef struct { int rep; int live; } global_ban_slot_t;
 #define BOT_BANS_PER_CHAN   10    /* live bans one bot may hold per channel  */
 #define TOMB_MIN_AGE_OFF    (7 * 86400L) /* tombstone age kept when purge is off */
-/* Oldest hub that stores and forwards C|/D|/B| (older ones drop them). */
-#define MODES_MIN_HUB       "2.4.5"
 #define BAN_BOT_SLACK       60    /* s a bot-written ban may exceed bantime */
 #define BANTIME_DEFAULT_MIN 120   /* built-in bantime (minutes)             */
 #define BAN_SWEEP_INTERVAL  60    /* s between expiry sweeps                */
-/* What C|, D| and B| add to a bulk payload at their caps. */
+/* What C|, D|, B| and K| add to a bulk payload at their caps. */
 #define MODES_RECORDS_MAX \
-  ( MAX_CHANNELS * C_LINE_MAX + D_LINE_MAX + MAX_BANS_TOTAL * B_LINE_MAX )
+  ( MAX_CHANNELS * C_LINE_MAX + D_LINE_MAX + MAX_BANS_TOTAL * B_LINE_MAX + \
+    MAX_CHANNELS * K_LINE_MAX )
 
 /* Bot config payload (hub_generate_bot_payload): globals + users + masks +
  * this bot's own fields + one b| line per other bot. */
 #define MAX_CONFIG_PAYLOAD \
-  ( MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
+  ( MAX_BOT_ENTRIES      * GLOBAK_LINE_MAX + \
     MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
     MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
     USER_ACCESS_RECORDS_MAX                + \
@@ -810,12 +831,12 @@ typedef struct { int rep; int live; } global_ban_slot_t;
 /* Hub<->hub full-state sync (hub_generate_sync_packet): globals + users +
  * masks + every bot's fields + peer/opt lines. */
 #define MAX_SYNC_PAYLOAD \
-  ( MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
+  ( MAX_BOT_ENTRIES      * GLOBAK_LINE_MAX + \
     MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
     MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
     USER_ACCESS_RECORDS_MAX                + \
     MAX_BOTS * BOT_SYNC_FIELDS * BOT_FIELD_LINE + \
-    MAX_BOTS             * HL_LINE_MAX     + \
+    MAX_BOTS             * HK_LINE_MAX     + \
     MAX_PEERS            * PEER_LINE_MAX   + \
     MODES_RECORDS_MAX                          + \
     REVOKE_RECORDS_MAX                         + \
@@ -827,18 +848,23 @@ typedef struct { int rep; int live; } global_ban_slot_t;
  * ircbot-testnet's tools/c/hub_tool.h derives HUB_TOOL_MAX_CONFIG from this at
  * MAX_BOTS. */
 /* The persisted roll-up plan (see pending_rollup_t): rollup| + target,
- * variant, kind, min_from, hub_target, plan_set and both 512-byte bases. */
+ * variant, kind, min_from, hub_target, plan_set and two empty base slots. */
 #define ROLLUP_LINE_MAX 1536
+/* The persisted multi-step plan (see upgrade_plan_t): uplan| + the fixed
+ * fields, both paths (MAX_UPGRADE_STEPS versions each) and the selection. */
+#define PLAN_LINE_MAX \
+  ( (size_t)512 + (size_t)2 * MAX_UPGRADE_STEPS * 65 + \
+    (size_t)MAX_UPGRADE_SELECT * 80 )
 #define HUB_CONFIG_FIXED_MAX \
-  ( (size_t)8192 + (size_t)ROLLUP_LINE_MAX + \
-    (size_t)MAX_BOT_ENTRIES      * GLOBAL_LINE_MAX + \
+  ( (size_t)8192 + (size_t)ROLLUP_LINE_MAX + (size_t)PLAN_LINE_MAX + \
+    (size_t)MAX_BOT_ENTRIES      * GLOBAK_LINE_MAX + \
     (size_t)MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
     (size_t)MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
     (size_t)USER_ACCESS_RECORDS_MAX                + \
     (size_t)MODES_RECORDS_MAX                      + \
     (size_t)REVOKE_RECORDS_MAX                     + \
     (size_t)MAX_BANS_TOTAL       * BU_LINE_MAX     + \
-    (size_t)2 * MAX_IP_ACL_ENTRIES * IP_ACL_LINE_MAX + \
+    (size_t)2 * MAX_IP_ACL_ENTRIES * IP_ACK_LINE_MAX + \
     (size_t)MAX_PEERS            * 512 )
 #define HUB_CONFIG_PER_BOT_MAX ((size_t)MAX_BOT_ENTRIES * 1100)
 
@@ -926,13 +952,21 @@ typedef struct {
   time_t last_used;   /* B| only: last ban match, max-merged outside LWW */
 } config_entry_t;
 
+/* K| (hub_storage.c hub_learned_*): one per managed channel. */
+typedef struct {
+  char   chan[MAX_CHAN];
+  char   key[MAX_KEY];
+  int    modes;          /* K_MODES_MASK bits */
+  time_t ts;
+} hub_chan_learned_t;
+
 typedef struct {
   char   uuid[37];
   char   name[64];
   /* Per-user Curve25519 combined pubkey (Ed25519 + X25519), base64-encoded
    * (88 chars + NUL) — the user's only credential: SSH console logins and bot
-   * ~A2 commands verify against it.  Empty (has_pubkey false) for a legacy
-   * record not yet given a key; such a user can authenticate nowhere.  The
+   * ~A2 commands verify against it.  Empty (has_pubkey false) for a user not
+   * yet given a key; such a user can authenticate nowhere.  The
    * matching private key lives only on the user's machine. */
   char   pubkey_b64[COMBINED_KEY_B64 + 1];
   bool   has_pubkey;
@@ -1032,9 +1066,9 @@ typedef struct {
   char want_variant[8];
   bool not_selected;    /* a selective run left it out: not a failure    */
   /* When a committed bot was first seen back on the target (its presence,
-   * or a follower's "back").  From ircbot UPGRADE_OPS_GATE_MIN_BOT on, that
-   * is not "done": the bot reports ok itself once it is re-opped where it
-   * was.  0 = not seen back yet. */
+   * or a follower's "back").  That is not "done": the bot reports ok itself
+   * once it is re-opped where it was (the next wave would otherwise leave a
+   * channel before this bot holds ops in it again).  0 = not seen back yet. */
   time_t back_at;
   char arch[32];
   char libc[16];
@@ -1080,13 +1114,11 @@ typedef struct {
   char   variant[8];          /* "" = keep each node's own variant       */
   char   kind[8];             /* "" = let each node pick bin/src         */
   char   min_from[64];        /* "*" = any                               */
-  char   base[512];           /* release base override, "" = compiled-in */
   /* The hubs' own target.  ircbot and irchub are separate products with
    * separate version lines and separate release trees, so a hub node is
-   * never checked against `target_ver`/`base` — those are the bots'.  An
-   * empty hub_ver leaves every hub on the build it runs. */
+   * never checked against `target_ver` — that is the bots'.  An empty
+   * hub_ver leaves every hub on the build it runs. */
   char   hub_ver[64];
-  char   hub_base[512];       /* irchub-releases override, "" = compiled-in */
   int    origin_fd;           /* admin connection that started it, or -1 */
   time_t started;
   time_t phase_started;
@@ -1108,8 +1140,7 @@ typedef struct {
 
 /* The plan a completed run left behind, and the one node being walked up to
  * it right now.  The plan is persisted in this hub's own .irchub.cnf (a
- * `rollup|` line, hub-local and never replicated — its base may be a test
- * hook's file:// URL) so a restart does not forget what the network is
+ * `rollup|` line, hub-local and never replicated) so a restart does not forget what the network is
  * supposed to be running; the attempt in flight and the retry ledger stay
  * volatile.  The roll-up is a convenience, never the record of what the
  * network runs (that is each node's own presence), and it only ever chases a
@@ -1120,16 +1151,14 @@ typedef struct {
   char   variant[8];
   char   kind[8];
   char   min_from[64];
-  char   base[512];
   char   hub_target[64];  /* the run's hub target, "" = hubs were not moved */
-  char   hub_base[512];
   time_t plan_set;
 
   /* The attempt in flight, if any. */
   bool   active;
   char   id[64];          /* its own run id, distinct from any real run  */
   char   uuid[64];        /* the node being rolled up                    */
-  char   node_kind;       /* 'b' bot — the only kind rolled up           */
+  char   node_kind;       /* 'b' a local bot, 'h' a directly linked hub  */
   char   step[64];        /* the version THIS attempt installs           */
   time_t started;
   bool   committed;
@@ -1214,7 +1243,7 @@ typedef struct {
  * with the host bits cleared; net/mask are its parsed form. */
 #define MAX_IP_ACL_ENTRIES 64          /* per list */
 #define IP_ACL_PATTERN_MAX 19          /* "255.255.255.255/32" + NUL */
-#define IP_ACL_LINE_MAX    48          /* w|<pattern>|<ts>\n */
+#define IP_ACK_LINE_MAX    48          /* w|<pattern>|<ts>\n */
 typedef struct {
   char     pattern[IP_ACL_PATTERN_MAX];
   uint32_t net;              /* host byte order */
@@ -1322,12 +1351,9 @@ typedef struct {
    * handed to the console thread untouched. */
   bool sniff_pending;
   long long sniff_deadline_ms;
-  /* Protocol version this bot connection advertised ("v|N" in its config
-   * push): 0 = not known yet, 1 = its push carried no v| (a pre-passwordless
-   * build; it was sent the legacy-shaped config at once), >= 2 = advertised.
-   * Per connection on purpose: a downgraded binary reconnecting is never
-   * mistaken for a passwordless one. */
-  int bot_proto;
+  /* Set by a handler that found this bot or peer below MESH_MIN_VERSION (or
+   * a push below BOT_PROTO_USER_FLAGS): the dispatch then drops the link. */
+  bool refused;
   /* CMD_CHAN_EVENT rate limit for this connection (CHAN_EVENT_MAX_PER_WINDOW
    * per CHAN_EVENT_WINDOW seconds); dropped events are counted. */
   time_t chan_ev_window;
@@ -1375,6 +1401,10 @@ typedef struct {
    * on overflow and whenever the bot sends a config push of its own. */
   unsigned char cfg_sent_hash[32];
   bool          cfg_sent_valid;
+  /* This connection has pushed its config once: the first push is answered
+   * with a full config even when it changed nothing (a reconnecting bot may
+   * hold a stale copy, e.g. its own old key after a rekey). */
+  bool          pushed;
 
   /* SHA-256 of the last bot tree queued to this bot (CMD_BOT_TREE): a change
    * push that would repeat it is skipped (the BOT_TREE_REFRESH one never is).
@@ -1562,6 +1592,9 @@ typedef struct {
   int global_idx[GLOBAL_IDX_SLOTS];
   global_ban_slot_t global_ban_chan[GLOBAL_IDX_SLOTS];
   int global_n_old, global_n_C, global_n_D, global_n_B;
+  /* K|: what the bots saw on IRC, one per live channel (never a tombstone). */
+  hub_chan_learned_t chan_learned[MAX_CHANNELS];
+  int chan_learned_count;
 
   // Named admin/oper records and their usermasks
   hub_user_record_t user_records[MAX_HUB_USER_RECORDS];
@@ -1600,7 +1633,6 @@ typedef struct {
   char   follow_target[64];     /* the bots' target (relayed COMMITs)    */
   char   follow_hub_target[64]; /* this hub's own target, "" = stay put  */
   char   follow_variant[8];
-  char   follow_hub_base[512];  /* irchub-releases base for this hub     */
   /* What the followed run asked of this hub's BOTS: the run's own variant
    * ("" = each keeps its own) and a selective run's uuid[=v],... list.  A
    * local bot's presence is only reported up as that bot's success when it
@@ -1609,11 +1641,6 @@ typedef struct {
   char   follow_bot_variant[8];
   char   follow_sel[MAX_UPGRADE_SELECT * 72];
   bool   follow_self_ready;  /* this hub itself can take the followed run */
-  /* UPGRADE_PASS_REWRITE_SECS: when the deferred pass rewrite is due (0 =
-   * none), and whether this process saved HUB_PASS_PREV_FILE —
-   * hub_update_rollback() restores it only then, never a stale copy. */
-  time_t pass_rewrite_due;
-  bool   pass_prev_saved;
   time_t follow_prepared;
   /* Nodes below this hub in the followed run's fan-out tree (its own peers'
    * subtrees).  Rebuilt for every run; see upgrade_route_t. */
@@ -1622,6 +1649,13 @@ typedef struct {
 
   /* Offline roll-up (see pending_rollup_t). */
   pending_rollup_t rollup;
+  upgrade_plan_t   plan;             /* a multi-step upgrade this hub drives */
+  /* The last `upgrade abort` this hub issued or relayed (see
+   * UPGRADE_CANCEL_HOLD): its id, when the admin typed it (mesh clock), and
+   * when this hub heard it (local clock). */
+  char             upgrade_cancel_id[64];
+  time_t           upgrade_cancel_issued;
+  time_t           upgrade_cancel_seen;
   rollup_try_t     rollup_tries[MAX_ROLLUP_TRIES];
   int              rollup_try_count;
 
@@ -1651,6 +1685,11 @@ typedef struct {
   recent_purge_t recent_purges[MAX_RECENT_PURGES];
   int recent_purge_count;
   time_t last_scheduled_purge;  // Timestamp of last scheduled purge this hub initiated
+  /* Purge floor: until purge_floor_until, a tombstone stamped before
+   * purge_floor is not re-created (a sync built before the purge, landing
+   * after it, would bring it back).  Memory only. */
+  time_t purge_floor;
+  time_t purge_floor_until;
 
   // OP_FORWARD_REQUEST deduplication: LRU ring prevents infinite re-broadcast storms
   seen_forward_t seen_forwards[MAX_SEEN_FORWARD_IDS];
@@ -1756,15 +1795,11 @@ void hub_config_write(hub_state_t *state);
 extern bool g_hub_config_readonly;
 
 /* a|/o| record codec (docs/passwordless.md §3.1), shared by config load,
- * peer sync and bot pushes.  Field 3 decides: a valid key = new format;
- * anything else is a legacy password, dropped, key taken from field 7.
- * *legacy (optional) reports which shape was seen. */
-bool hub_parse_user_record(const char *data, char type, hub_user_record_t *out,
-                           bool *legacy);
-/* Full line incl. "\n".  legacy_v1 emits the fail-closed shape for bots that
- * have not advertised v|2: a|uuid|name||act|seen|ts|pubkey. */
-int hub_format_user_record(const hub_user_record_t *u, bool legacy_v1,
-                           char *buf, size_t len);
+ * peer sync and bot pushes: uuid|name|pubkey|act|seen|ts|.  pubkey may be
+ * empty; anything else that is not a valid key refuses the line. */
+bool hub_parse_user_record(const char *data, char type, hub_user_record_t *out);
+/* Full line incl. "\n". */
+int hub_format_user_record(const hub_user_record_t *u, char *buf, size_t len);
 /* Timestamp for changing an EXISTING replicated record: now, but always past
  * its previous stamp.  Peers and bots accept only a strictly newer timestamp,
  * so an add and a remove in the same second would tie and the remove would
@@ -2007,6 +2042,28 @@ int hub_chan_cascade_del(hub_state_t *state, const char *chan, time_t ts, bool a
  * stored spelling to `name` when not NULL. */
 bool hub_chan_live(const hub_state_t *state, const char *chan, char *name, size_t cap);
 
+/* K| (learned channel state).  put: only while `chan` is live; LWW on ts,
+ * a tie to the byte-wise greater "key|modes".  ingest: one "chan|key|modes|ts"
+ * body (after "K|"), validated; true when stored.  drop: forget it (the
+ * channel went).  append: every K| line to buf at *off (false when full). */
+const hub_chan_learned_t *hub_learned_find(const hub_state_t *state, const char *chan);
+bool hub_learned_put(hub_state_t *state, const char *chan, const char *key, int modes,
+                     time_t ts);
+bool hub_learned_ingest(hub_state_t *state, const char *body);
+void hub_learned_drop(hub_state_t *state, const char *chan);
+int hub_learned_format(const hub_chan_learned_t *l, char *buf, size_t cap);
+bool hub_learned_append(const hub_state_t *state, char *buf, int cap, int *off);
+/* The purge's orphan sweep over global records: C|, B| (not "*") and K| of a
+ * channel with no live c|.  Returns how many went (purge_note'd by caller
+ * through `note`, may be NULL). */
+int hub_purge_chan_orphans(hub_state_t *state,
+                           void (*note)(void *, const char *kind, const char *name,
+                                        time_t ts), void *arg);
+/* A tombstone stamped `ts` that this hub does not hold may not be created
+ * while a purge's floor holds (PURGE_FLOOR_HOLD). */
+bool hub_purge_floor_blocks(const hub_state_t *state, time_t ts);
+void hub_purge_floor_set(hub_state_t *state, time_t cutoff);
+
 /* §3.2 mode string ("+stnkl 20", "" = default) and §4 settings string
  * ("bitch=1,flood join=5:60"): HUB_MODES_OK or BAD_MODES / BAD_SETTING /
  * TOO_LONG.  `bad` (may be NULL) receives the offending token. */
@@ -2068,11 +2125,6 @@ bool hub_ban_bot_write(hub_state_t *state, const char *bot_uuid, const char *val
                        time_t ts);
 /* 60 s sweep: `del` for every expired ban, announced to peers and bots. */
 void hub_bans_sweep(hub_state_t *state, time_t now);
-/* Names of peer hubs known to predate MODES_MIN_HUB (2.4.5) -- they drop C|,
- * D| and B| -- for the console warning.  Hubs whose version is not known yet
- * are not listed.  Returns the count (<= max). */
-int hub_old_hubs(const hub_state_t *state, char names[][64], int max);
-int hub_old_hubs_for(const hub_state_t *state, char names[][64], int max, const char *min_ver);
 /* CMD_CHAN_EVENT from an authenticated bot (validate, rate-limit, log). */
 void hub_chan_event_receive(hub_state_t *state, hub_client_t *client, const char *payload);
 /* Start the apply-once election (kind "mode") for `channel` on behalf of
@@ -2113,8 +2165,8 @@ int hub_access_purge(hub_state_t *state, time_t cutoff);
 bool hub_access_append(hub_state_t *state, char *buf, int cap, int *off,
                        bool (*keep)(hub_state_t *, const char *uuid, void *), void *arg);
 time_t hub_access_user_ts(hub_state_t *state, const hub_user_record_t *u);
-int hub_format_user_for_old(hub_state_t *state, const hub_user_record_t *u, bool legacy_v1,
-                            bool tomb, char *buf, size_t cap);
+int hub_format_user_for_old(hub_state_t *state, const hub_user_record_t *u, bool tomb,
+                            char *buf, size_t cap);
 bool hub_access_from_old_ok(hub_state_t *state, const char *uuid);
 char *hub_access_downgrade(hub_state_t *state, const char *payload, bool tomb);
 void hub_user_chans(hub_state_t *state, const char *uuid, char *out, size_t cap);
@@ -2127,10 +2179,8 @@ void hub_peer_enqueue_sync(hub_state_t *state, hub_client_t *c, uint8_t op, lane
                            const char *payload, const char *coalesce, uint64_t seq);
 
 void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len);
-/* proto_v2: the receiving connection advertised v|2 (new a|/o|/b| shapes);
- * false sends the fail-closed legacy shapes. */
 void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
-                              int bot_proto, char *buffer, int max_len);
+                              char *buffer, int max_len);
 void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
                                  int exclude_fd);
 
@@ -2146,7 +2196,6 @@ bool hub_revoke_parse(const char *rest, hub_revoked_t *out);
 int  hub_revoke_format(const hub_revoked_t *r, char *buf, size_t cap);
 bool hub_revoke_append(hub_state_t *state, char *buf, int max_len, int *off);
 bool hub_revoke_from_bot(hub_state_t *state, const bot_config_t *b);
-int  hub_revoke_migrate(hub_state_t *state);
 int  hub_retire_revoked_bots(hub_state_t *state);
 /* A bot's hl| hub list is well formed (hub_storage.c). */
 bool hub_hublist_valid(const char *v);
@@ -2203,7 +2252,7 @@ void hub_activity_send_bans(hub_state_t *state, hub_client_t *peer);
  * anything is downloaded.  `min_from` is what the driving hub sent ("" or "*"
  * = let the manifest decide); `reason` explains a false. */
 bool hub_update_can_take(const char *target_ver, const char *variant,
-                         const char *min_from, const char *base, char *reason,
+                         const char *min_from, char *reason,
                          size_t reason_size);
 /* One release a manifest lists: its version and date. */
 typedef struct {
@@ -2217,17 +2266,20 @@ int hub_update_list_releases(const char *root, const char *variant,
 /* CMD_UPGRADE_COMMIT.  Returns false with *err set and nothing touched; on
  * success it does not return -- the process is replaced and reports the
  * outcome after the restart. */
+/* The bots' ircbot-releases root this hub reads (see hub_update.c). */
+const char *hub_update_bot_root(void);
 /* Highest version `cur_ver` may take right now on the way to `target_ver`,
- * read from the release tree at <base>/<variant>.  Walks a node that sits
- * below a target's min_from_version there one release at a time. */
-bool hub_update_next_step(const char *base, const char *variant,
+ * read from the release tree at <root>/<variant> ("" = this hub's own root).
+ * Walks a node that sits below a target's min_from_version there one release
+ * at a time. */
+bool hub_update_next_step(const char *root, const char *variant,
                           const char *cur_ver, const char *target_ver,
                           char *out, size_t out_size, char *reason,
                           size_t reason_size);
 
 bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
                        const char *target_ver, const char *variant,
-                       const char *base, const char **err);
+                       const char **err);
 /* CMD_UPGRADE_ABORT: restore <exe>.prev / .irchub.cnf.prev and restart onto
  * them.  False when there is nothing retained to go back to. */
 bool hub_update_rollback(hub_state_t *state, const char *reason);

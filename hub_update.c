@@ -212,11 +212,6 @@ bool hub_update_rollback(hub_state_t *state, const char *reason) {
       hub_log_error("[UPGRADE] Could not restore %s; keeping the current one\n",
               prev_cfg);
   }
-  /* The pre-2.5.0 pass file, only if this process rewrote it (the old build
-   * cannot read the new one). */
-  if (state->pass_prev_saved && rename(HUB_PASS_PREV_FILE, HUB_PASS_FILE) != 0)
-    hub_log_error("[UPGRADE] Could not restore %s; keeping the current one\n",
-            HUB_PASS_PREV_FILE);
   if (rename(prev_exe, state->executable_path) != 0) {
     hub_log_error("[UPGRADE] Could not restore %s\n", prev_exe);
     return false;
@@ -420,23 +415,42 @@ static bool verify_sha256(const char *filepath, const char *expected_hash) {
 }
 
 /* ---- URL and filename gates --------------------------------------------
- * A non-empty IRCHUB_UPDATE_BASE overrides the compiled release base.  The
- * sandboxed testnet uses it to read a local irchub-releases tree over a
- * file:// URL with no outbound network.  When set, validate_url also accepts
- * URLs that begin with that base; the Ed25519 signature and the SHA-256 checks
- * stay fully active — only the github/https host allow-list is relaxed, and
- * only for this explicitly-configured base. */
+ * Test hook, compiled in only with -DIRC_TEST_HOOKS (the testnet's builds;
+ * never a release or a plain `make`): a non-empty IRCHUB_UPDATE_BASE
+ * overrides the compiled release root so the sandbox can read a local
+ * irchub-releases tree over file://, validate_url accepts URLs under it, and
+ * IRCHUB_UPDATE_PUBKEY / IRCHUB_BOT_RELEASE_BASE are read alongside it.  A
+ * production binary has no code that reads any of them: its roots and key
+ * are the compiled-in ones, so nobody who can set the daemon's environment
+ * can point it at their own signed releases. */
+#ifdef IRC_TEST_HOOKS
 static const char *hub_update_env_base(void) {
   const char *b = getenv("IRCHUB_UPDATE_BASE");
   return (b && b[0]) ? b : NULL;
 }
+#else
+static const char *hub_update_env_base(void) { return NULL; }
+#endif
 
-/* The base a run is working against: what the driving hub named, else the
- * operator's env override, else the compiled-in root. */
-static const char *effective_root(const char *base) {
-  if (base && base[0]) return base;
+/* The hub release root: the operator's env override, else the compiled-in
+ * root.  `root`, when given, is a tree the caller names explicitly (the bots'
+ * ircbot-releases root, for the roll-up and the release list). */
+static const char *effective_root(const char *root) {
+  if (root && root[0]) return root;
   const char *e = hub_update_env_base();
   return e ? e : HUB_UPDATE_BASE;
+}
+
+/* The bots' release root, for reading their manifest (roll-up stepping and
+ * the console's release list).  IRCHUB_BOT_RELEASE_BASE repoints it, but only
+ * alongside IRCHUB_UPDATE_BASE — the same sandbox gate as the test key — so
+ * a production hub always reads the compiled-in tree. */
+const char *hub_update_bot_root(void) {
+#ifdef IRC_TEST_HOOKS
+  const char *b = getenv("IRCHUB_BOT_RELEASE_BASE");
+  if (hub_update_env_base() && b && b[0]) return b;
+#endif
+  return HUB_BOT_RELEASE_BASE;
 }
 
 static bool validate_url(const char *url) {
@@ -470,14 +484,16 @@ static bool sanitize_filename(const char *input, char *out, size_t out_size) {
 static char *fetch_verified_manifest(const char *base, const char **err) {
   *err = NULL;
 
-  /* Pinned key, unless the local-source override is active AND a test key is
-   * provided (sandbox only): IRCHUB_UPDATE_PUBKEY is honored solely when
-   * IRCHUB_UPDATE_BASE is set, so production always uses the compiled key. */
+  /* Pinned key.  Only a test-hooks build (see hub_update_env_base) takes a
+   * throwaway key from IRCHUB_UPDATE_PUBKEY, and only alongside
+   * IRCHUB_UPDATE_BASE. */
   const char *pubkey_b64 = HUB_UPDATE_PUBKEY_B64;
+#ifdef IRC_TEST_HOOKS
   if (hub_update_env_base()) {
     const char *ep = getenv("IRCHUB_UPDATE_PUBKEY");
     if (ep && ep[0]) pubkey_b64 = ep;
   }
+#endif
   if (pubkey_b64[0] == '\0') {
     *err = "hub updater disabled (no signing key configured)";
     return NULL;
@@ -728,9 +744,8 @@ static bool can_take_local(const char *target_ver, const char *want_variant,
 
 /* <root>/<variant> for a hub release tree, or false when it does not fit or
  * carries anything that could split a URL or a shell word. */
-static bool release_tree(const char *base, const char *variant, char *out,
-                         size_t out_size) {
-  const char *root = effective_root(base);
+static bool release_tree(const char *variant, char *out, size_t out_size) {
+  const char *root = effective_root(NULL);
   if (strlen(root) >= 512 || strpbrk(root, ";|&`$ \t\r\n")) return false;
   if (!variant || !variant[0] || strlen(variant) > 7 ||
       strpbrk(variant, "/;|&`$ \t\r\n"))
@@ -746,7 +761,7 @@ static bool release_tree(const char *base, const char *variant, char *out,
  * abort, so the question is asked in full up front.  `min_from` is what the
  * driving hub sent; an empty or "*" value means the manifest decides. */
 bool hub_update_can_take(const char *target_ver, const char *variant,
-                         const char *min_from, const char *base, char *reason,
+                         const char *min_from, char *reason,
                          size_t reason_size) {
   if (reason && reason_size) reason[0] = '\0';
   const char *want_variant =
@@ -755,13 +770,10 @@ bool hub_update_can_take(const char *target_ver, const char *variant,
     return false;
 
   char tree[600];
-  if (!release_tree(base, want_variant, tree, sizeof(tree))) {
+  if (!release_tree(want_variant, tree, sizeof(tree))) {
     snprintf(reason, reason_size, "rejected malformed manifest base or variant");
     return false;
   }
-  /* A run's base travels the way the operator's override does, so artifact
-   * URLs under it validate here exactly as they will at COMMIT. */
-  if (base && base[0]) setenv("IRCHUB_UPDATE_BASE", base, 1);
   const char *verr = NULL;
   g_fetch_quick = HUB_UPDATE_QUICK_TIMEOUT;
   char *manifest = fetch_verified_manifest(tree, &verr);
@@ -781,7 +793,7 @@ bool hub_update_can_take(const char *target_ver, const char *variant,
     const char *other = strcmp(want_variant, "c") == 0 ? "rs" : "c";
     char otree[600], why_other[320];
     if (strncmp(reason, "this CPU lacks ", 15) == 0 &&
-        release_tree(base, other, otree, sizeof(otree))) {
+        release_tree(other, otree, sizeof(otree))) {
       g_fetch_quick = HUB_UPDATE_QUICK_TIMEOUT;
       char *om = fetch_verified_manifest(otree, &verr);
       g_fetch_quick = 0;
@@ -1132,7 +1144,7 @@ static bool write_upgrade_script(const hub_state_t *state, const char *kind,
  * replaced and reports in after the restart. */
 bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
                        const char *target_ver, const char *variant,
-                       const char *base, const char **err) {
+                       const char **err) {
   *err = NULL;
   if (!state || !upgrade_id || !target_ver) {
     *err = "malformed upgrade command";
@@ -1157,7 +1169,7 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
   /* The driving hub names the release tree ROOT; the variant picks the
    * subtree.  That is what lets one run leave each node on its own kind of
    * build — and lets an admin move a hub from the C build to the Rust one. */
-  const char *root = effective_root(base);
+  const char *root = effective_root(NULL);
   if (strlen(root) >= 512 || strpbrk(root, ";|&`$ \t\r\n")) {
     *err = "rejected malformed manifest base";
     return false;
@@ -1168,9 +1180,6 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
     *err = "manifest base too long";
     return false;
   }
-  /* Hand the base on the way the operator's override travels, so validate_url
-   * accepts artifact URLs under it and a local tree needs nothing else. */
-  if (base && base[0]) setenv("IRCHUB_UPDATE_BASE", base, 1);
 
   hub_log_info("[UPGRADE] Commit %s: %s -> %s (variant %s)\n", upgrade_id,
           HUB_VERSION, target_ver, want_variant);
@@ -1225,11 +1234,14 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
 
   /* Run the NEW binary's -selftest before anything is swapped: CPU, libraries
    * and this very config, checked by the build that would have to run on
-   * them.  A target older than -selftest would take the flag for a normal
-   * start, so it is never run; a source build is checked by the script. */
-  bool can_selftest =
-      hub_update_version_cmp(target_ver, UPGRADE_SELFTEST_MIN_HUB) >= 0;
-  if (can_selftest && strcasecmp(row.kind, "bin") == 0) {
+   * them; a source build is checked by the script.  A target older than
+   * MESH_MIN_VERSION cannot read this config (PBKDF2 600k) at all. */
+  if (hub_update_version_cmp(target_ver, MESH_MIN_VERSION) < 0) {
+    remove(archive);
+    *err = "target predates " MESH_MIN_VERSION " and cannot read this config";
+    return false;
+  }
+  if (strcasecmp(row.kind, "bin") == 0) {
     static char st_err[320];
     if (!staged_selftest(archive, st_err, sizeof(st_err))) {
       remove(archive);
@@ -1267,7 +1279,7 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
   /* From here a failure is the script's to handle: it restores <exe>.prev and
    * restarts the old build rather than leaving this hub with no binary. */
   if (!hub_upgrade_marker_write(upgrade_id, target_ver, want_variant) ||
-      !write_upgrade_script(state, row.kind, archive, prev_exe, can_selftest)) {
+      !write_upgrade_script(state, row.kind, archive, prev_exe, true)) {
     remove(HUB_UPGRADE_MARKER_FILE);
     rename(prev_exe, state->executable_path);
     remove(prev_cfg);
@@ -1296,7 +1308,7 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
  * or a peer hub — so the host arch/libc filter is deliberately not applied:
  * the node itself picks the artifact when it commits.  Returns the highest
  * version `cur_ver` may take right now on the way to `target_ver`. */
-bool hub_update_next_step(const char *base, const char *variant,
+bool hub_update_next_step(const char *root, const char *variant,
                           const char *cur_ver, const char *target_ver,
                           char *out, size_t out_size, char *reason,
                           size_t reason_size) {
@@ -1308,7 +1320,7 @@ bool hub_update_next_step(const char *base, const char *variant,
   }
 
   char tree[600];
-  const char *root = (base && base[0]) ? base : HUB_UPDATE_BASE;
+  root = effective_root(root);
   const char *var = (variant && variant[0]) ? variant : hub_update_host_variant();
   if (snprintf(tree, sizeof(tree), "%s/%s", root, var) >= (int)sizeof(tree)) {
     snprintf(reason, reason_size, "release base URL too long");
@@ -1406,11 +1418,13 @@ int hub_update_check_cli(const char *variant) {
   return 1;
 }
 
-bool hub_update_next_step(const char *base, const char *variant,
+const char *hub_update_bot_root(void) { return HUB_BOT_RELEASE_BASE; }
+
+bool hub_update_next_step(const char *root, const char *variant,
                           const char *cur_ver, const char *target_ver,
                           char *out, size_t out_size, char *reason,
                           size_t reason_size) {
-  (void)base;
+  (void)root;
   (void)variant;
   (void)cur_ver;
   (void)target_ver;
@@ -1431,12 +1445,11 @@ int hub_update_list_releases(const char *root, const char *variant,
 }
 
 bool hub_update_can_take(const char *target_ver, const char *variant,
-                         const char *min_from, const char *base, char *reason,
+                         const char *min_from, char *reason,
                          size_t reason_size) {
   (void)target_ver;
   (void)variant;
   (void)min_from;
-  (void)base;
   if (reason && reason_size)
     snprintf(reason, reason_size, "hub built without curl support");
   return false;
@@ -1444,12 +1457,11 @@ bool hub_update_can_take(const char *target_ver, const char *variant,
 
 bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
                        const char *target_ver, const char *variant,
-                       const char *base, const char **err) {
+                       const char **err) {
   (void)state;
   (void)upgrade_id;
   (void)target_ver;
   (void)variant;
-  (void)base;
   *err = "hub built without curl support";
   return false;
 }

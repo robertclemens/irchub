@@ -33,12 +33,8 @@ void hub_get_config_pass(const hub_state_t *s, char *out, size_t len) {
 }
 
 /* ---- a|/o| user record codec (docs/passwordless.md §3.1) ----
- *   new     uuid|name|pubkey|add/del|last_seen|ts|<reserved, empty>
- *   legacy  uuid|name|password|add/del|last_seen|ts[|pubkey]
- * Field 3 decides.  A valid key there means the new format; anything else is
- * a legacy password, which is never copied anywhere, and the key (if any) is
- * field 7.  Covers every older shape, including an old hub that stored a
- * pubkey in the password slot. */
+ *   uuid|name|pubkey|add/del|last_seen|ts|<reserved, empty>
+ * pubkey may be empty (a user not given a key yet). */
 static int split_fields(const char *s, const char **f, size_t *fl, int max) {
   int n = 0;
   while (n < max) {
@@ -50,6 +46,35 @@ static int split_fields(const char *s, const char **f, size_t *fl, int max) {
     s = bar + 1;
   }
   return n;
+}
+
+/* A multi-step path as one comma-separated field ("2.5.0,2.5.1"). */
+/* `path` is a char[n][64] passed flat, so a const plan needs no cast */
+static void plan_path_join(const char *path, int n, char *out, size_t cap) {
+  size_t o = 0;
+  out[0] = '\0';
+  for (int i = 0; i < n; i++) {
+    int w = snprintf(out + o, cap - o, "%s%s", i ? "," : "", path + (size_t)i * 64);
+    if (w < 0 || (size_t)w >= cap - o) break;
+    o += (size_t)w;
+  }
+}
+
+static bool plan_path_split(const char *s, size_t len, char path[][64],
+                            int *n) {
+  *n = 0;
+  size_t i = 0;
+  while (i < len) {
+    size_t j = i;
+    while (j < len && s[j] != ',') j++;
+    if (j == i || j - i >= 64 || *n >= MAX_UPGRADE_STEPS) return false;
+    memcpy(path[*n], s + i, j - i);
+    path[*n][j - i] = '\0';
+    if (!hub_upgrade_plan_field_ok(path[*n])) return false;
+    (*n)++;
+    i = j + 1;
+  }
+  return true;
 }
 
 static bool is_uuid_field(const char *s, size_t len) {
@@ -99,23 +124,18 @@ bool hub_parse_opt_value(const char *v, char flags[MAX_OPT_FLAGS + 1],
   return true;
 }
 
-bool hub_parse_user_record(const char *data, char type, hub_user_record_t *out,
-                           bool *legacy) {
+bool hub_parse_user_record(const char *data, char type, hub_user_record_t *out) {
   const char *f[8];
   size_t fl[8];
   memset(out, 0, sizeof(*out));
-  if (legacy) *legacy = false;
   int nf = split_fields(data, f, fl, 8);
   if (nf < 6 || !is_uuid_field(f[0], fl[0])) return false;
   if (fl[1] == 0 || fl[1] >= sizeof(out->name)) return false;
   memcpy(out->uuid, f[0], 36);
   memcpy(out->name, f[1], fl[1]);
-  if (field_pubkey(f[2], fl[2], out->pubkey_b64)) {
+  if (fl[2] > 0) {
+    if (!field_pubkey(f[2], fl[2], out->pubkey_b64)) return false;
     out->has_pubkey = true;
-  } else {
-    if (legacy) *legacy = true;
-    if (nf >= 7 && field_pubkey(f[6], fl[6], out->pubkey_b64))
-      out->has_pubkey = true;
   }
   out->type = type;
   out->is_active = (fl[3] == 3 && strncmp(f[3], "add", 3) == 0);
@@ -124,15 +144,8 @@ bool hub_parse_user_record(const char *data, char type, hub_user_record_t *out,
   return true;
 }
 
-int hub_format_user_record(const hub_user_record_t *u, bool legacy_v1,
-                           char *buf, size_t len) {
+int hub_format_user_record(const hub_user_record_t *u, char *buf, size_t len) {
   const char *pk = u->has_pubkey ? u->pubkey_b64 : "";
-  if (legacy_v1)
-    /* Old bots read field 3 as a ~A1 password: leave it EMPTY so they refuse
-     * every admin command (fail closed); they still get the key in field 7. */
-    return snprintf(buf, len, "%c|%s|%s||%s|%ld|%ld|%s\n", u->type, u->uuid,
-                    u->name, u->is_active ? "add" : "del", (long)u->last_seen,
-                    (long)u->timestamp, pk);
   return snprintf(buf, len, "%c|%s|%s|%s|%s|%ld|%ld|\n", u->type, u->uuid,
                   u->name, pk, u->is_active ? "add" : "del",
                   (long)u->last_seen, (long)u->timestamp);
@@ -172,9 +185,6 @@ void hub_config_write(hub_state_t *state) {
   SAFE_WRITE("bind_ip|%s\n", state->bind_ip[0] ? state->bind_ip : "127.0.0.1");
   SAFE_WRITE("uuid|%s\n", state->hub_uuid[0] ? state->hub_uuid : "");
   SAFE_WRITE("hub_name|%s\n", state->hub_friendly_name[0] ? state->hub_friendly_name : "");
-  /* No 'admin|' line is written: admins authenticate with the public keys in
-   * their a| records.  Existing files that carry an admin| line are silently
-   * ignored at load time. */
   /* Persist Lamport seq so it survives restart and stays monotonic. */
   SAFE_WRITE("lamport_seq|%llu\n", (unsigned long long)state->next_lamport_seq);
 
@@ -223,8 +233,9 @@ void hub_config_write(hub_state_t *state) {
   }
 
   /* The roll-up plan (upgrade plan, Task 13): hub-local, never replicated.
-   * rollup|target|variant|kind|min_from|hub_target|plan_set|base|hub_base —
-   * every field was checked free of '|' and line breaks before it was
+   * rollup|target|variant|kind|min_from|hub_target|plan_set|| — the two
+   * trailing slots once held run bases (gone in 2.5.1) and stay empty so a
+   * rolled-back 2.5.0 still reads the line.  Every field was checked free of '|' and line breaks before it was
    * accepted (hub_upgrade_plan_field_ok), and is checked again here, so the
    * line can never split or inject another. */
   {
@@ -233,12 +244,36 @@ void hub_config_write(hub_state_t *state) {
         hub_upgrade_plan_field_ok(r->variant) &&
         hub_upgrade_plan_field_ok(r->kind) &&
         hub_upgrade_plan_field_ok(r->min_from) &&
-        hub_upgrade_plan_field_ok(r->hub_target) &&
-        hub_upgrade_plan_field_ok(r->base) &&
-        hub_upgrade_plan_field_ok(r->hub_base)) {
-      SAFE_WRITE("rollup|%s|%s|%s|%s|%s|%lld|%s|%s\n", r->target, r->variant,
-                 r->kind, r->min_from, r->hub_target, (long long)r->plan_set,
-                 r->base, r->hub_base);
+        hub_upgrade_plan_field_ok(r->hub_target)) {
+      SAFE_WRITE("rollup|%s|%s|%s|%s|%s|%lld||\n", r->target, r->variant,
+                 r->kind, r->min_from, r->hub_target, (long long)r->plan_set);
+    }
+  }
+
+  /* A multi-step upgrade this hub drives (hub-local, never replicated):
+   * uplan|bot_target|hub_target|variant|kind|step|run_id|started|progressed|
+   *       bot_from|hub_from|bot_path|hub_path|sel
+   * The hub restarts onto each step itself; this line is how it carries on.
+   * Every field passed hub_upgrade_plan_field_ok when it was set and is
+   * checked again here, so the line can never split or inject another. */
+  {
+    const upgrade_plan_t *pl = &state->plan;
+    if (pl->active && hub_upgrade_plan_field_ok(pl->bot_target) &&
+        hub_upgrade_plan_field_ok(pl->hub_target) &&
+        hub_upgrade_plan_field_ok(pl->variant) &&
+        hub_upgrade_plan_field_ok(pl->kind) &&
+        hub_upgrade_plan_field_ok(pl->run_id) &&
+        hub_upgrade_plan_field_ok(pl->bot_from) &&
+        hub_upgrade_plan_field_ok(pl->hub_from) &&
+        hub_upgrade_plan_field_ok(pl->sel)) {
+      char bp[MAX_UPGRADE_STEPS * 65], hp[MAX_UPGRADE_STEPS * 65];
+      plan_path_join(&pl->bot_path[0][0], pl->bot_steps, bp, sizeof(bp));
+      plan_path_join(&pl->hub_path[0][0], pl->hub_steps, hp, sizeof(hp));
+      SAFE_WRITE("uplan|%s|%s|%s|%s|%d|%s|%lld|%lld|%s|%s|%s|%s|%s\n",
+                 pl->bot_target, pl->hub_target, pl->variant, pl->kind,
+                 pl->step, pl->run_id, (long long)pl->started,
+                 (long long)pl->progressed, pl->bot_from, pl->hub_from, bp, hp,
+                 pl->sel);
     }
   }
 
@@ -307,6 +342,13 @@ void hub_config_write(hub_state_t *state) {
                    (long)state->global_entries[i].last_used);
     }
   }
+  /* K|: what the bots saw on IRC, after the c| lines it needs at load. */
+  for (int i = 0; i < state->chan_learned_count; i++) {
+    char ll[K_LINE_MAX];
+    if (hub_learned_format(&state->chan_learned[i], ll, sizeof(ll)) > 0)
+      SAFE_WRITE("%s", ll);
+    secure_wipe(ll, sizeof(ll));
+  }
 
   // Local IP access lists: w|<pattern>|<added> (allow), x|... (deny)
   for (int i = 0; i < state->ip_allow_count; i++)
@@ -325,7 +367,7 @@ void hub_config_write(hub_state_t *state) {
   for (int i = 0; i < state->user_record_count; i++) {
     hub_user_record_t *u = &state->user_records[i];
     char uline[USER_LINE_MAX];
-    int ul = hub_format_user_record(u, false, uline, sizeof(uline));
+    int ul = hub_format_user_record(u, uline, sizeof(uline));
     if (ul <= 0 || ul >= (int)sizeof(uline)) { overflow = true; break; }
     SAFE_WRITE("%s", uline);
   }
@@ -519,7 +561,7 @@ static bool load_ip_acl_line(hub_state_t *state, char list, char *v, bool consol
 
 // FIXED: Use PBKDF2 and improved error handling
 bool hub_config_load(hub_state_t *state, const char *password) {
-  int cfg_legacy_users = 0;  /* password-era a|/o| lines or a p| line seen */
+  int cfg_bad_users = 0;     /* a|/o| lines that did not parse */
   int cfg_acl_fixed = 0;     /* w|/x| lines dropped, merged or canonicalised */
   struct stat cfg_st;
   if (stat(HUB_CONFIG_FILE, &cfg_st) == 0) {
@@ -582,20 +624,12 @@ bool hub_config_load(hub_state_t *state, const char *password) {
     return false;
   }
 
-  /* Current PBKDF2 count first, then the pre-2.5.0 count for a one-time
-   * migration: a legacy hit is rewritten under the current count below
-   * (never under -selftest, which must not touch the running build's file). */
   int plain_len = -1;
-  bool kdf_legacy = false;
-  for (int kdf = 0; kdf < 2 && plain_len < 0; kdf++) {
-    unsigned char key[32];
-    if (PKCS5_PBKDF2_HMAC(password, (int)strlen(password), salt, SALT_SIZE,
-                          kdf == 0 ? PBKDF2_ITERATIONS : PBKDF2_ITERATIONS_LEGACY,
-                          EVP_sha256(), 32, key) != 1) {
-      hub_log_error("[HUB] PBKDF2 failed\n");
-      secure_wipe(key, sizeof(key));
-      break;
-    }
+  unsigned char key[32];
+  if (PKCS5_PBKDF2_HMAC(password, (int)strlen(password), salt, SALT_SIZE,
+                        PBKDF2_ITERATIONS, EVP_sha256(), 32, key) != 1) {
+    hub_log_error("[HUB] PBKDF2 failed\n");
+  } else {
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (ctx) {
       int pl = 0, fl = 0;
@@ -604,7 +638,6 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag) == 1 &&
           EVP_DecryptFinal_ex(ctx, plaintext + pl, &fl) > 0) {
         plain_len = pl + fl;
-        kdf_legacy = (kdf == 1);
       } else {
         /* Partial plaintext may have been written by EVP_DecryptUpdate before
          * the GCM tag check failed. Wipe it so unverified data doesn't
@@ -613,11 +646,12 @@ bool hub_config_load(hub_state_t *state, const char *password) {
       }
       EVP_CIPHER_CTX_free(ctx);
     }
-    secure_wipe(key, sizeof(key));
   }
+  secure_wipe(key, sizeof(key));
   free(ciphertext);
   if (plain_len < 0) {
-    hub_log_error("[HUB] Config decryption failed (wrong password or corrupted file)\n");
+    hub_log_error("[HUB] Config decryption failed (wrong password, corrupted file, or "
+                  "written before 2.5.0: run 2.5.0 once)\n");
     free(plaintext);
     return false;
   }
@@ -652,11 +686,6 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         if (v && v[0]) {
           snprintf(state->hub_friendly_name, sizeof(state->hub_friendly_name), "%s", v);
         }
-      } else if (strcmp(k, "admin") == 0) {
-        /* Legacy 'admin|' line ignored (global admin password dropped in
-         * favour of per-admin records). Old configs simply lose this field
-         * on the next save; admins must already exist as a| records. */
-        (void)v;
       } else if (strcmp(k, "log_level") == 0) {
         long lv = strtol(v, NULL, 10);
         state->log_level = (int)(lv < LOG_NONE ? LOG_NONE
@@ -705,7 +734,8 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         }
       } else if (strcmp(k, "rollup") == 0) {
         /* rollup|target|variant|kind|min_from|hub_target|plan_set|base|hub_base
-         * — see hub_config_write.  A line that does not parse cleanly is
+         * — see hub_config_write; the two base slots are read past and
+         * ignored.  A line that does not parse cleanly is
          * dropped whole: no plan is better than half of one. */
         const char *f[9];
         size_t fl[9];
@@ -715,7 +745,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
             {r->target, sizeof(r->target)},     {r->variant, sizeof(r->variant)},
             {r->kind, sizeof(r->kind)},         {r->min_from, sizeof(r->min_from)},
             {r->hub_target, sizeof(r->hub_target)}, {NULL, 0},
-            {r->base, sizeof(r->base)},         {r->hub_base, sizeof(r->hub_base)}};
+            {NULL, 0},                          {NULL, 0}};
         bool ok = (n == 8 && fl[0] > 0);
         for (int i = 0; ok && i < 8; i++) {
           if (!out[i].dst) continue;
@@ -734,6 +764,52 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           memset(r, 0, sizeof(*r));
           hub_log_warning("[CONFIG] Ignoring a malformed rollup| line\n");
         }
+      } else if (strcmp(k, "uplan") == 0) {
+        /* See hub_config_write.  Dropped whole when it does not parse: no
+         * plan is better than half of one, and the admin can start again. */
+        const char *f[13];
+        size_t fl[13];
+        int n = split_fields(v, f, fl, 13);
+        upgrade_plan_t *pl = &state->plan;
+        memset(pl, 0, sizeof(*pl));
+        struct { char *dst; size_t cap; } out[13] = {
+            {pl->bot_target, sizeof(pl->bot_target)},
+            {pl->hub_target, sizeof(pl->hub_target)},
+            {pl->variant, sizeof(pl->variant)},
+            {pl->kind, sizeof(pl->kind)},
+            {NULL, 0},
+            {pl->run_id, sizeof(pl->run_id)},
+            {NULL, 0},
+            {NULL, 0},
+            {pl->bot_from, sizeof(pl->bot_from)},
+            {pl->hub_from, sizeof(pl->hub_from)},
+            {NULL, 0},
+            {NULL, 0},
+            {pl->sel, sizeof(pl->sel)}};
+        bool ok = (n == 13 && fl[0] > 0);
+        for (int i = 0; ok && i < 13; i++) {
+          if (!out[i].dst) continue;
+          if (fl[i] >= out[i].cap) ok = false;
+          else {
+            memcpy(out[i].dst, f[i], fl[i]);
+            out[i].dst[fl[i]] = '\0';
+            ok = hub_upgrade_plan_field_ok(out[i].dst);
+          }
+        }
+        if (ok)
+          ok = plan_path_split(f[10], fl[10], pl->bot_path, &pl->bot_steps) &&
+               plan_path_split(f[11], fl[11], pl->hub_path, &pl->hub_steps);
+        long long step = ok ? strtoll(f[4], NULL, 10) : -1;
+        int steps = pl->bot_steps > pl->hub_steps ? pl->bot_steps : pl->hub_steps;
+        if (ok && step >= 0 && step < steps) {
+          pl->step = (int)step;
+          pl->started = (time_t)strtoll(f[6], NULL, 10);
+          pl->progressed = (time_t)strtoll(f[7], NULL, 10);
+          pl->active = true;
+        } else {
+          memset(pl, 0, sizeof(*pl));
+          hub_log_warning("[CONFIG] Ignoring a malformed uplan| line\n");
+        }
       } else if (strcmp(k, "lamport_seq") == 0) {
         unsigned long long loaded_seq = 0;
         sscanf(v, "%llu", &loaded_seq);
@@ -750,8 +826,8 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           memcpy(state->hub_x25519_priv,  d + 32, 32);
           state->hub_keys_loaded = true;
         } else if (d) {
-          hub_log_error("[HUB] Hub private key in config is not 64 bytes "
-                  "(legacy RSA?). Re-run -setup with a Curve25519 key.\n");
+          hub_log_error("[HUB] Hub private key in config is not 64 bytes. "
+                  "Re-run -setup with a Curve25519 key.\n");
         }
         if (d) { secure_wipe(d, (size_t)out); free(d); }
       } else if (strcmp(k, "pub") == 0) {
@@ -763,68 +839,43 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         }
         if (d) free(d);
       } else if (strcmp(k, "peer") == 0) {
-        /* Formats accepted:
-         *   peer|ip|port                                 (oldest)
-         *   peer|ip|port|uuid|friendly_name              (v1)
-         *   peer|ip|port|uuid|friendly_name|pubkey_b64   (v2; pubkey may be empty)
-         */
-        char *ip = v;
-        char *port_str = strchr(ip, '|');
-        if (!port_str) port_str = strchr(ip, ':');
-
-        if (port_str && state->peer_count < MAX_PEERS) {
-          *port_str = 0;
-          port_str++;
-
-          char *uuid_str = strchr(port_str, '|');
-          if (uuid_str) {
-            *uuid_str = 0;
-            uuid_str++;
-
-            char *name_str = strchr(uuid_str, '|');
-            char *pubkey_str = NULL;
-            if (name_str) {
-              *name_str = 0;
-              name_str++;
-              pubkey_str = strchr(name_str, '|');
-              if (pubkey_str) { *pubkey_str = 0; pubkey_str++; }
+        /* peer|ip|port|uuid|friendly_name|pubkey_b64 (pubkey may be empty) */
+        char *f[5] = {0};
+        int nf = 0;
+        for (char *c = v; nf < 5; nf++) {
+          f[nf] = c;
+          char *bar = strchr(c, '|');
+          if (!bar) { nf++; break; }
+          *bar = 0;
+          c = bar + 1;
+        }
+        if (nf < 4 || !f[2][0]) {
+          hub_log_warning("[CONFIG] Ignoring malformed peer line\n");
+        } else if (state->peer_count < MAX_PEERS) {
+          hub_peer_config_t *p = &state->peers[state->peer_count];
+          memset(p, 0, sizeof(*p));
+          snprintf(p->ip, sizeof(p->ip), "%s", f[0]);
+          p->port = atoi(f[1]);
+          snprintf(p->uuid, sizeof(p->uuid), "%s", f[2]);
+          if (f[3][0])
+            snprintf(p->friendly_name, sizeof(p->friendly_name), "%s", f[3]);
+          p->has_pubkey = false;
+          if (nf >= 5 && f[4][0]) {
+            int dec_len = 0;
+            unsigned char *dec = base64_decode(f[4], &dec_len);
+            if (dec && dec_len == COMBINED_KEY_LEN) {
+              memcpy(p->ed_pub,     dec,                   ED25519_KEY_LEN);
+              memcpy(p->x25519_pub, dec + ED25519_KEY_LEN, X25519_KEY_LEN);
+              p->has_pubkey = true;
+            } else {
+              hub_log_warning("[PEER] peer %s pubkey wrong length (%d, need %d) — "
+                      "ignoring; v2 auth disabled for this peer\n",
+                      p->uuid, dec_len, COMBINED_KEY_LEN);
             }
-
-            hub_peer_config_t *p = &state->peers[state->peer_count];
-            snprintf(p->ip, sizeof(p->ip), "%s", ip);
-            p->port = atoi(port_str);
-            snprintf(p->uuid, sizeof(p->uuid), "%s", uuid_str);
-
-            if (name_str && name_str[0])
-              snprintf(p->friendly_name, sizeof(p->friendly_name), "%s", name_str);
-
-            p->has_pubkey = false;
-            if (pubkey_str && pubkey_str[0]) {
-              int dec_len = 0;
-              unsigned char *dec = base64_decode(pubkey_str, &dec_len);
-              if (dec && dec_len == COMBINED_KEY_LEN) {
-                memcpy(p->ed_pub,     dec,                   ED25519_KEY_LEN);
-                memcpy(p->x25519_pub, dec + ED25519_KEY_LEN, X25519_KEY_LEN);
-                p->has_pubkey = true;
-              } else {
-                hub_log_warning("[PEER] peer %s pubkey wrong length (%d, need %d) — "
-                        "ignoring; v2 auth disabled for this peer\n",
-                        p->uuid, dec_len, COMBINED_KEY_LEN);
-              }
-              if (dec) { secure_wipe(dec, (size_t)(dec_len > 0 ? dec_len : 0)); free(dec); }
-            }
-
-            p->fd = -1;
-            state->peer_count++;
-          } else {
-            // Old format: peer|ip|port (for backward compatibility)
-            hub_peer_config_t *p = &state->peers[state->peer_count];
-            snprintf(p->ip, sizeof(p->ip), "%s", ip);
-            p->port = atoi(port_str);
-            p->fd = -1;
-            p->has_pubkey = false;
-            state->peer_count++;
+            if (dec) { secure_wipe(dec, (size_t)(dec_len > 0 ? dec_len : 0)); free(dec); }
           }
+          p->fd = -1;
+          state->peer_count++;
         }
       } else if (strcmp(k, "b") == 0) {
         char *s2 = strchr(v, '|');
@@ -935,26 +986,21 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           }
         }
       }
-      // Handle a| o| m| lines (new typed arrays) and legacy c|/p| global entries
+      // Handle a| o| m| lines (typed arrays)
       else if (strcmp(k, "a") == 0 || strcmp(k, "o") == 0) {
-        /* hub_parse_user_record: new uuid|name|pubkey|act|seen|ts| or the
-         * legacy password shape (password dropped).  The pre-UUID global
-         * admin-password shape a|<password>|<ts> is ignored outright. */
+        /* hub_parse_user_record: uuid|name|pubkey|act|seen|ts| */
         if (state->user_record_count < MAX_HUB_USER_RECORDS) {
           hub_user_record_t *u = &state->user_records[state->user_record_count];
-          bool legacy = false;
-          if (hub_parse_user_record(v, k[0], u, &legacy)) {
+          if (hub_parse_user_record(v, k[0], u)) {
             state->user_record_count++;
-            if (legacy) cfg_legacy_users++;
           } else {
             memset(u, 0, sizeof(*u));
-            cfg_legacy_users++;  /* rewrite without the unparseable line */
+            hub_log_warning("[CONFIG] Ignoring malformed %s line\n", k);
+            cfg_bad_users++;  /* rewrite without the unparseable line */
           }
         }
       } else if (strcmp(k, "m") == 0) {
-        /* New format: uuid|mask|add/del|last_used|timestamp
-         * Old format: mask|add/del|timestamp
-         * Detect by UUID in first field. */
+        /* uuid|mask|add/del|last_used|timestamp */
         char first[40] = {0};
         char *pipe1 = strchr(v, '|');
         if (pipe1) {
@@ -1013,6 +1059,11 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           *s_ts = 0;
           hub_storage_put_record(state, k, v, (time_t)atoll(s_ts + 1));
         }
+      } else if (strcmp(k, "K") == 0) {
+        /* K|chan|key|modes|ts: kept only for a channel managed here (c| is
+         * written first); anything else is an orphan and stays behind. */
+        if (!hub_learned_ingest(state, v))
+          hub_log_debug("[CONFIG] Dropped K| line for a channel not managed here\n");
       } else if (strcmp(k, "bu") == 0) {
         /* bu|<#chan|*>|<mask>|<last_used>: a ban's last use, written right
          * after its B| line (activity, outside LWW).  No live ban: dropped. */
@@ -1024,9 +1075,6 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           long long lu = atoll(p2 + 1);
           if (slot && lu > (long long)*slot) *slot = (time_t)lu;
         }
-      } else if (strcmp(k, "p") == 0) {
-        /* Retired shared bot password: dropped (bots use public keys). */
-        cfg_legacy_users++;
       } else if (strcmp(k, "w") == 0 || strcmp(k, "x") == 0 ||
                  strcmp(k, "wc") == 0 || strcmp(k, "xc") == 0) {
         if (!load_ip_acl_line(state, k[0], v, k[1] == 'c'))
@@ -1165,27 +1213,14 @@ bool hub_config_load(hub_state_t *state, const char *password) {
     hub_access_prune(state);
     bool access_changed = state->uflag_record_count + state->uchan_record_count != access_before;
     access_changed |= hub_access_migrate(state) > 0;
-    /* Deleted bots from before the revoke list join it. */
-    int rv_new = hub_revoke_migrate(state);
-    if (rv_new > 0) {
-      hub_log_info("[REVOKE] %d deleted bot(s) added to the revoke list\n", rv_new);
-      access_changed = true;
-    }
     if (access_changed) {
       hub_config_write(state);
-    } else if (cfg_legacy_users > 0 || cfg_acl_fixed > 0 || kdf_legacy) {
-      /* Rewrite once so the passwords / p| line, IP-list lines that were
-       * dropped or canonicalised, and a pre-2.5.0 PBKDF2 count leave the
-       * file for good. */
+    } else if (cfg_bad_users > 0 || cfg_acl_fixed > 0) {
+      /* Rewrite once so unparseable user lines and IP-list lines that were
+       * dropped or canonicalised leave the file for good. */
       hub_config_write(state);
     }
   }
-  if (kdf_legacy && !g_hub_config_readonly)
-    hub_log_info("[HUB] Config re-encrypted with PBKDF2 %dk (was %dk)\n",
-                 PBKDF2_ITERATIONS / 1000, PBKDF2_ITERATIONS_LEGACY / 1000);
-  if (cfg_legacy_users > 0)
-    hub_log_info("[HUB] Config migrated to passwordless records (%d legacy "
-            "line(s)); passwords dropped\n", cfg_legacy_users);
   for (int i = 0; i < state->user_record_count; i++) {
     const hub_user_record_t *u = &state->user_records[i];
     if (u->is_active && !u->has_pubkey)

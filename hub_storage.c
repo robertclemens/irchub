@@ -314,6 +314,11 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
     return false;
   }
 
+  if (!hub_global_value_active(combined_value) && hub_purge_floor_blocks(state, ts)) {
+    hub_log_debug("[STORAGE] Global %s=%s: tombstone ts=%ld older than the last purge: "
+                  "not re-created\n", key, value, (long)ts);
+    return false;
+  }
   if (global_room(state, key)) {
     hub_log_debug("[STORAGE] Global %s=%s: NEW entry ts=%ld\n", key, value, (long)ts);
     config_entry_t *e = &state->global_entries[state->global_entry_count++];
@@ -363,6 +368,15 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
       if (strcmp(state->bots[i].uuid, uuid) == 0) b = &state->bots[i];
     if (!b && strcmp(key, "d") != 0) return false;
   }
+  /* A deleted bot purged here is not re-created from a sync built before the
+   * purge (a revoked one can only come back through its d entry). */
+  if (strcmp(key, "d") == 0 && value && strcmp(value, "1") == 0 &&
+      hub_purge_floor_blocks(state, ts)) {
+    bool known = false;
+    for (int i = 0; i < state->bot_count && !known; i++)
+      known = strcmp(state->bots[i].uuid, uuid) == 0;
+    if (!known) return false;
+  }
   bool ok = storage_update_entry(state, uuid, key, value, extra, op, ts);
   if (!ok || !per_bot) return ok;
   if (!b)
@@ -380,11 +394,10 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
                                  const char *key, const char *value,
                                  const char *extra, const char *op, time_t ts) {
 
-  /* Retired password-era keys (docs/passwordless.md §3.3): the shared bot
-   * password 'p' and the legacy global admin password 'a' are never stored
-   * again, whichever path (delta, push, sync, load) offers them. */
+  /* Keys no writer may store as plain entries, whichever path (delta,
+   * push, sync, load) offers them. */
   if (strcmp(key, "p") == 0 || strcmp(key, "a") == 0) {
-    hub_log_warning("[STORAGE] REJECTED retired key '%s' (passwordless)\n", key);
+    hub_log_warning("[STORAGE] REJECTED unknown key '%s'\n", key);
     return false;
   }
 
@@ -662,13 +675,7 @@ bool hub_storage_delete(hub_state_t *state, const char *uuid, time_t *ts_out) {
 // Does NOT include "b|uuid|" prefix for global items, preserving protocol
 // compatibility
 void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
-                              int bot_proto, char *buffer, int max_len) {
-  const bool proto_v2 = bot_proto >= BOT_PROTO_PASSWORDLESS;
-  /* Below BOT_PROTO_USER_FLAGS the bot does not know uf| / uc| (plan §3.2):
-   * users are re-stamped, a restricted one is a tombstone (a v2 bot, whose
-   * protocol we know) or left out (an older or not-yet-known one), and its
-   * masks and the access lines are not sent. */
-  const bool flags_ok = bot_proto >= BOT_PROTO_USER_FLAGS;
+                              char *buffer, int max_len) {
   int offset = 0;
   int written;
   buffer[0] = 0;
@@ -688,17 +695,13 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
       break;
     offset += written;
   }
+  // K|: what the bots saw on IRC, after the c| lines it hangs off.
+  hub_learned_append(state, buffer, max_len, &offset);
 
-  // 1a. Named admin/oper records.  A v2 (passwordless) bot gets
-  //     uuid|name|pubkey|act|seen|ts|; any other connection gets the legacy
-  //     shape with an EMPTY password slot, so an old bot refuses every admin
-  //     command instead of reading the public key as a password.
+  // 1a. Named admin/oper records: uuid|name|pubkey|act|seen|ts|
   for (int i = 0; i < state->user_record_count; i++) {
     hub_user_record_t *u = &state->user_records[i];
-    written = flags_ok ? hub_format_user_record(u, !proto_v2, buffer + offset,
-                                                (size_t)(max_len - offset))
-                       : hub_format_user_for_old(state, u, !proto_v2, proto_v2,
-                                                 buffer + offset, (size_t)(max_len - offset));
+    written = hub_format_user_record(u, buffer + offset, (size_t)(max_len - offset));
     if (written < 0 || written >= (max_len - offset)) break;
     offset += written;
   }
@@ -706,7 +709,6 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   // 1b. Add usermask records (new format: m| lines)
   for (int i = 0; i < state->mask_record_count; i++) {
     hub_mask_record_t *m = &state->mask_records[i];
-    if (!flags_ok && !hub_access_from_old_ok(state, m->uuid)) continue;
     written = snprintf(buffer + offset, (size_t)(max_len - offset),
                        "m|%s|%s|%s|%ld|%ld\n",
                        m->uuid, m->mask,
@@ -717,7 +719,7 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   }
 
   // 1b. Admin flags and oper channel bindings, after the users they name.
-  if (flags_ok) hub_access_append(state, buffer, max_len, &offset, NULL, NULL);
+  hub_access_append(state, buffer, max_len, &offset, NULL, NULL);
 
   // 1b. Add purge_days setting (allows bots to validate purge policies)
   // Format: pd|<days>|<timestamp>
@@ -766,14 +768,11 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   }
 
   // 3. Add OTHER bots as trusted-bot lines (for offline peer operation):
-  //    v2:     b|<hostmask>|<uuid>|<pubkey>|<ts>   (pubkey seals ~B2 traffic)
-  //    legacy: b|<hostmask>|<uuid>|<ts>
+  //    b|<hostmask>|<uuid>|<pubkey>|<ts>   (pubkey seals ~B2 traffic)
   //    ts = max(hostmask ts, pubkey ts) so a rekey alone is seen as newer.
-  //    v2 payloads end the list with T|<count>: the lines above are the whole
-  //    trusted set, so the bot drops every trusted bot they do not name (a
-  //    deleted or purged bot).  Without it a bot only ever added or updated
-  //    trust and a revoked bot kept ~B2 and op grants forever.  Bots that
-  //    predate the marker ignore the unknown line.
+  //    The list ends with T|<count>: the lines above are the whole trusted
+  //    set, so the bot drops every trusted bot they do not name (a deleted or
+  //    purged bot).  Without it a revoked bot kept ~B2 and op grants forever.
   int trusted_lines = 0;
   for (int i = 0; i < state->bot_count; i++) {
     if (strcmp(state->bots[i].uuid, uuid) == 0)
@@ -789,27 +788,20 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
     }
     if (!h) continue;
     long ts = (long)h->timestamp;
-    if (proto_v2) {
-      unsigned char raw[COMBINED_KEY_LEN];
-      bool key_ok = pub && hub_crypto_pubkey_b64_decode(pub->value, raw);
-      if (key_ok && (long)pub->timestamp > ts) ts = (long)pub->timestamp;
-      written = snprintf(buffer + offset, (size_t)(max_len - offset), "b|%s|%s|%s|%ld\n",
-                         h->value, b->uuid, key_ok ? pub->value : "", ts);
-    } else {
-      written = snprintf(buffer + offset, (size_t)(max_len - offset), "b|%s|%s|%ld\n",
-                         h->value, b->uuid, ts);
-    }
+    unsigned char raw[COMBINED_KEY_LEN];
+    bool key_ok = pub && hub_crypto_pubkey_b64_decode(pub->value, raw);
+    if (key_ok && (long)pub->timestamp > ts) ts = (long)pub->timestamp;
+    written = snprintf(buffer + offset, (size_t)(max_len - offset), "b|%s|%s|%s|%ld\n",
+                       h->value, b->uuid, key_ok ? pub->value : "", ts);
     if (written < 0 || written >= (max_len - offset))
       break;
     offset += written;
     trusted_lines++;
   }
-  if (proto_v2) {
-    written = snprintf(buffer + offset, (size_t)(max_len - offset), "T|%d\n",
-                       trusted_lines);
-    if (written > 0 && written < (max_len - offset))
-      offset += written;
-  }
+  written = snprintf(buffer + offset, (size_t)(max_len - offset), "T|%d\n",
+                     trusted_lines);
+  if (written > 0 && written < (max_len - offset))
+    offset += written;
 }
 
 /* ==========================================================================
@@ -1070,6 +1062,11 @@ bool hub_storage_put_record(hub_state_t *state, const char *key, const char *val
     return true;
   }
 
+  if (!in_active && hub_purge_floor_blocks(state, ts)) {
+    hub_log_debug("[STORAGE] %s| tombstone ts=%ld older than the last purge: not re-created\n",
+                  key, (long)ts);
+    return false;
+  }
   if (key[0] == 'B' && in_active) {
     char chan[MAX_CHAN];
     size_t cl = strcspn(value, "|");
@@ -1125,6 +1122,9 @@ int hub_chan_cascade_del(hub_state_t *state, const char *chan, time_t ts,
   int changed = 0;
   char out[8192];
   size_t off = 0;
+  /* What the bots saw goes with the channel: K| has no tombstone, and every
+   * hub drops it on the same c| del. */
+  hub_learned_drop(state, chan);
   for (int i = 0; i < state->global_entry_count; i++) {
     config_entry_t *e = &state->global_entries[i];
     char nv[sizeof(e->value)];
@@ -1175,4 +1175,163 @@ int hub_chan_cascade_del(hub_state_t *state, const char *chan, time_t ts,
     if (announce) state->bot_config_pending = true;
   }
   return changed;
+}
+
+/* ---- K|: learned channel state (docs/plans/2026-10-20_learned_state_purge_plan.md)
+ * One slot per live channel.  Existence is c|'s alone: a slot is written only
+ * while the channel is live and dropped with it, so a bot report that lands
+ * after a delete cannot bring the channel back. */
+static int learned_index(const hub_state_t *state, const char *chan) {
+  for (int i = 0; i < state->chan_learned_count; i++)
+    if (strcasecmp(state->chan_learned[i].chan, chan) == 0) return i;
+  return -1;
+}
+
+const hub_chan_learned_t *hub_learned_find(const hub_state_t *state, const char *chan) {
+  int i = chan ? learned_index(state, chan) : -1;
+  return i >= 0 ? &state->chan_learned[i] : NULL;
+}
+
+static bool learned_key_ok(const char *k) {
+  size_t n = strlen(k);
+  if (n >= MAX_KEY) return false;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)k[i];
+    if (c <= 0x20 || c == ',' || c == '|' || c >= 0x7f) return false;
+  }
+  return true;
+}
+
+bool hub_learned_put(hub_state_t *state, const char *chan, const char *key, int modes,
+                     time_t ts) {
+  if (!chan || !key || ts <= 0 || !rec_chan_ok(chan, false) || !learned_key_ok(key) ||
+      modes < 0 || (modes & ~K_MODES_MASK))
+    return false;
+  char name[MAX_CHAN];
+  if (!hub_chan_live(state, chan, name, sizeof(name))) return false;
+  int i = learned_index(state, name);
+  if (i >= 0) {
+    hub_chan_learned_t *l = &state->chan_learned[i];
+    if (ts < l->ts) return false;
+    if (ts == l->ts) {
+      char in[MAX_KEY + 16], cur[MAX_KEY + 16];
+      snprintf(in, sizeof(in), "%s|%d", key, modes);
+      snprintf(cur, sizeof(cur), "%s|%d", l->key, l->modes);
+      if (strcmp(in, cur) <= 0) return false;
+    }
+    snprintf(l->key, sizeof(l->key), "%s", key);
+    l->modes = modes;
+    l->ts = ts;
+    return true;
+  }
+  if (state->chan_learned_count >= MAX_CHANNELS) return false;
+  hub_chan_learned_t *l = &state->chan_learned[state->chan_learned_count++];
+  snprintf(l->chan, sizeof(l->chan), "%s", name);
+  snprintf(l->key, sizeof(l->key), "%s", key);
+  l->modes = modes;
+  l->ts = ts;
+  return true;
+}
+
+bool hub_learned_ingest(hub_state_t *state, const char *body) {
+  char buf[K_LINE_MAX];
+  if (!body || strlen(body) >= sizeof(buf)) return false;
+  snprintf(buf, sizeof(buf), "%s", body);
+  char *f[4];
+  char *p = buf;
+  for (int n = 0; n < 4; n++) {
+    f[n] = p;
+    char *bar = strchr(p, '|');
+    if (n < 3) {
+      if (!bar) return false;
+      *bar = '\0';
+      p = bar + 1;
+    } else if (bar) {
+      return false;
+    }
+  }
+  if (!rec_num_ok(f[2]) || strlen(f[2]) > 3 || !rec_num_ok(f[3])) return false;
+  return hub_learned_put(state, f[0], f[1], atoi(f[2]), (time_t)atoll(f[3]));
+}
+
+void hub_learned_drop(hub_state_t *state, const char *chan) {
+  int i = chan ? learned_index(state, chan) : -1;
+  if (i < 0) return;
+  secure_wipe(state->chan_learned[i].key, sizeof(state->chan_learned[i].key));
+  state->chan_learned[i] = state->chan_learned[--state->chan_learned_count];
+}
+
+int hub_learned_format(const hub_chan_learned_t *l, char *buf, size_t cap) {
+  int w = snprintf(buf, cap, "K|%s|%s|%d|%ld\n", l->chan, l->key, l->modes, (long)l->ts);
+  return (w < 0 || (size_t)w >= cap) ? -1 : w;
+}
+
+bool hub_learned_append(const hub_state_t *state, char *buf, int cap, int *off) {
+  for (int i = 0; i < state->chan_learned_count; i++) {
+    int w = hub_learned_format(&state->chan_learned[i], buf + *off, (size_t)(cap - *off));
+    if (w < 0) return false;
+    *off += w;
+  }
+  return true;
+}
+
+/* ---- Orphans and the purge floor ------------------------------------------ */
+int hub_purge_chan_orphans(hub_state_t *state,
+                           void (*note)(void *, const char *kind, const char *name,
+                                        time_t ts), void *arg) {
+  int gone = 0, n = state->global_entry_count;
+  /* Decide first (the index still matches the array), then compact. */
+  bool *drop = n > 0 ? calloc((size_t)n, sizeof(bool)) : NULL;
+  if (n > 0 && !drop) {
+    hub_log_error("[PURGE] calloc failed: orphan sweep skipped\n");
+    return 0;
+  }
+  for (int i = 0; i < n; i++) {
+    const config_entry_t *e = &state->global_entries[i];
+    bool is_c = e->key[0] == 'C' && !e->key[1], is_b = e->key[0] == 'B' && !e->key[1];
+    /* Live ones only: a tombstone is the purge's own business (its cutoff),
+     * and while it is young it is what stops an old add coming back. */
+    if (!(is_c || is_b) || !entry_active(e)) continue;
+    char chan[MAX_CHAN];
+    size_t cl = strcspn(e->value, "|");
+    if (cl >= sizeof(chan)) continue;
+    memcpy(chan, e->value, cl);
+    chan[cl] = '\0';
+    if ((is_b && strcmp(chan, "*") == 0) || hub_chan_live(state, chan, NULL, 0)) continue;
+    if (note) note(arg, is_c ? "chanset" : "ban", chan, e->timestamp);
+    drop[i] = true;
+    gone++;
+  }
+  if (gone) {
+    int o = 0;
+    for (int i = 0; i < n; i++) {
+      if (drop[i]) continue;
+      if (o != i) state->global_entries[o] = state->global_entries[i];
+      o++;
+    }
+    state->global_entry_count = o;
+    hub_global_reindex(state);
+  }
+  free(drop);
+  for (int i = 0; i < state->chan_learned_count; i++) {
+    if (hub_chan_live(state, state->chan_learned[i].chan, NULL, 0)) continue;
+    if (note) note(arg, "learned", state->chan_learned[i].chan, state->chan_learned[i].ts);
+    hub_learned_drop(state, state->chan_learned[i].chan);
+    gone++;
+    i--;
+  }
+  if (gone) state->config_dirty = true;
+  return gone;
+}
+
+bool hub_purge_floor_blocks(const hub_state_t *state, time_t ts) {
+  return state->purge_floor_until > time(NULL) && ts < state->purge_floor;
+}
+
+void hub_purge_floor_set(hub_state_t *state, time_t cutoff) {
+  time_t now = time(NULL);
+  time_t floor = cutoff > 0 ? cutoff : now;
+  if (state->purge_floor_until <= now || floor > state->purge_floor)
+    state->purge_floor = floor;
+  state->purge_floor_until = now + PURGE_FLOOR_HOLD;
 }

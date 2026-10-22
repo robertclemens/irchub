@@ -147,6 +147,8 @@ bool hub_uchan_put(hub_state_t *state, const char *uuid, const char *chan, bool 
   if (!uuid_shape(uuid) || !hub_uchan_name_ok(chan) || ts <= 0) return false;
   hub_uchan_record_t *r = hub_uchan_find(state, uuid, chan);
   if (!r) {
+    /* a tombstone older than the last purge is not re-created */
+    if (!active && hub_purge_floor_blocks(state, ts)) return false;
     if (state->uchan_record_count >= MAX_HUB_CHAN_BINDS) {
       hub_log_warning("[ACCESS] Binding table full (%d): uc| %s for %s dropped\n",
                       MAX_HUB_CHAN_BINDS, chan, uuid);
@@ -376,6 +378,12 @@ int hub_access_purge(hub_state_t *state, time_t cutoff) {
       dropped++;
       continue;
     }
+    /* A live binding to a channel nobody manages is an orphan: the channel
+     * went (or never was -- user chan add needs a managed one). */
+    if (r->is_active && strcmp(r->chan, "*") != 0 && !hub_chan_live(state, r->chan, NULL, 0)) {
+      dropped++;
+      continue;
+    }
     state->uchan_records[o++] = *r;
   }
   state->uchan_record_count = o;
@@ -407,8 +415,8 @@ bool hub_access_append(hub_state_t *state, char *buf, int cap, int *off,
 }
 
 /* ---- Older nodes (plan §3.2, T2) -----------------------------------------
- * A bot below BOT_PROTO_USER_FLAGS or a hub older than USER_FLAGS_MIN_HUB does
- * not know uf| / uc|: it would treat a restricted admin as full and a
+ * A peer hub whose version is not known yet (or older than MESH_MIN_VERSION,
+ * its link being refused) may not know uf| / uc|: it would treat a restricted admin as full and a
  * channel-bound oper as global.  So:
  *   - it never gets uf| / uc| lines;
  *   - it sees each user at hub_access_user_ts (the newest of the user record
@@ -434,8 +442,8 @@ time_t hub_access_user_ts(hub_state_t *state, const hub_user_record_t *u) {
 
 /* u's a|/o| line for an older node.  0 = left out (a restricted user and not
  * tomb), else as hub_format_user_record. */
-int hub_format_user_for_old(hub_state_t *state, const hub_user_record_t *u, bool legacy_v1,
-                            bool tomb, char *buf, size_t cap) {
+int hub_format_user_for_old(hub_state_t *state, const hub_user_record_t *u, bool tomb,
+                            char *buf, size_t cap) {
   bool restricted = hub_user_restricted(state, u);
   if (restricted && !tomb) {
     if (cap) buf[0] = '\0';
@@ -444,7 +452,7 @@ int hub_format_user_for_old(hub_state_t *state, const hub_user_record_t *u, bool
   hub_user_record_t c = *u;
   c.timestamp = hub_access_user_ts(state, u);
   if (restricted) c.is_active = false;
-  return hub_format_user_record(&c, legacy_v1, buf, cap);
+  return hub_format_user_record(&c, buf, cap);
 }
 
 /* A record an older node sent about user uuid may be taken in: not about a
@@ -501,7 +509,7 @@ char *hub_access_downgrade(hub_state_t *state, const char *payload, bool tomb) {
         keep = !hub_user_restricted(state, u);
       } else if (u) {
         char line[USER_LINE_MAX];
-        int w = hub_format_user_for_old(state, u, false, tomb, line, sizeof(line));
+        int w = hub_format_user_for_old(state, u, tomb, line, sizeof(line));
         if (w > 0 && w < (int)sizeof(line) && o + (size_t)w < cap) {
           memcpy(out + o, line, (size_t)w);
           o += (size_t)w;

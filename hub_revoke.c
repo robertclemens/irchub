@@ -248,9 +248,8 @@ bool hub_revoke_append(hub_state_t *state, char *buf, int max_len, int *off) {
   return true;
 }
 
-/* A deleted bot that has a key goes on the list (bot del, a synced delete, a
- * config load — so tombstones from before the list existed migrate).  True
- * when the list changed. */
+/* A deleted bot that has a key goes on the list (bot del, a synced delete).
+ * True when the list changed. */
 bool hub_revoke_from_bot(hub_state_t *state, const bot_config_t *b) {
   if (!b || b->is_active) return false;
   hub_revoked_t in;
@@ -272,13 +271,6 @@ bool hub_revoke_from_bot(hub_state_t *state, const bot_config_t *b) {
   }
   if (!have_pub || in.del_ts <= 0) return false;
   return hub_revoke_merge(state, &in);
-}
-
-int hub_revoke_migrate(hub_state_t *state) {
-  int n = 0;
-  for (int i = 0; i < state->bot_count; i++)
-    if (hub_revoke_from_bot(state, &state->bots[i])) n++;
-  return n;
 }
 
 /* The bot wiped itself: stamp it.  The rv| line to sync goes into line. */

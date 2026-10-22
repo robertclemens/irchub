@@ -511,8 +511,7 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
 static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
                               const char *target_ver, const char *variant,
                               const char *kind, const char *min_from,
-                              const char *base, const char *hub_ver,
-                              const char *hub_base, const char *sel,
+                              const char *hub_ver, const char *sel,
                               char *msg, size_t msg_size);
 static void hub_upgrade_status(hub_state_t *state, reply_t *r);
 static const config_entry_t *bot_entry_rec(const bot_config_t *b, const char *key);
@@ -523,10 +522,18 @@ static const char *upgrade_node_variant(const pending_upgrade_t *u,
                                         const upgrade_node_t *n);
 static bool upgrade_sel_lookup(const char *sel, const char *uuid, char *variant,
                                size_t variant_size);
-static bool upgrade_peer_takes_sel(const hub_state_t *state,
-                                   const hub_client_t *c);
 static void hub_upgrade_releases(hub_state_t *state, const char *payload,
                                  reply_t *r);
+static bool hub_upgrade_plan_begin(hub_state_t *state, hub_client_t *admin,
+                                   const char *target_ver, const char *variant,
+                                   const char *kind, const char *min_from,
+                                   const char *hub_ver, const char *sel,
+                                   char *msg, size_t msg_size);
+static void plan_note_run_end(hub_state_t *state, upgrade_phase_t phase);
+static void plan_stop(hub_state_t *state, const char *summary);
+static int upgrade_cancel_flood(hub_state_t *state);
+static int plan_steps(const upgrade_plan_t *pl);
+static void plan_path_csv(const char *path, int n, char *out, size_t cap);
 static void hub_upgrade_note_ready(hub_state_t *state, const char *payload,
                                    hub_client_t *from_peer);
 static hub_client_t *upgrade_find_client(hub_state_t *state, const char *uuid,
@@ -551,7 +558,6 @@ static void hub_rollup_note_presence(hub_state_t *state, const char *uuid,
 static bool hub_rollup_note_ready(hub_state_t *state, const char *payload);
 static bool hub_rollup_note_result(hub_state_t *state, const char *payload);
 static bool hub_rollup_forget(hub_state_t *state, const char *why);
-static bool ce_mesh_ready(const hub_state_t *state);
 static chan_elect_t *ce_start(hub_state_t *state, const char *kind, const char *channel,
                               const char *requester, const char *nick, const char *hostmask,
                               const hub_client_t *admin);
@@ -624,15 +630,13 @@ static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
 /* PURGE deduplication.  A purge is known by its cutoff plus the random id its
  * origin hub gave it.  Keyed on the cutoff alone, every "immediate" purge
  * (cutoff 0) looked like the previous one for PURGE_DEDUP_WINDOW seconds, and
- * peers skipped a second purge sent inside that window.  A line from a hub
- * that predates the id carries id "" and dedupes on its cutoff as before. */
+ * peers skipped a second purge sent inside that window. */
 static bool is_purge_recent(hub_state_t *state, time_t cutoff, const char *id) {
   time_t now = time(NULL);
-  time_t window = id[0] ? PURGE_DEDUP_WINDOW : PURGE_DEDUP_WINDOW_LEGACY;
   for (int i = 0; i < state->recent_purge_count; i++) {
     if (state->recent_purges[i].cutoff == cutoff &&
         strcmp(state->recent_purges[i].id, id) == 0 &&
-        now - state->recent_purges[i].received_at < window)
+        now - state->recent_purges[i].received_at < PURGE_DEDUP_WINDOW)
       return true;
   }
   return false;
@@ -1903,6 +1907,16 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
   time_t now = time(NULL);
   if (started <= 0 || (time_t)started > now) started = 0;
 
+  /* D1 of the 2.5.1 plan: a bot below MESH_MIN_VERSION is not served (it
+   * still reads 100k files and old record shapes).  The hub cannot roll it
+   * up either, so it says what to do and drops the link. */
+  if (version[0] && hub_update_version_cmp(version, MESH_MIN_VERSION) < 0) {
+    hub_log_warning("[HUB] Bot %s runs %s: refused; upgrade it by hand to %s\n",
+                    client->id, version, MESH_MIN_VERSION);
+    client->refused = true;
+    return;
+  }
+
   bool changed = strcmp(client->bot_version, version) != 0 ||
                  strcmp(client->bot_server, server) != 0 ||
                  strcmp(client->bot_variant, variant) != 0 ||
@@ -1938,14 +1952,10 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
       (!want[0] || strcmp(variant, want) == 0)) {
     hub_client_t *origin = upgrade_find_peer(state, state->follow_origin);
     if (origin) {
-      /* A bot that reports ready itself is only "back" — unless the driver
-       * is too old to know that status (it would read it as a failure). */
-      bool gated =
-          hub_update_version_cmp(version, UPGRADE_OPS_GATE_MIN_BOT) >= 0 &&
-          upgrade_peer_takes_sel(state, origin);
+      /* A bot that reports ready itself is only "back". */
       char p[192];
-      snprintf(p, sizeof(p), "%s|%s|%s|%s|", state->follow_id, client->id,
-               gated ? "back" : "ok", version);
+      snprintf(p, sizeof(p), "%s|%s|back|%s|", state->follow_id, client->id,
+               version);
       peer_send_urgent(state, origin, CMD_UPGRADE_RESULT, p);
     }
   }
@@ -2253,6 +2263,17 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
           state->tree_dirty = true;
         }
         break;
+      }
+      /* D4 of the 2.5.1 plan: a direct peer below MESH_MIN_VERSION loses
+       * its link once its own roster header names its version (relayed
+       * headers of hubs further away are only shown). */
+      if (hub_ver[0] && hub_update_version_cmp(hub_ver, MESH_MIN_VERSION) < 0 &&
+          strcmp(hub_uuid, upgrade_peer_uuid(state, from)) == 0) {
+        hub_log_warning("[MESH] Peer %s (%s) runs %s: link refused; upgrade it by "
+                        "hand to %s\n", hub_name, from->ip, hub_ver, MESH_MIN_VERSION);
+        from->refused = true;
+        free(relay);
+        return;
       }
       /* Same authoritative signal the bots give through their presence: a
        * hub node of a run we drive is done when it reappears in the gossip on
@@ -2712,10 +2733,11 @@ static bool split_horizon_has(hub_state_t *state, const mesh_hub_t *sender,
   return false;
 }
 
-/* Whether peer `c` knows admin flags / oper channel bindings (uf| / uc|):
- * 2 = USER_FLAGS_MIN_HUB or newer, 1 = known older, 0 = not known yet (its
- * version arrives with its first roster).  Below 2 it gets the downgraded
- * sync (hub_access_downgrade; tombstones only at 1). */
+/* Whether peer `c` is known current: 2 = MESH_MIN_VERSION or newer, 1 =
+ * known older (its link is being refused), 0 = not known yet (its version
+ * arrives with its first roster).  Below 2 it gets the downgraded sync
+ * (hub_access_downgrade; tombstones only at 1), so a peer that turns out to
+ * be older never over-trusts a restricted user meanwhile. */
 static int peer_flags_level(hub_state_t *state, const hub_client_t *c) {
   const char *cu = upgrade_peer_uuid(state, c);
   const char *ver = "";
@@ -2726,7 +2748,7 @@ static int peer_flags_level(hub_state_t *state, const hub_client_t *c) {
     if (mh) ver = mh->version;
   }
   if (!ver[0]) return 0;
-  return hub_update_version_cmp(ver, USER_FLAGS_MIN_HUB) >= 0 ? 2 : 1;
+  return hub_update_version_cmp(ver, MESH_MIN_VERSION) >= 0 ? 2 : 1;
 }
 
 /* The level of the peer on `fd` (0 when no authenticated peer has it). */
@@ -2892,6 +2914,18 @@ static void config_push_sync(hub_state_t *state, char *buf, int *off,
   buf[*off] = '\0';
 }
 
+/* The v| protocol a config push carries (0 when unreadable), -1 when it has
+ * no v| line. */
+static long push_proto(const char *payload) {
+  for (const char *p = payload; p && *p; p = strchr(p, '\n'), p = p ? p + 1 : NULL) {
+    if (p[0] == 'v' && p[1] == '|') {
+      long v = strtol(p + 2, NULL, 10);
+      return v > 0 && v < 1000 ? v : 0;
+    }
+  }
+  return -1;
+}
+
 static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
                                     char *payload) {
   if (client->type != CLIENT_BOT || !client->authenticated) {
@@ -2913,7 +2947,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
    * Rejecting those pushes here ensures a bot cannot mutate admin/oper/usermask/
    * channel/password state under opt 'h'.  These map 1:1 to the bot-side
    * HUB_ONLY_CMDS list: a=+/-admin/chkey, o=+/-oper/chkey, m=+/-usermask,
-   * c=join/part.  (p, the retired bot password, is ignored under every opt.)
+   * c=join/part.
    * The bot's own runtime identity (nick 'n', hostmask 'h') and its protocol
    * version 'v' are intrinsic state only the bot can report, so they stay
    * accepted.
@@ -2936,14 +2970,25 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
     return;
   }
 
+  /* v|<proto>|<unused> (docs/passwordless.md §3.4) heads a bot's full
+   * push; record-only pushes (user/mask/ban deltas, split frames) carry
+   * none.  A bot below BOT_PROTO_USER_FLAGS is refused before a line of it
+   * is taken in: it would over-trust restricted users (MESH_MIN_VERSION). */
+  long proto = push_proto(payload);
+  if (proto >= 0 && proto < BOT_PROTO_USER_FLAGS) {
+    hub_log_warning("[HUB] Bot %s pushes protocol v%ld (below v%d): refused; "
+                    "upgrade it by hand to %s\n", client->id, proto,
+                    BOT_PROTO_USER_FLAGS, MESH_MIN_VERSION);
+    client->refused = true;
+    return;
+  }
+
   char work_buf[MAX_BUFFER];
   snprintf(work_buf, sizeof(work_buf), "%s", payload);
 
   char *saveptr;
   char *line = strtok_r(work_buf, "\n", &saveptr);
   int updates = 0;
-  bool proto_upgraded = false;
-  bool saw_proto = false;
   char sync_buffer[MAX_BUFFER];
   int sync_offset = 0;
 
@@ -3001,24 +3046,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
 
     char *data = line + 2;
 
-    /* v|<proto>|<unused>: protocol capability (docs/passwordless.md §3.4).
-     * Recorded on this connection only; the first v >= 2 earns a fresh
-     * config in the new record shapes (below, after the loop). */
-    if (type == 'v') {
-      saw_proto = true;
-      long v = strtol(data, NULL, 10);
-      if (v >= BOT_PROTO_PASSWORDLESS && v < 1000 && client->bot_proto < v) {
-        client->bot_proto = (int)v;
-        proto_upgraded = true;
-        hub_log_info("[HUB] Bot %s speaks protocol v%ld (passwordless)\n",
-                client->id, v);
-      }
-      line = strtok_r(NULL, "\n", &saveptr);
-      continue;
-    }
-    if (type == 'p') {
-      hub_log_warning("[HUB] Ignored retired bot-password line from %s "
-              "(pre-passwordless bot)\n", client->id);
+    if (type == 'v') { /* read up front (push_proto) */
       line = strtok_r(NULL, "\n", &saveptr);
       continue;
     }
@@ -3094,6 +3122,17 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
                            client->id, chan, key, modes_val, op, ts);
         }
       }
+    } else if (type == 'K') {
+      /* K|chan|key|modes|ts: what this bot saw on IRC (learned key, +k/+i).
+       * Never existence: taken only while the channel is managed, under every
+       * opt (enforcement, D43). */
+      if (hub_learned_ingest(state, data)) {
+        updates++;
+        config_push_sync(state, sync_buffer, &sync_offset, client->fd, "K|%s\n", data);
+      } else {
+        hub_log_debug("[HUB] K| from %s not taken (channel not managed or not newer)\n",
+                      client->id);
+      }
     } else if (type == 'B') {
       /* Enforcement ban: B|chan|mask|expires|flags|setter|reason|op|ts.  A bot
        * writes only its own timed bans (hub_ban_bot_write holds the rules);
@@ -3115,8 +3154,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       hub_log_warning("[HUB] Ignored bot-pushed '%c' record from %s (console only)\n",
               type, client->id);
     } else if (type == 'm') {
-      /* New format: uuid|mask|add/del|last_used|timestamp
-       * Old format: mask|add/del|timestamp (legacy, ignored — hub drives config) */
+      /* uuid|mask|add/del|last_used|timestamp; anything else is ignored */
       char first[40] = {0};
       char *pf = strchr(data, '|');
       if (pf) { size_t fl = (size_t)(pf-data); if (fl<sizeof(first)){memcpy(first,data,fl);first[fl]=0;} }
@@ -3133,12 +3171,6 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
           last_used = atoll(p3+1);
           ts        = atoll(p4+1);
           bool is_active = (strncmp(act,"add",3)==0);
-          /* An older bot may hold a tombstone of a restricted user (plan
-           * §3.2): nothing it pushes about that user is taken in. */
-          if (client->bot_proto < BOT_PROTO_USER_FLAGS && !hub_access_from_old_ok(state, uuid)) {
-            line = strtok_r(NULL, "\n", &saveptr);
-            continue;
-          }
           /* Find or create mask record */
           hub_mask_record_t *found_m = NULL;
           for (int mi=0; mi<state->mask_record_count; mi++) {
@@ -3147,7 +3179,8 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
               found_m = &state->mask_records[mi]; break;
             }
           }
-          if (!found_m && state->mask_record_count < MAX_HUB_USER_MASKS) {
+          if (!found_m && state->mask_record_count < MAX_HUB_USER_MASKS &&
+              (is_active || !hub_purge_floor_blocks(state, (time_t)ts))) {
             found_m = &state->mask_records[state->mask_record_count++];
             memset(found_m,0,sizeof(*found_m));
             snprintf(found_m->uuid,sizeof(found_m->uuid),"%s",uuid);
@@ -3169,20 +3202,20 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         }
       }
     } else if (type == 'o' || type == 'a') {
-      /* hub_parse_user_record: uuid|name|pubkey|act|seen|ts| (or a legacy
-       * password shape, password dropped).  LWW by timestamp.  Outside opt
+      /* hub_parse_user_record: uuid|name|pubkey|act|seen|ts|.  LWW by
+       * timestamp.  Outside opt
        * 'h' the network lets bots create/re-key users (+admin/+oper/chkey);
        * a keyless push never erases a key the hub already holds. */
       hub_user_record_t in;
-      if (hub_parse_user_record(data, type, &in, NULL) &&
-          (client->bot_proto >= BOT_PROTO_USER_FLAGS || hub_access_from_old_ok(state, in.uuid))) {
+      if (hub_parse_user_record(data, type, &in)) {
         hub_user_record_t *found_u = NULL;
         for (int ui = 0; ui < state->user_record_count; ui++) {
           if (strcmp(state->user_records[ui].uuid, in.uuid) == 0) {
             found_u = &state->user_records[ui]; break;
           }
         }
-        if (!found_u && state->user_record_count < MAX_HUB_USER_RECORDS) {
+        if (!found_u && state->user_record_count < MAX_HUB_USER_RECORDS &&
+            (in.is_active || !hub_purge_floor_blocks(state, in.timestamp))) {
           found_u = &state->user_records[state->user_record_count++];
           memset(found_u, 0, sizeof(*found_u));
           snprintf(found_u->uuid, sizeof(found_u->uuid), "%s", in.uuid);
@@ -3202,7 +3235,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
           state->config_dirty = true;
           updates++;
           char uline[USER_LINE_MAX];
-          int w = hub_format_user_record(found_u, false, uline, sizeof(uline));
+          int w = hub_format_user_record(found_u, uline, sizeof(uline));
           if (w > 0 && w < (int)sizeof(uline))
             config_push_sync(state, sync_buffer, &sync_offset, client->fd,
                              "%s", uline);
@@ -3246,22 +3279,12 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
     line = strtok_r(NULL, "\n", &saveptr);
   }
 
-  /* Every passwordless bot puts v| in each push, so its absence marks an old
-   * build.  Say so once per connection, and sync it right away (below): its
-   * first config replaces every password it still holds with an empty slot,
-   * so it must not wait for the next periodic broadcast (§3.4, §9). */
-  /* A user this push created without uf| / uc| (an older bot's +admin /
-   * +oper) gets what it could do before flags (hub_access_migrate). */
+  /* A user this push created without uf| / uc| gets what it could do
+   * before flags (hub_access_migrate). */
   if (hub_access_migrate(state) > 0) updates++;
 
-  bool legacy_first = false;
-  if (!saw_proto && client->bot_proto == 0) {
-    client->bot_proto = 1;
-    legacy_first = true;
-    hub_log_warning("[HUB] Bot %s is a pre-passwordless build (no v|2): it gets "
-            "legacy records with empty password slots; upgrade it\n",
-            client->id);
-  }
+  bool first_push = !client->pushed;
+  client->pushed = true;
 
   if (updates > 0) {
     hub_log_debug("[HUB] Applied %d updates from %s\n", updates, client->id);
@@ -3282,10 +3305,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
     // This fixes issues where bots might miss updates if they were temporarily
     // unreachable
     broadcast_full_config_to_all_bots(state);
-  } else if (proto_upgraded || legacy_first) {
-    /* proto_upgraded: this connection just proved it is passwordless-capable
-     * — replace the legacy-shaped config it may hold (no b| keys) right away.
-     * legacy_first: an old build — empty its stored passwords right away. */
+  } else if (first_push) {
     send_config_to_bot(state, client, true);
   }
 }
@@ -3318,13 +3338,15 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
       break;
     offset += written;
   }
+  /* K|: what the bots saw on IRC, after the c| lines it hangs off. */
+  hub_learned_append(state, buffer, max_len, &offset);
 
   /* User records so peer hubs share admin/oper records, in the passwordless
    * shape uuid|name|pubkey|act|seen|ts| (peers are HUBv3, so they parse it). */
   for (int i = 0; i < state->user_record_count; i++) {
     hub_user_record_t *u = &state->user_records[i];
     if (max_len - offset <= 1) break;
-    written = hub_format_user_record(u, false, buffer + offset,
+    written = hub_format_user_record(u, buffer + offset,
                                      (size_t)(max_len - offset));
     if (written < 0 || written >= (max_len - offset)) break;
     offset += written;
@@ -3433,7 +3455,9 @@ static bool store_global_entry_raw(hub_state_t *state, const char *key,
     return false;
   }
 
-  // Add new entry
+  // Add new entry (a tombstone older than the last purge is not re-created)
+  if (!hub_global_value_active(value) && hub_purge_floor_blocks(state, ts))
+    return false;
   if (hub_global_room(state, key)) {
     snprintf(state->global_entries[state->global_entry_count].key,
              sizeof(state->global_entries[state->global_entry_count].key), "%s",
@@ -3518,7 +3542,11 @@ static bool parse_global_channel_value(const char *value,
  * entries are overwritten wholesale once the timestamp wins
  * (hub_storage_update_global_entry), so not carrying them forward erases them.
  * Matched ASCII case-insensitively on the channel name (D39), same as the storage layer. */
+/* The +k/+i the bots last saw: K| (2.5.1), else the modes field a 2.5.0 bot
+ * left on c|. */
 static int global_channel_modes(hub_state_t *state, const char *chan) {
+  const hub_chan_learned_t *l = hub_learned_find(state, chan);
+  if (l) return l->modes;
   for (int i = 0; i < state->global_entry_count; i++) {
     if (strcmp(state->global_entries[i].key, "c") != 0)
       continue;
@@ -3554,9 +3582,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
   char *line = strtok_r(work_buf, "\n", &saveptr);
   int updates = 0;
   int bot_push_updates = 0; /* only keys bots actually consume; gates full config push */
-  /* A peer that does not know uf| / uc| (or whose version we do not know
-   * yet) may hold a tombstone we sent it for a restricted user: nothing it
-   * says about such a user is taken in (hub_access_from_old_ok). */
+  /* A peer whose version we do not know yet may be an older node holding
+   * no uf| / uc|: nothing it says about a restricted user is taken in
+   * (hub_access_from_old_ok). */
   const bool origin_flags_ok = peer_fd_flags_level(state, origin_fd) == 2;
   int fwd_offset = 0;
   forward_buf[0] = 0;
@@ -3644,6 +3672,23 @@ static void process_peer_sync(hub_state_t *state, char *payload,
         updates++;
         bot_push_updates++;
         if (fwd_offset < (int)sync_cap - UC_LINE_MAX) {
+          int wfwd = snprintf(forward_buf + fwd_offset, sync_cap - (size_t)fwd_offset,
+                              "%s\n", line);
+          if (wfwd > 0) fwd_offset += wfwd;
+        }
+      }
+      line = strtok_r(NULL, "\n", &saveptr);
+      continue;
+    }
+
+    /* K|chan|key|modes|ts: what the bots saw on IRC.  Taken only while the
+     * channel is managed here; its c| line comes first in every sync. */
+    if (line[0] == 'K' && line[1] == '|') {
+      if (hub_learned_ingest(state, line + 2)) {
+        updates++;
+        bot_push_updates++;
+        state->config_dirty = true;
+        if (fwd_offset < (int)sync_cap - K_LINE_MAX) {
           int wfwd = snprintf(forward_buf + fwd_offset, sync_cap - (size_t)fwd_offset,
                               "%s\n", line);
           if (wfwd > 0) fwd_offset += wfwd;
@@ -3751,10 +3796,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
               }
 
               if (is_new_fmt && is_user_key) {
-                /* hub_parse_user_record: uuid|name|pubkey|act|seen|ts| (a
-                 * legacy password shape parses too; the password is dropped). */
+                /* hub_parse_user_record: uuid|name|pubkey|act|seen|ts| */
                 hub_user_record_t in;
-                if (hub_parse_user_record(vstart, key[0], &in, NULL)) {
+                if (hub_parse_user_record(vstart, key[0], &in)) {
                   const char *uuid = in.uuid, *uname = in.name;
                   long long last_seen = (long long)in.last_seen;
                   long long ts = (long long)in.timestamp;
@@ -3800,7 +3844,8 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                     }
                   }
                   if (!found_u && !discard_incoming &&
-                      state->user_record_count < MAX_HUB_USER_RECORDS) {
+                      state->user_record_count < MAX_HUB_USER_RECORDS &&
+                      (in.is_active || !hub_purge_floor_blocks(state, in.timestamp))) {
                     found_u=&state->user_records[state->user_record_count++];
                     memset(found_u,0,sizeof(*found_u));
                     snprintf(found_u->uuid,sizeof(found_u->uuid),"%s",uuid);
@@ -3821,10 +3866,9 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                     state->config_dirty = true;
                     updates++;
                     bot_push_updates++; /* admin/oper name change — bots need this */
-                    /* Forward our canonical a|/o| line, never the raw one: a
-                     * legacy-shaped line must not carry a password onward. */
+                    /* Forward our canonical a|/o| line, never the raw one. */
                     char uline[USER_LINE_MAX];
-                    int ul = hub_format_user_record(found_u, false, uline,
+                    int ul = hub_format_user_record(found_u, uline,
                                                     sizeof(uline));
                     if (ul > 0 && ul < (int)sizeof(uline) &&
                         fwd_offset < (int)sync_cap - USER_LINE_MAX) {
@@ -3867,7 +3911,8 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                     if (strcmp(state->mask_records[mi].uuid,uuid)==0 &&
                         strcasecmp(state->mask_records[mi].mask,mask_s)==0)
                       { found_m=&state->mask_records[mi]; break; }
-                  if (!found_m && state->mask_record_count < MAX_HUB_USER_MASKS) {
+                  if (!found_m && state->mask_record_count < MAX_HUB_USER_MASKS &&
+                      (is_active || !hub_purge_floor_blocks(state, (time_t)ts))) {
                     found_m=&state->mask_records[state->mask_record_count++];
                     memset(found_m,0,sizeof(*found_m));
                     snprintf(found_m->uuid,sizeof(found_m->uuid),"%s",uuid);
@@ -4175,8 +4220,15 @@ static void purge_note(reply_t *tombs, const char *kind, const char *id,
   if (ts > 0) reply_kvi(tombs, "ts", (long long)ts);
 }
 
+static void purge_note_orphan(void *arg, const char *kind, const char *name, time_t ts) {
+  purge_note((reply_t *)arg, kind, NULL, name, ts);
+}
+
 int hub_execute_purge(hub_state_t *state, time_t cutoff, reply_t *tombs) {
   int purged_count = 0;
+  /* For PURGE_FLOOR_HOLD, a sync built before this purge cannot re-create
+   * what it removes. */
+  hub_purge_floor_set(state, cutoff);
 
   // --- Purge tombstoned global entries (channels, admin masks, oper masks,
   //     channel settings, bans), compacted in place ---
@@ -4212,6 +4264,10 @@ int hub_execute_purge(hub_state_t *state, time_t cutoff, reply_t *tombs) {
 
   state->global_entry_count = new_count;
   hub_global_reindex(state);
+
+  // --- Orphans: live C| / B| (not "*") / K| of a channel no one manages,
+  //     whatever the cutoff (every hub and bot applies the same rule) ---
+  purged_count += hub_purge_chan_orphans(state, purge_note_orphan, tombs);
 
   // --- Purge tombstoned user_records (admins/opers) ---
   hub_user_record_t new_users[MAX_HUB_USER_RECORDS];
@@ -4879,13 +4935,19 @@ static config_entry_t *chan_entry(hub_state_t *state, const char *chan) {
 
 /* chan|name|key|modes|ts — the generic channel record; a later setting
  * adds a set.<name>= key (docs/console.md §3.1). */
-static bool reply_chan(reply_t *r, const config_entry_t *e) {
+static bool reply_chan(const hub_state_t *state, reply_t *r, const config_entry_t *e) {
   char name[128] = "", key[64] = "", op[16] = "";
   int modes = 0;
   if (!parse_global_channel_value(e->value, name, sizeof(name), key, sizeof(key),
                                   &modes, op, sizeof(op)) ||
       !name[0] || strcmp(op, "del") == 0)
     return false;
+  /* the key the bots join with and the +k/+i they saw (K|, when newer) */
+  const hub_chan_learned_t *l = hub_learned_find(state, name);
+  if (l) {
+    modes = l->modes;
+    if (l->ts > e->timestamp) snprintf(key, sizeof(key), "%s", l->key);
+  }
   char ml[4];
   chan_modes_letters(modes, ml);
   reply_rec(r, "chan");
@@ -4941,6 +5003,17 @@ static bool chan_active_key(hub_state_t *state, const char *chan, char *key,
     key[0] = '\0';
     return false;
   }
+  return true;
+}
+
+/* The key the bots join with: the newer of the admin's (c|) and the one they
+ * learned on IRC (K|); a tie keeps the admin's.  False when not managed. */
+static bool chan_effective_key(hub_state_t *state, const char *chan, char *key,
+                               size_t cap) {
+  if (!chan_active_key(state, chan, key, cap)) return false;
+  const hub_chan_learned_t *l = hub_learned_find(state, chan);
+  if (l && l->ts > hub_storage_global_ts(state, "c", chan))
+    snprintf(key, cap, "%s", l->key);
   return true;
 }
 
@@ -5265,32 +5338,6 @@ static const char *mf_admin_name(const hub_client_t *c) {
   return strncmp(c->id, "ADMIN:", 6) == 0 ? c->id + 6 : c->id;
 }
 
-static int mf_str_cmp(const void *a, const void *b) { return strcmp(a, b); }
-
-/* D38: names of the peer hubs older than 2.4.5, sorted, comma-joined, as
- * old_hubs=; nothing when there are none.  A command that wrote C|/D|/B|
- * calls this on its reply. */
-static void reply_old_hubs_for(const hub_state_t *state, reply_t *r, const char *min_ver);
-static void mf_reply_old_hubs(const hub_state_t *state, reply_t *r) {
-  reply_old_hubs_for(state, r, MODES_MIN_HUB);
-}
-
-/* old_hubs= for the hubs older than min_ver (user_flags: USER_FLAGS_MIN_HUB). */
-static void reply_old_hubs_for(const hub_state_t *state, reply_t *r, const char *min_ver) {
-  char names[16][64];
-  int n = hub_old_hubs_for(state, names, 16, min_ver);
-  if (n <= 0) return;
-  qsort(names, (size_t)n, sizeof(names[0]), mf_str_cmp);
-  char joined[16 * 65 + 1];
-  size_t o = 0;
-  for (int i = 0; i < n; i++) {
-    if (i) joined[o++] = ',';
-    for (const char *p = names[i]; *p && o + 2 < sizeof(joined); p++)
-      joined[o++] = (*p == ',' || (unsigned char)*p < 0x20 || *p == 0x7f) ? '_' : *p;
-  }
-  joined[o] = '\0';
-  reply_kv(r, "old_hubs", joined);
-}
 
 static bool mf_status_err(hub_state_t *state, hub_client_t *client, hub_modes_status_t st,
                           const char *what) {
@@ -5371,7 +5418,7 @@ static void mf_mode_card_extra(hub_state_t *state, reply_t *r, const char *cname
   reply_kv(r, "effective", eff);
   reply_kv(r, "source", src);
   char key[64], ml[4], dyn[8];
-  chan_active_key(state, cname, key, sizeof(key));
+  chan_effective_key(state, cname, key, sizeof(key));
   reply_kvb(r, "key_set", key[0] != '\0');
   secure_wipe(key, sizeof(key));
   chan_modes_letters(global_channel_modes(state, cname), ml);
@@ -5490,7 +5537,7 @@ static bool admin_chan_mode(hub_state_t *state, hub_client_t *client, const char
   hub_modes_status_t st = hub_chanset_put(state, cname, stored, cs.settings);
   if (st == HUB_MODES_OK && key_op) {
     char cur[64];
-    chan_active_key(state, cname, cur, sizeof(cur));
+    chan_effective_key(state, cname, cur, sizeof(cur));
     const char *want = key_op > 0 ? key : "";
     if (strcmp(cur, want) != 0) chan_store(state, cname, want);
     secure_wipe(cur, sizeof(cur));
@@ -5720,7 +5767,6 @@ static bool admin_chan_set(hub_state_t *state, hub_client_t *client, const char 
   reply_kvb(&r, "written", written);
   reply_kvi(&r, "bots", local_bot_count(state));
   reply_kvi(&r, "peers", linked_peer_count(state));
-  if (written) mf_reply_old_hubs(state, &r);
   for (int i = 0; i < nchg; i++) mf_chg_rec(&r, &chg[i], chg[i].name);
   return send_reply(state, client, &r);
 }
@@ -5803,7 +5849,6 @@ static bool admin_net_set(hub_state_t *state, hub_client_t *client, const char *
   reply_kvb(&r, "written", written);
   reply_kvi(&r, "bots", local_bot_count(state));
   reply_kvi(&r, "peers", linked_peer_count(state));
-  if (written) mf_reply_old_hubs(state, &r);
   return send_reply(state, client, &r);
 }
 
@@ -5962,7 +6007,6 @@ static bool admin_ban(hub_state_t *state, hub_client_t *client, const char *payl
     reply_kv(&r, "mask", mask);
     reply_kvi(&r, "bots", local_bot_count(state));
     reply_kvi(&r, "peers", linked_peer_count(state));
-    mf_reply_old_hubs(state, &r);
     return send_reply(state, client, &r);
   }
   /* add */
@@ -6013,7 +6057,6 @@ static bool admin_ban(hub_state_t *state, hub_client_t *client, const char *payl
   reply_kvb(&r, "existed", existed);
   reply_kvi(&r, "bots", local_bot_count(state));
   reply_kvi(&r, "peers", linked_peer_count(state));
-  mf_reply_old_hubs(state, &r);
   return send_reply(state, client, &r);
 }
 
@@ -6132,8 +6175,8 @@ static bool last_full_admin(hub_state_t *state, const char *uuid) {
  *   flags|<name>|<spec>          an admin's flags (+c-u edits, chu / +a replaces)
  *   chan|add|<name>|<#chan|*>    an oper's channels (U10: * and channels exclude
  *   chan|del|<name>|<#chan|*>    each other; del * removes every binding)
- * Answers user.flags | name | old | flags | peers | bots [| old_hubs]
- *      or user.chan | name | action | chan | chans | peers | bots [| old_hubs]. */
+ * Answers user.flags | name | old | flags | peers | bots
+ *      or user.chan | name | action | chan | chans | peers | bots. */
 static bool admin_user_access(hub_state_t *state, hub_client_t *client, const char *payload) {
   char kind[8] = "", f1[64] = "", f2[64] = "", f3[MAX_CHAN] = "";
   int nf = payload && payload[0] ? mf_field_count(payload) : 0;
@@ -6197,6 +6240,10 @@ static bool admin_user_access(hub_state_t *state, hub_client_t *client, const ch
     bool live = cur && cur->is_active;
     bool any_live = hub_user_chan_count(state, t->uuid, NULL) > 0;
     bool missing = strcmp(f3, "*") == 0 ? !any_live : !live;
+    /* A binding to a channel nobody manages would be an orphan from the
+     * start: the purge removes those (as channel mode / set / ban refuse). */
+    if (add && strcmp(f3, "*") != 0 && !hub_chan_live(state, f3, NULL, 0))
+      return mf_status_err(state, client, HUB_MODES_NOT_MANAGED, f3);
     if (!add && missing) {
       snprintf(msg, sizeof(msg), "%.63s has no %s", t->name,
                strcmp(f3, "*") == 0 ? "channels" : f3);
@@ -6224,7 +6271,6 @@ static bool admin_user_access(hub_state_t *state, hub_client_t *client, const ch
   }
   reply_kvi(&r, "peers", linked_peer_count(state));
   reply_kvi(&r, "bots", local_bot_count(state));
-  if (sync[0]) reply_old_hubs_for(state, &r, USER_FLAGS_MIN_HUB);
   return send_reply(state, client, &r);
 }
 
@@ -6288,27 +6334,26 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   case CMD_ADMIN_UPGRADE_NET: {
     /* Payload: target_ver|variant|kind|min_from|base|hub_ver|hub_base|sel —
      * everything past the version is optional ("" = let each node decide).
-     * target_ver/base are the bots' (ircbot-releases); hub_ver/hub_base are
-     * the hubs' own (irchub-releases), and an empty hub_ver leaves every hub
-     * where it is.  A base never contains '|' (hub_upgrade_start refuses
-     * one), so only the last field is a tail: the selection ("" = whole
-     * network), comma-separated name-or-uuid[=c|rs] tokens. */
+     * target_ver is the bots' (ircbot-releases); hub_ver is the hubs' own
+     * (irchub-releases), and an empty hub_ver leaves every hub where it is.
+     * The two base slots are no longer read: every node fetches from its own
+     * compiled-in root, the only tree its pinned key verifies.  Only the
+     * last field is a tail: the selection ("" = whole network),
+     * comma-separated name-or-uuid[=c|rs] tokens. */
     char ver[64] = "", variant[8] = "", kind[8] = "", min_from[64] = "";
-    char base[512] = "", hub_ver[64] = "", hub_base[512] = "";
+    char hub_ver[64] = "";
     char sel[MAX_UPGRADE_SELECT * 80] = "";
     if (payload) {
       wire_field(payload, 0, ver, sizeof(ver));
       wire_field(payload, 1, variant, sizeof(variant));
       wire_field(payload, 2, kind, sizeof(kind));
       wire_field(payload, 3, min_from, sizeof(min_from));
-      wire_field(payload, 4, base, sizeof(base));
       wire_field(payload, 5, hub_ver, sizeof(hub_ver));
-      wire_field(payload, 6, hub_base, sizeof(hub_base));
       wire_tail(payload, 7, sel, sizeof(sel));
     }
     char why[640];
-    if (!hub_upgrade_start(state, client, ver, variant, kind, min_from, base,
-                           hub_ver, hub_base, sel, why, sizeof(why)))
+    if (!hub_upgrade_plan_begin(state, client, ver, variant, kind, min_from,
+                                hub_ver, sel, why, sizeof(why)))
       return admin_err(state, client, "upg.refused",
                        strncmp(why, "ERROR: ", 7) == 0 ? why + 7 : why,
                        "upgrade status · upgrade releases");
@@ -6327,13 +6372,22 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     reply_kvi(&r, "selected", u->select_count);
     reply_kvi(&r, "bots", bots);
     reply_kvi(&r, "peers", hubs);
+    const upgrade_plan_t *pl = &state->plan;
+    if (pl->active && strcmp(pl->run_id, u->id) == 0) {
+      reply_kvi(&r, "step", pl->step + 1);
+      reply_kvi(&r, "steps", plan_steps(pl));
+      reply_kv(&r, "bot_final", pl->bot_target);
+      if (pl->hub_target[0]) reply_kv(&r, "hub_final", pl->hub_target);
+    }
     return send_reply(state, client, &r);
   }
 
   case CMD_ADMIN_UPGRADE_STATUS: {
-    /* "releases[|bot_base|hub_base]": what the admin console offers to pick
-     * from — the verified release manifests of both products and the nodes
-     * a selective run could name.  Read-only; allowed during a run. */
+    /* "releases[|bot_ver|hub_ver|sel]": what the admin console offers to
+     * pick from — the verified release manifests of both products and the
+     * nodes a selective run could name — plus, when targets are given, the
+     * path an `upgrade start` would take to them.  Read-only; allowed during
+     * a run. */
     if (payload && strncasecmp(payload, "releases", 8) == 0 &&
         (payload[8] == '\0' || payload[8] == '|')) {
       reply_t r;
@@ -6341,24 +6395,43 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       hub_upgrade_releases(state, payload, &r);
       return send_reply(state, client, &r);
     }
-    /* A payload of "abort" stops a run in flight and rolls the mesh back. */
+    /* A payload of "abort" stops a run in flight and rolls the mesh back,
+     * and stops a multi-step upgrade for good — here, and (flooded) on the
+     * hub driving it if that is another one. */
     if (payload && strcasecmp(payload, "abort") == 0) {
-      if (!state->upgrade.active)
-        return admin_err(state, client, "upg.none", "no upgrade is running",
-                         "upgrade status");
+      bool run = state->upgrade.active, plan = state->plan.active;
       int moved = 0;
-      for (int i = 0; i < state->upgrade.node_count; i++)
+      for (int i = 0; run && i < state->upgrade.node_count; i++)
         if (state->upgrade.nodes[i].state == UPG_NODE_DONE ||
             state->upgrade.nodes[i].state == UPG_NODE_COMMITTED)
           moved++;
       char id[64];
-      snprintf(id, sizeof(id), "%s", state->upgrade.id);
-      hub_upgrade_abort(state, "aborted by admin");
+      snprintf(id, sizeof(id), "%s", run ? state->upgrade.id : "");
+      int step = state->plan.step + 1, steps = plan_steps(&state->plan);
+      if (run) hub_upgrade_abort(state, "aborted by admin");
+      if (state->plan.active) {
+        char why[96];
+        snprintf(why, sizeof(why), "aborted by admin before step %d/%d", step,
+                 steps);
+        plan_stop(state, why);
+      }
+      int told = upgrade_cancel_flood(state);
       reply_t r;
       reply_init(&r);
+      if (!run && !plan) {
+        /* Nothing here; whatever runs elsewhere has been told to stop. */
+        reply_ok(&r, "upg.abort_sent");
+        reply_kvi(&r, "peers", told);
+        return send_reply(state, client, &r);
+      }
       reply_ok(&r, "upg.aborted");
-      reply_kv(&r, "id", id);
+      if (id[0]) reply_kv(&r, "id", id);
       reply_kvi(&r, "rolled_back", moved);
+      if (plan) {
+        reply_kvi(&r, "step", step);
+        reply_kvi(&r, "steps", steps);
+      }
+      reply_kvi(&r, "peers", told);
       return send_reply(state, client, &r);
     }
     /* "forget" drops the roll-up plan a finished run left behind, here and
@@ -7041,7 +7114,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         free(bl);
         reply_kvi(&r, "bans", nb);
       }
-      reply_chan(&r, e);
+      reply_chan(state, &r, e);
       /* every setting's effective value, so the view need not say only "all
        * default" */
       mf_setting_rows(state, &r, cn[0] ? cn : NULL, false);
@@ -7062,7 +7135,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     reply_kvi(&r, "bots_online", network_bots_online(state));
     for (int i = 0; i < state->global_entry_count; i++)
       if (strcmp(state->global_entries[i].key, "c") == 0)
-        reply_chan(&r, &state->global_entries[i]);
+        reply_chan(state, &r, &state->global_entries[i]);
     return send_reply(state, client, &r);
   }
 
@@ -7139,54 +7212,10 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       return admin_err(state, client, "channel.usage", "say which channel and nick",
                        "channel op <#chan> <nick>");
     /* One bot does it (CMD_CHAN_PROBE); the answer goes out when the
-     * election ends.  A mesh with an older hub keeps the old fan-out. */
-    if (ce_mesh_ready(state)) {
-      if (ce_start(state, "op", channel, "ADMIN", nick, "", client)) return true;
-      return admin_err(state, client, "channel.busy", "too many channel requests in flight",
-                       "try again in a few seconds");
-    }
-    char request_id[64];
-    generate_request_id(request_id, sizeof(request_id));
-    /* Every local bot is asked; one that is not opped there ignores it. */
-    int sent_count = 0;
-    for (int i = 0; i < state->client_count; i++) {
-      if (state->clients[i]->type != CLIENT_BOT || !state->clients[i]->authenticated)
-        continue;
-      char op_payload[256];
-      snprintf(op_payload, sizeof(op_payload), "%s|%s", nick, channel);
-      unsigned char plain[MAX_BUFFER];
-      plain[0] = CMD_OP_GRANT;
-      uint32_t pay_len = (uint32_t)strlen(op_payload);
-      uint32_t net_len = htonl(pay_len);
-      memcpy(&plain[1], &net_len, 4);
-      memcpy(&plain[5], op_payload, pay_len);
-      unsigned char enc[MAX_BUFFER], tag[GCM_TAG_LEN];
-      int enc_len = aes_gcm_encrypt(plain, (int)(5 + pay_len), state->clients[i]->session_key,
-                                    enc + 4, tag);
-      if (enc_len > 0) {
-        memcpy(enc + 4 + enc_len, tag, GCM_TAG_LEN);
-        net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-        memcpy(enc, &net_len, 4);
-        if (send(state->clients[i]->fd, enc, (size_t)(4 + enc_len + GCM_TAG_LEN), 0) > 0)
-          sent_count++;
-      }
-    }
-    /* Also forward to peer hubs to reach bots connected to them.  Stamp
-     * origin_ts now and mark seen locally so any loop-back is dropped. */
-    char admin_payload[256];
-    snprintf(admin_payload, sizeof(admin_payload), "%s:%s", nick, channel);
-    time_t admin_origin_ts = time(NULL);
-    op_forward_seen_check_and_add(state, request_id);
-    forward_op_request_to_peers(state, request_id, "ADMIN", "ANY", admin_payload, "", -1,
-                                admin_origin_ts, false);
-    reply_t r;
-    reply_init(&r);
-    reply_ok(&r, "channel.op");
-    reply_kv(&r, "nick", nick);
-    reply_kv(&r, "chan", channel);
-    reply_kvi(&r, "local", sent_count);
-    reply_kvi(&r, "peers", linked_peer_count(state));
-    return send_reply(state, client, &r);
+     * election ends. */
+    if (ce_start(state, "op", channel, "ADMIN", nick, "", client)) return true;
+    return admin_err(state, client, "channel.busy", "too many channel requests in flight",
+                     "try again in a few seconds");
   }
 
   case CMD_ADMIN_CHAN_MODE:
@@ -7206,25 +7235,9 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
         (channel[0] != '#' && channel[0] != '&'))
       return admin_err(state, client, "channel.usage", "say which channel and nick",
                        "channel invite <#chan> <nick>");
-    if (ce_mesh_ready(state)) {
-      if (ce_start(state, "invite", channel, "ADMIN", nick, "", client)) return true;
-      return admin_err(state, client, "channel.busy", "too many channel requests in flight",
-                       "try again in a few seconds");
-    }
-    /* Older hub in the mesh: the bots' own invite path, asked of everyone. */
-    char request_id[64];
-    generate_request_id(request_id, sizeof(request_id));
-    op_forward_seen_check_and_add(state, request_id);
-    int told = broadcast_chan_action(state, request_id, "ADMIN", "invite", channel, nick, "");
-    forward_chan_request_to_peers(state, request_id, "ADMIN", "invite", channel, nick, "", -1);
-    reply_t r;
-    reply_init(&r);
-    reply_ok(&r, "channel.invite");
-    reply_kv(&r, "nick", nick);
-    reply_kv(&r, "chan", channel);
-    reply_kvi(&r, "local", told);
-    reply_kvi(&r, "peers", linked_peer_count(state));
-    return send_reply(state, client, &r);
+    if (ce_start(state, "invite", channel, "ADMIN", nick, "", client)) return true;
+    return admin_err(state, client, "channel.busy", "too many channel requests in flight",
+                     "try again in a few seconds");
   }
 
   case CMD_ADMIN_PURGE_TOMBSTONES: {
@@ -7586,6 +7599,11 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       if (!nchans || (star && nchans > 1))
         return admin_err(state, client, "user.bad_chans",
                          "channels are * (every channel) or up to 16 of #a,#b", usage);
+      /* a binding to a channel nobody manages would be an orphan from the
+       * start (user chan add refuses it too) */
+      for (int k = 0; k < nchans; k++)
+        if (strcmp(chans[k], "*") != 0 && !hub_chan_live(state, chans[k], NULL, 0))
+          return mf_status_err(state, client, HUB_MODES_NOT_MANAGED, chans[k]);
     }
     if (!pname[0] || strchr(pname, '|') || strchr(pname, ' '))
       return admin_err(state, client, "user.bad_name", "that is not a usable name", usage);
@@ -7656,7 +7674,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
      * order a peer needs them (hub_peer_enqueue_sync downgrades it for an
      * older peer). */
     char sync[MAX_BUFFER];
-    int so = hub_format_user_record(u, false, sync, sizeof(sync));
+    int so = hub_format_user_record(u, sync, sizeof(sync));
     if (so < 0 || so >= (int)sizeof(sync)) so = 0;
     int w = snprintf(sync + so, sizeof(sync) - (size_t)so, "m|%s|%s|add|0|%ld\n", m->uuid,
                      m->mask, (long)now);
@@ -7683,7 +7701,6 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     reply_kvi(&r, "peers", linked_peer_count(state));
     reply_kvi(&r, "bots", local_bot_count(state));
     reply_kvi(&r, "port", state->listen_port ? state->listen_port : state->port);
-    if (hub_user_restricted(state, u)) reply_old_hubs_for(state, &r, USER_FLAGS_MIN_HUB);
     return send_reply(state, client, &r);
   }
 
@@ -7719,7 +7736,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     target->timestamp = hub_lww_next_ts(target->timestamp);
     state->config_dirty = true;
     char uline[USER_LINE_MAX];
-    int sync_len = hub_format_user_record(target, false, uline, sizeof(uline));
+    int sync_len = hub_format_user_record(target, uline, sizeof(uline));
     if (sync_len < 0 || sync_len >= (int)sizeof(uline)) sync_len = 0;
     memcpy(sync, uline, (size_t)sync_len);
     sync[sync_len] = '\0';
@@ -7890,7 +7907,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     target->timestamp = hub_lww_next_ts(target->timestamp);
     state->config_dirty = true;
     char sync[MAX_BUFFER];
-    hub_format_user_record(target, false, sync, sizeof(sync));
+    hub_format_user_record(target, sync, sizeof(sync));
     hub_broadcast_config_to_bots(state, sync);
     hub_broadcast_sync_to_peers(state, sync, -1);
     char fp[KEY_FP_LEN + 1];
@@ -8573,17 +8590,9 @@ static void process_chan_request(hub_state_t *state, hub_client_t *client,
 
   hub_log_info("[HUB] CHAN_REQUEST %s from %s for %s\n", kind, client->id, channel);
 
-  /* One bot answers it (CMD_CHAN_PROBE) unless an older hub is in the mesh. */
-  if (ce_mesh_ready(state)) {
-    if (!ce_start(state, kind, channel, client->id, nick, hostmask, NULL))
-      hub_log_warning("[CHANREQ] Election table full — dropping %s for %s\n", kind, channel);
-    return;
-  }
-  char request_id[64];
-  generate_request_id(request_id, sizeof(request_id));
-  op_forward_seen_check_and_add(state, request_id);
-  chan_request_dispatch(state, request_id, client->id, kind, channel, nick,
-                        hostmask, -1);
+  /* One bot answers it (CMD_CHAN_PROBE). */
+  if (!ce_start(state, kind, channel, client->id, nick, hostmask, NULL))
+    hub_log_warning("[CHANREQ] Election table full — dropping %s for %s\n", kind, channel);
 }
 
 /* A bot answering a request (today only `key`).  Route it to the requester if
@@ -8759,18 +8768,6 @@ static int ce_pick(int n) {
   return (int)(r % (uint32_t)n);
 }
 
-/* Every hub this one knows of speaks the election; otherwise the request takes
- * the old path end to end (an older hub ignores the new frames). */
-static bool ce_mesh_ready(const hub_state_t *state) {
-  for (int i = 0; i < state->mesh_hub_count; i++) {
-    const mesh_hub_t *m = &state->mesh_hubs[i];
-    if (state->hub_uuid[0] && strcmp(m->uuid, state->hub_uuid) == 0) continue;
-    if (!m->version[0] || hub_update_version_cmp(m->version, CHAN_ELECT_MIN_HUB) < 0)
-      return false;
-  }
-  return true;
-}
-
 static hub_client_t *ce_peer(hub_state_t *state, int fd) {
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
@@ -8847,31 +8844,6 @@ static bool ce_try_local(hub_state_t *state, chan_elect_t *e) {
   }
 }
 
-/* The old path, for local bots that never answered the probe.  Returns how
- * many were told. */
-static int ce_legacy_local(hub_state_t *state, chan_elect_t *e) {
-  int told = 0;
-  /* "mode" is new in 2.4.5: an older bot has no old-style request for it. */
-  if (strcmp(e->kind, "mode") == 0) return 0;
-  for (int i = 0; i < e->bot_n; i++) {
-    if (e->bots[i].st != 'a') continue;
-    hub_client_t *c = ce_bot(state, e->bots[i].uuid);
-    if (!c) continue;
-    char buf[MAX_MASK_LEN + 256];
-    bool ok;
-    if (strcmp(e->kind, "op") == 0) {
-      snprintf(buf, sizeof(buf), "%s|%s", e->nick, e->channel);
-      ok = send_cmd_to_bot(c, CMD_OP_GRANT, buf);
-    } else {
-      snprintf(buf, sizeof(buf), "%s|%s|%s|%s|%s|%s", e->id, e->kind, e->channel,
-               e->requester, e->nick, e->hostmask);
-      ok = send_cmd_to_bot(c, CMD_CHAN_ACTION, buf);
-    }
-    if (ok) told++;
-  }
-  return told;
-}
-
 /* "3 not opped, 1 not in channel" from our own bots' answers. */
 static void ce_reasons(const chan_elect_t *e, char *out, size_t cap) {
   out[0] = '\0';
@@ -8902,17 +8874,17 @@ static const char *ce_kind_word(const char *kind) {
 }
 
 /* The origin's end of an election: answer the console that asked, log, and
- * free the slot.  status: "ok" (one bot did it), "legacy" (older bots were
- * asked the old way), anything else = nobody could. */
+ * free the slot.  status: "ok" (one bot did it), "bitch" (refused, D12),
+ * anything else = nobody could. */
 static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
                       const char *by_uuid, const char *by_nick, const char *hub_name,
-                      const char *detail, int legacy) {
+                      const char *detail) {
   int asked = e->bot_n, hubs = 1;
   for (int i = 0; i < e->hub_n; i++) {
     asked += e->hubs[i].asked;
     hubs++;
   }
-  bool ok = strcmp(status, "ok") == 0, leg = strcmp(status, "legacy") == 0;
+  bool ok = strcmp(status, "ok") == 0;
   bool bitch = strcmp(status, "bitch") == 0;
   if (bitch)
     hub_log_info("[CHANREQ] %s %s on %s (id:%s): refused, not authorised and +bitch is on\n",
@@ -8922,10 +8894,6 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
     hub_log_info("[CHANREQ] %s %s on %s (id:%s): done by %s on %s\n", ce_kind_word(e->kind),
                  e->nick[0] ? e->nick : e->requester, e->channel, e->id,
                  by_nick && by_nick[0] ? by_nick : by_uuid, hub_name);
-  else if (leg)
-    hub_log_info("[CHANREQ] %s %s on %s (id:%s): no ready bot; %d older bot(s) asked\n",
-                 ce_kind_word(e->kind), e->nick[0] ? e->nick : e->requester, e->channel,
-                 e->id, legacy);
   else
     hub_log_info("[CHANREQ] %s %s on %s (id:%s): nobody could (%s)\n", ce_kind_word(e->kind),
                  e->nick[0] ? e->nick : e->requester, e->channel, e->id,
@@ -8944,9 +8912,6 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
     else if (ok)
       snprintf(res, sizeof(res), "%s|ok|%s by %.31s on %.63s", e->reply_rid,
                ce_kind_word(e->kind), by_nick && by_nick[0] ? by_nick : by_uuid, hub_name);
-    else if (leg)
-      snprintf(res, sizeof(res), "%s|ok|asked %d older bot%s", e->reply_rid, legacy,
-               legacy == 1 ? "" : "s");
     else {
       char why[160];
       ce_reasons(e, why, sizeof(why));
@@ -8975,20 +8940,16 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
   } else if (admin) {
     char code[24];
     snprintf(code, sizeof(code), "channel.%s", e->kind);
-    if (ok || leg) {
+    if (ok) {
       reply_t r;
       reply_init(&r);
       reply_ok(&r, code);
       if (e->nick[0] || strcmp(e->kind, "mode") != 0) reply_kv(&r, "nick", e->nick);
       reply_kv(&r, "chan", e->channel);
-      if (ok) {
-        reply_kv(&r, "by", by_nick && by_nick[0] ? by_nick : by_uuid);
-        reply_kv(&r, "by_uuid", by_uuid);
-        reply_kv(&r, "hub_name", hub_name);
-        if (detail && detail[0]) reply_kv(&r, "detail", detail);
-      } else {
-        reply_kvi(&r, "legacy", legacy);
-      }
+      reply_kv(&r, "by", by_nick && by_nick[0] ? by_nick : by_uuid);
+      reply_kv(&r, "by_uuid", by_uuid);
+      reply_kv(&r, "hub_name", hub_name);
+      if (detail && detail[0]) reply_kv(&r, "detail", detail);
       reply_kvi(&r, "asked", asked);
       reply_kvi(&r, "hubs", hubs);
       if (strcmp(e->kind, "mode") == 0) {
@@ -8999,7 +8960,6 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
           char eff_chan[MAX_CHAN];
           snprintf(eff_chan, sizeof(eff_chan), "%s", cn);
           mf_mode_card_extra(state, &r, eff_chan);
-          mf_reply_old_hubs(state, &r);
         }
       }
       send_reply(state, admin, &r);
@@ -9024,15 +8984,13 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
                       why[0] ? why : (detail ? detail : ""));
       if (mw < 0) msg[0] = '\0';
       if (strcmp(e->kind, "mode") == 0) {
-        /* the modes were stored before the election: say so, and warn about
-         * older hubs here too (D38) */
+        /* the modes were stored before the election: say so */
         reply_t er;
         reply_init(&er);
         reply_err(&er, "channel.nobody", msg,
                   "the modes are stored; a bot must be in the channel and opped there to "
                   "apply them (channel mode again)");
         reply_kvb(&er, "stored", true);
-        mf_reply_old_hubs(state, &er);
         send_reply(state, admin, &er);
       } else {
         admin_err(state, admin, "channel.nobody", msg,
@@ -9057,8 +9015,10 @@ static void ce_done_up(hub_state_t *state, chan_elect_t *e, const char *bot_uuid
   ce_up(state, e, CMD_CHAN_ELECT_DONE, buf);
 }
 
-/* Origin, nobody local can: the next hub with a ready bot, else the older
- * bots, else nobody. */
+/* Origin, nobody local can: the next hub with a ready bot, else nobody.  A
+ * bot that never answered the probe is not handed a blind old-style request:
+ * every bot the mesh admits (MESH_MIN_VERSION) answers probes, so silence
+ * means busy or gone, and the old fan-out skipped +bitch (D12). */
 static void ce_try_hub(hub_state_t *state, chan_elect_t *e) {
   int ready = 0;
   for (int i = 0; i < e->hub_n; i++)
@@ -9081,19 +9041,7 @@ static void ce_try_hub(hub_state_t *state, chan_elect_t *e) {
     ce_try_hub(state, e); /* that hub's link went away: the next one */
     return;
   }
-  int legacy = ce_legacy_local(state, e);
-  for (int i = 0; i < e->hub_n; i++) {
-    chan_elect_hub_t *h = &e->hubs[i];
-    if (h->silent <= 0 || strcmp(e->kind, "mode") == 0) continue;
-    hub_client_t *p = ce_peer(state, h->fd);
-    char buf[160];
-    snprintf(buf, sizeof(buf), "%s|%s|legacy", e->id, h->uuid);
-    if (p && peer_send_urgent(state, p, CMD_CHAN_ELECT_DO, buf)) legacy += h->silent;
-  }
-  if (legacy > 0)
-    ce_finish(state, e, "legacy", NULL, NULL, NULL, NULL, legacy);
-  else
-    ce_finish(state, e, "nobody", NULL, NULL, NULL, NULL, 0);
+  ce_finish(state, e, "nobody", NULL, NULL, NULL, NULL);
 }
 
 /* Nothing (more) to do locally: the origin asks the mesh, a relay says so. */
@@ -9226,17 +9174,6 @@ static void process_user_chan_request(hub_state_t *state, hub_client_t *client,
   if (!hub_chan_live(state, chan, NULL, 0)) UCR_FAIL("%s is not a managed channel", chan);
   hub_log_info("[CHANREQ] %s for %s (%s) on %s, from %s\n", kind, nick, u->name, chan,
                client->id);
-  if (!ce_mesh_ready(state)) {
-    /* An older hub in the mesh: the old ask-everyone path, no answer back. */
-    if (strcmp(kind, "op") == 0) UCR_FAIL("older hubs in the mesh: ask an admin");
-    char request_id[64];
-    generate_request_id(request_id, sizeof(request_id));
-    op_forward_seen_check_and_add(state, request_id);
-    chan_request_dispatch(state, request_id, u->uuid, kind, chan, nick, mask, -1);
-    snprintf(res, sizeof(res), "%s|ok|asked every bot (older hubs in the mesh)", rid);
-    send_cmd_to_bot(client, CMD_USER_CHAN_RESULT, res);
-    return;
-  }
   chan_elect_t *e = ce_start(state, kind, chan, u->uuid, nick, mask, NULL);
   if (!e) UCR_FAIL("too many channel requests in flight; try again");
   e->reply_fd = client->fd;
@@ -9279,7 +9216,7 @@ static void process_chan_done(hub_state_t *state, hub_client_t *client,
     if (strcmp(e->bots[i].uuid, client->id) == 0) b = &e->bots[i];
   if (strcmp(status, "ok") == 0) {
     if (e->origin)
-      ce_finish(state, e, "ok", client->id, b ? b->nick : "", hub_display_name(state), clean, 0);
+      ce_finish(state, e, "ok", client->id, b ? b->nick : "", hub_display_name(state), clean);
     else {
       ce_done_up(state, e, client->id, b ? b->nick : "", "ok", clean);
       e->phase = CE_ACKED;
@@ -9292,7 +9229,7 @@ static void process_chan_done(hub_state_t *state, hub_client_t *client,
       strcmp(e->kind, "op") == 0) {
     if (e->origin)
       ce_finish(state, e, "bitch", client->id, b ? b->nick : "", hub_display_name(state),
-                clean, 0);
+                clean);
     else {
       ce_done_up(state, e, client->id, b ? b->nick : "", "fail", clean);
       e->phase = CE_ACKED;
@@ -9376,7 +9313,8 @@ static void process_chan_elect_ack(hub_state_t *state, hub_client_t *client,
   if (!e->origin) ce_up(state, e, CMD_CHAN_ELECT_ACK, payload);
 }
 
-/* ELECT_DO: eid|hub_uuid|elect or legacy.  Ours: act; else route it on. */
+/* ELECT_DO: eid|hub_uuid|elect.  Ours: act; else route it on.  "legacy"
+ * (from a 2.5.0 origin) is no longer acted on: see ce_try_hub. */
 static void process_chan_elect_do(hub_state_t *state, hub_client_t *client,
                                   const char *payload) {
   char id[64] = "", hub[64] = "", mode[8] = "";
@@ -9394,13 +9332,7 @@ static void process_chan_elect_do(hub_state_t *state, hub_client_t *client,
       }
     return;
   }
-  if (strcmp(mode, "legacy") == 0) {
-    int n = ce_legacy_local(state, e);
-    hub_log_info("[CHANREQ] %s %s on %s (id:%s): %d older bot(s) asked here\n",
-                 ce_kind_word(e->kind), e->nick[0] ? e->nick : e->requester, e->channel,
-                 e->id, n);
-    return;
-  }
+  if (strcmp(mode, "elect") != 0) return;
   if (!ce_try_local(state, e)) ce_local_exhausted(state, e);
 }
 
@@ -9430,10 +9362,10 @@ static void process_chan_elect_done(hub_state_t *state, hub_client_t *client,
   roster_clean(ck, sizeof(ck), nick);
   roster_clean(cd, sizeof(cd), detail);
   if (strcmp(status, "ok") == 0)
-    ce_finish(state, e, "ok", cb, ck, cn, cd, 0);
+    ce_finish(state, e, "ok", cb, ck, cn, cd);
   else if (strcmp(status, "fail") == 0 && strcmp(cd, "bitch") == 0 &&
            strcmp(e->kind, "op") == 0)
-    ce_finish(state, e, "bitch", cb, ck, cn, cd, 0);
+    ce_finish(state, e, "bitch", cb, ck, cn, cd);
   else
     ce_try_hub(state, e);
 }
@@ -9465,13 +9397,19 @@ void hub_chan_elect_tick(hub_state_t *state, time_t now) {
     chan_elect_t *e = &state->chan_elections[i];
     if (!e->active) continue;
     if (now - e->created > CHAN_ELECT_TTL) {
-      if (e->origin) ce_finish(state, e, "timeout", NULL, NULL, NULL, "timed out", 0);
+      if (e->origin) ce_finish(state, e, "timeout", NULL, NULL, NULL, "timed out");
       e->active = false;
       continue;
     }
     switch (e->phase) {
     case CE_PROBE:
       if (ce_count(e, 'a') > 0 && now - e->phase_at < CHAN_ELECT_PROBE_WAIT) break;
+      /* still silent: a no, with the reason the answer gives */
+      for (int j = 0; j < e->bot_n; j++)
+        if (e->bots[j].st == 'a') {
+          e->bots[j].st = 'n';
+          snprintf(e->bots[j].reason, sizeof(e->bots[j].reason), "no answer");
+        }
       if (!e->origin) {
         char ack[256];
         snprintf(ack, sizeof(ack), "%s|%s|%s|%d|%d|%d", e->id, state->hub_uuid,
@@ -9793,9 +9731,7 @@ static void upgrade_finish(hub_state_t *state, upgrade_phase_t phase,
     snprintf(r->variant, sizeof(r->variant), "%s", u->variant);
     snprintf(r->kind, sizeof(r->kind), "%s", u->kind);
     snprintf(r->min_from, sizeof(r->min_from), "%s", u->min_from);
-    snprintf(r->base, sizeof(r->base), "%s", u->base);
     snprintf(r->hub_target, sizeof(r->hub_target), "%s", u->hub_ver);
-    snprintf(r->hub_base, sizeof(r->hub_base), "%s", u->hub_base);
     r->plan_set = time(NULL);
     state->rollup_try_count = 0;
     hub_config_write(state); /* the plan survives a restart (Task 13) */
@@ -9809,6 +9745,10 @@ static void upgrade_finish(hub_state_t *state, upgrade_phase_t phase,
   hub_opt_flag_set(state, OPT_CONFIG_FROZEN, false);
   hub_log_info("[UPGRADE] Run %s %s: %s\n", u->id, upgrade_phase_name(phase),
           u->summary);
+  /* A step of a multi-step upgrade: decide whether the next one follows.
+   * Before this hub restarts onto the step itself, so the decision is on
+   * disk when the new build boots. */
+  plan_note_run_end(state, phase);
 }
 
 /* Tell every node that already moved (or is moving) to go back, then end the
@@ -10000,46 +9940,6 @@ static const char *upgrade_node_variant(const pending_upgrade_t *u,
   return n->want_variant[0] ? n->want_variant : u->variant;
 }
 
-/* Every hub a selective run could cross must understand the `sel` field of a
- * peer PREPARE (see UPGRADE_SELECT_MIN_HUB).  Names the first one that does
- * not, or returns false. */
-static bool upgrade_old_hub(const hub_state_t *state, char *who,
-                            size_t who_size) {
-  for (int i = 0; i < state->peer_count; i++) {
-    const hub_peer_config_t *p = &state->peers[i];
-    if (!p->connected) continue;
-    if (!p->remote_version[0] ||
-        hub_update_version_cmp(p->remote_version, UPGRADE_SELECT_MIN_HUB) < 0) {
-      snprintf(who, who_size, "%s (%s)",
-               p->friendly_name[0] ? p->friendly_name : p->uuid,
-               p->remote_version[0] ? p->remote_version : "version unknown");
-      return true;
-    }
-  }
-  for (int i = 0; i < state->mesh_hub_count; i++) {
-    const mesh_hub_t *m = &state->mesh_hubs[i];
-    if (strcmp(m->uuid, state->hub_uuid) == 0 || !m->version[0]) continue;
-    if (hub_update_version_cmp(m->version, UPGRADE_SELECT_MIN_HUB) < 0) {
-      snprintf(who, who_size, "%s (%s)", m->name[0] ? m->name : m->uuid,
-               m->version);
-      return true;
-    }
-  }
-  return false;
-}
-
-/* Is the peer connection `c` known to run a hub new enough for `sel`? */
-static bool upgrade_peer_takes_sel(const hub_state_t *state,
-                                   const hub_client_t *c) {
-  for (int i = 0; i < state->peer_count; i++) {
-    const hub_peer_config_t *p = &state->peers[i];
-    if (!p->connected || p->fd != c->fd) continue;
-    return p->remote_version[0] &&
-           hub_update_version_cmp(p->remote_version, UPGRADE_SELECT_MIN_HUB) >= 0;
-  }
-  return false;
-}
-
 /* Send one node its CMD_UPGRADE_COMMIT.  A node that dropped off in the
  * meantime is marked unable rather than failing the run — Task 7 rolls it up
  * when it reconnects. */
@@ -10086,7 +9986,7 @@ static bool upgrade_commit_node(hub_state_t *state, upgrade_node_t *n) {
     upgrade_finish(state, UPG_DONE, done_msg);
 
     const char *err = NULL;
-    if (!hub_update_commit(state, u->id, ver, variant, u->hub_base, &err)) {
+    if (!hub_update_commit(state, u->id, ver, variant, &err)) {
       /* The other nodes are already on the target and the freeze is lifted;
        * only this hub stayed behind.  Say so in the summary rather than
        * leaving the run reading "done" with no explanation. */
@@ -10145,8 +10045,7 @@ static bool upgrade_commit_node(hub_state_t *state, upgrade_node_t *n) {
 static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
                               const char *target_ver, const char *variant,
                               const char *kind, const char *min_from,
-                              const char *base, const char *hub_ver,
-                              const char *hub_base, const char *sel,
+                              const char *hub_ver, const char *sel,
                               char *msg, size_t msg_size) {
   pending_upgrade_t *u = &state->upgrade;
   if (u->active) {
@@ -10182,22 +10081,9 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
     snprintf(msg, msg_size, "ERROR: bad min_from version");
     return false;
   }
-  /* The base travels to every node and ends up in a shell-free download path
-   * there, but reject the obvious shapes here rather than at each node. */
-  if (base && base[0] &&
-      (strlen(base) >= sizeof(u->base) || strpbrk(base, ";|&`$ \t\r\n"))) {
-    snprintf(msg, msg_size, "ERROR: bad manifest base");
-    return false;
-  }
   if (hub_ver && (strlen(hub_ver) >= sizeof(u->hub_ver) ||
                   strpbrk(hub_ver, "|;&`$ \t\r\n"))) {
     snprintf(msg, msg_size, "ERROR: bad hub target version");
-    return false;
-  }
-  if (hub_base && hub_base[0] &&
-      (!hub_ver || !hub_ver[0] || strlen(hub_base) >= sizeof(u->hub_base) ||
-       strpbrk(hub_base, ";|&`$ \t\r\n"))) {
-    snprintf(msg, msg_size, "ERROR: bad hub manifest base");
     return false;
   }
 
@@ -10267,14 +10153,6 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
       snprintf(msg, msg_size, "ERROR: the selection names no node");
       return false;
     }
-    char who[160];
-    if (upgrade_old_hub(state, who, sizeof(who))) {
-      snprintf(msg, msg_size,
-               "ERROR: hub %s is older than %s and cannot take a selective "
-               "run — upgrade the hubs first with a whole-network run",
-               who, UPGRADE_SELECT_MIN_HUB);
-      return false;
-    }
   }
 
   /* One spelling of a version everywhere a run compares it with strcmp —
@@ -10292,9 +10170,7 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
   snprintf(u->kind, sizeof(u->kind), "%s", kind ? kind : "");
   snprintf(u->min_from, sizeof(u->min_from), "%s",
            (min_from && min_from[0]) ? min_from : "*");
-  snprintf(u->base, sizeof(u->base), "%s", base ? base : "");
   snprintf(u->hub_ver, sizeof(u->hub_ver), "%s", hub_ver ? hub_ver : "");
-  snprintf(u->hub_base, sizeof(u->hub_base), "%s", hub_base ? hub_base : "");
   u->select_count = picks;
   int sw = 0;
   for (int k = 0; k < picks; k++) {
@@ -10320,14 +10196,16 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
   hub_opt_flag_set(state, OPT_CONFIG_FROZEN, true);
 
   /* Two shapes of the same PREPARE.  A bot gets the six fields it has always
-   * read; a peer hub also needs the hubs' own target and base, appended so
-   * the bot prefix stays byte-identical and a follower can relay it on, and
-   * — in a selective run — the resolved selection, which tells it which of
-   * its own bots to ask and whether it is itself part of the run. */
-  char prepare_peer[1600 + sizeof(u->sel_wire)];
-  snprintf(prepare_peer, sizeof(prepare_peer), "%s|%s|%s|%s|%s|%s|%s|%s%s%s",
-           u->id, u->target_ver, u->variant, u->kind, u->min_from, u->base,
-           u->hub_ver, u->hub_base, u->sel_wire[0] ? "|" : "", u->sel_wire);
+   * read; a peer hub also needs the hubs' own target, appended so the bot
+   * prefix stays byte-identical and a follower can relay it on, and — in a
+   * selective run — the resolved selection, which tells it which of its own
+   * bots to ask and whether it is itself part of the run.  Both base slots
+   * stay empty (2.5.0 nodes still count fields): each node reads its own
+   * compiled-in root. */
+  char prepare_peer[600 + sizeof(u->sel_wire)];
+  snprintf(prepare_peer, sizeof(prepare_peer), "%s|%s|%s|%s|%s||%s|%s%s",
+           u->id, u->target_ver, u->variant, u->kind, u->min_from,
+           u->hub_ver, u->sel_wire[0] ? "|" : "", u->sel_wire);
 
   int bots = 0, peers = 0;
   for (int i = 0; i < state->client_count; i++) {
@@ -10343,9 +10221,8 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
       /* The variant this bot is asked about is ITS target build, so a bot
        * told "=c" checks the C manifest at PREPARE, not its own. */
       char prepare[1024];
-      snprintf(prepare, sizeof(prepare), "%s|%s|%s|%s|%s|%s", u->id,
-               u->target_ver, upgrade_node_variant(u, n), u->kind, u->min_from,
-               u->base);
+      snprintf(prepare, sizeof(prepare), "%s|%s|%s|%s|%s|", u->id,
+               u->target_ver, upgrade_node_variant(u, n), u->kind, u->min_from);
       if (send_cmd_to_bot(c, CMD_UPGRADE_PREPARE, prepare)) {
         bots++;
       } else {
@@ -10394,7 +10271,7 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
       snprintf(why, sizeof(why), "no hub target in this run");
     else
       can = hub_update_can_take(u->hub_ver, upgrade_node_variant(u, self),
-                                u->min_from, u->hub_base, why, sizeof(why));
+                                u->min_from, why, sizeof(why));
     self->not_selected = !picked;
     self->state = can ? UPG_NODE_READY : UPG_NODE_UNABLE;
     /* Explicit precision: a long reason is truncated on purpose. */
@@ -10628,8 +10505,7 @@ static void hub_upgrade_note_presence(hub_state_t *state, const char *uuid,
     return;
   /* A bot that reports ready itself (once re-opped where it was) is only
    * "back" here: the next wave waits for its ok, or UPGRADE_OPS_GRACE. */
-  if (node->kind == 'b' &&
-      hub_update_version_cmp(target, UPGRADE_OPS_GATE_MIN_BOT) >= 0) {
+  if (node->kind == 'b') {
     if (!node->back_at) {
       node->back_at = time(NULL);
       hub_log_info("[UPGRADE] %s is back on %s; waiting for it to report ready\n",
@@ -10664,6 +10540,22 @@ static bool hub_rollup_target_proven(const hub_state_t *state,
   for (int i = 0; i < state->roster_count; i++) {
     const bot_roster_t *e = &state->roster[i];
     if (strcmp(e->bot_uuid, except) != 0 && strcmp(e->version, target) == 0)
+      return true;
+  }
+  return false;
+}
+
+/* The hubs' counterpart: some hub other than `except` — this one, or any in
+ * the mesh map — announces the hub target. */
+static bool hub_rollup_hub_target_proven(hub_state_t *state, const char *target,
+                                         const char *except) {
+  if (strcmp(state->hub_uuid, except) != 0 &&
+      hub_update_version_cmp(HUB_VERSION, target) == 0)
+    return true;
+  for (int i = 0; i < state->mesh_hub_count; i++) {
+    const mesh_hub_t *m = &state->mesh_hubs[i];
+    if (strcmp(m->uuid, except) != 0 && m->version[0] &&
+        hub_update_version_cmp(m->version, target) == 0)
       return true;
   }
   return false;
@@ -10744,10 +10636,28 @@ static void process_peer_upgrade_forget(hub_state_t *state, hub_client_t *peer,
   if (atoll(ts) <= 0 || age > UPGRADE_FORGET_TTL || age < -UPGRADE_FORGET_TTL)
     return;
   if (op_forward_seen_check_and_add(state, id)) return;
-  /* A plan is never dropped under a run: the freeze is replicated, so every
-   * hub sees the same answer the admin's own hub gave. */
-  if (!state->upgrade.active && !hub_config_frozen(state))
+  char flag[4] = "", issued_s[24] = "";
+  wire_field(payload, 2, flag, sizeof(flag));
+  wire_field(payload, 3, issued_s, sizeof(issued_s));
+  if (strcmp(flag, "A") == 0) {
+    /* `upgrade abort` typed on another hub: stop whatever this hub drives —
+     * a run in flight, and a multi-step plan between its steps — unless it
+     * started after the admin typed it (a re-sent abort meeting a new run).
+     * Remembered, so a peer that comes up in the next UPGRADE_CANCEL_HOLD
+     * seconds hears it too. */
+    time_t issued = (time_t)(issued_s[0] ? atoll(issued_s) : atoll(ts));
+    snprintf(state->upgrade_cancel_id, sizeof(state->upgrade_cancel_id), "%s", id);
+    state->upgrade_cancel_issued = issued;
+    state->upgrade_cancel_seen = time(NULL);
+    if (state->upgrade.active && state->upgrade.started <= issued)
+      hub_upgrade_abort(state, "aborted by an admin on another hub");
+    if (state->plan.active && state->plan.started <= issued)
+      plan_stop(state, "aborted by an admin on another hub");
+  } else if (!state->upgrade.active && !hub_config_frozen(state)) {
+    /* A plan is never dropped under a run: the freeze is replicated, so
+     * every hub sees the same answer the admin's own hub gave. */
     hub_rollup_forget(state, "forgotten by an admin on another hub");
+  }
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
     if (c->type == CLIENT_HUB && c->authenticated && c != peer)
@@ -10757,18 +10667,28 @@ static void process_peer_upgrade_forget(hub_state_t *state, hub_client_t *peer,
 
 /* Is this uuid a node worth catching up, and may we try it now? */
 static bool hub_rollup_may_try(hub_state_t *state, const char *uuid,
-                               const char *version) {
+                               char node_kind, const char *version) {
   pending_rollup_t *r = &state->rollup;
   if (!r->have_plan || r->active) return false;
   if (state->upgrade.active) return false; /* a real run owns the mesh */
+  /* ...and so does a multi-step upgrade between its steps: the next step
+   * moves every node anyway, and a straggler is caught up after the last. */
+  if (state->plan.active) return false;
   /* The freeze is the mesh-wide "a run is in flight" signal: it is set at
    * PREPARE, replicated with the rest of the opt record, and lifted when the
    * run ends.  A follower learns a run finished from it — nothing else tells
    * it — and neither end may chase a straggler while it holds. */
   if (hub_config_frozen(state)) return false;
   if (!uuid || !uuid[0] || !version || !version[0]) return false;
-  if (hub_update_version_cmp(version, r->target) >= 0) return false;
-  if (!hub_rollup_target_proven(state, r->target, uuid)) return false;
+  if (node_kind == 'h') {
+    if (!r->hub_target[0] ||
+        hub_update_version_cmp(version, r->hub_target) >= 0 ||
+        !hub_rollup_hub_target_proven(state, r->hub_target, uuid))
+      return false;
+  } else if (hub_update_version_cmp(version, r->target) >= 0 ||
+             !hub_rollup_target_proven(state, r->target, uuid)) {
+    return false;
+  }
   time_t now = time(NULL);
   if (now - r->plan_set < ROLLUP_SETTLE) return false;
   const rollup_try_t *t = rollup_try_for(state, uuid, false);
@@ -10782,29 +10702,37 @@ static bool hub_rollup_may_try(hub_state_t *state, const char *uuid,
 static void hub_rollup_consider(hub_state_t *state, const char *uuid,
                                 char node_kind, const char *version) {
   pending_rollup_t *r = &state->rollup;
-  if (!hub_rollup_may_try(state, uuid, version)) return;
+  if (!hub_rollup_may_try(state, uuid, node_kind, version)) return;
 
   /* Stepping: when the node is below the target's min_from it cannot jump
    * straight there, so ask the manifest for the highest release it may take
    * from where it is.  A manifest this hub cannot read (no curl, no key, no
    * network) is not fatal — aim straight at the target and let the node's own
    * updater refuse if it must. */
-  /* Read the BOT's release tree for its own build: the hub's tree and the
-   * hub's variant say nothing about which ircbot releases exist. */
+  /* Read the node's OWN product tree for its own build: a bot steps along
+   * ircbot-releases, a hub along this hub's irchub tree. */
   char step[64], why[192] = "";
-  hub_client_t *bc =
-      node_kind == 'b' ? upgrade_find_client(state, uuid, CLIENT_BOT) : NULL;
-  const char *step_variant = r->variant[0]           ? r->variant
-                             : (bc && bc->bot_variant[0]) ? bc->bot_variant
-                                                          : "c";
-  if (!hub_update_next_step(r->base[0] ? r->base : HUB_BOT_RELEASE_BASE,
-                            step_variant, version, r->target, step,
-                            sizeof(step), why, sizeof(why))) {
-    snprintf(step, sizeof(step), "%s", r->target);
+  const char *target = node_kind == 'h' ? r->hub_target : r->target;
+  const char *step_variant;
+  if (node_kind == 'h') {
+    const mesh_hub_t *m = mesh_hub_find(state, uuid);
+    step_variant = (m && m->variant[0]) ? m->variant : hub_update_host_variant();
+  } else {
+    hub_client_t *bc = upgrade_find_client(state, uuid, CLIENT_BOT);
+    step_variant = r->variant[0]                ? r->variant
+                   : (bc && bc->bot_variant[0]) ? bc->bot_variant
+                                                : "c";
+  }
+  if (!hub_update_next_step(node_kind == 'h' ? NULL : hub_update_bot_root(),
+                            step_variant, version, target, step, sizeof(step),
+                            why, sizeof(why))) {
+    snprintf(step, sizeof(step), "%s", target);
     if (why[0])
       hub_log_info("[ROLLUP] No step read for %s (%s); aiming at %s\n", uuid, why,
-              r->target);
+              target);
   }
+  if (step[0] == 'v' && isdigit((unsigned char)step[1]))
+    memmove(step, step + 1, strlen(step));
 
   r->active = true;
   r->committed = false;
@@ -10817,20 +10745,32 @@ static void hub_rollup_consider(hub_state_t *state, const char *uuid,
   /* min_from is "*": the step was already chosen against the manifest, and a
    * second check at the node would only re-answer the same question. */
   char prepare[1024];
-  snprintf(prepare, sizeof(prepare), "%s|%s|%s|%s|*|%s", r->id, r->step,
-           r->variant, r->kind, r->base);
-
-  /* Local bots only (see the peer-gossip presence hook): a roll-up PREPARE
-   * sent to a peer hub would be taken for a run's and fanned mesh-wide. */
-  hub_client_t *c =
-      node_kind == 'b' ? upgrade_find_client(state, uuid, CLIENT_BOT) : NULL;
-  bool sent = c && send_cmd_to_bot(c, CMD_UPGRADE_PREPARE, prepare);
+  bool sent;
+  if (node_kind == 'h') {
+    /* A directly linked hub gets the peer shape of a SELECTIVE run naming
+     * only itself: it checks its own hub target, asks none of its bots, and
+     * whatever it relays on is answered "not selected" and ignored here.  A
+     * selective PREPARE leaves no roll-up plan behind on anyone, and our own
+     * copy coming back around a cycle is dropped by the seen-ring. */
+    snprintf(prepare, sizeof(prepare), "%s|%s|%s|%s|*||%s||%s", r->id,
+             r->target, r->variant, r->kind, r->step, uuid);
+    op_forward_seen_check_and_add(state, r->id);
+    hub_client_t *pc = upgrade_find_peer(state, uuid);
+    sent = pc && peer_send_urgent(state, pc, CMD_UPGRADE_PREPARE, prepare);
+  } else {
+    /* Local bots only for the bot side: the run's bot PREPARE carries no
+     * selection, so sent to a peer it would be fanned mesh-wide. */
+    snprintf(prepare, sizeof(prepare), "%s|%s|%s|%s|*|", r->id, r->step,
+             r->variant, r->kind);
+    hub_client_t *c = upgrade_find_client(state, uuid, CLIENT_BOT);
+    sent = c && send_cmd_to_bot(c, CMD_UPGRADE_PREPARE, prepare);
+  }
   if (!sent) {
     hub_rollup_end(state, "could not deliver PREPARE", true);
     return;
   }
   hub_log_info("[ROLLUP] %s is on %s, the network is on %s: PREPARE %s -> %s\n",
-          uuid, version, r->target, r->id, r->step);
+          uuid, version, target, r->id, r->step);
 }
 
 /* CMD_UPGRADE_READY carrying a roll-up id.  Returns true when it was one. */
@@ -10848,10 +10788,18 @@ static bool hub_rollup_note_ready(hub_state_t *state, const char *payload) {
     hub_rollup_end(state, reason[0] ? reason : "node cannot take it", true);
     return true;
   }
-  char commit[192];
-  snprintf(commit, sizeof(commit), "%s|%s|%s", r->id, r->step, r->variant);
-  hub_client_t *c = upgrade_find_client(state, r->uuid, CLIENT_BOT);
-  bool sent = c && send_cmd_to_bot(c, CMD_UPGRADE_COMMIT, commit);
+  char commit[256];
+  bool sent;
+  if (r->node_kind == 'h') {
+    /* addressed to the hub itself (4th field), as a run commits a hub */
+    snprintf(commit, sizeof(commit), "%s|%s||%s", r->id, r->step, r->uuid);
+    hub_client_t *pc = upgrade_find_peer(state, r->uuid);
+    sent = pc && peer_send_urgent(state, pc, CMD_UPGRADE_COMMIT, commit);
+  } else {
+    snprintf(commit, sizeof(commit), "%s|%s|%s", r->id, r->step, r->variant);
+    hub_client_t *c = upgrade_find_client(state, r->uuid, CLIENT_BOT);
+    sent = c && send_cmd_to_bot(c, CMD_UPGRADE_COMMIT, commit);
+  }
   if (!sent) {
     hub_rollup_end(state, "disconnected before commit", true);
     return true;
@@ -10959,20 +10907,470 @@ static void hub_rollup_settle(hub_state_t *state, time_t now) {
     hub_rollup_forget(state, "complete: every bot and hub is on the target");
 }
 
+/* Hubs have no presence frame of their own here: the mesh gossip carries
+ * each hub's version.  So once a maintenance tick, (a) end a hub attempt
+ * whose hub is back on the step, and (b) consider ONE directly linked hub
+ * that is behind the plan's hub target.  Of the hubs linked to a lagging
+ * hub, only the one with the lowest uuid walks it, so two neighbours never
+ * prepare it at once; a hub whose links are not known yet is walked by any. */
+static void hub_rollup_scan_hubs(hub_state_t *state) {
+  pending_rollup_t *r = &state->rollup;
+  if (!r->have_plan || !r->hub_target[0]) return;
+  if (r->active) {
+    if (r->node_kind != 'h') return;
+    const mesh_hub_t *m = mesh_hub_find(state, r->uuid);
+    if (m && m->version[0] && hub_update_version_cmp(m->version, r->step) >= 0) {
+      char uuid[64], ver[ROSTER_VERSION_MAX + 1];
+      snprintf(uuid, sizeof(uuid), "%s", r->uuid);
+      snprintf(ver, sizeof(ver), "%s", m->version);
+      hub_rollup_end(state, "back on the step it was given", false);
+      hub_rollup_consider(state, uuid, 'h', ver);
+    }
+    return;
+  }
+  for (int i = 0; i < state->peer_count; i++) {
+    const hub_peer_config_t *p = &state->peers[i];
+    if (!p->connected || !p->uuid[0]) continue;
+    const mesh_hub_t *m = mesh_hub_find(state, p->uuid);
+    if (!m || !m->version[0] ||
+        hub_update_version_cmp(m->version, r->hub_target) >= 0)
+      continue;
+    bool mine = true;
+    for (int k = 0; k < m->link_count && mine; k++)
+      if (m->links[k].online && strcmp(m->links[k].uuid, state->hub_uuid) < 0)
+        mine = false;
+    if (!mine) continue;
+    hub_rollup_consider(state, p->uuid, 'h', m->version);
+    if (r->active) return;
+  }
+}
+
 /* Time out an attempt that went nowhere, and drop a plan nobody is owed.
  * Runs on the maintenance clock. */
 static void hub_rollup_tick(hub_state_t *state, time_t now) {
   pending_rollup_t *r = &state->rollup;
   hub_rollup_settle(state, now);
+  hub_rollup_scan_hubs(state);
   if (!r->active) return;
   if (now - r->started <= ROLLUP_TIMEOUT) return;
   hub_rollup_end(state, r->committed ? "did not come back on the step in time"
                                      : "no answer to PREPARE", true);
 }
 
+/* ---- Multi-step upgrades -------------------------------------------------
+ * `upgrade start` to a version some node cannot reach in one go — it sits
+ * below that release's min_from — takes the intermediate releases the signed
+ * manifests name, one ordinary run per step.  The path is planned once, up
+ * front, from the oldest node of each product; each step's target is the
+ * newest release the previous one may install (hub_update_next_step), so a
+ * release that floors nothing is skipped.  Every node finishes a step before
+ * any starts the next: a release's min_from is also what keeps a newer mesh
+ * from refusing nodes still on an older one (MESH_MIN_VERSION).
+ *
+ * Only this hub knows the plan, and it restarts onto each step itself, so the
+ * plan lives in its .irchub.cnf (uplan|, see hub_config_write).  Nothing new
+ * goes on the wire: each step is a run like any other, which is what lets it
+ * move 2.4.x nodes that know nothing about plans. */
+
+static int plan_steps(const upgrade_plan_t *pl) {
+  return pl->bot_steps > pl->hub_steps ? pl->bot_steps : pl->hub_steps;
+}
+
+/* `path` is a char[n][64] passed flat, so a const plan needs no cast */
+static void plan_path_csv(const char *path, int n, char *out, size_t cap) {
+  size_t o = 0;
+  out[0] = '\0';
+  for (int i = 0; i < n; i++) {
+    int w = snprintf(out + o, cap - o, "%s%s", i ? "," : "", path + (size_t)i * 64);
+    if (w < 0 || (size_t)w >= cap - o) break;
+    o += (size_t)w;
+  }
+}
+
+static void strip_v(char *v) {
+  if (v[0] == 'v' && isdigit((unsigned char)v[1])) memmove(v, v + 1, strlen(v));
+}
+
+/* The admin's selection resolved to "uuid,uuid,...", or "" for the whole
+ * network.  A token that does not resolve is left out here: hub_upgrade_start
+ * resolves the selection again and refuses it with the reason. */
+static void plan_sel_uuids(hub_state_t *state, const char *sel, char *out,
+                           size_t cap) {
+  out[0] = '\0';
+  if (!sel || !sel[0]) return;
+  int nc = 0;
+  upgrade_cand_t *cands = upgrade_candidates(state, &nc);
+  if (!cands) return;
+  char work[MAX_UPGRADE_SELECT * 80];
+  snprintf(work, sizeof(work), "%s", sel);
+  size_t o = 0;
+  char *save = NULL;
+  for (char *tok = strtok_r(work, ", ", &save); tok;
+       tok = strtok_r(NULL, ", ", &save)) {
+    char *eq = strchr(tok, '=');
+    if (eq) *eq = '\0';
+    char err[256];
+    const upgrade_cand_t *c = upgrade_resolve(cands, nc, tok, err, sizeof(err));
+    if (!c) continue;
+    int w = snprintf(out + o, cap - o, "%s%s", o ? "," : "", c->uuid);
+    if (w < 0 || (size_t)w >= cap - o) break;
+    o += (size_t)w;
+  }
+  free(cands);
+}
+
+/* The oldest version (and its build) among the nodes of one product a run
+ * would move: 'b' bots — local and those the roster gossip reports — or 'h'
+ * hubs, this one included.  "" when no version is known. */
+static void plan_oldest(hub_state_t *state, char kind, const char *uuids,
+                        char *ver, size_t vcap, char *var, size_t varcap) {
+  ver[0] = var[0] = '\0';
+#define PLAN_CONSIDER(u, v, b)                                                 \
+  do {                                                                         \
+    if ((v)[0] && (!uuids[0] || upgrade_sel_lookup(uuids, (u), NULL, 0)) &&   \
+        (!ver[0] || hub_update_version_cmp((v), ver) < 0)) {                   \
+      snprintf(ver, vcap, "%s", (v));                                          \
+      snprintf(var, varcap, "%s", (b));                                        \
+    }                                                                          \
+  } while (0)
+  if (kind == 'h') {
+    PLAN_CONSIDER(state->hub_uuid, HUB_VERSION, hub_update_host_variant());
+    for (int i = 0; i < state->mesh_hub_count; i++) {
+      const mesh_hub_t *m = &state->mesh_hubs[i];
+      if (m->uuid[0] && strcmp(m->uuid, state->hub_uuid) != 0)
+        PLAN_CONSIDER(m->uuid, m->version, m->variant);
+    }
+  } else {
+    for (int i = 0; i < state->client_count; i++) {
+      const hub_client_t *c = state->clients[i];
+      if (c->type == CLIENT_BOT && c->authenticated)
+        PLAN_CONSIDER(c->id, c->bot_version, c->bot_variant);
+    }
+    for (int i = 0; i < state->roster_count; i++) {
+      const bot_roster_t *e = &state->roster[i];
+      PLAN_CONSIDER(e->bot_uuid, e->version, e->variant);
+    }
+  }
+#undef PLAN_CONSIDER
+}
+
+/* The steps from `from` to `target` along one release tree: each one the
+ * newest release the previous may install.  Returns the count (0 = nothing
+ * to do), or -1 with `why` set when the path cannot be walked or is longer
+ * than MAX_UPGRADE_STEPS.  A manifest this hub cannot read gives the one-step
+ * path a run always took: the nodes still check min_from themselves. */
+static int plan_path(const char *root, const char *variant, const char *from,
+                     const char *target, char path[][64], char *why,
+                     size_t why_size) {
+  why[0] = '\0';
+  if (!from[0]) {
+    snprintf(path[0], 64, "%s", target);
+    return 1;
+  }
+  if (hub_update_version_cmp(from, target) >= 0) return 0;
+  char cur[64];
+  snprintf(cur, sizeof(cur), "%s", from);
+  int n = 0;
+  while (hub_update_version_cmp(cur, target) < 0) {
+    char step[64], err[192] = "";
+    if (!hub_update_next_step(root, variant, cur, target, step, sizeof(step),
+                              err, sizeof(err))) {
+      if (n == 0) {
+        snprintf(path[0], 64, "%s", target);
+        return 1;
+      }
+      snprintf(why, why_size, "no step from %s towards %s: %s", cur, target,
+               err[0] ? err : "manifest unreadable");
+      return -1;
+    }
+    strip_v(step);
+    if (hub_update_version_cmp(step, cur) <= 0) {
+      snprintf(why, why_size, "no release in the manifest can be installed over %s",
+               cur);
+      return -1;
+    }
+    if (n >= MAX_UPGRADE_STEPS) {
+      snprintf(why, why_size,
+               "the path from %s to %s takes more than %d steps — upgrade to "
+               "an intermediate release first", from, target, MAX_UPGRADE_STEPS);
+      return -1;
+    }
+    snprintf(path[n++], 64, "%s", step);
+    snprintf(cur, sizeof(cur), "%s", step);
+  }
+  return n;
+}
+
+/* Plan both products' paths into `pl` (not yet active).  False with `why`. */
+static bool plan_compute(hub_state_t *state, const char *bot_ver,
+                         const char *hub_ver, const char *variant,
+                         const char *sel, upgrade_plan_t *pl, char *why,
+                         size_t why_size) {
+  memset(pl, 0, sizeof(*pl));
+  snprintf(pl->bot_target, sizeof(pl->bot_target), "%s", bot_ver);
+  strip_v(pl->bot_target);
+  snprintf(pl->hub_target, sizeof(pl->hub_target), "%s", hub_ver ? hub_ver : "");
+  strip_v(pl->hub_target);
+  char uuids[MAX_UPGRADE_SELECT * 72], var[16];
+  plan_sel_uuids(state, sel, uuids, sizeof(uuids));
+  plan_oldest(state, 'b', uuids, pl->bot_from, sizeof(pl->bot_from), var, sizeof(var));
+  int n = plan_path(hub_update_bot_root(),
+                    variant && variant[0] ? variant : var[0] ? var : "c",
+                    pl->bot_from, pl->bot_target, pl->bot_path, why, why_size);
+  if (n < 0) return false;
+  pl->bot_steps = n;
+  if (pl->hub_target[0]) {
+    plan_oldest(state, 'h', uuids, pl->hub_from, sizeof(pl->hub_from), var, sizeof(var));
+    n = plan_path(NULL, variant && variant[0] ? variant : var[0] ? var : "c",
+                  pl->hub_from, pl->hub_target, pl->hub_path, why, why_size);
+    if (n < 0) return false;
+    pl->hub_steps = n;
+  }
+  return true;
+}
+
+/* The targets of step `i`.  A product whose path is shorter sits the later
+ * steps out: its final target, which every node of it already runs. */
+static void plan_step_targets(const upgrade_plan_t *pl, int i, char *bot,
+                              char *hub) {
+  if (pl->bot_steps == 0) snprintf(bot, 64, "%s", pl->bot_target);
+  else snprintf(bot, 64, "%s", pl->bot_path[i < pl->bot_steps ? i : pl->bot_steps - 1]);
+  if (!pl->hub_target[0]) hub[0] = '\0';
+  else if (pl->hub_steps == 0) snprintf(hub, 64, "%s", pl->hub_target);
+  else snprintf(hub, 64, "%s", pl->hub_path[i < pl->hub_steps ? i : pl->hub_steps - 1]);
+}
+
+static void plan_stop(hub_state_t *state, const char *summary) {
+  upgrade_plan_t *pl = &state->plan;
+  if (!pl->active) return;
+  pl->active = false;
+  pl->run_id[0] = '\0';
+  upgrade_clean(pl->summary, sizeof(pl->summary), summary);
+  hub_log_info("[UPGRADE] Multi-step upgrade to %s%s%s stopped: %s\n",
+               pl->bot_target, pl->hub_target[0] ? " / hubs " : "",
+               pl->hub_target, pl->summary);
+  hub_config_write(state);
+}
+
+/* Start step `pl->step` as an ordinary run.  False when it could not start
+ * (the plan is stopped with the reason). */
+static bool plan_start_step(hub_state_t *state, hub_client_t *admin,
+                            const char *min_from, char *msg, size_t msg_size) {
+  upgrade_plan_t *pl = &state->plan;
+  char bot[64], hub[64];
+  plan_step_targets(pl, pl->step, bot, hub);
+  if (!hub_upgrade_start(state, admin, bot, pl->variant, pl->kind, min_from,
+                         hub, pl->sel, msg, msg_size))
+    return false;
+  snprintf(pl->run_id, sizeof(pl->run_id), "%s", state->upgrade.id);
+  pl->progressed = time(NULL);
+  pl->next_at = 0;
+  hub_config_write(state);
+  hub_log_info("[UPGRADE] Step %d/%d of the upgrade to %s: run %s (bots -> %s%s%s)\n",
+               pl->step + 1, plan_steps(pl), pl->bot_target, pl->run_id, bot,
+               hub[0] ? ", hubs -> " : "", hub);
+  return true;
+}
+
+/* CMD_ADMIN_UPGRADE_NET: plan the path, then start its first step.  A
+ * one-step path is exactly the run `upgrade start` always was, and keeps no
+ * plan. */
+static bool hub_upgrade_plan_begin(hub_state_t *state, hub_client_t *admin,
+                                   const char *target_ver, const char *variant,
+                                   const char *kind, const char *min_from,
+                                   const char *hub_ver, const char *sel,
+                                   char *msg, size_t msg_size) {
+  upgrade_plan_t *pl = &state->plan;
+  if (pl->active) {
+    snprintf(msg, msg_size,
+             "ERROR: a multi-step upgrade to %s is in progress (step %d/%d) — "
+             "upgrade abort stops it", pl->bot_target, pl->step + 1,
+             plan_steps(pl));
+    return false;
+  }
+  if (!target_ver || !target_ver[0] || !hub_upgrade_plan_field_ok(target_ver) ||
+      strlen(target_ver) >= 64 ||
+      (hub_ver && (strlen(hub_ver) >= 64 || !hub_upgrade_plan_field_ok(hub_ver) ||
+                   strchr(hub_ver, ',')))) {
+    /* let the run refuse it with its own words */
+    return hub_upgrade_start(state, admin, target_ver ? target_ver : "", variant,
+                             kind, min_from, hub_ver, sel, msg, msg_size);
+  }
+  upgrade_plan_t np;
+  char why[256];
+  if (!plan_compute(state, target_ver, hub_ver, variant, sel, &np, why,
+                    sizeof(why))) {
+    snprintf(msg, msg_size, "ERROR: %s", why);
+    return false;
+  }
+  if (plan_steps(&np) <= 1)
+    return hub_upgrade_start(state, admin, target_ver, variant, kind, min_from,
+                             hub_ver, sel, msg, msg_size);
+  if ((variant && strlen(variant) >= sizeof(np.variant)) ||
+      (kind && strlen(kind) >= sizeof(np.kind)) ||
+      (sel && (strlen(sel) >= sizeof(np.sel) || !hub_upgrade_plan_field_ok(sel)))) {
+    snprintf(msg, msg_size, "ERROR: bad variant, kind or selection");
+    return false;
+  }
+  snprintf(np.variant, sizeof(np.variant), "%s", variant ? variant : "");
+  snprintf(np.kind, sizeof(np.kind), "%s", kind ? kind : "");
+  snprintf(np.sel, sizeof(np.sel), "%s", sel ? sel : "");
+  np.started = time(NULL);
+  np.active = true;
+  *pl = np;
+  if (!plan_start_step(state, admin, min_from, msg, msg_size)) {
+    memset(pl, 0, sizeof(*pl));
+    return false;
+  }
+  return true;
+}
+
+/* A run ended; if it was a step of the plan, decide what follows.  A step
+ * that left a node behind — one that answered, is not on the step, and could
+ * not take it — stops the plan there: the next step would move the rest of
+ * the mesh past a version that node can still talk to.  A node that never
+ * answered (down) does not: the roll-up walks it up afterwards. */
+static void plan_note_run_end(hub_state_t *state, upgrade_phase_t phase) {
+  upgrade_plan_t *pl = &state->plan;
+  pending_upgrade_t *u = &state->upgrade;
+  if (!pl->active || !pl->run_id[0] || strcmp(pl->run_id, u->id) != 0) return;
+  int steps = plan_steps(pl);
+  char why[320];
+  pl->run_id[0] = '\0';
+  pl->progressed = time(NULL);
+  if (phase != UPG_DONE) {
+    snprintf(why, sizeof(why), "step %d/%d %s: %s", pl->step + 1, steps,
+             upgrade_phase_name(phase), u->summary);
+    plan_stop(state, why);
+    return;
+  }
+  int behind = 0;
+  const upgrade_node_t *first = NULL;
+  for (int i = 0; i < u->node_count; i++) {
+    const upgrade_node_t *n = &u->nodes[i];
+    if (n->state != UPG_NODE_UNABLE || n->not_selected || !n->cur_version[0])
+      continue;
+    const char *to = upgrade_node_target(u, n);
+    if (!to[0] || hub_update_version_cmp(n->cur_version, to) >= 0) continue;
+    if (!first) first = n;
+    behind++;
+  }
+  if (behind) {
+    snprintf(why, sizeof(why),
+             "step %d/%d left %d node(s) behind (%.40s: %.60s); fix it and "
+             "start the upgrade again", pl->step + 1, steps, behind,
+             first->name[0] ? first->name : first->uuid, first->reason);
+    plan_stop(state, why);
+    return;
+  }
+  if (pl->step + 1 >= steps) {
+    snprintf(why, sizeof(why), "done: all %d steps completed", steps);
+    plan_stop(state, why);
+    return;
+  }
+  pl->step++;
+  pl->next_at = time(NULL) + UPGRADE_PLAN_SETTLE;
+  hub_config_write(state);
+  hub_log_info("[UPGRADE] Step %d/%d done; step %d starts in %d s\n", pl->step,
+               steps, pl->step + 1, UPGRADE_PLAN_SETTLE);
+}
+
+/* Drive the plan between its steps (maintenance clock). */
+static void hub_plan_tick(hub_state_t *state, time_t now) {
+  upgrade_plan_t *pl = &state->plan;
+  if (!pl->active || state->upgrade.active) return;
+  if (pl->run_id[0]) {
+    /* A step was in flight when this hub went down: its run table went with
+     * the old process.  The freeze it set is still up — lift it — and run
+     * the step again; nodes already on it answer that they are. */
+    hub_log_warning("[UPGRADE] Step %d/%d (run %s) was cut off by a restart; "
+                    "running it again\n", pl->step + 1, plan_steps(pl), pl->run_id);
+    if (hub_config_frozen(state)) hub_opt_flag_set(state, OPT_CONFIG_FROZEN, false);
+    pl->run_id[0] = '\0';
+    pl->next_at = now + UPGRADE_PLAN_SETTLE;
+    hub_config_write(state);
+    return;
+  }
+  if (pl->next_at == 0) {
+    /* just booted (onto a step, typically): let the mesh come back first */
+    pl->next_at = now + UPGRADE_PLAN_SETTLE;
+    return;
+  }
+  if (pl->progressed > 0 && now - pl->progressed > UPGRADE_PLAN_TTL) {
+    plan_stop(state, "no progress for a day; start the upgrade again");
+    return;
+  }
+  if (now < pl->next_at) return;
+  if (hub_config_frozen(state) || state->rollup.active) return;
+  char msg[640];
+  if (!plan_start_step(state, NULL, "", msg, sizeof(msg))) {
+    char why[192];
+    snprintf(why, sizeof(why), "step %d/%d could not start: %.140s",
+             pl->step + 1, plan_steps(pl),
+             strncmp(msg, "ERROR: ", 7) == 0 ? msg + 7 : msg);
+    plan_stop(state, why);
+  }
+}
+
+/* Tell every hub to stop whatever upgrade it drives: an UPGRADE_FORGET
+ * flagged "A" (abort), id|ts|A|issued.  `issued` is when the admin typed it:
+ * a run or plan started after that is not the one meant.  A 2.5.0 hub reads
+ * the frame as a plain forget. */
+static int upgrade_cancel_flood(hub_state_t *state) {
+  char id[64], fwd[128];
+  generate_request_id(id, sizeof(id));
+  op_forward_seen_check_and_add(state, id);
+  time_t now = time(NULL);
+  snprintf(state->upgrade_cancel_id, sizeof(state->upgrade_cancel_id), "%s", id);
+  state->upgrade_cancel_issued = state->upgrade_cancel_seen = now;
+  snprintf(fwd, sizeof(fwd), "%s|%lld|A|%lld", id, (long long)now, (long long)now);
+  int told = 0;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_HUB && c->authenticated &&
+        peer_send_urgent(state, c, CMD_UPGRADE_FORGET, fwd))
+      told++;
+  }
+  return told;
+}
+
+/* "releases|bot_ver|hub_ver|sel": the path `upgrade start` would take, for
+ * the console's confirmation card. */
+static void upgrade_plan_preview(hub_state_t *state, const char *payload,
+                                 reply_t *r) {
+  if (!payload || payload[8] != '|') return;
+  char bot[64] = "", hub[64] = "", sel[MAX_UPGRADE_SELECT * 80] = "";
+  wire_field(payload, 1, bot, sizeof(bot));
+  wire_field(payload, 2, hub, sizeof(hub));
+  wire_tail(payload, 3, sel, sizeof(sel));
+  if (!bot[0] || !hub_upgrade_plan_field_ok(bot) ||
+      (hub[0] && !hub_upgrade_plan_field_ok(hub)))
+    return;
+  upgrade_plan_t *np = calloc(1, sizeof(*np));
+  if (!np) return;
+  char why[256];
+  bool ok = plan_compute(state, bot, hub, "", sel, np, why, sizeof(why));
+  char path[MAX_UPGRADE_STEPS * 65];
+  reply_rec(r, "path");
+  reply_kv(r, "product", "bot");
+  if (np->bot_from[0]) reply_kv(r, "from", np->bot_from);
+  plan_path_csv(&np->bot_path[0][0], np->bot_steps, path, sizeof(path));
+  if (path[0]) reply_kv(r, "steps", path);
+  if (!ok) reply_kv(r, "err", why);
+  if (ok && hub[0]) {
+    reply_rec(r, "path");
+    reply_kv(r, "product", "hub");
+    if (np->hub_from[0]) reply_kv(r, "from", np->hub_from);
+    plan_path_csv(&np->hub_path[0][0], np->hub_steps, path, sizeof(path));
+    if (path[0]) reply_kv(r, "steps", path);
+  }
+  free(np);
+}
+
 /* The rolling plan, one step per maintenance tick. */
 void hub_upgrade_tick(hub_state_t *state, time_t now) {
   hub_rollup_tick(state, now);
+  hub_plan_tick(state, now);
   pending_upgrade_t *u = &state->upgrade;
   if (!u->active) return;
 
@@ -11195,9 +11593,11 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
                                          hub_client_t *peer,
                                          const char *payload) {
   /* id|ver|variant|kind|min_from|base|hub_ver|hub_base — the bots' six
-   * fields, then the hubs' own target and base (see hub_upgrade_start). */
+   * fields, then the hubs' own target (see hub_upgrade_start).  The base
+   * slots are skipped: a 2.5.0 driver may still fill them, but every node
+   * reads its own compiled-in root, the only tree its pinned key verifies. */
   char id[64] = "", ver[64] = "", variant[8] = "", kind[8] = "";
-  char min_from[64] = "", base[512] = "", hub_ver[64] = "", hub_base[512] = "";
+  char min_from[64] = "", hub_ver[64] = "";
   if (!wire_field(payload, 0, id, sizeof(id)) ||
       !wire_field(payload, 1, ver, sizeof(ver)) || !id[0] || !ver[0]) {
     hub_log_warning("[UPGRADE] Malformed UPGRADE_PREPARE from peer %s\n", peer->ip);
@@ -11206,9 +11606,7 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
   wire_field(payload, 2, variant, sizeof(variant));
   wire_field(payload, 3, kind, sizeof(kind));
   wire_field(payload, 4, min_from, sizeof(min_from));
-  wire_field(payload, 5, base, sizeof(base));
   wire_field(payload, 6, hub_ver, sizeof(hub_ver));
-  wire_field(payload, 7, hub_base, sizeof(hub_base));
   /* 9th field (2.4.3+): a selective run's resolved selection, uuid[=v],... */
   char sel[MAX_UPGRADE_SELECT * 72] = "";
   wire_tail(payload, 8, sel, sizeof(sel));
@@ -11225,9 +11623,8 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
    * driver enforced on its admin: nothing that could split a line. */
   if (!hub_upgrade_plan_field_ok(id) || !hub_upgrade_plan_field_ok(ver) ||
       !hub_upgrade_plan_field_ok(variant) || !hub_upgrade_plan_field_ok(kind) ||
-      !hub_upgrade_plan_field_ok(min_from) || !hub_upgrade_plan_field_ok(base) ||
-      !hub_upgrade_plan_field_ok(hub_ver) ||
-      !hub_upgrade_plan_field_ok(hub_base)) {
+      !hub_upgrade_plan_field_ok(min_from) ||
+      !hub_upgrade_plan_field_ok(hub_ver)) {
     hub_log_warning("[UPGRADE] Malformed UPGRADE_PREPARE from peer %s\n", peer->ip);
     return;
   }
@@ -11269,7 +11666,7 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
   if (!self_picked)
     snprintf(why, sizeof(why), "not selected");
   else if (hub_ver[0])
-    ready = hub_update_can_take(hub_ver, self_variant, min_from, hub_base, why,
+    ready = hub_update_can_take(hub_ver, self_variant, min_from, why,
                                 sizeof(why));
   else
     snprintf(why, sizeof(why), "no hub target in this run");
@@ -11284,8 +11681,6 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
            self_variant[0] ? self_variant : hub_update_host_variant());
   snprintf(state->follow_hub_target, sizeof(state->follow_hub_target), "%s",
            hub_ver);
-  snprintf(state->follow_hub_base, sizeof(state->follow_hub_base), "%s",
-           hub_base);
   snprintf(state->follow_bot_variant, sizeof(state->follow_bot_variant), "%s",
            variant);
   snprintf(state->follow_sel, sizeof(state->follow_sel), "%s", sel);
@@ -11307,9 +11702,7 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
     snprintf(r->kind, sizeof(r->kind), "%s", kind);
     snprintf(r->min_from, sizeof(r->min_from), "%s",
              min_from[0] ? min_from : "*");
-    snprintf(r->base, sizeof(r->base), "%s", base);
     snprintf(r->hub_target, sizeof(r->hub_target), "%s", hub_ver);
-    snprintf(r->hub_base, sizeof(r->hub_base), "%s", hub_base);
     r->plan_set = time(NULL);
     state->rollup_try_count = 0;
     hub_config_write(state); /* the plan survives a restart (Task 13) */
@@ -11330,8 +11723,8 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
         !upgrade_sel_lookup(sel, c->id, bot_variant, sizeof(bot_variant)))
       continue;
     char bot_prepare[1024];
-    snprintf(bot_prepare, sizeof(bot_prepare), "%s|%s|%s|%s|%s|%s", id, ver,
-             bot_variant[0] ? bot_variant : variant, kind, min_from, base);
+    snprintf(bot_prepare, sizeof(bot_prepare), "%s|%s|%s|%s|%s|", id, ver,
+             bot_variant[0] ? bot_variant : variant, kind, min_from);
     if (send_cmd_to_bot(c, CMD_UPGRADE_PREPARE, bot_prepare)) relayed++;
   }
   if (relayed)
@@ -11341,20 +11734,16 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
    * what carries a run past the driver's immediate neighbours: every hub the
    * mesh can reach joins the run, whatever shape the peer links are wired in
    * (a chain, a star, a partial mesh).  Their answers come back to us and we
-   * forward them up, so the driver sees one flat node table. */
+   * forward them up, so the driver sees one flat node table.  Rebuilt from
+   * the checked fields, so a base a 2.5.0 driver put in goes no further. */
+  char fwd[600 + sizeof(sel)];
+  snprintf(fwd, sizeof(fwd), "%s|%s|%s|%s|%s||%s|%s%s", id, ver, variant, kind,
+           min_from, hub_ver, sel[0] ? "|" : "", sel);
   int fanned = 0;
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
     if (c->type != CLIENT_HUB || !c->authenticated || c == peer) continue;
-    /* A hub too old to read the selection would ask all of its bots and
-     * adopt the target as its roll-up plan; the driver refuses a selective
-     * run it can see such a hub in, and this catches one it could not. */
-    if (selective && !upgrade_peer_takes_sel(state, c)) {
-      hub_log_warning("[UPGRADE] Not relaying selective run %s to %s: it is "
-                      "older than %s\n", id, c->id, UPGRADE_SELECT_MIN_HUB);
-      continue;
-    }
-    if (peer_send_urgent(state, c, CMD_UPGRADE_PREPARE, payload)) fanned++;
+    if (peer_send_urgent(state, c, CMD_UPGRADE_PREPARE, fwd)) fanned++;
   }
   if (fanned)
     hub_log_info("[UPGRADE] Re-broadcast PREPARE %s to %d peer hub(s)\n", id, fanned);
@@ -11493,8 +11882,7 @@ static void process_peer_upgrade_commit(hub_state_t *state, hub_client_t *peer,
 
   const char *err = NULL;
   if (!hub_update_commit(state, id, ver,
-                         variant[0] ? variant : state->follow_variant,
-                         state->follow_hub_base, &err)) {
+                         variant[0] ? variant : state->follow_variant, &err)) {
     /* Nothing was changed on disk; stay on this build and say why. */
     hub_log_warning("[UPGRADE] Commit %s refused: %s\n", id,
             err ? err : "unknown error");
@@ -11554,6 +11942,15 @@ static void process_peer_upgrade_abort(hub_state_t *state, hub_client_t *peer,
  * run was aiming at.  The driver also infers success from the roster gossip,
  * so a lost RESULT costs nothing. */
 void hub_upgrade_report_pending(hub_state_t *state, hub_client_t *peer) {
+  /* A recent `upgrade abort` goes to every link that comes up: the hub it
+   * was meant for may have been restarting onto a step when it was typed. */
+  if (state->upgrade_cancel_id[0] &&
+      time(NULL) - state->upgrade_cancel_seen < UPGRADE_CANCEL_HOLD) {
+    char fwd[128];
+    snprintf(fwd, sizeof(fwd), "%s|%lld|A|%lld", state->upgrade_cancel_id,
+             (long long)time(NULL), (long long)state->upgrade_cancel_issued);
+    peer_send_urgent(state, peer, CMD_UPGRADE_FORGET, fwd);
+  }
   char id[64], want[64], want_variant[16];
   if (!hub_update_take_pending(id, sizeof(id), want, sizeof(want), want_variant,
                                sizeof(want_variant)))
@@ -11600,6 +11997,32 @@ static void hub_upgrade_status(hub_state_t *state, reply_t *r) {
     reply_kvi(r, "set", (long long)ru->plan_set);
     reply_kvi(r, "expires", (long long)(ru->plan_set + ROLLUP_PLAN_TTL));
   }
+  /* A multi-step upgrade: the whole path, where it is, and — once it has
+   * stopped — why (kept until this hub restarts). */
+  const upgrade_plan_t *pl = &state->plan;
+  if (pl->active || pl->summary[0]) {
+    char path[MAX_UPGRADE_STEPS * 65];
+    reply_rec(r, "plan");
+    reply_kvb(r, "active", pl->active);
+    reply_kvi(r, "step", pl->step + 1);
+    reply_kvi(r, "steps", plan_steps(pl));
+    reply_kv(r, "bot_final", pl->bot_target);
+    if (pl->bot_from[0]) reply_kv(r, "bot_from", pl->bot_from);
+    plan_path_csv(&pl->bot_path[0][0], pl->bot_steps, path, sizeof(path));
+    if (path[0]) reply_kv(r, "bot_path", path);
+    if (pl->hub_target[0]) {
+      reply_kv(r, "hub_final", pl->hub_target);
+      if (pl->hub_from[0]) reply_kv(r, "hub_from", pl->hub_from);
+      plan_path_csv(&pl->hub_path[0][0], pl->hub_steps, path, sizeof(path));
+      if (path[0]) reply_kv(r, "hub_path", path);
+    }
+    if (pl->active) {
+      reply_kv(r, "state", pl->run_id[0] ? "running" : "waiting");
+      if (!pl->run_id[0] && pl->next_at > 0) reply_kvi(r, "next", (long long)pl->next_at);
+    }
+    reply_kvi(r, "started", (long long)pl->started);
+    if (pl->summary[0]) reply_kv(r, "summary", pl->summary);
+  }
   for (int i = 0; u->id[0] && i < u->node_count; i++) {
     const upgrade_node_t *n = &u->nodes[i];
     reply_rec(r, "node");
@@ -11621,34 +12044,23 @@ static void hub_upgrade_status(hub_state_t *state, reply_t *r) {
   }
 }
 
-/* CMD_ADMIN_UPGRADE_STATUS "releases[|bot_base|hub_base]": everything the
+/* CMD_ADMIN_UPGRADE_STATUS "releases[|bot_ver|hub_ver|sel]": everything the
  * admin console needs to offer choices instead of free text:
  *   ok|upg.releases
  *   rel|product|ver|date|bases           newest first, per product
  *   relerr|product|base|msg              a tree that could not be read
  *   node|kind|uuid|name|ver|base         the nodes a selective run can name
+ *   path|product|from|steps|err          the path `upgrade start` would take
  * Manifests are signature-verified exactly as an upgrade would read them;
  * an unverifiable tree lists nothing. */
-static void hub_upgrade_releases(hub_state_t *state, const char *payload, reply_t *r) {
-  char bot_base[512] = "", hub_base[512] = "";
-  if (payload[8] == '|') {
-    wire_field(payload, 1, bot_base, sizeof(bot_base));
-    wire_field(payload, 2, hub_base, sizeof(hub_base));
-  }
-  if ((bot_base[0] && !hub_upgrade_plan_field_ok(bot_base)) ||
-      (hub_base[0] && !hub_upgrade_plan_field_ok(hub_base))) {
-    reply_err(r, "upg.bad_base", "that is not a usable release base",
-              "upgrade releases [bot=<url>] [hub=<url>]");
-    return;
-  }
+static void hub_upgrade_releases(hub_state_t *state, const char *payload,
+                                 reply_t *r) {
   reply_ok(r, "upg.releases");
-  if (bot_base[0]) reply_kv(r, "bot_base", bot_base);
-  if (hub_base[0]) reply_kv(r, "hub_base", hub_base);
   static const char *variants[] = {"c", "rs"};
   for (int prod = 0; prod < 2; prod++) {
     const char *pname = prod == 0 ? "bot" : "hub";
-    const char *root = prod == 0 ? (bot_base[0] ? bot_base : HUB_BOT_RELEASE_BASE)
-                                 : hub_base; /* "" = this hub's own root */
+    /* NULL = this hub's own root */
+    const char *root = prod == 0 ? hub_update_bot_root() : NULL;
     hub_release_t merged[MAX_UPGRADE_RELEASES];
     char have[MAX_UPGRADE_RELEASES][8];
     int nm = 0;
@@ -11745,6 +12157,7 @@ static void hub_upgrade_releases(hub_state_t *state, const char *payload, reply_
     if (e->version[0]) reply_kv(r, "ver", e->version);
     if (e->variant[0]) reply_kv(r, "base", e->variant);
   }
+  upgrade_plan_preview(state, payload, r);
 }
 
 /* A local bot's CMD_UPGRADE_READY/RESULT.  If this hub is following a run
@@ -12609,7 +13022,7 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client,
 
   // Use the new payload generator that combines Global + Bot-specific
   // and omits "b|uuid|" prefix for correct bot parsing
-  hub_generate_bot_payload(state, client->id, client->bot_proto,
+  hub_generate_bot_payload(state, client->id,
                            payload, MAX_CONFIG_PAYLOAD);
 
   int len = (int)strlen(payload);
@@ -12771,20 +13184,9 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
           plain[pl] = 0;
           char *payload = (char *)plain;
 
-          // HUBv2 = a pre-passwordless peer.  It would send a|/o| records with
-          // passwords and read ours as passwords, so mixed versions must never
-          // exchange state (docs/passwordless.md §3.4): refuse it by name.
-          if (strncmp(payload, "HUBv2|", 6) == 0) {
-            hub_log_warning("[HUB] Peer %s speaks HUBv2 (pre-passwordless) — refusing; "
-                    "upgrade that hub (all hubs upgrade together)\n",
-                    client->ip);
-            record_failed_auth(state, client->ip);
-            secure_wipe(plain, sizeof(plain));
-            hub_disconnect_client(state, client);
-            return false;
-          }
-          // v3 HUB Peer Authentication (Ed25519 signature, no password)
-          else if (strncmp(payload, "HUBv3|", 6) == 0) {
+          // v3 HUB Peer Authentication (Ed25519 signature, no password).  Any
+          // other handshake (HUBv2 and older included) is refused below.
+          if (strncmp(payload, "HUBv3|", 6) == 0) {
             /* Format: "HUBv3|<uuid>|<port>|<name>|<bind_ip>|<ts>|<sig_b64>" */
             char peer_uuid[64] = "", peer_name[64] = "", peer_bind_ip[64] = "";
             char ts_str[32] = "", sig_b64[128] = "";
@@ -13030,6 +13432,12 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               }
             } else if (client->type == CLIENT_BOT) {
               process_bot_command(state, client, cmd, payload_ptr);
+              if (client->refused) { /* below MESH_MIN_VERSION */
+                secure_wipe(plain, (size_t)packet_len + 1);
+                free(plain);
+                hub_disconnect_client(state, client);
+                return false;
+              }
             } else if (client->type == CLIENT_HUB) {
               if (cmd == CMD_PEER_SYNC || cmd == CMD_PEER_BCAST) {
                 process_peer_sync(state, payload_ptr, client->fd,
@@ -13038,6 +13446,12 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 process_mesh_state(state, client, payload_ptr);
               } else if (cmd == CMD_BOT_ROSTER) {
                 process_bot_roster(state, client, payload_ptr);
+                if (client->refused) { /* a peer below MESH_MIN_VERSION */
+                  secure_wipe(plain, (size_t)packet_len + 1);
+                  free(plain);
+                  hub_disconnect_client(state, client);
+                  return false;
+                }
               } else if (cmd == CMD_OP_FORWARD_REQUEST) {
                 process_forward_op_request(state, client, payload_ptr);
               } else if (cmd == CMD_OP_FORWARD_GRANT) {

@@ -2309,18 +2309,6 @@ static void user_access(const fmt_ctx_t *ctx, const crec_t *u, char *out, size_t
   else snprintf(out, cap, "%s", GL(G_DASH));
 }
 
-/* old_hubs= on a user change: hubs that do not know flags / channels. */
-static void user_old_hubs_warn(const fmt_ctx_t *ctx, const crec_t *r, flines_t *out) {
-  const char *h = rvs(r, "old_hubs");
-  if (!h) return;
-  char m[512];
-  snprintf(m, sizeof(m),
-           "older hubs do not know flags or channels: %s %s they and their bots do not get "
-           "this user until upgraded to 2.4.7",
-           h, GL(G_DASH));
-  warn(ctx, out, m);
-}
-
 /* "+chu" -> "channels, opers, upgrades"; "a" -> "full admin". */
 static void flags_words(const char *flags, char *out, size_t cap) {
   static const struct { char f; const char *w; } W[] = {
@@ -2450,7 +2438,6 @@ static void render_user_change(const fmt_ctx_t *ctx, const creply_t *rep, flines
     if (rvs(r, "chans")) res_kv(out, "channels", !strcmp(rv(r, "chans"), "*") ? "* (every channel)"
                                                                          : rv(r, "chans"));
     effect(ctx, out, ph);
-    user_old_hubs_warn(ctx, r, out);
     if (rv(r, "role") && !strcmp(rv(r, "role"), "admin")) {
       snprintf(subj, sizeof(subj), "%s logs in with: ssh -i <their>_ed25519 -p %lld %s@<this hub>", name,
                rvi(r, "port", 0), name);
@@ -2491,7 +2478,6 @@ static void render_user_change(const fmt_ctx_t *ctx, const creply_t *rep, flines
     res_kv(out, "can", subj);
     if (!rvb(r, "written")) effect(ctx, out, "no change: they already had those flags");
     else effect(ctx, out, ph);
-    user_old_hubs_warn(ctx, r, out);
   } else if (!strcmp(code, "user.chan")) {
     snprintf(what, sizeof(what), "User %s", name);
     bool add = rv(r, "action") && !strcmp(rv(r, "action"), "add");
@@ -2503,7 +2489,6 @@ static void render_user_change(const fmt_ctx_t *ctx, const creply_t *rep, flines
                             : !strcmp(rv(r, "chans"), "*") ? "* (every channel)" : rv(r, "chans"));
     if (!rvb(r, "written")) effect(ctx, out, "no change: they already had that");
     else effect(ctx, out, ph);
-    user_old_hubs_warn(ctx, r, out);
   } else {
     bool add = !strcmp(code, "user.mask_added");
     long long m = rvi(r, "masks", 0);
@@ -2697,14 +2682,6 @@ static void render_channel_change(const fmt_ctx_t *ctx, const creply_t *rep, fli
       effect(ctx, out, ph);
       return;
     }
-    if (rvi(r, "legacy", 0) > 0) { /* nobody ready; older bots asked */
-      fmt_ok(ctx, inv ? "Invite request sent" : "Op request sent", subj, out);
-      long long lg = rvi(r, "legacy", 0);
-      snprintf(ph, sizeof(ph), "no bot reported ready; %lld older bot%s asked the old way", lg,
-               lg == 1 ? "" : "s");
-      effect(ctx, out, ph);
-      return;
-    }
     fmt_ok(ctx, inv ? "Invite request sent" : "Op request sent", subj, out);
     long long local = rvi(r, "local", 0);
     if (local > 0)
@@ -2822,18 +2799,6 @@ static const char *modes_source_phrase(const char *src) {
   return "built-in default";
 }
 
-/* D38: a command that wrote C|/D|/B| names the hubs that will drop them. */
-static void old_hubs_warn(const fmt_ctx_t *ctx, const crec_t *r, flines_t *out) {
-  const char *h = rvs(r, "old_hubs");
-  if (!h) return;
-  char m[512];
-  snprintf(m, sizeof(m),
-           "older hubs drop settings, modes and bans: %s %s upgrade them to 2.4.5 or the bots "
-           "behind them get none",
-           h, GL(G_DASH));
-  warn(ctx, out, m);
-}
-
 static void push_effects(const fmt_ctx_t *ctx, const crec_t *r, flines_t *out) {
   char ph[160], pp[96];
   long long bots = rvi(r, "bots", 0), peers = rvi(r, "peers", 0);
@@ -2881,7 +2846,6 @@ static void render_channel_mode(const fmt_ctx_t *ctx, const creply_t *rep, fline
   }
   if (rvb(r, "dynlimit"))
     warn(ctx, out, "+l is stored but +dynamiclimit is on: the dynamic limit wins");
-  old_hubs_warn(ctx, r, out);
 }
 
 /* channel.settings / network.settings: every setting, its value, where it comes from. */
@@ -2964,7 +2928,6 @@ static void render_settings_change(const fmt_ctx_t *ctx, const creply_t *rep, fl
       effect(ctx, out, ph);
       push_effects(ctx, r, out);
     }
-    old_hubs_warn(ctx, r, out);
     return;
   }
   if (net_target) snprintf(what, sizeof(what), "Network default");
@@ -2984,7 +2947,6 @@ static void render_settings_change(const fmt_ctx_t *ctx, const creply_t *rep, fl
   }
   if (!rvb(r, "written")) effect(ctx, out, "no change: it already had these values");
   else push_effects(ctx, r, out);
-  old_hubs_warn(ctx, r, out);
 }
 
 /* ban.* */
@@ -3071,7 +3033,6 @@ static void render_ban_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
   if (!strcmp(rep->code, "ban.removed")) {
     fmt_ok(ctx, "Ban removed", subj, out);
     push_effects(ctx, r, out);
-    old_hubs_warn(ctx, r, out);
     return;
   }
   fmt_ok(ctx, rvb(r, "existed") ? "Ban updated" : "Ban added", subj, out);
@@ -3084,7 +3045,6 @@ static void render_ban_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
     effect(ctx, out, ph);
   }
   push_effects(ctx, r, out);
-  old_hubs_warn(ctx, r, out);
 }
 
 /* The settings a channel overrides ("bitch=1,flood join=5:60") as a person
@@ -3175,10 +3135,62 @@ static int node_rank(const char *st) {
   return 4;
 }
 
+/* "2.4.8 → 2.5.0 → 2.5.1" from a plan record's <p>_from / <p>_path. */
+static void plan_path_line(const fmt_ctx_t *ctx, const crec_t *pl, const char *p, char *out,
+                           size_t cap) {
+  char k[16], work[1100];
+  snprintf(k, sizeof(k), "%s_path", p);
+  snprintf(work, sizeof(work), "%s", rv(pl, k) ? rv(pl, k) : "");
+  snprintf(k, sizeof(k), "%s_from", p);
+  size_t o = 0;
+  int w = snprintf(out, cap, "%s", rv(pl, k) ? rv(pl, k) : "");
+  if (w > 0) o = (size_t)w < cap ? (size_t)w : cap - 1;
+  char *save = NULL;
+  for (char *t = strtok_r(work, ",", &save); t && o + 1 < cap; t = strtok_r(NULL, ",", &save)) {
+    w = snprintf(out + o, cap - o, "%s%s %s", o ? " " : "", GL(G_ARROW), t);
+    if (w < 0) break;
+    o += (size_t)w < cap - o ? (size_t)w : cap - o - 1;
+  }
+}
+
+/* The multi-step plan card lines (view 4 and `upgrade status`). */
+static void render_upg_plan(const fmt_ctx_t *ctx, const crec_t *pl, int L, flines_t *out) {
+  char v[512], a[48], b[48];
+  long long step = rvi(pl, "step", 0), steps = rvi(pl, "steps", 0);
+  bool active = rvb(pl, "active");
+  const char *st = rv(pl, "state") ? rv(pl, "state") : "";
+  if (active && !strcmp(st, "running"))
+    snprintf(v, sizeof(v), "step %lld/%lld running", step, steps);
+  else if (active) {
+    long long nx = rvi(pl, "next", 0) - ctx->now;
+    fmt_span(nx > 0 ? nx : 0, b, sizeof(b));
+    snprintf(v, sizeof(v), "step %lld/%lld starts in %s", step, steps, b);
+  } else
+    snprintf(v, sizeof(v), "stopped at step %lld/%lld", step, steps);
+  fmt_card_line(ctx, out, L, "multi-step", v, active ? RL_NORMAL : RL_DIM);
+  plan_path_line(ctx, pl, "bot", v, sizeof(v));
+  if (v[0]) fmt_card_line(ctx, out, L, "  bots", v, RL_NORMAL);
+  if (rvs(pl, "hub_final")) {
+    plan_path_line(ctx, pl, "hub", v, sizeof(v));
+    if (!v[0]) snprintf(v, sizeof(v), "already on %s", rv(pl, "hub_final"));
+    fmt_card_line(ctx, out, L, "  hubs", v, RL_NORMAL);
+  }
+  fmt_when(rvi(pl, "started", 0), ctx->now, a, sizeof(a));
+  fmt_span(ctx->now - rvi(pl, "started", 0), b, sizeof(b));
+  snprintf(v, sizeof(v), "%s %s %s ago", a, GL(G_DOT), b);
+  fmt_card_line(ctx, out, L, "  started", v, RL_DIM);
+  if (rvs(pl, "summary")) fmt_card_line(ctx, out, L, "  ended", rv(pl, "summary"), RL_DIM);
+  if (active)
+    fmt_card_line(ctx, out, L, "", "upgrade abort stops the rest and rolls back only the step running",
+                  RL_DIM);
+}
+
 static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
-  const crec_t *r = &rep->res, *ru = NULL;
-  for (int i = 0; i < rep->n; i++)
+  const crec_t *r = &rep->res, *ru = NULL, *pl = NULL;
+  for (int i = 0; i < rep->n; i++) {
     if (!strcmp(rep->r[i].type, "rollup")) ru = &rep->r[i];
+    if (!strcmp(rep->r[i].type, "plan")) pl = &rep->r[i];
+  }
   char v[512], a[48], b[48];
   char plan[160] = "";
   if (ru) {
@@ -3191,6 +3203,7 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
   const int L = 12;
   if (!rvs(r, "id")) {
     fmt_title(ctx, out, "Upgrades", "no run on this hub");
+    if (pl) render_upg_plan(ctx, pl, L, out);
     if (ru) {
       fmt_when(rvi(ru, "set", 0), ctx->now, a, sizeof(a));
       fmt_span(ctx->now - rvi(ru, "set", 0), b, sizeof(b));
@@ -3223,6 +3236,7 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
   fmt_span(ctx->now - rvi(r, "started", 0), b, sizeof(b));
   snprintf(v, sizeof(v), "%s %s %s ago", a, GL(G_DOT), b);
   fmt_card_line(ctx, out, L, "started", v, RL_NORMAL);
+  if (pl) render_upg_plan(ctx, pl, L, out);
   long long sel = rvi(r, "selective", 0);
   if (sel > 0) snprintf(v, sizeof(v), "%lld node%s named", sel, sel == 1 ? "" : "s");
   else snprintf(v, sizeof(v), "no (whole network)");
@@ -3305,7 +3319,6 @@ static int ver_cmp(const char *a, const char *b) {
 static void render_upg_releases(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   for (int prod = 0; prod < 2; prod++) {
     const char *p = prod == 0 ? "bot" : "hub";
-    const char *base = rv(&rep->res, prod == 0 ? "bot_base" : "hub_base");
     const char *oldest = NULL;
     for (int k = 0; k < rep->n; k++) {
       const crec_t *nd = &rep->r[k];
@@ -3314,7 +3327,7 @@ static void render_upg_releases(const fmt_ctx_t *ctx, const creply_t *rep, fline
       if (!oldest || ver_cmp(rv(nd, "ver"), oldest) < 0) oldest = rv(nd, "ver");
     }
     fmt_title(ctx, out, prod == 0 ? "Bot releases" : "Hub releases",
-              base && *base ? base : prod == 0 ? "ircbot-releases (default base)" : "this hub's release base");
+              prod == 0 ? "ircbot-releases" : "irchub-releases");
     static const col_t cols[] = {{"VERSION", 'L', 1}, {"DATE", 'L', 1}, {"CODE", 'L', 1}};
     tbl_t t;
     tbl_init(&t, cols, 3, -1, 0, 0);
@@ -3400,12 +3413,35 @@ static void render_upg_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
                rvi(r, "bots", 0), rvi(r, "bots", 0) == 1 ? "" : "s", rvi(r, "peers", 0),
                rvi(r, "peers", 0) == 1 ? "" : "s");
     effect(ctx, out, ph);
+    if (rvi(r, "steps", 0) > 1) {
+      if (rvs(r, "hub_final"))
+        snprintf(ph, sizeof(ph), "step %lld of %lld on the way to bots %s, hubs %s; the next starts when this one is done",
+                 rvi(r, "step", 0), rvi(r, "steps", 0), rv(r, "bot_final"), rv(r, "hub_final"));
+      else
+        snprintf(ph, sizeof(ph), "step %lld of %lld on the way to bots %s; the next starts when this one is done",
+                 rvi(r, "step", 0), rvi(r, "steps", 0), rv(r, "bot_final") ? rv(r, "bot_final") : "?");
+      effect(ctx, out, ph);
+    }
     effect(ctx, out, "the config is frozen until it finishes");
   } else if (!strcmp(rep->code, "upg.aborted")) {
-    snprintf(what, sizeof(what), "Upgrade %s aborted", rv(r, "id") ? rv(r, "id") : "?");
+    if (rvs(r, "id")) snprintf(what, sizeof(what), "Upgrade %s aborted", rv(r, "id"));
+    else snprintf(what, sizeof(what), "Multi-step upgrade aborted");
     long long n = rvi(r, "rolled_back", 0);
-    snprintf(subj, sizeof(subj), "rolling back %lld upgraded node%s", n, n == 1 ? "" : "s");
+    if (rvs(r, "id"))
+      snprintf(subj, sizeof(subj), "rolling back %lld upgraded node%s", n, n == 1 ? "" : "s");
+    else
+      snprintf(subj, sizeof(subj), "between steps: nothing to roll back");
     fmt_ok(ctx, what, subj, out);
+    if (rvi(r, "steps", 0) > 0) {
+      snprintf(ph, sizeof(ph), "stopped at step %lld of %lld; no later step will start", rvi(r, "step", 0),
+               rvi(r, "steps", 0));
+      effect(ctx, out, ph);
+    }
+  } else if (!strcmp(rep->code, "upg.abort_sent")) {
+    long long peers = rvi(r, "peers", 0);
+    fmt_ok(ctx, "No upgrade runs on this hub", NULL, out);
+    snprintf(ph, sizeof(ph), "told %lld other hub%s to stop any upgrade they drive", peers, peers == 1 ? "" : "s");
+    effect(ctx, out, ph);
   } else {
     long long peers = rvi(r, "peers", 0);
     snprintf(ph, sizeof(ph), "told %lld other hub%s to drop theirs", peers, peers == 1 ? "" : "s");
@@ -3701,7 +3737,6 @@ void fmt_reply(const fmt_ctx_t *ctx, const creply_t *rep, const char *words, fli
   const char *c = rep->code ? rep->code : "";
   if (rep->err) {
     fmt_error(ctx, rv(&rep->res, "msg"), rv(&rep->res, "hint"), out);
-    old_hubs_warn(ctx, &rep->res, out);
     if (!strcmp(c, "bot.ambiguous")) {
       static const col_t cols[] = {{"UUID", 'L', 1}, {"NICK", 'L', 1}, {"STATE", 'L', 1}};
       tbl_t t;
