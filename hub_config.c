@@ -21,6 +21,20 @@ void hub_set_config_pass(hub_state_t *s, const char *pass) {
   memcpy(s->config_pass, pass ? pass : "", n);
   memset(s->config_pass + n, 0, sizeof(s->config_pass) - n);
   mlock(s->config_pass, sizeof(s->config_pass));
+  hub_config_key_forget(s); /* derived from the old password */
+}
+
+void hub_config_key_forget(hub_state_t *s) {
+  secure_wipe(s->cfg_key, sizeof(s->cfg_key));
+  secure_wipe(s->cfg_key_salt, sizeof(s->cfg_key_salt));
+  s->cfg_key_set = false;
+}
+
+static void cfg_key_keep(hub_state_t *s, const unsigned char *salt, const unsigned char *key) {
+  if (!s->cfg_key_set) mlock(s->cfg_key, sizeof(s->cfg_key));
+  memcpy(s->cfg_key_salt, salt, sizeof(s->cfg_key_salt));
+  memcpy(s->cfg_key, key, sizeof(s->cfg_key));
+  s->cfg_key_set = true;
 }
 
 void hub_get_config_pass(const hub_state_t *s, char *out, size_t len) {
@@ -155,6 +169,7 @@ int hub_format_user_record(const hub_user_record_t *u, char *buf, size_t len) {
 /* Set by -selftest: a staged build loads and validates the live config but
  * must never rewrite (migrate) it under the build that is still running. */
 bool g_hub_config_readonly = false;
+bool g_hub_config_loading = false;
 
 void hub_config_write(hub_state_t *state) {
   if (g_hub_config_readonly) return;
@@ -234,8 +249,8 @@ void hub_config_write(hub_state_t *state) {
 
   /* The roll-up plan (upgrade plan, Task 13): hub-local, never replicated.
    * rollup|target|variant|kind|min_from|hub_target|plan_set|| — the two
-   * trailing slots once held run bases (gone in 2.5.1) and stay empty so a
-   * rolled-back 2.5.0 still reads the line.  Every field was checked free of '|' and line breaks before it was
+   * trailing slots once held run bases (gone in 2.5.1) and are reserved,
+   * always empty.  Every field was checked free of '|' and line breaks before it was
    * accepted (hub_upgrade_plan_field_ok), and is checked again here, so the
    * line can never split or inject another. */
   {
@@ -443,23 +458,31 @@ void hub_config_write(hub_state_t *state) {
   unsigned char salt[SALT_SIZE], key[32], iv[GCM_IV_LEN], tag[GCM_TAG_LEN];
   /* CRITICAL: GCM nonce reuse is catastrophic. Bail out instead of writing
    * with a predictable IV/salt if the RNG is unavailable. */
-  if (RAND_bytes(salt, sizeof(salt)) != 1 ||
-      RAND_bytes(iv,   sizeof(iv))   != 1) {
+  if (RAND_bytes(iv, sizeof(iv)) != 1 ||
+      (!state->cfg_key_set && RAND_bytes(salt, sizeof(salt)) != 1)) {
     hub_log_error("[HUB] RAND_bytes failed; aborting config write\n");
     secure_wipe(buffer, (size_t)offset);
     free(buffer);
     return;
   }
 
-  /* Decode XOR-obfuscated config password before use */
-  char plain_pass[MAX_PASS];
-  hub_get_config_pass(state, plain_pass, sizeof(plain_pass));
-  int pbkdf2_ok = PKCS5_PBKDF2_HMAC(plain_pass, (int)strlen(plain_pass), salt,
-                                      SALT_SIZE, PBKDF2_ITERATIONS, EVP_sha256(),
-                                      32, key);
-  secure_wipe(plain_pass, sizeof(plain_pass));
+  int pbkdf2_ok = 1;
+  if (state->cfg_key_set) {
+    memcpy(salt, state->cfg_key_salt, sizeof(salt));
+    memcpy(key, state->cfg_key, sizeof(key));
+  } else {
+    /* Decode XOR-obfuscated config password before use */
+    char plain_pass[MAX_PASS];
+    hub_get_config_pass(state, plain_pass, sizeof(plain_pass));
+    pbkdf2_ok = PKCS5_PBKDF2_HMAC(plain_pass, (int)strlen(plain_pass), salt,
+                                  SALT_SIZE, PBKDF2_ITERATIONS, EVP_sha256(),
+                                  32, key);
+    secure_wipe(plain_pass, sizeof(plain_pass));
+    if (pbkdf2_ok) cfg_key_keep(state, salt, key);
+  }
   if (!pbkdf2_ok) {
     hub_log_error("[HUB] PBKDF2 failed\n");
+    secure_wipe(key, sizeof(key));  /* may hold part of an output */
     secure_wipe(buffer, (size_t)offset);
     free(buffer);
     return;
@@ -467,6 +490,7 @@ void hub_config_write(hub_state_t *state) {
 
   unsigned char *ciphertext = malloc((size_t)(offset + 16));
   if (!ciphertext) {
+    secure_wipe(key, sizeof(key));
     secure_wipe(buffer, (size_t)offset);
     free(buffer);
     return;
@@ -475,6 +499,7 @@ void hub_config_write(hub_state_t *state) {
   int len, cipher_len;
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
   if (!ctx) {
+    secure_wipe(key, sizeof(key));
     free(ciphertext);
     secure_wipe(buffer, (size_t)offset);
     free(buffer);
@@ -504,16 +529,22 @@ void hub_config_write(hub_state_t *state) {
   int tmp_fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
   FILE *fp = (tmp_fd >= 0) ? fdopen(tmp_fd, "wb") : NULL;
   if (!fp && tmp_fd >= 0) close(tmp_fd);
+  /* Renamed over the config only when every byte reached the disk: with the
+   * disk full, a truncated .tmp replaced the good file and the next start
+   * failed to decrypt it. */
+  bool saved = false;
   if (fp) {
-    fwrite(salt, 1, SALT_SIZE, fp);
-    fwrite(iv, 1, GCM_IV_LEN, fp);
-    fwrite(tag, 1, GCM_TAG_LEN, fp);
-    fwrite(ciphertext, 1, (size_t)cipher_len, fp);
-    fflush(fp);
-    fsync(fileno(fp));
-    fclose(fp);
-    rename(tmp, HUB_CONFIG_FILE);
+    saved = fwrite(salt, 1, SALT_SIZE, fp) == SALT_SIZE &&
+            fwrite(iv, 1, GCM_IV_LEN, fp) == GCM_IV_LEN &&
+            fwrite(tag, 1, GCM_TAG_LEN, fp) == GCM_TAG_LEN &&
+            fwrite(ciphertext, 1, (size_t)cipher_len, fp) == (size_t)cipher_len &&
+            fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+    saved = fclose(fp) == 0 && saved;
+    saved = saved && rename(tmp, HUB_CONFIG_FILE) == 0;
+    if (!saved) unlink(tmp);
   }
+  if (!saved)
+    hub_log_error("[HUB] Config write failed: the previous config is kept\n");
 
   // ADDED: Secure cleanup
   secure_wipe(key, sizeof(key));
@@ -560,7 +591,16 @@ static bool load_ip_acl_line(hub_state_t *state, char list, char *v, bool consol
 }
 
 // FIXED: Use PBKDF2 and improved error handling
+static bool config_load(hub_state_t *state, const char *password);
+
 bool hub_config_load(hub_state_t *state, const char *password) {
+  g_hub_config_loading = true;
+  bool ok = config_load(state, password);
+  g_hub_config_loading = false;
+  return ok;
+}
+
+static bool config_load(hub_state_t *state, const char *password) {
   int cfg_bad_users = 0;     /* a|/o| lines that did not parse */
   int cfg_acl_fixed = 0;     /* w|/x| lines dropped, merged or canonicalised */
   struct stat cfg_st;
@@ -638,6 +678,7 @@ bool hub_config_load(hub_state_t *state, const char *password) {
           EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag) == 1 &&
           EVP_DecryptFinal_ex(ctx, plaintext + pl, &fl) > 0) {
         plain_len = pl + fl;
+        cfg_key_keep(state, salt, key);
       } else {
         /* Partial plaintext may have been written by EVP_DecryptUpdate before
          * the GCM tag check failed. Wipe it so unverified data doesn't
@@ -868,9 +909,9 @@ bool hub_config_load(hub_state_t *state, const char *password) {
               memcpy(p->x25519_pub, dec + ED25519_KEY_LEN, X25519_KEY_LEN);
               p->has_pubkey = true;
             } else {
-              hub_log_warning("[PEER] peer %s pubkey wrong length (%d, need %d) — "
+              hub_log_warning("[PEER] %s pubkey wrong length (%d, need %d) — "
                       "ignoring; v2 auth disabled for this peer\n",
-                      p->uuid, dec_len, COMBINED_KEY_LEN);
+                      hub_who(state, 'h', p->uuid), dec_len, COMBINED_KEY_LEN);
             }
             if (dec) { secure_wipe(dec, (size_t)(dec_len > 0 ? dec_len : 0)); free(dec); }
           }
@@ -1175,8 +1216,8 @@ bool hub_config_load(hub_state_t *state, const char *password) {
         }
       }
       if (!has_owner) {
-        hub_log_debug("[HUB] Dedup: dropped orphaned mask '%s' (UUID %s)\n",
-                m->mask, m->uuid);
+        hub_log_debug("[HUB] Dedup: dropped orphaned mask '%s' (%s)\n",
+                m->mask, hub_who(state, 'u', m->uuid));
         continue;
       }
       /* Check for duplicate (same uuid+mask already in dedup_masks) */

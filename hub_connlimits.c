@@ -51,6 +51,9 @@ static const cset_t SETS[] = {
   {HUB_CONN_CONN, "authfail", K_RATE3, {O(fail_n), O(fail_s), O(fail_block)},
    {MAX_FAILED_AUTH_ATTEMPTS, FAILED_AUTH_RESET_TIME, FAILED_AUTH_BLOCK_DURATION}, {1, 1, 30},
    {1000, 86400, SSH_BLOCK_MAX}, "N:S[:B], N 1 to 1000, S 1 to 86400, B 30 to 86400"},
+  {HUB_CONN_CONN, "startups", K_RATE3, {O(startups_start), O(startups_rate), O(startups_full)},
+   {STARTUPS_DEF_START, STARTUPS_DEF_RATE, STARTUPS_DEF_FULL}, {1, 1, 1},
+   {MAX_CLIENTS, 100, MAX_CLIENTS}, "S:R[:F], S 1 to 100, R 1 to 100 (%), F 1 to 100"},
 };
 #undef O
 #define NSETS ((int)(sizeof(SETS) / sizeof(SETS[0])))

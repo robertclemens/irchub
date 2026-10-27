@@ -85,6 +85,7 @@ bool console_ctl_write(int fd, const char *text) {
   memcpy(buf, &nl, 4);
   memcpy(buf + 4, text, len);
   size_t off = 0, total = 4 + len;
+  int waits = 0;
   while (off < total) {
     ssize_t n = send(fd, buf + off, total - off, MSG_NOSIGNAL);
     if (n > 0) {
@@ -92,13 +93,20 @@ bool console_ctl_write(int fd, const char *text) {
       continue;
     }
     if (n < 0 && errno == EINTR) continue;
-    if (n < 0 && IO_WOULD_BLOCK(errno)) {
+    /* Nothing sent yet: 1 s, then give up with the stream intact.  Part of
+     * the frame sent: the reader is mid-frame, so wait up to 5 s more. */
+    if (n < 0 && IO_WOULD_BLOCK(errno) && waits < (off ? 5 : 1)) {
       struct pollfd p = {fd, POLLOUT, 0};
-      if (poll(&p, 1, 1000) > 0) continue;
+      waits++;
+      if (poll(&p, 1, 1000) >= 0) continue;
     }
-    return false;
+    break;
   }
-  return true;
+  if (off == total) return true;
+  /* A part-sent frame would make the reader take the next frame's bytes for
+   * the rest of this one: end the stream instead, both ends see EOF. */
+  if (off > 0) shutdown(fd, SHUT_RDWR);
+  return false;
 }
 
 /* The ssh-ed25519 public key blob: string "ssh-ed25519" || string pub. */

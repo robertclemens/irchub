@@ -314,6 +314,7 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
     return false;
   }
 
+  if (hub_ts_ahead(ts)) return false;
   if (!hub_global_value_active(combined_value) && hub_purge_floor_blocks(state, ts)) {
     hub_log_debug("[STORAGE] Global %s=%s: tombstone ts=%ld older than the last purge: "
                   "not re-created\n", key, value, (long)ts);
@@ -390,9 +391,37 @@ bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
   return ok;
 }
 
+/* A stored field is one '|'-separated slot of a newline-separated line: a
+ * control byte (a newline above all) or a '|' would split it into lines or
+ * fields of the sender's choosing once it is forwarded or saved.  A c/m/o
+ * global's value and extra are themselves '|'-separated (#chan|key|modes|op)
+ * and parsed by their own reader, so `bar` lets those through; never a
+ * control byte. */
+static bool storage_field_ok(const char *s, bool bar) {
+  for (; s && *s; s++)
+    if ((unsigned char)*s < 0x20 || *s == 0x7f || (*s == '|' && !bar)) return false;
+  return true;
+}
+
 static bool storage_update_entry(hub_state_t *state, const char *uuid,
                                  const char *key, const char *value,
                                  const char *extra, const char *op, time_t ts) {
+
+  const bool global = strcmp(key, "c") == 0 || strcmp(key, "m") == 0 ||
+                      strcmp(key, "o") == 0;
+  if (!storage_field_ok(uuid, false) || !storage_field_ok(key, false) ||
+      !storage_field_ok(value, global) || !storage_field_ok(extra, global) ||
+      !storage_field_ok(op, false)) {
+    hub_log_warning("[STORAGE] REJECTED a record for %s: control byte or '|' "
+                    "in a field\n",
+                    storage_field_ok(uuid, false) ? hub_who(state, 'b', uuid) : "?");
+    return false;
+  }
+  if (hub_ts_ahead(ts)) {
+    hub_log_warning("[STORAGE] REJECTED %s for %s: stamp %lld is ahead of this "
+                    "clock\n", key, hub_who(state, 'b', uuid), (long long)ts);
+    return false;
+  }
 
   /* Keys no writer may store as plain entries, whichever path (delta,
    * push, sync, load) offers them. */
@@ -418,7 +447,8 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
   if (strcmp(uuid, "n") == 0 || strcmp(uuid, "h") == 0 ||
       strcmp(uuid, "seen") == 0 || strcmp(uuid, "pub") == 0 ||
       strcmp(uuid, "d") == 0 || strcmp(uuid, "t") == 0) {
-    hub_log_warning("[STORAGE] REJECTED: Invalid UUID '%s' (bot-specific key used as UUID)\n", uuid);
+    hub_log_warning("[STORAGE] REJECTED: Invalid UUID '%s' (bot-specific key used as UUID)\n",
+                    hub_who(state, 'b', uuid));
     return false;
   }
 
@@ -438,7 +468,7 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
       strcmp(key, "seen") != 0 && strcmp(key, "d") != 0 &&
       strcmp(key, "hl") != 0) {
     hub_log_warning("[STORAGE] REJECTED per-bot key '%s' for %s (not in whitelist)\n",
-            key, uuid);
+            key, hub_who(state, 'b', uuid));
     return false;
   }
   {
@@ -451,11 +481,12 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
     else                              cap = 31; /* seen/d/t: short numerics */
     if (vlen > cap) {
       hub_log_warning("[STORAGE] REJECTED per-bot '%s' for %s: value too long "
-              "(%zu > %zu)\n", key, uuid, vlen, cap);
+              "(%zu > %zu)\n", key, hub_who(state, 'b', uuid), vlen, cap);
       return false;
     }
     if (strcmp(key, "hl") == 0 && !hub_hublist_valid(value)) {
-      hub_log_warning("[STORAGE] REJECTED per-bot 'hl' for %s: not a hub list\n", uuid);
+      hub_log_warning("[STORAGE] REJECTED per-bot 'hl' for %s: not a hub list\n",
+                      hub_who(state, 'b', uuid));
       return false;
     }
   }
@@ -464,7 +495,7 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
    * protection matches bans against it, so a '*' here would shield everyone. */
   if (strcmp(key, "h") == 0 && value && value[0] && !hostmask_literal(value)) {
     hub_log_warning("[STORAGE] REJECTED per-bot 'h' for %s: not a literal "
-            "nick!user@host\n", uuid);
+            "nick!user@host\n", hub_who(state, 'b', uuid));
     return false;
   }
 
@@ -535,7 +566,7 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
   bool is_singleton = (strcmp(key, "n") == 0 || strcmp(key, "a") == 0 ||
                        strcmp(key, "p") == 0 || strcmp(key, "h") == 0 ||
                        strcmp(key, "d") == 0 || strcmp(key, "pub") == 0 ||
-                       strcmp(key, "seen") == 0);
+                       strcmp(key, "seen") == 0 || strcmp(key, "hl") == 0);
 
   /* is_active follows the 'd' entry alone.  An 'n' or 's' entry used to set
    * it back to true ("auto-undelete on check-in"): a peer still holding a
@@ -632,7 +663,7 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
     return true;
   }
 
-  hub_log_warning("[STORAGE] Bot %s has reached MAX_BOT_ENTRIES\n", uuid);
+  hub_log_warning("[STORAGE] %s has reached MAX_BOT_ENTRIES\n", hub_who(state, 'b', uuid));
   return false;
 }
 
@@ -972,6 +1003,7 @@ bool hub_record_valid(const char *key, const char *value) {
  * hub picks the same side (docs/modes.md D2; same shape as the opt rule). */
 static bool rec_accepts(time_t in_ts, const char *in_val, bool in_active,
                         time_t cur_ts, const char *cur_val, bool cur_active) {
+  if (hub_ts_ahead(in_ts)) return false;
   if (in_ts != cur_ts) return in_ts > cur_ts;
   if (cur_active != in_active) return cur_active && !in_active;
   return strcmp(in_val, cur_val) > 0;
@@ -1023,7 +1055,8 @@ static bool evict_oldest_tombstone(hub_state_t *state, const char *key) {
 
 bool hub_storage_put_record(hub_state_t *state, const char *key, const char *value,
                             time_t ts) {
-  if (!state || !key || !value || !key_is_modes(key) || ts <= 0) return false;
+  if (!state || !key || !value || !key_is_modes(key) || ts <= 0 || hub_ts_ahead(ts))
+    return false;
   if (!hub_record_valid(key, value)) {
     hub_log_warning("[STORAGE] REJECTED malformed %s| record\n", key);
     return false;
@@ -1204,8 +1237,8 @@ static bool learned_key_ok(const char *k) {
 
 bool hub_learned_put(hub_state_t *state, const char *chan, const char *key, int modes,
                      time_t ts) {
-  if (!chan || !key || ts <= 0 || !rec_chan_ok(chan, false) || !learned_key_ok(key) ||
-      modes < 0 || (modes & ~K_MODES_MASK))
+  if (!chan || !key || ts <= 0 || hub_ts_ahead(ts) || !rec_chan_ok(chan, false) ||
+      !learned_key_ok(key) || modes < 0 || (modes & ~K_MODES_MASK))
     return false;
   char name[MAX_CHAN];
   if (!hub_chan_live(state, chan, name, sizeof(name))) return false;

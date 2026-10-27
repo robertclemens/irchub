@@ -726,8 +726,8 @@ bool hub_ban_bot_write(hub_state_t *state, const char *bot_uuid, const char *val
   }
   /* Never over a trusted bot's or an admin's / oper's own mask. */
   if (hub_ban_protected(state, mask, NULL, 0) != HUB_MODES_OK) {
-    hub_log_warning("[BANS] ban %s in %s from bot %s refused (protected mask)\n", mask,
-                    chan, bot_uuid);
+    hub_log_warning("[BANS] ban %s in %s from %s refused (protected mask)\n", mask,
+                    chan, hub_who(state, 'b', bot_uuid));
     return false;
   }
   /* A bot holds at most BOT_BANS_PER_CHAN live bans per channel; renewing its
@@ -743,8 +743,8 @@ bool hub_ban_bot_write(hub_state_t *state, const char *bot_uuid, const char *val
       if (hub_ascii_ieq(c, chan) && strcmp(st, bot_uuid) == 0) mine++;
     }
     if (mine >= BOT_BANS_PER_CHAN) {
-      hub_log_warning("[BANS] ban in %s from bot %s refused (%d live bans)\n", chan,
-                      bot_uuid, mine);
+      hub_log_warning("[BANS] ban in %s from %s refused (%d live bans)\n", chan,
+                      hub_who(state, 'b', bot_uuid), mine);
       return false;
     }
   }
@@ -773,7 +773,7 @@ void hub_bans_sweep(hub_state_t *state, time_t now) {
     /* One second past the record's own stamp: every hub sweeping the same ban
      * writes the same tombstone at the same stamp, so they agree without
      * talking, and any newer edit (an extension made on another hub) wins. */
-    time_t ts = e->timestamp + 1;
+    time_t ts = hub_ts_add(e->timestamp, 1);
     if (!hub_storage_put_record(state, "B", value, ts)) continue;
     swept++;
     int w = snprintf(out + off, sizeof(out) - off, "B|%s|%ld\n", value, (long)ts);
@@ -817,7 +817,7 @@ void hub_chan_event_receive(hub_state_t *state, hub_client_t *client,
   if (now - client->chan_ev_window >= CHAN_EVENT_WINDOW) {
     if (client->chan_ev_dropped > 0)
       hub_log_debug("[CHAN] %d event(s) from %s dropped (rate limit)\n",
-                    client->chan_ev_dropped, client->id);
+                    client->chan_ev_dropped, hub_who_client(state, client));
     client->chan_ev_window = now;
     client->chan_ev_count = 0;
     client->chan_ev_dropped = 0;
@@ -833,7 +833,7 @@ void hub_chan_event_receive(hub_state_t *state, hub_client_t *client,
   char buf[MAX_CHAN + 16 + CHAN_EVENT_TARGET_MAX + CHAN_EVENT_DETAIL_MAX + 8];
   size_t n = strlen(payload);
   if (n >= sizeof(buf)) {
-    hub_log_debug("[CHAN] oversize event from %s dropped\n", client->id);
+    hub_log_debug("[CHAN] oversize event from %s dropped\n", hub_who_client(state, client));
     return;
   }
   memcpy(buf, payload, n + 1);
@@ -845,17 +845,9 @@ void hub_chan_event_receive(hub_state_t *state, hub_client_t *client,
   if (!detail || !chan_name_shape(chan) || !event_action_ok(action) || !target[0] ||
       strlen(target) > CHAN_EVENT_TARGET_MAX || strlen(detail) > CHAN_EVENT_DETAIL_MAX ||
       !no_ctrl(target) || !no_ctrl(detail)) {
-    hub_log_debug("[CHAN] malformed event from %s dropped\n", client->id);
+    hub_log_debug("[CHAN] malformed event from %s dropped\n", hub_who_client(state, client));
     return;
   }
-  char nick[MAX_NICK] = "";
-  for (int i = 0; i < state->bot_count; i++)
-    if (strcmp(state->bots[i].uuid, client->id) == 0) {
-      bot_entry_value(&state->bots[i], "n", nick, sizeof(nick));
-      break;
-    }
-  for (char *q = nick; *q; q++)
-    if ((unsigned char)*q < 0x21 || *q == 0x7f) *q = '_';
   hub_log_info("[CHAN] chan %s %s %s by %s: %s\n", chan, action, target,
-               nick[0] ? nick : client->id, detail);
+               hub_who_client(state, client), detail);
 }

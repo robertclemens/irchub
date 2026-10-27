@@ -195,14 +195,28 @@ bool peer_enqueue(hub_client_t *peer, queued_msg_t *m) {
       lane->count--;
       lane->bytes        -= old->payload_len;
       peer->out_total_bytes -= old->payload_len;
-      hub_log_warning("[MESH] queue %s lane full — dropping oldest (peer fd=%d)\n",
-              li == LANE_DELTA ? "DELTA" : "BULK", peer->fd);
+      time_t now = time(NULL);
+      if (now - peer->drop_logged >= QUEUE_DROP_LOG_EVERY) {
+        if (peer->drop_unlogged > 0)
+          hub_log_warning("[MESH] queue %s lane full — dropping oldest (peer fd=%d); "
+                          "%d more dropped in the last %ds\n",
+                          li == LANE_DELTA ? "DELTA" : "BULK", peer->fd,
+                          peer->drop_unlogged, (int)(now - peer->drop_logged));
+        else
+          hub_log_warning("[MESH] queue %s lane full — dropping oldest (peer fd=%d)\n",
+                          li == LANE_DELTA ? "DELTA" : "BULK", peer->fd);
+        peer->drop_logged = now;
+        peer->drop_unlogged = 0;
+      } else {
+        peer->drop_unlogged++;
+      }
       cfg_push_lost(peer, old);
       queued_msg_free(old);
     }
   }
 
-  /* Append. */
+  /* Append.  Output waiting where none was: the write-stall clock starts. */
+  if (!peer_has_pending_writes(peer)) peer->write_wait_since = time(NULL);
   m->next = NULL;
   if (lane->tail) lane->tail->next = m;
   else            lane->head       = m;
@@ -223,14 +237,14 @@ bool peer_has_pending_writes(hub_client_t *peer) {
 }
 
 bool hub_client_has_buffered_frame(const hub_client_t *c) {
-  if (!c || c->fd <= 0 || !c->recv_buf || c->recv_len < 4) return false;
+  if (!c || c->fd <= 0 || !c->recv_buf || c->recv_len - c->recv_off < 4) return false;
   uint32_t net_len;
-  memcpy(&net_len, c->recv_buf, 4);
+  memcpy(&net_len, c->recv_buf + c->recv_off, 4);
   int packet_len = (int)ntohl(net_len);
   /* An out-of-range prefix counts: the pump refuses it and drops the client
    * rather than leaving it parked on a length that can never complete. */
   if (packet_len < 0 || packet_len > c->recv_cap - 4) return true;
-  return c->recv_len >= 4 + packet_len;
+  return c->recv_len - c->recv_off >= 4 + packet_len;
 }
 
 void peer_queue_destroy(hub_client_t *peer) {
@@ -257,6 +271,14 @@ void peer_queue_destroy(hub_client_t *peer) {
 /* Encrypt `m` using peer->session_key into peer->writing_buf.  Returns the
  * total wire length (4-byte length prefix + ciphertext + tag) or 0 on
  * failure. */
+/* Review 6: the AAD of frame number `ctr` sent with direction byte `dir` on a
+ * sequenced link (CMD_LINK_SEQ). */
+static void link_aad(char dir, uint64_t ctr, unsigned char out[HUB_LINK_AAD_LEN]) {
+  memcpy(out, "LNK1", 4);
+  out[4] = (unsigned char)dir;
+  for (int i = 0; i < 8; i++) out[5 + i] = (unsigned char)(ctr >> (56 - 8 * i));
+}
+
 static int peer_encrypt_into_writing(hub_client_t *peer, queued_msg_t *m) {
   /* Change 5: heap the plaintext scratch — a bulk CONFIG_DATA/PEER_SYNC frame
    * (up to MAX_BULK_PAYLOAD) is far too large for the stack. */
@@ -284,7 +306,7 @@ static int peer_encrypt_into_writing(hub_client_t *peer, queued_msg_t *m) {
    * without it the bot computed a garbage length, failed its bounds check and
    * silently dropped every tree push.  CMD_CHAN_DO is queued behind a config
    * push (send_cmd_to_bot_after_config). */
-  if (m->cmd == CMD_CONFIG_DATA || m->cmd == CMD_BOT_TREE ||
+  if (peer->type == CLIENT_BOT || m->cmd == CMD_CONFIG_DATA || m->cmd == CMD_BOT_TREE ||
       m->cmd == CMD_ACTIVITY_REPLY || m->cmd == CMD_CHAN_DO) {
     inner_len_field = htonl((uint32_t)m->payload_len);
   } else {
@@ -296,21 +318,31 @@ static int peer_encrypt_into_writing(hub_client_t *peer, queued_msg_t *m) {
   int total_plain = 5 + m->payload_len;
 
   /* D2: writing_buf may be the small pre-auth buffer. Refuse to encrypt a
-   * frame that would not fit (4-byte length prefix + ciphertext + tag).
-   * AES-GCM ciphertext length equals the plaintext length. */
-  if (4 + total_plain + GCM_TAG_LEN > peer->writing_cap) {
+   * frame that would not fit (4-byte length prefix + IV + ciphertext + tag:
+   * aes_gcm_encrypt writes the IV first).  AES-GCM ciphertext length equals
+   * the plaintext length. */
+  if (4 + GCM_IV_LEN + total_plain + GCM_TAG_LEN > peer->writing_cap) {
     secure_wipe(plain, plain_alloc);
     free(plain);
     return 0;
   }
 
   unsigned char tag[GCM_TAG_LEN];
-  int cipher_len = aes_gcm_encrypt(plain, total_plain, peer->session_key,
-                                   peer->writing_buf + 4, tag);
+  unsigned char aad[HUB_LINK_AAD_LEN];
+  bool seq = peer->link_tx_seq;
+  if (seq) link_aad(peer->link_dir_tx, peer->link_tx_ctr, aad);
+  int cipher_len = aes_gcm_encrypt_aad(plain, total_plain, seq ? aad : NULL,
+                                       seq ? HUB_LINK_AAD_LEN : 0, peer->session_key,
+                                       peer->writing_buf + 4, tag);
   /* Wipe plaintext copy ASAP. */
   secure_wipe(plain, plain_alloc);
   free(plain);
   if (cipher_len <= 0) return 0;
+  /* Review 6: every frame sealed after our "go" is sequenced. */
+  if (seq)
+    peer->link_tx_ctr++;
+  else if (m->cmd == CMD_LINK_SEQ && m->payload_len == 2 && memcmp(m->payload, "go", 2) == 0)
+    peer->link_tx_seq = true;
   memcpy(peer->writing_buf + 4 + cipher_len, tag, GCM_TAG_LEN);
   int packet_len = cipher_len + GCM_TAG_LEN;
   uint32_t nl = htonl((uint32_t)packet_len);
@@ -334,6 +366,7 @@ void peer_drain_writable(hub_state_t *state, hub_client_t *peer) {
       peer->writing_offset += (int)s;
       /* Account against bandwidth window. */
       time_t now = time(NULL);
+      peer->write_wait_since = now;
       if (peer->bw_window_start != now) {
         peer->bw_window_start = now;
         peer->bw_bytes_in_window = 0;
@@ -404,6 +437,7 @@ void peer_drain_writable(hub_state_t *state, hub_client_t *peer) {
         if (s > 0) {
           peer->writing_offset    += (int)s;
           peer->bw_bytes_in_window += (int)s;
+          peer->write_wait_since = now;
           continue;
         }
         if (s < 0 && (IO_WOULD_BLOCK(errno) || errno == EINTR))
@@ -435,6 +469,53 @@ static bool peer_send_urgent(hub_state_t *state, hub_client_t *peer,
     return false;  /* caller must hub_disconnect_client */
   }
   return true;
+}
+
+/* Every frame to a linked bot or peer after the handshake goes through its
+ * queue.  A direct write() blocked the whole loop on a client that stopped
+ * reading, and could land inside a part-sent queued frame (the receiver's
+ * GCM check then failed and it dropped the link).  LANE_URGENT keeps the old
+ * order -- ahead of queued deltas and bulk frames, behind the frame already
+ * in flight -- and the drain right after sends it at once when the socket
+ * has room.  false = not queued (no socket, URGENT full, no memory). */
+bool hub_client_send(hub_state_t *state, hub_client_t *c, uint8_t cmd,
+                     const char *payload) {
+  if (!c || c->fd < 0 || c->internal) return false;
+  if (!peer_send_urgent(state, c, cmd, payload)) return false;
+  peer_drain_writable(state, c);
+  return true;
+}
+
+/* Review 6: start the sequenced framing on a link that just authenticated
+ * (a bot, or a peer whose uuid is `peer_uuid`): fix the direction bytes and
+ * send "offer".  A 2.5.1 node ignores it and the link stays as it is. */
+void hub_link_offer(hub_state_t *state, hub_client_t *c, const char *peer_uuid) {
+  if (c->type == CLIENT_HUB) {
+    bool lower = peer_uuid && strcmp(state->hub_uuid, peer_uuid) < 0;
+    c->link_dir_tx = lower ? 'L' : 'G';
+    c->link_dir_rx = lower ? 'G' : 'L';
+  } else {
+    c->link_dir_tx = 'H';
+    c->link_dir_rx = 'B';
+  }
+  peer_send_urgent(state, c, CMD_LINK_SEQ, "offer");
+}
+
+/* Review 6: CMD_LINK_SEQ from the other end.  Its "offer" is answered with
+ * our "go" (our frames after it are sequenced, see peer_encrypt_into_writing);
+ * its "go" says every frame it sends after it is. */
+static void link_seq_recv(hub_state_t *state, hub_client_t *c, const char *what) {
+  if (strcmp(what, "offer") == 0 && !c->link_offered) {
+    c->link_offered = true;
+    if (!c->link_go_queued) {
+      c->link_go_queued = true;
+      peer_send_urgent(state, c, CMD_LINK_SEQ, "go");
+    }
+  } else if (strcmp(what, "go") == 0 && c->link_offered && !c->link_rx_seq) {
+    c->link_rx_seq = true;
+    c->link_rx_ctr = 0;
+    hub_log_debug("[HUB] %s: sequenced link framing on\n", hub_who_client(state, c));
+  }
 }
 
 uint64_t hub_next_lamport_seq(hub_state_t *state) {
@@ -494,6 +575,8 @@ bool hub_delta_seen_check_and_update(hub_state_t *state,
 static bool send_response(hub_state_t *state, hub_client_t *client,
                           const char *msg);
 static bool send_pong(hub_state_t *state, hub_client_t *c);
+static bool send_cmd_to_bot(hub_state_t *state, hub_client_t *bot, uint8_t cmd,
+                            const char *payload);
 static void process_mesh_state(hub_state_t *state, hub_client_t *c,
                                char *payload);
 static void process_peer_sync(hub_state_t *state, char *payload, int origin_fd,
@@ -732,29 +815,135 @@ bool hub_should_initiate_scheduled_purge(hub_state_t *state) {
 
 // ============ RATE LIMITING FUNCTIONS ============
 
-static ip_rate_limit_t* find_or_create_ip_limit(hub_state_t *state, const char *ip) {
-    // Find existing entry
+/* The slot an address would take in the rate-limit table: its own entry,
+ * a free one, or the entry idle longest (no connection open, not blocked).
+ * -1 when every entry is open or blocked.  *fresh: the slot is not yet
+ * this address's. */
+static int ip_limit_slot(const hub_state_t *state, const char *ip, time_t now, bool *fresh) {
+    *fresh = false;
     for (int i = 0; i < state->ip_limits_count; i++) {
         if (strcmp(state->ip_limits[i].ip, ip) == 0) {
-            return &state->ip_limits[i];
+            return i;
         }
     }
 
-    // Create new entry if space available
-    if (state->ip_limits_count < MAX_IP_RATE_LIMITS) {
-        ip_rate_limit_t *entry = &state->ip_limits[state->ip_limits_count++];
-        snprintf(entry->ip, sizeof(entry->ip), "%s", ip);
-        entry->active_connections = 0;
-        entry->failed_auth_count = 0;
-        entry->last_failed_auth = 0;
-        entry->blocked_until = 0;
-        entry->first_seen = time(NULL);
-        entry->churn_window_start = entry->first_seen;
-        entry->churn_count = 0;
-        return entry;
+    *fresh = true;
+    if (state->ip_limits_count < MAX_IP_RATE_LIMITS) return state->ip_limits_count;
+    /* Full: reuse the entry idle longest.  Without this, MAX_IP_RATE_LIMITS
+     * addresses inside the hourly prune left every new one untracked. */
+    int slot = -1;
+    time_t oldest = 0;
+    for (int i = 0; i < state->ip_limits_count; i++) {
+        const ip_rate_limit_t *e = &state->ip_limits[i];
+        if (e->active_connections > 0 || (e->blocked_until > 0 && now < e->blocked_until))
+            continue;
+        time_t last = e->first_seen;
+        if (e->last_failed_auth > last) last = e->last_failed_auth;
+        if (e->churn_window_start > last) last = e->churn_window_start;
+        if (slot < 0 || last < oldest) { slot = i; oldest = last; }
+    }
+    return slot;
+}
+
+static ip_rate_limit_t* find_or_create_ip_limit(hub_state_t *state, const char *ip) {
+    time_t now = time(NULL);
+    bool fresh;
+    int slot = ip_limit_slot(state, ip, now, &fresh);
+    if (slot < 0) return NULL;  /* every entry open or blocked */
+    ip_rate_limit_t *entry = &state->ip_limits[slot];
+    if (!fresh) return entry;
+    if (slot == state->ip_limits_count) state->ip_limits_count++;
+    memset(entry, 0, sizeof(*entry));
+    snprintf(entry->ip, sizeof(entry->ip), "%s", ip);
+    entry->first_seen = now;
+    entry->churn_window_start = now;
+    return entry;
+}
+
+/* 13b: a bot or peer authenticated from `ip`. */
+void hub_known_ip_note(hub_state_t *state, const char *ip) {
+    if (!ip || !*ip) return;
+    time_t now = time(NULL);
+    int slot = -1;
+    for (int i = 0; i < state->known_ip_count; i++) {
+        if (strcmp(state->known_ips[i].ip, ip) == 0) { slot = i; break; }
+        if (slot < 0 || state->known_ips[i].last_ok < state->known_ips[slot].last_ok) slot = i;
+    }
+    if (slot < 0 || (state->known_ip_count < MAX_KNOWN_IPS &&
+                     strcmp(state->known_ips[slot].ip, ip) != 0))
+        slot = state->known_ip_count++;
+    snprintf(state->known_ips[slot].ip, sizeof(state->known_ips[slot].ip), "%s", ip);
+    state->known_ips[slot].last_ok = now;
+}
+
+/* An address this hub has reason to trust: a configured peer, a bot in the
+ * roster (any hub's), a bot or peer that authenticated here lately, or a
+ * console login within SSH_SUCCESS_MEMORY. */
+static bool ip_known(const hub_state_t *state, const char *ip, time_t now) {
+    for (int i = 0; i < state->peer_count; i++)
+        if (strcmp(state->peers[i].ip, ip) == 0 || strcmp(state->peers[i].remote_ip, ip) == 0)
+            return true;
+    for (int i = 0; i < state->known_ip_count; i++)
+        if (strcmp(state->known_ips[i].ip, ip) == 0)
+            return now - state->known_ips[i].last_ok < KNOWN_IP_MEMORY;
+    for (int i = 0; i < state->roster_count; i++)
+        if (strcmp(state->roster[i].ip, ip) == 0) return true;
+    return hub_ssh_table_recent_ok(state->ssh_ips, state->ssh_ip_count, ip, now);
+}
+
+static void startup_refused(hub_state_t *state, time_t now, const char *ip, const char *why) {
+    if (now - state->startup_logged >= STARTUP_LOG_EVERY) {
+        if (state->startup_unlogged > 0)
+            hub_log_warning("[RATE_LIMIT] Connection from %s refused (%s); %d more refused "
+                            "in the last %ds\n", ip, why, state->startup_unlogged,
+                            (int)(now - state->startup_logged));
+        else
+            hub_log_warning("[RATE_LIMIT] Connection from %s refused (%s)\n", ip, why);
+        state->startup_logged = now;
+        state->startup_unlogged = 0;
+    } else {
+        state->startup_unlogged++;
+    }
+}
+
+/* 13b: the gate before is_ip_allowed.  Known addresses always pass; an
+ * unknown one is refused while the rate-limit table has no room for it
+ * (rather than let through untracked), and otherwise goes through a random
+ * early drop on the connections not yet authenticated (hub set conn
+ * startups), so a flood of stalled handshakes cannot hold every slot. */
+bool hub_startup_admit(hub_state_t *state, const char *ip) {
+    if (state->trust_loopback &&
+        (strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0)) return true;
+    time_t now = time(NULL);
+    if (ip_known(state, ip, now)) return true;
+
+    bool fresh;
+    if (ip_limit_slot(state, ip, now, &fresh) < 0) {
+        startup_refused(state, now, ip, "unknown address, rate-limit table full");
+        return false;
     }
 
-    return NULL;  // No space (shouldn't happen with large limit)
+    int open = 0;
+    for (int i = 0; i < state->client_count; i++) {
+        const hub_client_t *c = state->clients[i];
+        if (c->inbound && !c->authenticated) open++;
+    }
+    const hub_conn_cfg_t *cc = &state->conn_cfg;
+    int start = cc->startups_start;
+    int full = cc->startups_full > start ? cc->startups_full : start;
+    if (open < start) return true;
+    bool drop = true;
+    if (open < full) {
+        int p = cc->startups_rate + (100 - cc->startups_rate) * (open - start) / (full - start);
+        uint32_t r;
+        if (RAND_bytes((unsigned char *)&r, sizeof(r)) == 1) drop = (int)(r % 100) < p;
+    }
+    if (drop) {
+        char why[96];
+        snprintf(why, sizeof(why), "unknown address, %d connections not yet authenticated", open);
+        startup_refused(state, now, ip, why);
+    }
+    return !drop;
 }
 
 /* D2: allocate a client's recv/writing buffers. recv_buf is `size`; writing_buf
@@ -821,7 +1010,7 @@ bool is_ip_allowed(hub_state_t *state, const char *ip) {
         (strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0)) return true;
 
     ip_rate_limit_t *entry = find_or_create_ip_limit(state, ip);
-    if (!entry) return true;  // If can't track, allow (fail open)
+    if (!entry) return true;  /* untracked: only a known address gets here (13b) */
 
     time_t now = time(NULL);
 
@@ -1131,10 +1320,11 @@ static void retire_ack_apply(hub_state_t *state, hub_client_t *client, const cha
   if (hub_revoke_mark_wiped(state, client->id, time(NULL), line, sizeof(line)))
     hub_broadcast_sync_to_peers(state, line, -1);
   if (wiped)
-    hub_log_info("[REVOKE] Revoked bot %s wiped its config and is exiting\n", client->id);
+    hub_log_info("[REVOKE] Revoked %s wiped its config and is exiting\n",
+                 hub_who_client(state, client));
   else
-    hub_log_warning("[REVOKE] Revoked bot %s could not wipe its config; it exits, and "
-                    "is told again if it ever connects\n", client->id);
+    hub_log_warning("[REVOKE] Revoked %s could not wipe its config; it exits, and "
+                    "is told again if it ever connects\n", hub_who_client(state, client));
 }
 
 /* bot del, here or on another hub: every connected bot this hub holds that is
@@ -1150,13 +1340,13 @@ int hub_retire_revoked_bots(hub_state_t *state) {
       continue;
     queued_msg_t *m = queued_msg_new(CMD_BOT_RETIRE, LANE_URGENT, NULL, 0);
     if (!m || !peer_enqueue(c, m)) {
-      hub_log_warning("[REVOKE] Could not queue CMD_BOT_RETIRE for %s\n", c->id);
+      hub_log_warning("[REVOKE] Could not queue CMD_BOT_RETIRE for %s\n", hub_who_client(state, c));
       continue;
     }
     c->retiring = true;
     c->retire_sent = now;
-    hub_log_info("[REVOKE] Deleted bot %s is connected here: told to wipe its config\n",
-                 c->id);
+    hub_log_info("[REVOKE] Deleted %s is connected here: told to wipe its config\n",
+                 hub_who_client(state, c));
     n++;
   }
   /* Its row in the tree goes now, on every hub, rather than when the gossip
@@ -1170,6 +1360,77 @@ int hub_retire_revoked_bots(hub_state_t *state) {
     i++;
   }
   return n;
+}
+
+
+/* Review 7b: true when a HUBv3 hello with this ephemeral key was accepted in
+ * the last HELLO_SEEN_SECS -- a replay, which would otherwise take over the
+ * live link -- else it is remembered.  Only verified, fresh hellos get here,
+ * so the ring holds real peers' hellos only. */
+static bool hello_replayed(hub_state_t *state, const unsigned char eph[32]) {
+  time_t now = time(NULL);
+  for (int i = 0; i < HELLO_SEEN_MAX; i++)
+    if (state->hello_seen_at[i] && now - state->hello_seen_at[i] <= HELLO_SEEN_SECS &&
+        CRYPTO_memcmp(state->hello_seen[i], eph, 32) == 0)
+      return true;
+  memcpy(state->hello_seen[state->hello_seen_next], eph, 32);
+  state->hello_seen_at[state->hello_seen_next] = now;
+  state->hello_seen_next = (state->hello_seen_next + 1) % HELLO_SEEN_MAX;
+  return false;
+}
+
+/* Review 7a: peer `p` already has a live link when `newc`, a link it dialled,
+ * authenticates.  Both dialled by it: the new one is a reconnect and replaces
+ * the old.  One dialled each way (both hubs dialled at once): the link the
+ * lower uuid dialled stays, so the two hubs keep the same one without
+ * talking.  True when `newc` stays; the old link is then shut down and
+ * reaped on its EOF, as in supersede_bot_sessions. */
+static bool peer_link_tie(hub_state_t *state, int p, hub_client_t *newc) {
+  const hub_peer_config_t *peer = &state->peers[p];
+  hub_client_t *old = NULL;
+  for (int i = 0; peer->connected && i < state->client_count && !old; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c != newc && c->type == CLIENT_HUB && c->fd >= 0 && c->fd == peer->fd)
+      old = c;
+  }
+  if (!old) return true;
+  bool keep_new = old->inbound || strcmp(peer->uuid, state->hub_uuid) < 0;
+  if (keep_new) {
+    hub_log_info("[MESH] %s: a second link (old one from %s) — keeping the new one\n",
+                 hub_who(state, 'h', peer->uuid), old->ip);
+    old->superseded = true;
+    shutdown(old->fd, SHUT_RDWR);
+  } else {
+    hub_log_info("[MESH] %s dialled while our link to it is up — ours stays (the "
+                 "lower uuid's link wins)\n", hub_who(state, 'h', peer->uuid));
+  }
+  return keep_new;
+}
+
+/* L6: one live session per bot.  An older one for the same uuid (a reconnect
+ * before its dead socket timed out, or a second process with the same key)
+ * is shut down now and reaped by the main loop on its EOF; the bot lookups
+ * skip it meanwhile.  Repeats are counted per hour across sessions. */
+static void supersede_bot_sessions(hub_state_t *state, hub_client_t *client) {
+  time_t now = time(NULL);
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *o = state->clients[i];
+    if (o == client || o->type != CLIENT_BOT || !o->authenticated || o->superseded ||
+        strcmp(o->id, client->id) != 0)
+      continue;
+    o->superseded = true;
+    if (o->fd >= 0) shutdown(o->fd, SHUT_RDWR);
+    bool same_hour = now - o->replace_window < 3600;
+    client->replace_window = same_hour ? o->replace_window : now;
+    client->replace_count = (same_hour ? o->replace_count : 0) + 1;
+    if (client->replace_count > BOT_REPLACE_WARN_PER_HOUR)
+      hub_log_warning("[HUB] %s replaced its own live session again (%d times in the "
+                      "last hour): two processes with one key, or a stolen key\n",
+                      hub_who_client(state, client), client->replace_count);
+    else
+      hub_log_info("[HUB] %s logged in while its old session (%s) was live: the old one "
+                   "is closed\n", hub_who_client(state, client), o->ip);
+  }
 }
 
 bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
@@ -1189,8 +1450,8 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
       char st[2] = {pl > 5 ? (char)plain[5] : '0', '\0'};
       retire_ack_apply(state, client, st);
     } else {
-      hub_log_info("[REVOKE] Revoked bot %s did not answer the wipe (an older build?); "
-                   "closed\n", client->id);
+      hub_log_info("[REVOKE] Revoked %s did not answer the wipe (an older build?); "
+                   "closed\n", hub_who_client(state, client));
     }
     secure_wipe(plain, sizeof(plain));
     secure_wipe(client->session_key, sizeof(client->session_key));
@@ -1204,6 +1465,9 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     memcpy(uuid, data, (size_t)packet_len);
     uuid[packet_len] = '\0';
 
+    /* The claimed UUID is raw pre-authentication input: logged as the bytes
+     * that arrived (the log sanitizer escapes them), never through hub_who,
+     * which would flatten control bytes the sanitizer exists to show. */
     hub_log_debug("[HUB] Bot auth attempt from %s with UUID: %s\n", client->ip, uuid);
 
     /* A revoked bot goes through the whole handshake (it must prove its
@@ -1222,8 +1486,8 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
       return false;
     }
     if (client->quarantine)
-      hub_log_info("[REVOKE] Revoked bot %s connecting from %s: checking its key\n",
-                   uuid, client->ip);
+      hub_log_info("[REVOKE] Revoked %s connecting from %s: checking its key\n",
+                   hub_who(state, 'b', uuid), client->ip);
 
     // Generate challenge + ephemeral X25519 keypair
     if (RAND_bytes(client->challenge, 32) != 1) {
@@ -1279,15 +1543,17 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     secure_wipe(transcript, off);
     free(transcript);
 
-    unsigned char out_buf[128];
-    memcpy(out_buf,       client->challenge, 32);
-    memcpy(out_buf + 32,  eph_pub,           32);
-    memcpy(out_buf + 64,  hub_sig,           64);
-
+    /* length prefix and body in one write: two small writes stall ~40 ms on
+     * Nagle + the bot's delayed ACK */
+    unsigned char out_buf[4 + 128];
     uint32_t nl = htonl(128);
-    if (write(client->fd, &nl, 4) != 4 ||
-        write(client->fd, out_buf, 128) != 128) {
-      hub_log_warning("[HUB] Failed to send v2 challenge to %s\n", uuid);
+    memcpy(out_buf,       &nl,               4);
+    memcpy(out_buf + 4,   client->challenge, 32);
+    memcpy(out_buf + 36,  eph_pub,           32);
+    memcpy(out_buf + 68,  hub_sig,           64);
+
+    if (write(client->fd, out_buf, sizeof(out_buf)) != (ssize_t)sizeof(out_buf)) {
+      hub_log_warning("[HUB] Failed to send v2 challenge to %s\n", hub_who(state, 'b', uuid));
       return false;
     }
 
@@ -1295,24 +1561,25 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     client->bot_auth_state = BOT_AUTH_CHALLENGE_SENT;
     client->last_seen = time(NULL);
 
-    hub_log_debug("[HUB] Sent v2 signed Curve25519 challenge to bot %s\n", uuid);
+    hub_log_debug("[HUB] Sent v2 signed Curve25519 challenge to %s\n", hub_who(state, 'b', uuid));
     return true;
   }
 
   // PHASE 2: Receive 64-byte Ed25519 signature
   if (!client->authenticated &&
       client->bot_auth_state == BOT_AUTH_CHALLENGE_SENT) {
-    hub_log_debug("[HUB] Received signature from bot %s (%d bytes)\n", client->id, packet_len);
+    hub_log_debug("[HUB] Received signature from %s (%d bytes)\n", hub_who_client(state, client),
+                  packet_len);
 
     if (packet_len != 64 || !client->bot_eph_priv_set) {
-      hub_log_warning("[HUB] Bad signature size or state from %s\n", client->id);
+      hub_log_warning("[HUB] Bad signature size or state from %s\n", hub_who_client(state, client));
       return false;
     }
 
     unsigned char bot_combined[64], bot_ed_pub[32], bot_x_pub[32];
     if (client->quarantine ? !load_revoked_pub(state, client->id, bot_combined)
                            : !load_bot_combined_pub(state, client->id, bot_combined)) {
-      hub_log_warning("[HUB] No public key for bot %s\n", client->id);
+      hub_log_warning("[HUB] No public key for %s\n", hub_who_client(state, client));
       return false;
     }
     hub_crypto_split_combined(bot_combined, bot_ed_pub, bot_x_pub);
@@ -1327,7 +1594,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
       unsigned char *msg = malloc(msg_len);
       if (!msg) {
         hub_log_error("[HUB] OOM building challenge transcript for %s\n",
-                client->id);
+                hub_who_client(state, client));
         secure_wipe(bot_combined, 64);
         return false;
       }
@@ -1343,7 +1610,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
       free(msg);
 
       if (!sig_ok) {
-        hub_log_warning("[HUB] Invalid signature from bot %s\n", client->id);
+        hub_log_warning("[HUB] Invalid signature from %s\n", hub_who_client(state, client));
         record_failed_auth(state, client->ip);
         secure_wipe(bot_combined, 64);
         return false;
@@ -1352,7 +1619,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
 
     unsigned char shared[32];
     if (!hub_crypto_x25519_derive(client->bot_eph_x25519_priv, bot_x_pub, shared)) {
-      hub_log_error("[HUB] X25519 derive failed for %s\n", client->id);
+      hub_log_error("[HUB] X25519 derive failed for %s\n", hub_who_client(state, client));
       secure_wipe(bot_combined, 64);
       return false;
     }
@@ -1369,7 +1636,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     client->bot_eph_priv_set = false;
     secure_wipe(bot_combined, 64);
     if (!ok) {
-      hub_log_error("[HUB] HKDF failed for %s\n", client->id);
+      hub_log_error("[HUB] HKDF failed for %s\n", hub_who_client(state, client));
       return false;
     }
 
@@ -1384,28 +1651,29 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     /* A revoked bot gets CMD_BOT_RETIRE in the ACK's place: it wipes its
      * config, answers CMD_BOT_RETIRE_ACK, and is never a CLIENT_BOT here. */
     unsigned char ack_plain = client->quarantine ? CMD_BOT_RETIRE : 0x01;
-    unsigned char ack_wire[GCM_IV_LEN + 1 + GCM_TAG_LEN];
+    /* framed in one buffer, one write (see the challenge above) */
+    unsigned char ack_wire[4 + GCM_IV_LEN + 1 + GCM_TAG_LEN];
     unsigned char ack_tag[GCM_TAG_LEN];
     int enc_len = aes_gcm_encrypt(&ack_plain, 1,
-                                  client->session_key, ack_wire, ack_tag);
+                                  client->session_key, ack_wire + 4, ack_tag);
     if (enc_len <= 0) {
-      hub_log_error("[HUB] ACK encrypt failed for %s\n", client->id);
+      hub_log_error("[HUB] ACK encrypt failed for %s\n", hub_who_client(state, client));
       return false;
     }
-    memcpy(ack_wire + enc_len, ack_tag, GCM_TAG_LEN);
+    memcpy(ack_wire + 4 + enc_len, ack_tag, GCM_TAG_LEN);
     int ack_total = enc_len + GCM_TAG_LEN;
 
     uint32_t nl = htonl((uint32_t)ack_total);
-    if (write(client->fd, &nl, 4) != 4 ||
-        write(client->fd, ack_wire, (size_t)ack_total) != ack_total) {
-      hub_log_warning("[HUB] Failed to send v2 ACK to %s\n", client->id);
+    memcpy(ack_wire, &nl, 4);
+    if (write(client->fd, ack_wire, (size_t)(4 + ack_total)) != 4 + ack_total) {
+      hub_log_warning("[HUB] Failed to send v2 ACK to %s\n", hub_who_client(state, client));
       return false;
     }
 
     if (client->quarantine) {
       client->bot_auth_state = BOT_AUTH_QUARANTINE;
-      hub_log_info("[REVOKE] Revoked bot %s proved its key: told to wipe its config\n",
-                   client->id);
+      hub_log_info("[REVOKE] Revoked %s proved its key: told to wipe its config\n",
+                   hub_who_client(state, client));
       return true;
     }
 
@@ -1413,11 +1681,14 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     client->authenticated = true;
     client->bot_auth_state = BOT_AUTH_COMPLETE;
     client->last_seen = time(NULL);
+    supersede_bot_sessions(state, client);
+    hub_known_ip_note(state, client->ip);
+    hub_link_offer(state, client, NULL);
 
     /* D2: grow buffers to full size now that the bot is authenticated. */
     if (!hub_client_promote_buffers(client)) {
       hub_log_error("[HUB] Buffer promotion OOM for %s — disconnecting\n",
-              client->id);
+              hub_who_client(state, client));
       return false;
     }
 
@@ -1428,7 +1699,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     hub_roster_mark_dirty(state, true);
     state->last_presence_gossip = 0;
 
-    hub_log_info("[HUB] Bot %s authenticated (Curve25519)\n", client->id);
+    hub_log_info("[HUB] %s authenticated (Curve25519)\n", hub_who_client(state, client));
     return true;
   }
 
@@ -1708,15 +1979,15 @@ static void process_mesh_state(hub_state_t *state, hub_client_t *c,
             }
           }
 
-          // Also update UUID if it changed (in case peer was added without UUID)
-          if (fields >= 3 && remote_uuid[0] && strcmp(remote_uuid, "-") != 0) {
-            if (!state->peers[i].uuid[0] ||
-                strcmp(state->peers[i].uuid, remote_uuid) != 0) {
-              snprintf(state->peers[i].uuid,
-                      sizeof(state->peers[i].uuid), "%s", remote_uuid);
-              hub_log_debug("[MESH] Updated peer UUID to: %s\n", remote_uuid);
-              config_updated = true;
-            }
+          /* Fill in the uuid only for a peer we hold none for.  A linked
+           * peer proved the uuid we hold in its handshake; gossip proves
+           * nothing.  Rewriting it let a peer take another hub's identity
+           * (that hub's own handshake then checked the wrong key) and wrote
+           * the unchecked text into the config's peer| line. */
+          if (fields >= 3 && !state->peers[i].uuid[0] && hub_uuid_shape(remote_uuid)) {
+            snprintf(state->peers[i].uuid, sizeof(state->peers[i].uuid), "%s", remote_uuid);
+            hub_log_debug("[MESH] Updated peer UUID to: %s\n", hub_who(state, 'h', remote_uuid));
+            config_updated = true;
           }
 
           // Write config once if anything changed
@@ -1767,10 +2038,9 @@ void hub_roster_mark_dirty(hub_state_t *state, bool local) {
 void hub_roster_expire(hub_state_t *state, time_t now) {
   for (int i = 0; i < state->roster_count;) {
     if (now - state->roster[i].reported_at > BOT_ROSTER_TTL) {
-      hub_log_info("[PRESENCE] %s on hub %s aged out of the roster\n",
-              state->roster[i].nick[0] ? state->roster[i].nick
-                                       : state->roster[i].bot_uuid,
-              state->roster[i].hub_name);
+      hub_log_info("[PRESENCE] %s on %s aged out of the roster\n",
+              hub_who(state, 'b', state->roster[i].bot_uuid),
+              hub_who(state, 'h', state->roster[i].hub_uuid));
       state->roster[i] = state->roster[--state->roster_count];
       state->tree_dirty = true;
       continue; /* the swapped-in entry still needs checking */
@@ -1779,9 +2049,8 @@ void hub_roster_expire(hub_state_t *state, time_t now) {
   }
   for (int i = 0; i < state->mesh_hub_count;) {
     if (now - state->mesh_hubs[i].reported_at > BOT_ROSTER_TTL) {
-      hub_log_info("[PRESENCE] Hub %s aged out of the mesh map\n",
-              state->mesh_hubs[i].name[0] ? state->mesh_hubs[i].name
-                                          : state->mesh_hubs[i].uuid);
+      hub_log_info("[PRESENCE] %s aged out of the mesh map\n",
+              hub_who(state, 'h', state->mesh_hubs[i].uuid));
       state->mesh_hubs[i] = state->mesh_hubs[--state->mesh_hub_count];
       state->tree_dirty = true;
       continue;
@@ -1805,7 +2074,7 @@ static mesh_hub_t *mesh_hub_get(hub_state_t *state, const char *uuid) {
   if (h) return h;
   if (state->mesh_hub_count >= MAX_MESH_HUBS) {
     hub_log_warning("[PRESENCE] Mesh map full (%d) — %s is not relayed\n",
-            MAX_MESH_HUBS, uuid);
+            MAX_MESH_HUBS, hub_who(state, 'h', uuid));
     return NULL;
   }
   h = &state->mesh_hubs[state->mesh_hub_count++];
@@ -1861,7 +2130,7 @@ static void roster_upsert(hub_state_t *state, const bot_roster_t *in) {
   }
   if (state->roster_count >= MAX_BOT_ROSTER) {
     hub_log_warning("[PRESENCE] Roster full (%d) — dropping report for %s\n",
-            MAX_BOT_ROSTER, in->bot_uuid);
+            MAX_BOT_ROSTER, hub_who(state, 'b', in->bot_uuid));
     return;
   }
   state->roster[state->roster_count++] = *in;
@@ -1911,8 +2180,18 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
    * still reads 100k files and old record shapes).  The hub cannot roll it
    * up either, so it says what to do and drops the link. */
   if (version[0] && hub_update_version_cmp(version, MESH_MIN_VERSION) < 0) {
-    hub_log_warning("[HUB] Bot %s runs %s: refused; upgrade it by hand to %s\n",
-                    client->id, version, MESH_MIN_VERSION);
+    hub_log_warning("[HUB] %s runs %s: refused; upgrade it by hand to %s\n",
+                    hub_who_client(state, client), version, MESH_MIN_VERSION);
+    client->refused = true;
+    return;
+  }
+  /* Review 6: a bot this new sends CMD_LINK_SEQ "offer" as its first frame,
+   * before any presence; none means it was stripped on the way. */
+  if (version[0] && !client->link_offered &&
+      hub_update_version_cmp(version, HUB_LINK_SEQ_VERSION) >= 0) {
+    hub_log_warning("[HUB] %s runs %s but never offered the sequenced link framing "
+                    "(a frame stripped on the way?): dropped\n",
+                    hub_who_client(state, client), version);
     client->refused = true;
     return;
   }
@@ -1927,7 +2206,7 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
   client->bot_started = (time_t)started;
 
   if (changed) {
-    hub_log_info("[PRESENCE] Bot %s: version %s (%s) on %s\n", client->id,
+    hub_log_info("[PRESENCE] %s: version %s (%s) on %s\n", hub_who_client(state, client),
             version[0] ? version : "?", variant[0] ? variant : "?",
             server[0] ? server : "(no server)");
     hub_roster_mark_dirty(state, true);
@@ -2271,6 +2550,17 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
           strcmp(hub_uuid, upgrade_peer_uuid(state, from)) == 0) {
         hub_log_warning("[MESH] Peer %s (%s) runs %s: link refused; upgrade it by "
                         "hand to %s\n", hub_name, from->ip, hub_ver, MESH_MIN_VERSION);
+        from->refused = true;
+        free(relay);
+        return;
+      }
+      /* Review 6: a direct peer this new offered CMD_LINK_SEQ on connect. */
+      if (hub_ver[0] && !from->link_offered &&
+          hub_update_version_cmp(hub_ver, HUB_LINK_SEQ_VERSION) >= 0 &&
+          strcmp(hub_uuid, upgrade_peer_uuid(state, from)) == 0) {
+        hub_log_warning("[MESH] Peer %s (%s) runs %s but never offered the sequenced link "
+                        "framing (a frame stripped on the way?): link dropped\n",
+                        hub_name, from->ip, hub_ver);
         from->refused = true;
         free(relay);
         return;
@@ -2735,10 +3025,9 @@ static bool split_horizon_has(hub_state_t *state, const mesh_hub_t *sender,
 
 /* Whether peer `c` is known current: 2 = MESH_MIN_VERSION or newer, 1 =
  * known older (its link is being refused), 0 = not known yet (its version
- * arrives with its first roster).  Below 2 it gets the downgraded sync
- * (hub_access_downgrade; tombstones only at 1), so a peer that turns out to
- * be older never over-trusts a restricted user meanwhile. */
-static int peer_flags_level(hub_state_t *state, const hub_client_t *c) {
+ * arrives with its first roster).  Config sync flows only at 2: an older hub
+ * does not know uf| / uc| and would over-trust every restricted user. */
+static int peer_version_level(hub_state_t *state, const hub_client_t *c) {
   const char *cu = upgrade_peer_uuid(state, c);
   const char *ver = "";
   for (int i = 0; cu[0] && i < state->peer_count && !ver[0]; i++)
@@ -2751,26 +3040,18 @@ static int peer_flags_level(hub_state_t *state, const hub_client_t *c) {
   return hub_update_version_cmp(ver, MESH_MIN_VERSION) >= 0 ? 2 : 1;
 }
 
-/* The level of the peer on `fd` (0 when no authenticated peer has it). */
-static int peer_fd_flags_level(hub_state_t *state, int fd) {
-  for (int i = 0; i < state->client_count; i++) {
-    hub_client_t *c = state->clients[i];
-    if (c->type == CLIENT_HUB && c->authenticated && c->fd == fd)
-      return peer_flags_level(state, c);
-  }
-  return 0;
-}
-
-/* One sync payload onto peer c's queue, downgraded for an older peer. */
+/* One sync payload onto peer c's queue.  Held, not sent, while c's version
+ * is not known: hub_peer_sync_release sends the full state once it is. */
 void hub_peer_enqueue_sync(hub_state_t *state, hub_client_t *c, uint8_t op, lane_t lane,
                               const char *payload, const char *coalesce, uint64_t seq) {
-  int level = peer_flags_level(state, c);
-  char *down = level < 2 ? hub_access_downgrade(state, payload, level == 1) : NULL;
-  if (level < 2 && !down) return;
-  const char *send = down ? down : payload;
-  int len = (int)strlen(send);
+  int level = peer_version_level(state, c);
+  if (level < 2) {
+    if (level == 0) c->sync_held = true;
+    return;
+  }
+  int len = (int)strlen(payload);
   if (len > 0) {
-    queued_msg_t *m = queued_msg_new(op, lane, (const unsigned char *)send, len);
+    queued_msg_t *m = queued_msg_new(op, lane, (const unsigned char *)payload, len);
     if (m) {
       if (coalesce) queued_msg_set_coalesce(m, state->hub_uuid, seq, coalesce);
       if (!peer_enqueue(c, m)) {
@@ -2780,7 +3061,54 @@ void hub_peer_enqueue_sync(hub_state_t *state, hub_client_t *c, uint8_t op, lane
       }
     }
   }
-  free(down);
+}
+
+/* Peer c's roster just named a current version: everything held while it
+ * was unknown goes now, as one full sync, and a CMD_SYNC_REQUEST fetches
+ * the state it sent meanwhile (dropped unread, see the dispatch). */
+static void hub_peer_sync_release(hub_state_t *state, hub_client_t *c) {
+  if (!c->sync_held || peer_version_level(state, c) != 2) return;
+  c->sync_held = false;
+  char *full = malloc(MAX_SYNC_PAYLOAD);
+  if (!full) {
+    hub_log_error("[PEER] OOM building the held sync for %s\n", c->ip);
+    c->sync_held = true; /* the next roster tries again */
+    return;
+  }
+  hub_generate_sync_packet(state, full, MAX_SYNC_PAYLOAD);
+  hub_peer_enqueue_sync(state, c, CMD_PEER_SYNC, LANE_BULK, full, "handshake_sync",
+                        hub_next_lamport_seq(state));
+  free(full);
+  peer_send_urgent(state, c, CMD_SYNC_REQUEST, "");
+  hub_log_debug("[MESH] Peer %s is current: held sync sent, its own requested\n", c->ip);
+}
+
+/* Sync tracing (debug): a delta's path through the mesh, record by record,
+ * so a lost or leaked record can be followed hub to hub.  Frames longer than
+ * SYNC_TRACE_MAX_LINES are full-state syncs and are not traced. */
+#define SYNC_TRACE_MAX_LINES 16
+#define SYNC_TRACE_LINE 120
+
+static int sync_trace_lines(const char *payload) {
+  int n = 0;
+  for (const char *p = payload; *p; p++)
+    if (*p == '\n') n++;
+  return n + (payload[0] && payload[strlen(payload) - 1] != '\n');
+}
+
+/* The payload's first line, cut at SYNC_TRACE_LINE - 1 bytes. */
+static void sync_trace_first(char *out, size_t size, const char *payload) {
+  size_t n = strcspn(payload, "\n");
+  if (n >= size) n = size - 1;
+  memcpy(out, payload, n);
+  out[n] = '\0';
+}
+
+/* Append peer c's name to a ", "-separated list. */
+static void sync_trace_name(char *list, size_t size, const hub_client_t *c) {
+  size_t o = strlen(list);
+  if (o < size)
+    snprintf(list + o, size - o, "%s%s", o ? ", " : "", c->id[0] ? c->id : c->ip);
 }
 
 /* One config payload to every authenticated peer except `exclude_fd`.
@@ -2806,19 +3134,34 @@ static void sync_send_to_peers(hub_state_t *state, const char *payload,
                                    : NULL;
 
   int skipped = 0;
+  char to[256] = "", skip[256] = "", held[256] = "";
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
     if (c->type != CLIENT_HUB || !c->authenticated || c->fd == exclude_fd)
       continue;
     if (sender && split_horizon_has(state, sender, c)) {
       skipped++;
+      sync_trace_name(skip, sizeof(skip), c);
       continue;
     }
+    if (peer_version_level(state, c) == 2)
+      sync_trace_name(to, sizeof(to), c);
+    else
+      sync_trace_name(held, sizeof(held), c);
     hub_peer_enqueue_sync(state, c, sync_bcast_opcode(state, c), lane, payload, coalesce, seq);
   }
   if (skipped)
     hub_log_debug("[MESH] Forward skipped %d peer(s) the sender reaches itself\n",
             skipped);
+  /* Where a delta went (a full-state sync is too big and too routine). */
+  int lines = sync_trace_lines(payload);
+  if (lines <= SYNC_TRACE_MAX_LINES) {
+    char first[SYNC_TRACE_LINE];
+    sync_trace_first(first, sizeof(first), payload);
+    hub_log_debug("[MESH] Sync %s, %d line(s) [%s]: to %s; skipped %s; held %s\n",
+                  split ? "bcast forward" : exclude_fd != -1 ? "forward" : "own change",
+                  lines, first, to[0] ? to : "-", skip[0] ? skip : "-", held[0] ? held : "-");
+  }
 }
 
 void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
@@ -2933,7 +3276,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
     return;
   }
 
-  hub_log_debug("[HUB] Processing config push from %s\n", client->id);
+  hub_log_debug("[HUB] Processing config push from %s\n", hub_who_client(state, client));
   /* The bot's tables may now differ from what it was last sent (a push the
    * hub does not accept stays in them), so its next broadcast goes out. */
   client->cfg_sent_valid = false;
@@ -2960,15 +3303,16 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       (strchr(state->opt_flags, OPT_HUB_ONLY_MUTATIONS) != NULL);
 
   /* Task 6 — opt 'F' (OPT_CONFIG_FROZEN): an upgrade run is open, so the
-   * store holds still entirely.  Dropping the whole push (rather than
-   * filtering it) is deliberate: a bot that restarts mid-roll re-pushes its
-   * config on reconnect, and nothing here is lost that the bot will not
-   * offer again once the freeze lifts. */
-  if (hub_config_frozen(state)) {
-    hub_log_warning("[UPGRADE] config frozen: REJECTED config push from %s\n",
-            client->id);
-    return;
-  }
+   * store holds still: a bot that restarts mid-roll re-pushes its config on
+   * reconnect, and nothing is lost that it will not offer again once the
+   * freeze lifts.  Its own nick (n|) and hostmask (h|) are the exception —
+   * runtime identity, not config.  A bot that comes back from its upgrade
+   * under another nick is opped by its peers only once they learn the new
+   * mask, and the run waits for exactly that op (UPGRADE_OPS_WAIT). */
+  const bool frozen = hub_config_frozen(state);
+  if (frozen)
+    hub_log_warning("[UPGRADE] config frozen: only nick/hostmask taken from "
+                    "config push from %s\n", hub_who_client(state, client));
 
   /* v|<proto>|<unused> (docs/passwordless.md §3.4) heads a bot's full
    * push; record-only pushes (user/mask/ban deltas, split frames) carry
@@ -2976,8 +3320,8 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
    * is taken in: it would over-trust restricted users (MESH_MIN_VERSION). */
   long proto = push_proto(payload);
   if (proto >= 0 && proto < BOT_PROTO_USER_FLAGS) {
-    hub_log_warning("[HUB] Bot %s pushes protocol v%ld (below v%d): refused; "
-                    "upgrade it by hand to %s\n", client->id, proto,
+    hub_log_warning("[HUB] %s pushes protocol v%ld (below v%d): refused; "
+                    "upgrade it by hand to %s\n", hub_who_client(state, client), proto,
                     BOT_PROTO_USER_FLAGS, MESH_MIN_VERSION);
     client->refused = true;
     return;
@@ -2993,7 +3337,8 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
   int sync_offset = 0;
 
   while (line) {
-    if (strlen(line) < 2 || line[0] == '#') {
+    if (strlen(line) < 2 || line[0] == '#' ||
+        (frozen && !((line[0] == 'n' || line[0] == 'h') && line[1] == '|'))) {
       line = strtok_r(NULL, "\n", &saveptr);
       continue;
     }
@@ -3005,9 +3350,10 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       bool changed = false;
       if (hub_only_mutations) {
         hub_log_warning("[HUB] opt 'h' active: REJECTED bot-pushed '%.2s' record from %s "
-                        "(hub-authoritative)\n", line, client->id);
+                        "(hub-authoritative)\n", line, hub_who_client(state, client));
       } else if (!hub_access_ingest(state, line[1], line + 3, true, &changed)) {
-        hub_log_warning("[HUB] Ignored invalid '%.2s' record from %s\n", line, client->id);
+        hub_log_warning("[HUB] Ignored invalid '%.2s' record from %s\n", line,
+                        hub_who_client(state, client));
       } else if (changed) {
         updates++;
         config_push_sync(state, sync_buffer, &sync_offset, client->fd, "%s\n", line);
@@ -3024,7 +3370,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       bot_config_t *b = bot_by_uuid(state, client->id);
       const config_entry_t *cur = b ? bot_entry_rec(b, "hl") : NULL;
       if (!hub_hublist_valid(v)) {
-        hub_log_warning("[HUB] Ignored invalid hub list from %s\n", client->id);
+        hub_log_warning("[HUB] Ignored invalid hub list from %s\n", hub_who_client(state, client));
       } else if (b && (!cur || strcmp(cur->value, v) != 0)) {
         long long ts = (long long)hub_lww_next_ts(cur ? cur->timestamp : 0);
         if (hub_storage_update_entry(state, client->id, "hl", v, "", "", (time_t)ts)) {
@@ -3059,7 +3405,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         (type == 'a' || type == 'o' || type == 'm')) {
       hub_log_warning("[HUB] opt 'h' active: REJECTED bot-pushed '%c' record from %s "
               "(hub-authoritative — mutation must originate from the admin console)\n",
-              type, client->id);
+              type, hub_who_client(state, client));
       line = strtok_r(NULL, "\n", &saveptr);
       continue;
     }
@@ -3099,7 +3445,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
       if (parsed >= 3 && hub_only_mutations &&
           (strcmp(op, "add") != 0 || !hub_chan_live(state, chan, NULL, 0))) {
         hub_log_warning("[HUB] opt 'h' active: REJECTED bot-pushed 'c' %s for %s "
-                "from %s (hub-authoritative)\n", op, chan, client->id);
+                "from %s (hub-authoritative)\n", op, chan, hub_who_client(state, client));
         parsed = 0;
       }
 
@@ -3131,7 +3477,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
         config_push_sync(state, sync_buffer, &sync_offset, client->fd, "K|%s\n", data);
       } else {
         hub_log_debug("[HUB] K| from %s not taken (channel not managed or not newer)\n",
-                      client->id);
+                      hub_who_client(state, client));
       }
     } else if (type == 'B') {
       /* Enforcement ban: B|chan|mask|expires|flags|setter|reason|op|ts.  A bot
@@ -3152,7 +3498,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
     } else if (type == 'C' || type == 'D') {
       /* Channel settings and network defaults are written by the console only. */
       hub_log_warning("[HUB] Ignored bot-pushed '%c' record from %s (console only)\n",
-              type, client->id);
+              type, hub_who_client(state, client));
     } else if (type == 'm') {
       /* uuid|mask|add/del|last_used|timestamp; anything else is ignored */
       char first[40] = {0};
@@ -3180,6 +3526,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
             }
           }
           if (!found_m && state->mask_record_count < MAX_HUB_USER_MASKS &&
+              !hub_ts_ahead((time_t)ts) &&
               (is_active || !hub_purge_floor_blocks(state, (time_t)ts))) {
             found_m = &state->mask_records[state->mask_record_count++];
             memset(found_m,0,sizeof(*found_m));
@@ -3215,6 +3562,7 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
           }
         }
         if (!found_u && state->user_record_count < MAX_HUB_USER_RECORDS &&
+            !hub_ts_ahead(in.timestamp) &&
             (in.is_active || !hub_purge_floor_blocks(state, in.timestamp))) {
           found_u = &state->user_records[state->user_record_count++];
           memset(found_u, 0, sizeof(*found_u));
@@ -3282,12 +3630,21 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
   /* A user this push created without uf| / uc| gets what it could do
    * before flags (hub_access_migrate). */
   if (hub_access_migrate(state) > 0) updates++;
+  /* A hubless bot's removal may have left no +a admin: undo it everywhere. */
+  if (updates > 0) {
+    int restored = 0;
+    char *floor = hub_admin_floor_restore(state, hub_who_client(state, client), &restored);
+    if (floor) {
+      if (floor[0]) hub_broadcast_sync_to_peers(state, floor, -1);
+      free(floor);
+    }
+  }
 
   bool first_push = !client->pushed;
   client->pushed = true;
 
   if (updates > 0) {
-    hub_log_debug("[HUB] Applied %d updates from %s\n", updates, client->id);
+    hub_log_debug("[HUB] Applied %d updates from %s\n", updates, hub_who_client(state, client));
 
     // Update "seen" timestamp to track last successful sync
     time_t now = time(NULL);
@@ -3375,8 +3732,7 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len) {
     if (written > 0 && written < (max_len - offset)) offset += written;
   }
 
-  /* Mesh-wide settings and the revoke list.  An older peer never gets
-   * either (hub_access_downgrade). */
+  /* Mesh-wide settings and the revoke list. */
   hub_gsetting_append(state, buffer, max_len, &offset);
   hub_revoke_append(state, buffer, max_len, &offset);
 
@@ -3456,6 +3812,7 @@ static bool store_global_entry_raw(hub_state_t *state, const char *key,
   }
 
   // Add new entry (a tombstone older than the last purge is not re-created)
+  if (hub_ts_ahead(ts)) return false;
   if (!hub_global_value_active(value) && hub_purge_floor_blocks(state, ts))
     return false;
   if (hub_global_room(state, key)) {
@@ -3542,24 +3899,10 @@ static bool parse_global_channel_value(const char *value,
  * entries are overwritten wholesale once the timestamp wins
  * (hub_storage_update_global_entry), so not carrying them forward erases them.
  * Matched ASCII case-insensitively on the channel name (D39), same as the storage layer. */
-/* The +k/+i the bots last saw: K| (2.5.1), else the modes field a 2.5.0 bot
- * left on c|. */
+/* The +k/+i the bots last saw (K|), 0 when no bot has reported the channel. */
 static int global_channel_modes(hub_state_t *state, const char *chan) {
   const hub_chan_learned_t *l = hub_learned_find(state, chan);
-  if (l) return l->modes;
-  for (int i = 0; i < state->global_entry_count; i++) {
-    if (strcmp(state->global_entries[i].key, "c") != 0)
-      continue;
-    char stored_chan[128];  /* matches the admin handlers' channel buffers */
-    int modes = 0;
-    if (!parse_global_channel_value(state->global_entries[i].value,
-                                    stored_chan, sizeof(stored_chan),
-                                    NULL, 0, &modes, NULL, 0))
-      continue;
-    if (hub_ascii_ieq(stored_chan, chan))
-      return modes;
-  }
-  return 0;
+  return l ? l->modes : 0;
 }
 
 static void process_peer_sync(hub_state_t *state, char *payload,
@@ -3570,25 +3913,37 @@ static void process_peer_sync(hub_state_t *state, char *payload,
    * buffer are heap-allocated to the sync ceiling.  A stack MAX_BUFFER here
    * silently truncated the sync, dropping every record past 16 KB. */
   const size_t sync_cap = MAX_SYNC_PAYLOAD;
-  char *work_buf = malloc(sync_cap);
-  char *forward_buf = malloc(sync_cap);
+  /* The tokenizing copy is sized to this frame.  The forward buffer keeps the
+   * full ceiling -- forwarded lines can be re-formatted from stored records,
+   * longer than they came in -- but is allocated once and reused, not twice
+   * MAX_SYNC_PAYLOAD per frame (review 2026-10-25 #25).  One caller, the
+   * pump, so it is never in use twice. */
+  static char *forward_buf;
+  size_t plen = strnlen(payload, sync_cap - 1);
+  char *work_buf = malloc(plen + 1);
+  if (!forward_buf) forward_buf = malloc(sync_cap);
   if (!work_buf || !forward_buf) {
     free(work_buf);
-    free(forward_buf);
     return;
   }
-  snprintf(work_buf, sync_cap, "%s", payload);
+  memcpy(work_buf, payload, plen);
+  work_buf[plen] = '\0';
 
   char *line = strtok_r(work_buf, "\n", &saveptr);
   int updates = 0;
   int bot_push_updates = 0; /* only keys bots actually consume; gates full config push */
-  /* A peer whose version we do not know yet may be an older node holding
-   * no uf| / uc|: nothing it says about a restricted user is taken in
-   * (hub_access_from_old_ok). */
-  const bool origin_flags_ok = peer_fd_flags_level(state, origin_fd) == 2;
   int fwd_offset = 0;
   forward_buf[0] = 0;
   g_hub_stats.sync_frames++;
+
+  /* Sync tracing: every record applied is logged, and in a delta (not a
+   * full-state sync) every record refused too. */
+  const char *frame = bcast ? "PEER_BCAST" : "PEER_SYNC";
+  bool trace = sync_trace_lines(payload) <= SYNC_TRACE_MAX_LINES;
+  char from[HUB_WHO_MAX] = "?";
+  for (int i = 0; i < state->client_count; i++)
+    if (state->clients[i]->fd == origin_fd)
+      snprintf(from, sizeof(from), "%s", hub_who_client(state, state->clients[i]));
 
   while (line) {
     g_hub_stats.sync_records++;
@@ -3634,30 +3989,12 @@ static void process_peer_sync(hub_state_t *state, char *payload,
         hub_log_info("[MESH] Forwarded INVITE_REQUEST: invite %s into %s\n",
                 inv_nick, inv_chan);
         /* Broadcast CMD_INVITE_REQUEST to our connected bots */
-        unsigned char plain[MAX_BUFFER], inv_buf[MAX_BUFFER];
-        unsigned char inv_tag[GCM_TAG_LEN];
         char inv_payload[160];
-        int inv_pay_len = snprintf(inv_payload, sizeof(inv_payload),
-                                   "%s|%s", inv_nick, inv_chan);
-        plain[0] = (unsigned char)CMD_INVITE_REQUEST;
-        uint32_t inv_net_pay = htonl((uint32_t)inv_pay_len);
-        memcpy(&plain[1], &inv_net_pay, 4);
-        memcpy(&plain[5], inv_payload, (size_t)inv_pay_len);
+        snprintf(inv_payload, sizeof(inv_payload), "%s|%s", inv_nick, inv_chan);
         for (int i = 0; i < state->client_count; i++) {
           hub_client_t *bc = state->clients[i];
-          if (bc->type == CLIENT_BOT && bc->authenticated) {
-            int enc_len = aes_gcm_encrypt(plain, 5 + inv_pay_len,
-                                          bc->session_key, inv_buf + 4,
-                                          inv_tag);
-            if (enc_len > 0) {
-              memcpy(inv_buf + 4 + enc_len, inv_tag, GCM_TAG_LEN);
-              uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-              memcpy(inv_buf, &net_len, 4);
-              if (write(bc->fd, inv_buf, (size_t)(4 + enc_len + GCM_TAG_LEN)) <= 0) {
-                // write failed, continue to next client
-              }
-            }
-          }
+          if (bc->type == CLIENT_BOT && bc->authenticated)
+            send_cmd_to_bot(state, bc, CMD_INVITE_REQUEST, inv_payload);
         }
       }
       line = strtok_r(NULL, "\n", &saveptr);
@@ -3788,12 +4125,6 @@ static void process_peer_sync(hub_state_t *state, char *payload,
               }
               bool is_new_fmt = (strlen(first_f)==36 && first_f[8]=='-' &&
                                  first_f[13]=='-' && first_f[18]=='-' && first_f[23]=='-');
-              if (is_new_fmt && !origin_flags_ok && !hub_access_from_old_ok(state, first_f)) {
-                hub_log_debug("[MESH] Ignored %s| record for restricted user %s from an "
-                              "older peer\n", key, first_f);
-                line = strtok_r(NULL, "\n", &saveptr);
-                continue;
-              }
 
               if (is_new_fmt && is_user_key) {
                 /* hub_parse_user_record: uuid|name|pubkey|act|seen|ts| */
@@ -3824,7 +4155,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                              strcmp(uuid, ex->uuid) < 0);
                         if (incoming_wins) {
                           hub_log_info("[MESH] Dedup: '%s' (%c) UUID collision resolved, adopting %s\n",
-                                  uname, key[0], uuid);
+                                  uname, key[0], hub_who(state, 'u', uuid));
                           /* Remap existing record's masks, flags and channel
                            * bindings to the incoming UUID */
                           hub_access_remap_uuid(state, ex->uuid, uuid);
@@ -3845,6 +4176,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                   }
                   if (!found_u && !discard_incoming &&
                       state->user_record_count < MAX_HUB_USER_RECORDS &&
+                      !hub_ts_ahead(in.timestamp) &&
                       (in.is_active || !hub_purge_floor_blocks(state, in.timestamp))) {
                     found_u=&state->user_records[state->user_record_count++];
                     memset(found_u,0,sizeof(*found_u));
@@ -3912,6 +4244,7 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                         strcasecmp(state->mask_records[mi].mask,mask_s)==0)
                       { found_m=&state->mask_records[mi]; break; }
                   if (!found_m && state->mask_record_count < MAX_HUB_USER_MASKS &&
+                      !hub_ts_ahead((time_t)ts) &&
                       (is_active || !hub_purge_floor_blocks(state, (time_t)ts))) {
                     found_m=&state->mask_records[state->mask_record_count++];
                     memset(found_m,0,sizeof(*found_m));
@@ -3959,7 +4292,11 @@ static void process_peer_sync(hub_state_t *state, char *payload,
                 val[val_len] = 0;
                 long long ts = atoll(p_last + 1);
 
-                if (store_global_entry_raw(state, key, val, ts)) {
+                bool stored = store_global_entry_raw(state, key, val, ts);
+                if (stored || trace)
+                  hub_log_debug("[MESH] %s from %s: %s|%s|%lld -> %s\n", frame, from, key, val,
+                                ts, stored ? "applied" : "refused");
+                if (stored) {
                   updates++;
                   bot_push_updates++; /* channel/password/global — bots need this */
                   // Forward to other peers
@@ -4076,10 +4413,14 @@ static void process_peer_sync(hub_state_t *state, char *payload,
           // For other keys (pub, h, n, etc.): leave parsed_val empty
           // so hub_storage_update_entry will use the original val buffer
 
-          if (hub_storage_update_entry(state, uuid, key,
-              parsed_val[0] ? parsed_val : val,
-              parsed_extra,
-              parsed_op, ts)) {
+          bool stored = hub_storage_update_entry(state, uuid, key,
+                                                 parsed_val[0] ? parsed_val : val,
+                                                 parsed_extra, parsed_op, ts);
+          if (stored || trace)
+            hub_log_debug("[MESH] %s from %s: %s %s|%s|%lld -> %s\n", frame, from,
+                          hub_who(state, 'b', uuid), key, val, ts,
+                          stored ? "applied" : "refused");
+          if (stored) {
             updates++;
             /* seen/t are hub-side metadata; bots don't consume them */
             if (strcmp(key, "seen") != 0 && strcmp(key, "t") != 0)
@@ -4101,11 +4442,22 @@ static void process_peer_sync(hub_state_t *state, char *payload,
   }
 
   /* Records left on a merged-away uuid go; a user this sync created without
-   * uf| / uc| (an older hub's) gets what it could do before flags. */
+   * uf| / uc| gets its default (hub_access_migrate). */
   hub_access_prune(state);
   if (hub_access_migrate(state) > 0) {
     updates++;
     bot_push_updates++;
+  }
+  /* Two hubs that each removed a different +a admin before they synced may
+   * have left none: undo the race, on every peer including the sender. */
+  if (updates > 0) {
+    int restored = 0;
+    char *floor = hub_admin_floor_restore(state, "a peer sync", &restored);
+    if (floor) {
+      if (floor[0]) hub_broadcast_sync_to_peers(state, floor, -1);
+      bot_push_updates++;
+      free(floor);
+    }
   }
 
   if (updates > 0)
@@ -4126,7 +4478,8 @@ static void process_peer_sync(hub_state_t *state, char *payload,
   }
 
   free(work_buf);
-  free(forward_buf);
+  /* kept for the next frame: wipe what this one put in it */
+  secure_wipe(forward_buf, (size_t)fwd_offset + 1);
 }
 
 static bool send_response(hub_state_t *state, hub_client_t *client,
@@ -4139,59 +4492,17 @@ static bool send_response(hub_state_t *state, hub_client_t *client,
     hub_disconnect_client(state, client);
     return false;
   }
-  int len = (int)strlen(msg);
-  /* Allocate exactly what the wire frame needs: 4-byte length prefix +
-   * GCM_IV_LEN-prefix ciphertext (same size as plaintext) + GCM tag.
-   * Using the stack here caused overflows for large admin responses
-   * (e.g. CMD_ADMIN_LIST_PEERS builds up to 65536-byte strings). */
-  int buf_size = 4 + GCM_IV_LEN + len + GCM_TAG_LEN;
-  unsigned char *buffer = malloc((size_t)buf_size);
-  if (!buffer) {
-    hub_disconnect_client(state, client);
-    return false;
-  }
-
-  unsigned char tag[GCM_TAG_LEN];
-  int enc_len = aes_gcm_encrypt((const unsigned char *)msg, len, client->session_key,
-                                buffer + 4, tag);
-  if (enc_len <= 0) {
-    free(buffer);
-    hub_disconnect_client(state, client);
-    return false;
-  }
-  memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-  uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-  memcpy(buffer, &net_len, 4);
-  bool ok = (write(client->fd, buffer, (size_t)(4 + enc_len + GCM_TAG_LEN)) ==
-             (ssize_t)(4 + enc_len + GCM_TAG_LEN));
-  free(buffer);
-  if (!ok) {
-    hub_disconnect_client(state, client);
-    return false;
-  }
+  /* Admin replies go to SSH consoles only; a bot that sent an admin opcode
+   * gets none (a frame sealed here, outside the queue, would also break the
+   * link's sequence: review 6). */
+  hub_log_debug("[HUB] Admin reply to non-console %s dropped\n", client->ip);
   return true;
 }
 
 static bool send_pong(hub_state_t *state, hub_client_t *c) {
-  unsigned char buffer[MAX_BUFFER];
-  unsigned char tag[GCM_TAG_LEN];
-  unsigned char plain[16];
-
-  plain[0] = CMD_PING;
-  uint32_t zero = 0;
-  memcpy(&plain[1], &zero, 4);
-
-  int enc_len = aes_gcm_encrypt(plain, 5, c->session_key, buffer + 4, tag);
-  if (enc_len > 0) {
-    memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-    memcpy(buffer, &net_len, 4);
-
-    if (write(c->fd, buffer, (size_t)(4 + enc_len + GCM_TAG_LEN)) !=
-        (ssize_t)(4 + enc_len + GCM_TAG_LEN)) {
-      hub_disconnect_client(state, c);
-      return false;
-    }
+  if (!hub_client_send(state, c, CMD_PING, NULL)) {
+    hub_disconnect_client(state, c);
+    return false;
   }
   return true;
 }
@@ -4382,11 +4693,11 @@ write_and_notify:
                                      (const unsigned char *)purge_msg,
                                      purge_len);
     if (!m) {
-      hub_log_error("[PURGE] OOM queueing PURGE for bot %s\n", c->id);
+      hub_log_error("[PURGE] OOM queueing PURGE for %s\n", hub_who_client(state, c));
       continue;
     }
     if (!peer_enqueue(c, m))
-      hub_log_warning("[PURGE] could not queue PURGE for bot %s\n", c->id);
+      hub_log_warning("[PURGE] could not queue PURGE for %s\n", hub_who_client(state, c));
   }
 
   return purged_count;
@@ -4433,7 +4744,8 @@ static int local_bot_count(const hub_state_t *state) {
 static hub_client_t *local_bot_client(hub_state_t *state, const char *uuid) {
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
-    if (c->type == CLIENT_BOT && c->authenticated && strcmp(c->id, uuid) == 0)
+    if (c->type == CLIENT_BOT && c->authenticated && !c->superseded &&
+        strcmp(c->id, uuid) == 0)
       return c;
   }
   return NULL;
@@ -4472,6 +4784,93 @@ static const config_entry_t *bot_entry_rec(const bot_config_t *b, const char *ke
   return NULL;
 }
 
+static char *who_slot(void) {
+  static _Thread_local char slots[HUB_WHO_SLOTS][HUB_WHO_MAX];
+  static _Thread_local int next;
+  next = (next + 1) % HUB_WHO_SLOTS;
+  return slots[next];
+}
+
+/* Names come from the store and from peers: no control byte reaches a log
+ * line through one. */
+static char *who_clean(char *out) {
+  for (char *q = out; *q; q++)
+    if ((unsigned char)*q < 0x20 || *q == 0x7f) *q = '_';
+  return out;
+}
+
+/* The name a uuid goes by, or NULL; *word is what it is ("bot", "hub",
+ * "admin", "oper"). */
+static const char *who_name(const hub_state_t *state, char kind, const char *uuid,
+                            const char **word) {
+  if (kind == 0 || kind == 'b') {
+    *word = "bot";
+    for (int i = 0; i < state->bot_count; i++) {
+      if (strcmp(state->bots[i].uuid, uuid) != 0) continue;
+      const config_entry_t *n = bot_entry_rec(&state->bots[i], "n");
+      if (n && n->value[0]) return n->value;
+      break;
+    }
+    for (int r = 0; r < state->roster_count; r++)
+      if (strcmp(state->roster[r].bot_uuid, uuid) == 0 && state->roster[r].nick[0])
+        return state->roster[r].nick;
+  }
+  if (kind == 0 || kind == 'h') {
+    *word = "hub";
+    if (strcmp(state->hub_uuid, uuid) == 0 && state->hub_friendly_name[0])
+      return state->hub_friendly_name;
+    for (int i = 0; i < state->peer_count; i++)
+      if (strcmp(state->peers[i].uuid, uuid) == 0 && state->peers[i].friendly_name[0])
+        return state->peers[i].friendly_name;
+    for (int i = 0; i < state->mesh_hub_count; i++)
+      if (strcmp(state->mesh_hubs[i].uuid, uuid) == 0 && state->mesh_hubs[i].name[0])
+        return state->mesh_hubs[i].name;
+  }
+  if (kind == 0 || kind == 'u') {
+    *word = "user";
+    for (int i = 0; i < state->user_record_count; i++) {
+      const hub_user_record_t *u = &state->user_records[i];
+      if (strcmp(u->uuid, uuid) != 0) continue;
+      *word = u->type == 'a' ? "admin" : "oper";
+      if (u->name[0]) return u->name;
+      break;
+    }
+  }
+  if (kind == 0) *word = "?";
+  return NULL;
+}
+
+const char *hub_who(const hub_state_t *state, char kind, const char *uuid) {
+  char *out = who_slot();
+  const char *word = kind == 'b' ? "bot" : kind == 'h' ? "hub" : kind == 'u' ? "user" : "?";
+  const char *name = state && uuid && uuid[0] ? who_name(state, kind, uuid, &word) : NULL;
+  if (kind == 0 && !name) /* nothing knows it, not even what it is */
+    snprintf(out, HUB_WHO_MAX, "? (%.63s)", uuid && uuid[0] ? uuid : "?");
+  else
+    snprintf(out, HUB_WHO_MAX, "%s %.63s (%.63s)", word, name ? name : "?",
+             uuid && uuid[0] ? uuid : "?");
+  return who_clean(out);
+}
+
+const char *hub_who_client(const hub_state_t *state, const hub_client_t *c) {
+  if (!c) return "?";
+  if (c->type == CLIENT_BOT && c->id[0]) return hub_who(state, 'b', c->id);
+  char *out = who_slot();
+  if (c->type == CLIENT_HUB) {
+    const char *uuid = "";
+    for (int i = 0; state && i < state->peer_count; i++)
+      if (state->peers[i].connected && state->peers[i].fd == c->fd)
+        uuid = state->peers[i].uuid;
+    snprintf(out, HUB_WHO_MAX, "hub %.63s (%.63s)", c->id[0] ? c->id : "?",
+             uuid[0] ? uuid : "?");
+  } else if (c->type == CLIENT_ADMIN && strncmp(c->id, "ADMIN:", 6) == 0) {
+    snprintf(out, HUB_WHO_MAX, "admin %s", c->id + 6);
+  } else {
+    snprintf(out, HUB_WHO_MAX, "%s", c->id[0] ? c->id : c->ip);
+  }
+  return who_clean(out);
+}
+
 static bot_config_t *bot_by_uuid(hub_state_t *state, const char *uuid) {
   for (int i = 0; i < state->bot_count; i++)
     if (strcmp(state->bots[i].uuid, uuid) == 0) return &state->bots[i];
@@ -4489,6 +4888,27 @@ static int network_bots_online(hub_state_t *state) {
   for (int i = 0; i < state->bot_count; i++)
     if (state->bots[i].is_active && bot_online(state, state->bots[i].uuid)) n++;
   return n;
+}
+
+/* Every hub in the mesh tree (its H rows: this hub, its peers and the hubs
+ * beyond them); *up gets the ones online.  -1 when the tree can't be built. */
+static int network_hubs(hub_state_t *state, int *up) {
+  *up = 0;
+  char *tree = malloc(MAX_TREE_PAYLOAD);
+  if (!tree) return -1;
+  int len = hub_build_tree(state, tree, MAX_TREE_PAYLOAD);
+  int total = 0;
+  for (int i = 0; len > 0 && i < len; i++) {
+    if ((i == 0 || tree[i - 1] == '\n') && i + 2 < len && tree[i] == 'H' && tree[i + 1] == '|') {
+      total++;
+      /* H|depth|name|uuid|online|... */
+      int f = 0, j = i;
+      while (j < len && tree[j] != '\n' && f < 4) if (tree[j++] == '|') f++;
+      if (f == 4 && j < len && tree[j] == '1') (*up)++;
+    }
+  }
+  free(tree);
+  return total;
 }
 
 /* bot|uuid|nick|online|ver|base|started|server|hub|hub_uuid|hub_name|ip|
@@ -5196,7 +5616,7 @@ static bool admin_ip_acl_change(hub_state_t *state, hub_client_t *client,
   state->ip_acl_changed = true;
   state->config_dirty = true;
   hub_log_info("[ACCESS_CONTROL] %s %s %slist by %s\n", e.pattern,
-               add ? "added to" : "removed from", name, client->id);
+               add ? "added to" : "removed from", name, hub_who_client(state, client));
 
   reply_t r;
   reply_init(&r);
@@ -5259,6 +5679,8 @@ static bool admin_hub_show(hub_state_t *state, hub_client_t *client) {
   int bots = 0;
   for (int i = 0; i < state->bot_count; i++)
     if (state->bots[i].is_active) bots++;
+  int hubs_up = 0;
+  const int hubs = network_hubs(state, &hubs_up);
 
   reply_t r;
   reply_init(&r);
@@ -5280,6 +5702,10 @@ static bool admin_hub_show(hub_state_t *state, hub_client_t *client) {
   reply_kv(&r, "ssh_fp", ssh_fp);
   reply_kvi(&r, "peers_up", peers_up);
   reply_kvi(&r, "peers", state->peer_count);
+  if (hubs > 0) {
+    reply_kvi(&r, "hubs_up", hubs_up);
+    reply_kvi(&r, "hubs", hubs);
+  }
   reply_kvi(&r, "bots_here", local_bot_count(state));
   reply_kvi(&r, "bots_online", network_bots_online(state));
   reply_kvi(&r, "bots", bots);
@@ -5890,13 +6316,13 @@ static bool admin_set_ssh(hub_state_t *state, hub_client_t *client, const char *
   const char *name = conn ? f1 : f0, *value = conn ? f2 : f1;
   if ((conn && nf != 3) || (!conn && nf != 2))
     return admin_err(state, client, "hub.bad_value", "say a setting and its value",
-                     conn ? "hub set conn <perip|churn|authfail> <value|default>"
+                     conn ? "hub set conn <perip|churn|authfail|startups> <value|default>"
                           : "hub set ssh <name> <value|default>");
   char old[48], now[48], why[160];
   if (!hub_conn_cfg_get(&state->conn_cfg, group, name, old, sizeof(old))) {
     snprintf(why, sizeof(why), "unknown %s setting \"%.30s\"", gname, name);
     return admin_err(state, client, "hub.unknown_setting", why,
-                     conn ? "perip, churn, authfail"
+                     conn ? "perip, churn, authfail, startups"
                           : "preauth, preauthip, sessions, grace, authtries, idle, authfail, "
                             "connect, block, cmdrate");
   }
@@ -5937,7 +6363,8 @@ static bool admin_set_ssh(hub_state_t *state, hub_client_t *client, const char *
     state->conn_cfg = next;
     state->config_dirty = true;
     hub_console_limits_changed(state);
-    hub_log_info("[CONFIG] %s %s %s -> %s by %s\n", gname, name, old, now, client->id);
+    hub_log_info("[CONFIG] %s %s %s -> %s by %s\n", gname, name, old, now,
+                 hub_who_client(state, client));
   }
   reply_init(&r);
   reply_ok(&r, "hub.set");
@@ -6209,7 +6636,7 @@ static bool admin_user_access(hub_state_t *state, hub_client_t *client, const ch
     if (!hub_uflags_edit(old, f2, nw, sizeof(nw)) || !nw[0])
       return admin_err(state, client, "user.bad_flags",
                        "flags are +a (full admin) or letters from bchou; +x-y changes some",
-                       "+a, +chu, +b-u");
+                       "+a, +chu, +b-u · help user set lists the flags");
     if (!strchr(nw, 'a') && last_full_admin(state, t->uuid))
       return admin_err(state, client, "user.last_admin",
                        "that is the last full admin (+a); the network needs one",
@@ -6310,7 +6737,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     hub_user_record_t *me = admin_of_client(state, client);
     char need = admin_flag_needed(state, me, cmd, payload);
     if (need && (!me || !hub_user_has_flag(state, me->uuid, need))) {
-      hub_log_warning("[ADMIN] %s refused 0x%02x: needs +%c\n", client->id, (unsigned)cmd, need);
+      hub_log_warning("[ADMIN] %s refused 0x%02x: needs +%c\n", hub_who_client(state, client),
+                      (unsigned)cmd, need);
       snprintf(msg, sizeof(msg), "this needs +%c (%s)", need, admin_flag_word(need));
       return admin_err(state, client, "user.no_flag", msg,
                        need == 'a' ? "ask a full admin (+a)" : "ask a full admin (+a) for the flag");
@@ -6783,7 +7211,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     if (!hub_crypto_generate_combined_keypair(priv64, pub64)) {
       secure_wipe(priv64, 64);
       hub_log_error("[AUDIT] Hub keypair regeneration by %s failed; the old "
-                    "key stays\n", client->id);
+                    "key stays\n", hub_who_client(state, client));
       return admin_err(state, client, "hub.keygen_failed",
                        "key generation failed; the old key stays", NULL);
     }
@@ -6810,7 +7238,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     console_ssh_fingerprint(state->hub_ed25519_pub, ssh_fp, sizeof(ssh_fp));
     hub_log_warning("[AUDIT] Hub keypair regenerated by %s: new key %s; "
                     "peers and bots are disconnected and must re-learn it\n",
-                    client->id, fp);
+                    hub_who_client(state, client), fp);
     hub_console_hostkey_changed(state);  /* SSH host key follows, now */
 
     /* Disconnect peers + bots so they must reauthenticate (and rediscover
@@ -7051,8 +7479,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     free(dec);
     peer_key_fp(p, fp);
     state->config_dirty = true;
-    hub_log_info("[HUB] Peer %s pubkey set by %s\n", p->uuid[0] ? p->uuid : p->ip,
-                 client->id);
+    hub_log_info("[HUB] %s pubkey set by %s\n", p->uuid[0] ? hub_who(state, 'h', p->uuid) : p->ip,
+                 hub_who_client(state, client));
     char uuid[64], name[64];
     snprintf(uuid, sizeof(uuid), "%s", p->uuid);
     snprintf(name, sizeof(name), "%s", p->friendly_name);
@@ -7580,7 +8008,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     if (is_admin) {
       if (!hub_uflags_edit("", pacc, flags, sizeof(flags)) || !flags[0])
         return admin_err(state, client, "user.bad_flags",
-                         "flags are +a (full admin) or letters from bchou", "+a, +chu, +b");
+                         "flags are +a (full admin) or letters from bchou",
+                         "+a, +chu, +b · help user add lists the flags");
     } else {
       char work[512];
       snprintf(work, sizeof(work), "%s", pacc);
@@ -7671,8 +8100,7 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     state->config_dirty = true;
     /* Bots get fresh per-connection payloads (right shape per bot version);
      * peers get ONE sync: the record, its mask, its flags / bindings, in the
-     * order a peer needs them (hub_peer_enqueue_sync downgrades it for an
-     * older peer). */
+     * order a peer needs them. */
     char sync[MAX_BUFFER];
     int so = hub_format_user_record(u, sync, sizeof(sync));
     if (so < 0 || so >= (int)sizeof(sync)) so = 0;
@@ -8047,7 +8475,7 @@ static void forward_op_request_to_peers(hub_state_t *state,
       return;
     }
     hub_log_debug("[HUB] Routed OP_FORWARD_REQUEST (id:%s) to peer fd=%d, the hub of %s\n",
-            request_id, route->fd, target_uuid);
+            request_id, route->fd, hub_who(state, 'b', target_uuid));
     return;
   }
 
@@ -8137,7 +8565,7 @@ static void process_forward_op_request(hub_state_t *state,
   }
 
   hub_log_debug("[HUB] Received OP_FORWARD_REQUEST (id:%s) from peer fd=%d target=%s channel=%s\n",
-          request_id, client->fd, target_uuid, channel);
+          request_id, client->fd, hub_who(state, 'b', target_uuid), channel);
 
   // Handle admin requests specially (target_uuid = "ANY", requester_uuid = "ADMIN")
   if (strcmp(target_uuid, "ANY") == 0 && strcmp(requester_uuid, "ADMIN") == 0) {
@@ -8154,26 +8582,10 @@ static void process_forward_op_request(hub_state_t *state,
             state->clients[i]->authenticated) {
           char op_payload[256];
           snprintf(op_payload, sizeof(op_payload), "%s|%s", nick, chan);
-
-          unsigned char plain[MAX_BUFFER], buffer[MAX_BUFFER], tag[GCM_TAG_LEN];
-          plain[0] = CMD_OP_GRANT;
-          int pay_len = (int)strlen(op_payload);
-          uint32_t net_pay_len = htonl((uint32_t)pay_len);
-          memcpy(&plain[1], &net_pay_len, 4);
-          memcpy(&plain[5], op_payload, (size_t)pay_len);
-
-          int enc_len = aes_gcm_encrypt(plain, 5 + pay_len,
-                                       state->clients[i]->session_key,
-                                       buffer + 4, tag);
-          if (enc_len > 0) {
-            memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-            uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-            memcpy(buffer, &net_len, 4);
-
-            if (send(state->clients[i]->fd, buffer, (size_t)(4 + enc_len + GCM_TAG_LEN), 0) > 0) {
-              sent_count++;
-            }
-          }
+          /* queued like every bot frame (a direct send could land inside a
+           * part-sent one, and is outside the link's sequence: review 6) */
+          if (send_cmd_to_bot(state, state->clients[i], CMD_OP_GRANT, op_payload))
+            sent_count++;
         }
       }
 
@@ -8224,7 +8636,7 @@ static void process_forward_op_request(hub_state_t *state,
 
     if (requester_hostmask[0] == '\0') {
       hub_log_warning("[HUB] No hostmask for requester %s (not in payload or storage)\n",
-              requester_uuid);
+              hub_who(state, 'b', requester_uuid));
       char fail_payload[256];
       snprintf(fail_payload, sizeof(fail_payload), "%s|No hostmask found",
                request_id);
@@ -8237,33 +8649,18 @@ static void process_forward_op_request(hub_state_t *state,
     snprintf(grant_payload, sizeof(grant_payload), "%s|%s", requester_hostmask,
              channel);
 
-    unsigned char plain[MAX_BUFFER], buffer[MAX_BUFFER], tag[GCM_TAG_LEN];
-    plain[0] = CMD_OP_GRANT;
-    int pay_len = (int)strlen(grant_payload);
-    uint32_t net_pay_len = htonl((uint32_t)pay_len);
-    memcpy(&plain[1], &net_pay_len, 4);
-    memcpy(&plain[5], grant_payload, (size_t)pay_len);
-
-    int enc_len = aes_gcm_encrypt(plain, 5 + pay_len, target->session_key,
-                                  buffer + 4, tag);
-    if (enc_len > 0) {
-      memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-      uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-      memcpy(buffer, &net_len, 4);
-
-      if (write(target->fd, buffer, (size_t)(4 + enc_len + GCM_TAG_LEN)) > 0) {
-        hub_log_debug("[HUB] Sent OP_GRANT to local bot %s for request id:%s\n",
-                target_uuid, request_id);
-        /* Forward grant confirmation back to origin peer via URGENT. */
-        peer_send_urgent(state, client, CMD_OP_FORWARD_GRANT, request_id);
-        hub_log_debug("[HUB] Queued OP_FORWARD_GRANT URGENT back to peer for id:%s\n",
-                request_id);
-      }
+    if (send_cmd_to_bot(state, target, CMD_OP_GRANT, grant_payload)) {
+      hub_log_debug("[HUB] Sent OP_GRANT to local %s for request id:%s\n",
+              hub_who(state, 'b', target_uuid), request_id);
+      /* Forward grant confirmation back to origin peer via URGENT. */
+      peer_send_urgent(state, client, CMD_OP_FORWARD_GRANT, request_id);
+      hub_log_debug("[HUB] Queued OP_FORWARD_GRANT URGENT back to peer for id:%s\n",
+              request_id);
     }
   } else {
     // Target not found locally - forward to other peers (exclude origin)
-    hub_log_debug("[HUB] Target bot %s not found locally, forwarding to %d peer(s)\n",
-            target_uuid, state->client_count);
+    hub_log_debug("[HUB] Target %s not found locally, forwarding to %d peer(s)\n",
+            hub_who(state, 'b', target_uuid), state->client_count);
     forward_op_request_to_peers(state, request_id, requester_uuid, target_uuid,
                                  channel, carried_hostmask, client->fd, (time_t)origin_ts,
                                  flooded);
@@ -8343,26 +8740,11 @@ static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
 
   if (requester) {
     // Send failure notification to requester
-    unsigned char plain[MAX_BUFFER], buffer[MAX_BUFFER], tag[GCM_TAG_LEN];
-    plain[0] = CMD_OP_FAILED;
     const char *fail_msg =
         (reason[0] != '\0') ? reason : "Target bot not found on network";
-    int msg_len = (int)strlen(fail_msg);
-    uint32_t net_msg_len = htonl((uint32_t)msg_len);
-    memcpy(&plain[1], &net_msg_len, 4);
-    memcpy(&plain[5], fail_msg, (size_t)msg_len);
-
-    int enc_len = aes_gcm_encrypt(plain, 5 + msg_len, requester->session_key,
-                                  buffer + 4, tag);
-    if (enc_len > 0) {
-      memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-      uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-      memcpy(buffer, &net_len, 4);
-      if (write(requester->fd, buffer, (size_t)(4 + enc_len + GCM_TAG_LEN)) > 0) {
-        hub_log_info("[HUB] Notified requester bot of failure for id:%s\n",
-                request_id);
-      }
-    }
+    if (send_cmd_to_bot(state, requester, CMD_OP_FAILED, fail_msg))
+      hub_log_info("[HUB] Notified requester bot of failure for id:%s\n",
+              request_id);
   }
 
   // Remove the pending request
@@ -8374,44 +8756,24 @@ static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
 // ========== Channel-Access Requests (unban / invite / key) ==========
 
 /* Frame `payload` under `cmd` and write it to one authenticated bot. */
-static bool send_cmd_to_bot(hub_client_t *bot, uint8_t cmd,
+static bool send_cmd_to_bot(hub_state_t *state, hub_client_t *bot, uint8_t cmd,
                             const char *payload) {
   int pay_len = payload ? (int)strlen(payload) : 0;
   if (pay_len + 5 > MAX_BUFFER)
     return false;
-
-  unsigned char plain[MAX_BUFFER], buf[MAX_BUFFER], tag[GCM_TAG_LEN];
-  plain[0] = cmd;
-  uint32_t net_pay = htonl((uint32_t)pay_len);
-  memcpy(&plain[1], &net_pay, 4);
-  if (pay_len)
-    memcpy(&plain[5], payload, (size_t)pay_len);
-
-  int enc_len = aes_gcm_encrypt(plain, 5 + pay_len, bot->session_key, buf + 4,
-                                tag);
-  if (enc_len <= 0) {
-    secure_wipe(plain, (size_t)(5 + pay_len));
-    return false;
-  }
-  memcpy(buf + 4 + enc_len, tag, GCM_TAG_LEN);
-  uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-  memcpy(buf, &net_len, 4);
-  bool ok = write(bot->fd, buf, (size_t)(4 + enc_len + GCM_TAG_LEN)) > 0;
-  /* A CHAN_REPLY carries a channel key, so the cleartext frame does not stay
-   * on the stack after it has gone out.  Only the bytes used are touched. */
-  secure_wipe(plain, (size_t)(5 + pay_len));
-  return ok;
+  /* queued_msg_free wipes the payload copy (a CHAN_REPLY carries a key) */
+  return hub_client_send(state, bot, cmd, payload);
 }
 
 /* A frame that acts on config the bot may not have yet (a `mode` job reads
  * the C| modes and c| key the console has just stored): send the owed config
  * push now, past the coalescing window, and queue the frame behind it in
- * LANE_BULK -- send_cmd_to_bot writes straight to the socket and would
- * overtake a config still waiting in the bot's queue. */
+ * LANE_BULK -- send_cmd_to_bot goes out on LANE_URGENT and would overtake a
+ * config still waiting in the bot's queue. */
 static bool send_cmd_to_bot_after_config(hub_state_t *state, hub_client_t *bot,
                                          uint8_t cmd, const char *payload) {
   if (state->bot_config_pending) send_owed_bot_config(state, time(NULL));
-  if (!peer_has_pending_writes(bot)) return send_cmd_to_bot(bot, cmd, payload);
+  if (!peer_has_pending_writes(bot)) return send_cmd_to_bot(state, bot, cmd, payload);
   queued_msg_t *m = queued_msg_new(cmd, LANE_BULK, (const unsigned char *)payload,
                                    payload ? (int)strlen(payload) : 0);
   return m && peer_enqueue(bot, m);
@@ -8522,10 +8884,10 @@ static int broadcast_chan_action(hub_state_t *state, const char *request_id,
       continue;
     if (strcmp(bc->id, requester_uuid) == 0)
       continue; /* never ask the locked-out bot to help itself */
-    if (send_cmd_to_bot(bc, CMD_CHAN_ACTION, action))
+    if (send_cmd_to_bot(state, bc, CMD_CHAN_ACTION, action))
       sent++;
     else
-      hub_log_warning("[HUB] Failed to send CHAN_ACTION to bot %s\n", bc->id);
+      hub_log_warning("[HUB] Failed to send CHAN_ACTION to %s\n", hub_who_client(state, bc));
   }
   return sent;
 }
@@ -8561,11 +8923,12 @@ static void process_chan_request(hub_state_t *state, hub_client_t *client,
   char kind[8], channel[MAX_CHAN];
   if (sscanf(payload, "%7[^|]|%64s", kind, channel) != 2 ||
       !chan_kind_valid(kind)) {
-    hub_log_warning("[HUB] Invalid CHAN_REQUEST payload from %s\n", client->id);
+    hub_log_warning("[HUB] Invalid CHAN_REQUEST payload from %s\n", hub_who_client(state, client));
     return;
   }
   if (channel[0] != '#' && channel[0] != '&') {
-    hub_log_warning("[HUB] CHAN_REQUEST from %s for non-channel '%s'\n", client->id,
+    hub_log_warning("[HUB] CHAN_REQUEST from %s for non-channel '%s'\n",
+                    hub_who_client(state, client),
             channel);
     return;
   }
@@ -8579,16 +8942,17 @@ static void process_chan_request(hub_state_t *state, hub_client_t *client,
    * flooding the mesh with something no bot can act on. */
   if (strcmp(kind, "unban") == 0 && hostmask[0] == '\0') {
     hub_log_warning("[HUB] No hostmask for %s — cannot service unban for %s\n",
-            client->id, channel);
+            hub_who_client(state, client), channel);
     return;
   }
   if (strcmp(kind, "invite") == 0 && nick[0] == '\0') {
     hub_log_warning("[HUB] No nick for %s — cannot service invite for %s\n",
-            client->id, channel);
+            hub_who_client(state, client), channel);
     return;
   }
 
-  hub_log_info("[HUB] CHAN_REQUEST %s from %s for %s\n", kind, client->id, channel);
+  hub_log_info("[HUB] CHAN_REQUEST %s from %s for %s\n", kind, hub_who_client(state, client),
+               channel);
 
   /* One bot answers it (CMD_CHAN_PROBE). */
   if (!ce_start(state, kind, channel, client->id, nick, hostmask, NULL))
@@ -8606,7 +8970,7 @@ static void process_chan_reply(hub_state_t *state, hub_client_t *client,
    * their source, so there is no second copy of the key to wipe afterwards. */
   if (sscanf(payload, "%63[^|]|%7[^|]|%64[^|]|%15[^|]", request_id, kind,
              channel, status) != 4) {
-    hub_log_warning("[HUB] Invalid CHAN_REPLY payload from %s\n", client->id);
+    hub_log_warning("[HUB] Invalid CHAN_REPLY payload from %s\n", hub_who_client(state, client));
     return;
   }
   /* The data field is the remainder after the 4th '|' — a channel key may
@@ -8623,14 +8987,14 @@ static void process_chan_reply(hub_state_t *state, hub_client_t *client,
   if (!req) {
     /* Late or duplicate answer — the first one already went home. */
     hub_log_warning("[HUB] CHAN_REPLY (id:%s) from %s matches no pending request\n",
-            request_id, client->id);
+            request_id, hub_who_client(state, client));
     return;
   }
   /* Bind the answer to what was actually asked: holding a request id must not
    * let a bot hand the requester a key for some other channel. */
   if (strcmp(req->kind, kind) != 0 || strcasecmp(req->channel, channel) != 0) {
     hub_log_warning("[HUB] CHAN_REPLY (id:%s) from %s answers %s/%s but the request "
-            "was %s/%s — dropped\n", request_id, client->id, kind, channel,
+            "was %s/%s — dropped\n", request_id, hub_who_client(state, client), kind, channel,
             req->kind, req->channel);
     return;
   }
@@ -8652,12 +9016,12 @@ static void process_chan_reply(hub_state_t *state, hub_client_t *client,
         break;
       }
     }
-    if (target && send_cmd_to_bot(target, CMD_CHAN_REPLY, out))
+    if (target && send_cmd_to_bot(state, target, CMD_CHAN_REPLY, out))
       hub_log_info("[HUB] CHAN_REPLY %s for %s delivered to %s\n", kind, channel,
-              req->requester_uuid);
+              hub_who(state, 'b', req->requester_uuid));
     else
       hub_log_warning("[HUB] CHAN_REPLY %s for %s undeliverable to %s\n", kind, channel,
-              req->requester_uuid);
+              hub_who(state, 'b', req->requester_uuid));
   } else {
     for (int i = 0; i < state->client_count; i++) {
       hub_client_t *c = state->clients[i];
@@ -8715,9 +9079,9 @@ static void process_forward_chan_reply(hub_state_t *state, hub_client_t *client,
       if (state->clients[i]->type == CLIENT_BOT &&
           state->clients[i]->authenticated &&
           strcmp(state->clients[i]->id, req->requester_uuid) == 0) {
-        send_cmd_to_bot(state->clients[i], CMD_CHAN_REPLY, payload);
+        send_cmd_to_bot(state, state->clients[i], CMD_CHAN_REPLY, payload);
         hub_log_debug("[HUB] CHAN_FWD_REPLY (id:%s) from peer fd=%d delivered to %s\n",
-                request_id, client->fd, req->requester_uuid);
+                request_id, client->fd, hub_who(state, 'b', req->requester_uuid));
         break;
       }
     }
@@ -8779,7 +9143,9 @@ static hub_client_t *ce_peer(hub_state_t *state, int fd) {
 static hub_client_t *ce_bot(hub_state_t *state, const char *uuid) {
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
-    if (c->type == CLIENT_BOT && c->authenticated && strcmp(c->id, uuid) == 0) return c;
+    if (c->type == CLIENT_BOT && c->authenticated && !c->superseded &&
+        strcmp(c->id, uuid) == 0)
+      return c;
   }
   return NULL;
 }
@@ -8803,7 +9169,7 @@ static void ce_probe_local(hub_state_t *state, chan_elect_t *e) {
     chan_elect_bot_t *b = &e->bots[e->bot_n++];
     snprintf(b->uuid, sizeof(b->uuid), "%s", c->id);
     bot_nick_from_config(state, c->id, b->nick, sizeof(b->nick));
-    b->st = send_cmd_to_bot(c, CMD_CHAN_PROBE, probe) ? 'a' : 'n';
+    b->st = send_cmd_to_bot(state, c, CMD_CHAN_PROBE, probe) ? 'a' : 'n';
     if (b->st == 'n') snprintf(b->reason, sizeof(b->reason), "unreachable");
   }
   e->phase = CE_PROBE;
@@ -8833,7 +9199,7 @@ static bool ce_try_local(hub_state_t *state, chan_elect_t *e) {
       snprintf(act, sizeof(act), "%s|%s|%s|%s|%s|%s", e->id, e->kind, e->channel,
                e->requester, e->nick, e->hostmask);
     if (!c || !(mode ? send_cmd_to_bot_after_config(state, c, CMD_CHAN_DO, act)
-                     : send_cmd_to_bot(c, CMD_CHAN_DO, act))) {
+                     : send_cmd_to_bot(state, c, CMD_CHAN_DO, act))) {
       snprintf(b->reason, sizeof(b->reason), "unreachable");
       continue;
     }
@@ -8893,7 +9259,7 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
   else if (ok)
     hub_log_info("[CHANREQ] %s %s on %s (id:%s): done by %s on %s\n", ce_kind_word(e->kind),
                  e->nick[0] ? e->nick : e->requester, e->channel, e->id,
-                 by_nick && by_nick[0] ? by_nick : by_uuid, hub_name);
+                 by_uuid && by_uuid[0] ? hub_who(state, 'b', by_uuid) : by_nick, hub_name);
   else
     hub_log_info("[CHANREQ] %s %s on %s (id:%s): nobody could (%s)\n", ce_kind_word(e->kind),
                  e->nick[0] ? e->nick : e->requester, e->channel, e->id,
@@ -8918,7 +9284,7 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
       snprintf(res, sizeof(res), "%s|fail|no bot could: %d asked on %d hub%s%s%.120s",
                e->reply_rid, asked, hubs, hubs == 1 ? "" : "s", why[0] ? "; " : "", why);
     }
-    send_cmd_to_bot(c, CMD_USER_CHAN_RESULT, res);
+    send_cmd_to_bot(state, c, CMD_USER_CHAN_RESULT, res);
     break;
   }
 
@@ -9129,21 +9495,23 @@ static void process_user_chan_request(hub_state_t *state, hub_client_t *client,
   }
   if (++client->uchan_req_count > USER_CHAN_REQ_MAX) {
     if (client->uchan_req_count == USER_CHAN_REQ_MAX + 1)
-      hub_log_warning("[CHANREQ] %s sends too many user requests; dropping\n", client->id);
+      hub_log_warning("[CHANREQ] %s sends too many user requests; dropping\n",
+                      hub_who_client(state, client));
     return;
   }
   if (!payload || mf_field_count(payload) != 6 || !wire_field(payload, 0, rid, sizeof(rid)) ||
       !wire_field(payload, 1, kind, sizeof(kind)) || !wire_field(payload, 2, chan, sizeof(chan)) ||
       !wire_field(payload, 3, uuid, sizeof(uuid)) || !wire_field(payload, 4, nick, sizeof(nick)) ||
       !wire_field(payload, 5, mask, sizeof(mask))) {
-    hub_log_warning("[CHANREQ] Malformed USER_CHAN_REQUEST from %s\n", client->id);
+    hub_log_warning("[CHANREQ] Malformed USER_CHAN_REQUEST from %s\n",
+                    hub_who_client(state, client));
     return;
   }
   for (const char *p = rid; *p; p++)
     if (!isalnum((unsigned char)*p) && *p != '-') rid[0] = '\0';
   char res[256];
   if (!rid[0]) {
-    hub_log_warning("[CHANREQ] Bad request id from %s\n", client->id);
+    hub_log_warning("[CHANREQ] Bad request id from %s\n", hub_who_client(state, client));
     return;
   }
 #define UCR_FAIL(...)                                                         \
@@ -9151,7 +9519,7 @@ static void process_user_chan_request(hub_state_t *state, hub_client_t *client,
     int n_ = snprintf(res, sizeof(res), "%s|fail|", rid);                     \
     if (n_ > 0 && (size_t)n_ < sizeof(res))                                   \
       snprintf(res + n_, sizeof(res) - (size_t)n_, __VA_ARGS__);              \
-    send_cmd_to_bot(client, CMD_USER_CHAN_RESULT, res);                       \
+    send_cmd_to_bot(state, client, CMD_USER_CHAN_RESULT, res);                       \
     return;                                                                   \
   } while (0)
   if (strcmp(kind, "op") != 0 && strcmp(kind, "invite") != 0 && strcmp(kind, "unban") != 0)
@@ -9168,12 +9536,12 @@ static void process_user_chan_request(hub_state_t *state, hub_client_t *client,
                                       : hub_user_chan_ok(state, u->uuid, chan));
   if (!allowed) {
     hub_log_warning("[CHANREQ] %s asked %s %s on %s for %s: refused (no rights there)\n",
-                    client->id, kind, nick, chan, u ? u->name : uuid);
+                    hub_who_client(state, client), kind, nick, chan, hub_who(state, 'u', uuid));
     UCR_FAIL("no rights on %s", chan);
   }
   if (!hub_chan_live(state, chan, NULL, 0)) UCR_FAIL("%s is not a managed channel", chan);
   hub_log_info("[CHANREQ] %s for %s (%s) on %s, from %s\n", kind, nick, u->name, chan,
-               client->id);
+               hub_who_client(state, client));
   chan_elect_t *e = ce_start(state, kind, chan, u->uuid, nick, mask, NULL);
   if (!e) UCR_FAIL("too many channel requests in flight; try again");
   e->reply_fd = client->fd;
@@ -9258,8 +9626,9 @@ static void process_chan_elect_fwd(hub_state_t *state, hub_client_t *client,
   wire_field(payload, 5, nick, sizeof(nick));
   wire_field(payload, 6, hostmask, sizeof(hostmask));
   wire_field(payload, 7, ts, sizeof(ts));
-  long long age = (long long)time(NULL) - atoll(ts);
-  if (atoll(ts) <= 0 || age > CHAN_ELECT_TTL || age < -CHAN_ELECT_TTL) return;
+  long long t = atoll(ts); /* saturates: age only for a positive stamp */
+  long long age = t > 0 ? (long long)time(NULL) - t : 0;
+  if (t <= 0 || age > CHAN_ELECT_TTL || age < -CHAN_ELECT_TTL) return;
   if (op_forward_seen_check_and_add(state, id)) return; /* another path got here first */
 
   chan_elect_t *e = ce_alloc(state);
@@ -9288,17 +9657,16 @@ static void process_chan_elect_fwd(hub_state_t *state, hub_client_t *client,
                 e->id, client->fd, kind, nick[0] ? nick : requester, channel, e->bot_n);
 }
 
-/* ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|silent.  The origin records
+/* ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|0.  The origin records
  * it; a relay remembers which peer leads to that hub and passes it on. */
 static void process_chan_elect_ack(hub_state_t *state, hub_client_t *client,
                                    const char *payload) {
-  char id[64] = "", hub[64] = "", name[64] = "", a[12] = "", r[12] = "", s[12] = "";
+  char id[64] = "", hub[64] = "", name[64] = "", a[12] = "", r[12] = "";
   wire_field(payload, 0, id, sizeof(id));
   wire_field(payload, 1, hub, sizeof(hub));
   wire_field(payload, 2, name, sizeof(name));
   wire_field(payload, 3, a, sizeof(a));
   wire_field(payload, 4, r, sizeof(r));
-  wire_field(payload, 5, s, sizeof(s));
   chan_elect_t *e = id[0] && hub[0] ? ce_find(state, id) : NULL;
   if (!e || e->hub_n >= MAX_MESH_HUBS) return;
   for (int i = 0; i < e->hub_n; i++)
@@ -9309,12 +9677,10 @@ static void process_chan_elect_ack(hub_state_t *state, hub_client_t *client,
   h->fd = client->fd;
   h->asked = atoi(a) > 0 ? atoi(a) : 0;
   h->ready = atoi(r) > 0 ? atoi(r) : 0;
-  h->silent = atoi(s) > 0 ? atoi(s) : 0;
   if (!e->origin) ce_up(state, e, CMD_CHAN_ELECT_ACK, payload);
 }
 
-/* ELECT_DO: eid|hub_uuid|elect.  Ours: act; else route it on.  "legacy"
- * (from a 2.5.0 origin) is no longer acted on: see ce_try_hub. */
+/* ELECT_DO: eid|hub_uuid|elect.  Ours: act; else route it on. */
 static void process_chan_elect_do(hub_state_t *state, hub_client_t *client,
                                   const char *payload) {
   char id[64] = "", hub[64] = "", mode[8] = "";
@@ -9687,7 +10053,7 @@ static hub_client_t *upgrade_find_client(hub_state_t *state, const char *uuid,
                                          client_type_t type) {
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
-    if (c->type == type && c->authenticated && strcmp(c->id, uuid) == 0)
+    if (c->type == type && c->authenticated && !c->superseded && strcmp(c->id, uuid) == 0)
       return c;
   }
   return NULL;
@@ -9775,7 +10141,7 @@ static void hub_upgrade_abort(hub_state_t *state, const char *reason) {
       if (peer && peer_send_urgent(state, peer, CMD_UPGRADE_ABORT, relay)) told++;
     } else if (n->kind == 'b') {
       hub_client_t *c = upgrade_find_client(state, n->uuid, CLIENT_BOT);
-      if (c && send_cmd_to_bot(c, CMD_UPGRADE_ABORT, msg)) told++;
+      if (c && send_cmd_to_bot(state, c, CMD_UPGRADE_ABORT, msg)) told++;
     } else if (n->kind == 'h') {
       /* Peer hub as a self-node: id||reason (empty uuid = "you, not a bot"). */
       hub_client_t *c = upgrade_find_peer(state, n->uuid);
@@ -9963,7 +10329,7 @@ static bool upgrade_commit_node(hub_state_t *state, upgrade_node_t *n) {
       snprintf(n->reason, sizeof(n->reason),
                "its hub restarted before it could be committed");
       hub_log_warning("[UPGRADE] Not committing %s: hub %s already restarted\n",
-                      n->uuid, n->via);
+                      hub_who(state, 0, n->uuid), n->via);
       return false;
     }
   }
@@ -10019,7 +10385,7 @@ static bool upgrade_commit_node(hub_state_t *state, upgrade_node_t *n) {
     sent = peer && peer_send_urgent(state, peer, CMD_UPGRADE_COMMIT, relay);
   } else if (n->kind == 'b') {
     hub_client_t *c = upgrade_find_client(state, n->uuid, CLIENT_BOT);
-    sent = c && send_cmd_to_bot(c, CMD_UPGRADE_COMMIT, payload);
+    sent = c && send_cmd_to_bot(state, c, CMD_UPGRADE_COMMIT, payload);
   } else if (n->kind == 'h') {
     hub_client_t *c = upgrade_find_peer(state, n->uuid);
     sent = c && peer_send_urgent(state, c, CMD_UPGRADE_COMMIT, payload);
@@ -10031,7 +10397,7 @@ static bool upgrade_commit_node(hub_state_t *state, upgrade_node_t *n) {
   }
   n->state = UPG_NODE_COMMITTED;
   n->committed_at = time(NULL);
-  hub_log_info("[UPGRADE] COMMIT %s -> %s (%s)\n", u->id, n->uuid, ver);
+  hub_log_info("[UPGRADE] COMMIT %s -> %s (%s)\n", u->id, hub_who(state, 0, n->uuid), ver);
   return true;
 }
 
@@ -10200,8 +10566,8 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
    * prefix stays byte-identical and a follower can relay it on, and — in a
    * selective run — the resolved selection, which tells it which of its own
    * bots to ask and whether it is itself part of the run.  Both base slots
-   * stay empty (2.5.0 nodes still count fields): each node reads its own
-   * compiled-in root. */
+   * are reserved and always empty (fields are positional): each node reads
+   * its own compiled-in root. */
   char prepare_peer[600 + sizeof(u->sel_wire)];
   snprintf(prepare_peer, sizeof(prepare_peer), "%s|%s|%s|%s|%s||%s|%s%s",
            u->id, u->target_ver, u->variant, u->kind, u->min_from,
@@ -10223,7 +10589,7 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
       char prepare[1024];
       snprintf(prepare, sizeof(prepare), "%s|%s|%s|%s|%s|", u->id,
                u->target_ver, upgrade_node_variant(u, n), u->kind, u->min_from);
-      if (send_cmd_to_bot(c, CMD_UPGRADE_PREPARE, prepare)) {
+      if (send_cmd_to_bot(state, c, CMD_UPGRADE_PREPARE, prepare)) {
         bots++;
       } else {
         n->state = UPG_NODE_UNABLE;
@@ -10237,8 +10603,8 @@ static bool hub_upgrade_start(hub_state_t *state, hub_client_t *admin,
        * only — see upgrade_peer_uuid(). */
       const char *puuid = upgrade_peer_uuid(state, c);
       if (!puuid[0]) {
-        hub_log_warning("[UPGRADE] Peer %s has no uuid yet — left out of run %s\n",
-                c->id, u->id);
+        hub_log_warning("[UPGRADE] %s has no uuid yet — left out of run %s\n",
+                hub_who_client(state, c), u->id);
         continue;
       }
       upgrade_node_t *n = upgrade_add_node(u, puuid, 'h', c->fd, NULL);
@@ -10339,7 +10705,8 @@ static void hub_upgrade_note_ready(hub_state_t *state, const char *payload,
   wire_field(payload, 9, relbuf, sizeof(relbuf));
   if (hub_rollup_note_ready(state, payload)) return;
   if (!u->active || strcmp(u->id, id) != 0) {
-    hub_log_debug("[UPGRADE] READY for unknown run %s from %s — ignoring\n", id, uuid);
+    hub_log_debug("[UPGRADE] READY for unknown run %s from %s — ignoring\n", id,
+                  hub_who(state, 0, uuid));
     return;
   }
   upgrade_node_t *node = upgrade_find_node(u, uuid);
@@ -10352,13 +10719,15 @@ static void hub_upgrade_note_ready(hub_state_t *state, const char *payload,
       char nkind = (kindbuf[0] == 'h') ? 'h' : 'b';
       node = upgrade_add_node(u, uuid, nkind, -1, cur);
       if (!node) {
-        hub_log_warning("[UPGRADE] No room for remote node %s in run %s\n", uuid, id);
+        hub_log_warning("[UPGRADE] No room for remote %s in run %s\n", hub_who(state, 0, uuid),
+                        id);
         return;
       }
       snprintf(node->via, sizeof(node->via), "%.63s",
                upgrade_peer_uuid(state, from_peer));
     } else {
-      hub_log_warning("[UPGRADE] READY from %s which is not in run %s\n", uuid, id);
+      hub_log_warning("[UPGRADE] READY from %s which is not in run %s\n", hub_who(state, 0, uuid),
+                      id);
       return;
     }
   } else if (from_peer && !node->via[0] && node->kind != 's') {
@@ -10370,7 +10739,7 @@ static void hub_upgrade_note_ready(hub_state_t *state, const char *payload,
    * reconnected and was re-asked by a follower) must not move a node that is
    * already committed or finished back to "ready" — that re-commits it. */
   if (node->state != UPG_NODE_PENDING) {
-    hub_log_debug("[UPGRADE] Duplicate READY from %s (%s) — ignored\n", uuid,
+    hub_log_debug("[UPGRADE] Duplicate READY from %s (%s) — ignored\n", hub_who(state, 0, uuid),
                   upgrade_node_state_name(node->state));
     return;
   }
@@ -10405,7 +10774,7 @@ static void hub_upgrade_note_ready(hub_state_t *state, const char *payload,
     long rel = strtol(relbuf, NULL, 10);
     node->relayed = (rel > 0 && rel <= MAX_UPGRADE_NODES) ? (int)rel : 0;
   }
-  hub_log_debug("[UPGRADE] %s is %s (%s %s/%s)%s%s\n", uuid,
+  hub_log_debug("[UPGRADE] %s is %s (%s %s/%s)%s%s\n", hub_who(state, 0, uuid),
           upgrade_node_state_name(node->state), cur, arch, libc,
           node->reason[0] ? ": " : "", node->reason);
 }
@@ -10434,7 +10803,7 @@ static void hub_upgrade_note_result(hub_state_t *state, const char *payload) {
    * own ABORT — is logged and dropped: a finished node must never be turned
    * back into a failure by noise (run 83aac614's eb04). */
   if (node->state != UPG_NODE_COMMITTED) {
-    hub_log_info("[UPGRADE] %s reports %s (%s) while %s — ignored%s%s\n", uuid,
+    hub_log_info("[UPGRADE] %s reports %s (%s) while %s — ignored%s%s\n", hub_who(state, 0, uuid),
                  status, ver, upgrade_node_state_name(node->state),
                  detail[0] ? ": " : "", detail);
     return;
@@ -10444,7 +10813,7 @@ static void hub_upgrade_note_result(hub_state_t *state, const char *payload) {
   if (strcmp(status, "back") == 0) {
     if (!node->back_at) node->back_at = time(NULL);
     hub_log_info("[UPGRADE] %s is back (%s); waiting for it to report ready\n",
-                 uuid, ver);
+                 hub_who(state, 0, uuid), ver);
     return;
   }
   upgrade_clean(node->reason, sizeof(node->reason), detail);
@@ -10461,7 +10830,7 @@ static void hub_upgrade_note_result(hub_state_t *state, const char *payload) {
     if (!node->reason[0])
       snprintf(node->reason, sizeof(node->reason), "%s", status);
   }
-  hub_log_info("[UPGRADE] %s reports %s (%s)%s%s\n", uuid, status, ver,
+  hub_log_info("[UPGRADE] %s reports %s (%s)%s%s\n", hub_who(state, 0, uuid), status, ver,
           node->reason[0] ? ": " : "", node->reason);
 }
 
@@ -10490,7 +10859,7 @@ static void hub_upgrade_note_presence(hub_state_t *state, const char *uuid,
       snprintf(node->reason, sizeof(node->reason),
                "came back on %.40s after reporting done", version);
       hub_log_warning("[UPGRADE] %s fell back to %s after reporting done\n",
-                      uuid, version);
+                      hub_who(state, 0, uuid), version);
     }
     return;
   }
@@ -10509,12 +10878,12 @@ static void hub_upgrade_note_presence(hub_state_t *state, const char *uuid,
     if (!node->back_at) {
       node->back_at = time(NULL);
       hub_log_info("[UPGRADE] %s is back on %s; waiting for it to report ready\n",
-                   uuid, version);
+                   hub_who(state, 0, uuid), version);
     }
     return;
   }
   node->state = UPG_NODE_DONE;
-  hub_log_info("[UPGRADE] %s is back on %s\n", uuid, version);
+  hub_log_info("[UPGRADE] %s is back on %s\n", hub_who(state, 0, uuid), version);
 }
 
 bool hub_upgrade_plan_field_ok(const char *s) {
@@ -10601,7 +10970,7 @@ static void hub_rollup_end(hub_state_t *state, const char *why, bool charge) {
       t->last_try = time(NULL);
     }
   }
-  hub_log_info("[ROLLUP] %s -> %s: %s\n", r->uuid, r->step, why);
+  hub_log_info("[ROLLUP] %s -> %s: %s\n", hub_who(state, 0, r->uuid), r->step, why);
   r->active = false;
   r->committed = false;
   r->id[0] = r->uuid[0] = r->step[0] = '\0';
@@ -10632,8 +11001,9 @@ static void process_peer_upgrade_forget(hub_state_t *state, hub_client_t *peer,
     hub_log_warning("[ROLLUP] Malformed UPGRADE_FORGET from peer %s\n", peer->ip);
     return;
   }
-  long long age = (long long)time(NULL) - atoll(ts);
-  if (atoll(ts) <= 0 || age > UPGRADE_FORGET_TTL || age < -UPGRADE_FORGET_TTL)
+  long long t = atoll(ts); /* saturates: age only for a positive stamp */
+  long long age = t > 0 ? (long long)time(NULL) - t : 0;
+  if (t <= 0 || age > UPGRADE_FORGET_TTL || age < -UPGRADE_FORGET_TTL)
     return;
   if (op_forward_seen_check_and_add(state, id)) return;
   char flag[4] = "", issued_s[24] = "";
@@ -10728,7 +11098,8 @@ static void hub_rollup_consider(hub_state_t *state, const char *uuid,
                             why, sizeof(why))) {
     snprintf(step, sizeof(step), "%s", target);
     if (why[0])
-      hub_log_info("[ROLLUP] No step read for %s (%s); aiming at %s\n", uuid, why,
+      hub_log_info("[ROLLUP] No step read for %s (%s); aiming at %s\n", hub_who(state, 0, uuid),
+                   why,
               target);
   }
   if (step[0] == 'v' && isdigit((unsigned char)step[1]))
@@ -10763,14 +11134,14 @@ static void hub_rollup_consider(hub_state_t *state, const char *uuid,
     snprintf(prepare, sizeof(prepare), "%s|%s|%s|%s|*|", r->id, r->step,
              r->variant, r->kind);
     hub_client_t *c = upgrade_find_client(state, uuid, CLIENT_BOT);
-    sent = c && send_cmd_to_bot(c, CMD_UPGRADE_PREPARE, prepare);
+    sent = c && send_cmd_to_bot(state, c, CMD_UPGRADE_PREPARE, prepare);
   }
   if (!sent) {
     hub_rollup_end(state, "could not deliver PREPARE", true);
     return;
   }
   hub_log_info("[ROLLUP] %s is on %s, the network is on %s: PREPARE %s -> %s\n",
-          uuid, version, target, r->id, r->step);
+          hub_who(state, 0, uuid), version, target, r->id, r->step);
 }
 
 /* CMD_UPGRADE_READY carrying a roll-up id.  Returns true when it was one. */
@@ -10798,7 +11169,7 @@ static bool hub_rollup_note_ready(hub_state_t *state, const char *payload) {
   } else {
     snprintf(commit, sizeof(commit), "%s|%s|%s", r->id, r->step, r->variant);
     hub_client_t *c = upgrade_find_client(state, r->uuid, CLIENT_BOT);
-    sent = c && send_cmd_to_bot(c, CMD_UPGRADE_COMMIT, commit);
+    sent = c && send_cmd_to_bot(state, c, CMD_UPGRADE_COMMIT, commit);
   }
   if (!sent) {
     hub_rollup_end(state, "disconnected before commit", true);
@@ -10806,7 +11177,7 @@ static bool hub_rollup_note_ready(hub_state_t *state, const char *payload) {
   }
   r->committed = true;
   r->started = time(NULL);
-  hub_log_info("[ROLLUP] COMMIT %s -> %s (%s)\n", r->id, r->uuid, r->step);
+  hub_log_info("[ROLLUP] COMMIT %s -> %s (%s)\n", r->id, hub_who(state, 0, r->uuid), r->step);
   return true;
 }
 
@@ -10847,7 +11218,7 @@ static const char *rollup_bot_version(const hub_state_t *state, const char *uuid
   const char *best = NULL;
   for (int i = 0; i < state->client_count; i++) {
     const hub_client_t *c = state->clients[i];
-    if (c->type == CLIENT_BOT && c->authenticated && c->bot_version[0] &&
+    if (c->type == CLIENT_BOT && c->authenticated && !c->superseded && c->bot_version[0] &&
         strcmp(c->id, uuid) == 0)
       best = c->bot_version;
   }
@@ -11079,8 +11450,10 @@ static int plan_path(const char *root, const char *variant, const char *from,
         snprintf(path[0], 64, "%s", target);
         return 1;
       }
-      snprintf(why, why_size, "no step from %s towards %s: %s", cur, target,
-               err[0] ? err : "manifest unreadable");
+      /* A long manifest error is cut to fit (gcc 8 wants the result read). */
+      if (snprintf(why, why_size, "no step from %s towards %s: %s", cur, target,
+                   err[0] ? err : "manifest unreadable") >= (int)why_size)
+        hub_log_debug("[UPDATE] step error cut to %zu bytes\n", why_size - 1);
       return -1;
     }
     strip_v(step);
@@ -11314,8 +11687,7 @@ static void hub_plan_tick(hub_state_t *state, time_t now) {
 
 /* Tell every hub to stop whatever upgrade it drives: an UPGRADE_FORGET
  * flagged "A" (abort), id|ts|A|issued.  `issued` is when the admin typed it:
- * a run or plan started after that is not the one meant.  A 2.5.0 hub reads
- * the frame as a plain forget. */
+ * a run or plan started after that is not the one meant. */
 static int upgrade_cancel_flood(hub_state_t *state) {
   char id[64], fwd[128];
   generate_request_id(id, sizeof(id));
@@ -11408,7 +11780,7 @@ void hub_upgrade_tick(hub_state_t *state, time_t now) {
     n->state = UPG_NODE_DONE;
     snprintf(n->reason, sizeof(n->reason), "back on target; no ready report");
     hub_log_info("[UPGRADE] %s: back %ld s without a ready report; done\n",
-                 n->uuid, (long)(now - n->back_at));
+                 hub_who(state, 0, n->uuid), (long)(now - n->back_at));
   }
   /* A committed node that never came back fails the whole run: the rest of
    * the mesh must not keep marching onto a build that does not come up. */
@@ -11521,7 +11893,8 @@ static void upgrade_route_note(hub_state_t *state, const char *uuid,
     return;
   }
   if (state->follow_route_count >= MAX_UPGRADE_ROUTES) {
-    hub_log_warning("[UPGRADE] No room to route %s — it stays out of the run\n", uuid);
+    hub_log_warning("[UPGRADE] No room to route %s — it stays out of the run\n",
+                    hub_who(state, 0, uuid));
     return;
   }
   upgrade_route_t *r = &state->follow_routes[state->follow_route_count++];
@@ -11594,8 +11967,8 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
                                          const char *payload) {
   /* id|ver|variant|kind|min_from|base|hub_ver|hub_base — the bots' six
    * fields, then the hubs' own target (see hub_upgrade_start).  The base
-   * slots are skipped: a 2.5.0 driver may still fill them, but every node
-   * reads its own compiled-in root, the only tree its pinned key verifies. */
+   * slots are reserved and never read: every node reads its own compiled-in
+   * root, the only tree its pinned key verifies. */
   char id[64] = "", ver[64] = "", variant[8] = "", kind[8] = "";
   char min_from[64] = "", hub_ver[64] = "";
   if (!wire_field(payload, 0, id, sizeof(id)) ||
@@ -11725,7 +12098,7 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
     char bot_prepare[1024];
     snprintf(bot_prepare, sizeof(bot_prepare), "%s|%s|%s|%s|%s|", id, ver,
              bot_variant[0] ? bot_variant : variant, kind, min_from);
-    if (send_cmd_to_bot(c, CMD_UPGRADE_PREPARE, bot_prepare)) relayed++;
+    if (send_cmd_to_bot(state, c, CMD_UPGRADE_PREPARE, bot_prepare)) relayed++;
   }
   if (relayed)
     hub_log_info("[UPGRADE] Relayed PREPARE %s to %d local bot(s)\n", id, relayed);
@@ -11735,7 +12108,7 @@ static void process_peer_upgrade_prepare(hub_state_t *state,
    * mesh can reach joins the run, whatever shape the peer links are wired in
    * (a chain, a star, a partial mesh).  Their answers come back to us and we
    * forward them up, so the driver sees one flat node table.  Rebuilt from
-   * the checked fields, so a base a 2.5.0 driver put in goes no further. */
+   * the checked fields, so anything in a reserved slot goes no further. */
   char fwd[600 + sizeof(sel)];
   snprintf(fwd, sizeof(fwd), "%s|%s|%s|%s|%s||%s|%s%s", id, ver, variant, kind,
            min_from, hub_ver, sel[0] ? "|" : "", sel);
@@ -11792,7 +12165,7 @@ static bool hub_upgrade_relay_upstream(hub_state_t *state, hub_client_t *from,
   hub_client_t *origin = upgrade_find_peer(state, state->follow_origin);
   if (!origin) {
     hub_log_debug("[UPGRADE] Driver of %s is gone — dropping a relayed answer for "
-            "%s\n", id, uuid);
+            "%s\n", id, hub_who(state, 0, uuid));
     return true;
   }
   peer_send_urgent(state, origin, (uint8_t)cmd, payload);
@@ -11855,7 +12228,7 @@ static void process_peer_upgrade_commit(hub_state_t *state, hub_client_t *peer,
     if (bot) {
       char relay[192];
       snprintf(relay, sizeof(relay), "%s|%s|%s", id, ver, variant);
-      if (!send_cmd_to_bot(bot, CMD_UPGRADE_COMMIT, relay))
+      if (!send_cmd_to_bot(state, bot, CMD_UPGRADE_COMMIT, relay))
         hub_upgrade_answer_result_uuid(state, peer, id, target_uuid, "skip",
                                        "bot not reachable through this hub");
       return;
@@ -11902,8 +12275,9 @@ static void process_peer_upgrade_abort(hub_state_t *state, hub_client_t *peer,
   wire_field(payload, 0, id, sizeof(id));
   wire_field(payload, 1, uuid, sizeof(uuid));
   wire_tail(payload, 2, reason, sizeof(reason));
-  hub_log_info("[UPGRADE] Abort %s from peer %s%s%s: %s\n", id[0] ? id : "(no id)",
-          peer->ip, uuid[0] ? " for bot " : "", uuid[0] ? uuid : "",
+  hub_log_info("[UPGRADE] Abort %s from %s%s%s: %s\n", id[0] ? id : "(no id)",
+          hub_who_client(state, peer), uuid[0] ? " for " : "",
+          uuid[0] ? hub_who(state, 'b', uuid) : "",
           reason[0] ? reason : "no reason given");
 
   /* A named node that is not this hub: one of its local bots (which gets the
@@ -11917,7 +12291,7 @@ static void process_peer_upgrade_abort(hub_state_t *state, hub_client_t *peer,
       snprintf(relay, sizeof(relay), "%s|", id);
       upgrade_clean(relay + strlen(relay), sizeof(relay) - strlen(relay),
                     reason);
-      send_cmd_to_bot(bot, CMD_UPGRADE_ABORT, relay);
+      send_cmd_to_bot(state, bot, CMD_UPGRADE_ABORT, relay);
       return;
     }
     const char *via = upgrade_route_via(state, uuid);
@@ -12041,6 +12415,16 @@ static void hub_upgrade_status(hub_state_t *state, reply_t *r) {
     const char *want = upgrade_node_variant(u, n);
     if (want[0] && strcmp(want, n->variant) != 0) reply_kv(r, "want", want);
     if (n->reason[0]) reply_kv(r, "reason", n->reason);
+    /* idle: a hub a bots-only run never moves (it only relays the run to its
+     * bots).  already: a node that declined because it already runs the
+     * target build -- a no-op, not a failure. */
+    if (n->kind != 'b' && !u->hub_ver[0] &&
+        (n->not_selected || n->state == UPG_NODE_UNABLE))
+      reply_kvb(r, "idle", true);
+    else if (!n->not_selected && n->state == UPG_NODE_UNABLE && to[0] && n->cur_version[0] &&
+             hub_update_version_cmp(n->cur_version, to) == 0 &&
+             (!want[0] || strcmp(want, n->variant) == 0))
+      reply_kvb(r, "already", true);
   }
 }
 
@@ -12190,7 +12574,8 @@ static hub_client_t *bot_relay_local_target(hub_state_t *state,
                                             const char *uuid) {
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
-    if (c->type == CLIENT_BOT && c->authenticated && strcmp(c->id, uuid) == 0)
+    if (c->type == CLIENT_BOT && c->authenticated && !c->superseded &&
+        strcmp(c->id, uuid) == 0)
       return c;
   }
   return NULL;
@@ -12208,12 +12593,12 @@ static bool bot_relay_deliver(hub_client_t *target, const char *sender_uuid,
     hub_log_warning("[HUB] CMD_BOT_RELAY: forwarded payload too long\n");
     return false;
   }
-  if (!send_cmd_to_bot(target, CMD_BOT_MSG, forwarded)) {
-    hub_log_warning("[HUB] CMD_BOT_RELAY: write to %s failed\n", target->id);
+  if (!send_cmd_to_bot(g_state, target, CMD_BOT_MSG, forwarded)) {
+    hub_log_warning("[HUB] CMD_BOT_RELAY: write to %s failed\n", hub_who_client(g_state, target));
     return false;
   }
   hub_log_debug("[HUB] CMD_BOT_RELAY: forwarded to %s (%d bytes)\n",
-          target->id, len);
+          hub_who_client(g_state, target), len);
   return true;
 }
 
@@ -12233,7 +12618,12 @@ static int bot_relay_forward(hub_state_t *state, const char *request_id,
       hub_client_t *c = state->clients[i];
       if (c->type != CLIENT_HUB || !c->authenticated || c->fd == exclude_fd)
         continue;
-      if (peer_send_urgent(state, c, CMD_BOT_RELAY_FWD, fwd)) sent++;
+      /* DELTA, not URGENT: a full lane drops the oldest relay, while a full
+       * URGENT lane would take the peer link down with it. */
+      queued_msg_t *m = queued_msg_new(CMD_BOT_RELAY_FWD, LANE_DELTA,
+                                       (const unsigned char *)fwd, len);
+      if (m && peer_enqueue(c, m)) sent++;
+      peer_drain_writable(state, c);
     }
   } else {
     hub_log_warning("[HUB] CMD_BOT_RELAY: too long to forward to peers\n");
@@ -12283,7 +12673,9 @@ static void process_peer_bot_relay(hub_state_t *state, hub_client_t *peer,
     return;
   }
   long long origin_ts = atoll(ts);
-  long long age = (long long)time(NULL) - origin_ts;
+  /* age only for a positive stamp: atoll saturates, and now - LLONG_MIN
+   * overflows */
+  long long age = origin_ts > 0 ? (long long)time(NULL) - origin_ts : 0;
   if (origin_ts <= 0 || age > BOT_RELAY_FWD_TTL || age < -BOT_RELAY_FWD_TTL) {
     hub_log_debug("[HUB] Dropping stale BOT_RELAY_FWD (id:%s, age=%llds)\n", id,
             age);
@@ -12412,13 +12804,13 @@ static void process_activity(hub_state_t *state, hub_client_t *from,
       ok = last == line + 2 + 36;
     }
     if (!ok) {
-      hub_log_debug("[ACTIVITY] malformed line from %s\n", from->id);
+      hub_log_debug("[ACTIVITY] malformed line from %s\n", hub_who_client(state, from));
       continue;
     }
     char *end = NULL;
     long long ts = strtoll(last + 1, &end, 10);
     if (!end || *end != '\0' || ts <= 0 || ts > now + ACTIVITY_MAX_FUTURE) {
-      hub_log_debug("[ACTIVITY] bad time from %s\n", from->id);
+      hub_log_debug("[ACTIVITY] bad time from %s\n", hub_who_client(state, from));
       continue;
     }
     time_t *slot = NULL;
@@ -12444,7 +12836,7 @@ static void process_activity(hub_state_t *state, hub_client_t *from,
   }
   if (raised) {
     state->config_dirty = true;
-    hub_log_debug("[ACTIVITY] %d record(s) raised by %s\n", raised, from->id);
+    hub_log_debug("[ACTIVITY] %d record(s) raised by %s\n", raised, hub_who_client(state, from));
     activity_flood(state, fwd, fwd_len,
                    from->type == CLIENT_HUB ? from->fd : -1);
   }
@@ -12485,7 +12877,8 @@ void hub_activity_send_bans(hub_state_t *state, hub_client_t *peer) {
       lines++;
     }
   }
-  if (lines) hub_log_debug("[ACTIVITY] %d ban last-use line(s) sent to %s\n", lines, peer->id);
+  if (lines) hub_log_debug("[ACTIVITY] %d ban last-use line(s) sent to %s\n", lines,
+                           hub_who_client(state, peer));
   free(buf);
 }
 
@@ -12495,7 +12888,7 @@ static void activity_reply_send(hub_client_t *bot, const char *frame, int len) {
                                    (const unsigned char *)frame, len);
   if (!m) return;
   if (!peer_enqueue(bot, m))
-    hub_log_warning("[ACTIVITY] reply enqueue failed for %s\n", bot->id);
+    hub_log_warning("[ACTIVITY] reply enqueue failed for %s\n", hub_who_client(g_state, bot));
 }
 
 /* CMD_ACTIVITY_QUERY from a bot: <req_id>|users or <req_id>|masks|<uuid|*>.
@@ -12505,17 +12898,17 @@ static void process_activity_query(hub_state_t *state, hub_client_t *bot,
   char req[ACTIVITY_REQ_ID_MAX + 1] = "", kind[8] = "", who[40] = "";
   if (!wire_field(payload, 0, req, sizeof(req)) || !bot_relay_id_ok(req) ||
       !wire_field(payload, 1, kind, sizeof(kind))) {
-    hub_log_warning("[ACTIVITY] invalid query from %s\n", bot->id);
+    hub_log_warning("[ACTIVITY] invalid query from %s\n", hub_who_client(state, bot));
     return;
   }
   bool masks = strcmp(kind, "masks") == 0;
   if (!masks && strcmp(kind, "users") != 0) {
-    hub_log_warning("[ACTIVITY] unknown query kind from %s\n", bot->id);
+    hub_log_warning("[ACTIVITY] unknown query kind from %s\n", hub_who_client(state, bot));
     return;
   }
   if (masks && (!wire_field(payload, 2, who, sizeof(who)) ||
                 (strcmp(who, "*") != 0 && !activity_uuid_ok(who)))) {
-    hub_log_warning("[ACTIVITY] invalid masks query from %s\n", bot->id);
+    hub_log_warning("[ACTIVITY] invalid masks query from %s\n", hub_who_client(state, bot));
     return;
   }
   bool all = !masks || strcmp(who, "*") == 0;
@@ -12562,7 +12955,7 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
   switch (cmd) {
   case CMD_PING:
     if (!HIDEPINGPONG)
-      hub_log_debug("[HUB] Bot %s PING\n", client->id);
+      hub_log_debug("[HUB] %s PING\n", hub_who_client(state, client));
     break;
 
   case CMD_BOT_PRESENCE:
@@ -12590,7 +12983,7 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
   } break;
 
   case CMD_CONFIG_PULL:
-    hub_log_debug("[HUB] Config PULL request from %s\n", client->id);
+    hub_log_debug("[HUB] Config PULL request from %s\n", hub_who_client(state, client));
     send_config_to_bot(state, client, true);
     break;
 
@@ -12603,10 +12996,11 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
      * with two trailing fields |<origin_hub_uuid>|<lamport_seq> for the
      * seen-set. We compose that into the payload for CMD_PEER_SYNC DELTA. */
     char key[32], val[1024];
-    long long ts;
+    long long ts = 0; /* "key|val" with no stamp means now */
     client->cfg_sent_valid = false; /* as for CMD_CONFIG_PUSH */
     if (sscanf(payload, "%31[^|]|%1023[^|]|%lld", key, val, &ts) < 2) {
-      hub_log_warning("[HUB] Invalid CMD_BOT_DELTA from %s — ignoring\n", client->id);
+      hub_log_warning("[HUB] Invalid CMD_BOT_DELTA from %s — ignoring\n",
+                      hub_who_client(state, client));
       break;
     }
     if (ts == 0) ts = (long long)time(NULL);
@@ -12621,16 +13015,17 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
          strcmp(key, "m") == 0 || strcmp(key, "c") == 0 ||
          strcmp(key, "p") == 0)) {
       hub_log_warning("[HUB] opt 'h' active: REJECTED bot delta '%s' from %s "
-              "(hub-authoritative)\n", key, client->id);
+              "(hub-authoritative)\n", key, hub_who_client(state, client));
       break;
     }
 
     /* Task 6 — opt 'F' (OPT_CONFIG_FROZEN): while an upgrade run is open the
-     * store does not move at all, or a node that restarts mid-roll comes back
-     * against a config its neighbours have not seen. */
-    if (hub_config_frozen(state)) {
+     * store does not move, or a node that restarts mid-roll comes back
+     * against a config its neighbours have not seen.  The bot's nick and
+     * hostmask still move (see process_bot_config_push). */
+    if (hub_config_frozen(state) && strcmp(key, "n") != 0 && strcmp(key, "h") != 0) {
       hub_log_warning("[UPGRADE] config frozen: REJECTED bot delta '%s' from %s\n",
-              key, client->id);
+              key, hub_who_client(state, client));
       break;
     }
 
@@ -12640,7 +13035,7 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
      * rejected key/value simply returns "not accepted" below. */
 
     hub_log_debug("[HUB] BOT_DELTA from %s: key=%s val=%.40s ts=%lld\n",
-            client->id, key, val, ts);
+            hub_who_client(state, client), key, val, ts);
 
     bool accepted = hub_storage_update_entry(state, client->id, key,
                                              val, "", "", (time_t)ts);
@@ -12670,15 +13065,10 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
 
     sync_send_to_peers(state, delta_line, -1, false, LANE_DELTA, coalesce, seq);
 
-    /* Also push fresh config to locally connected bots so they learn the
-     * new hostmask / nick immediately without waiting for anti-entropy. */
-    for (int i = 0; i < state->client_count; i++) {
-      hub_client_t *c = state->clients[i];
-      if (c->type == CLIENT_BOT && c->authenticated &&
-          strcmp(c->id, client->id) != 0) {
-        send_config_to_bot(state, c, false);
-      }
-    }
+    /* The local bots learn the new hostmask / nick from the next coalesced
+     * push (within BOT_CONFIG_PUSH_COALESCE), not one full push per delta:
+     * a reconnect burst made that O(deltas x bots) frames of the same state. */
+    broadcast_full_config_to_all_bots(state);
     break;
   }
 
@@ -12688,12 +13078,12 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     char channel[MAX_CHAN];
 
     if (sscanf(payload, "%63[^|]|%64s", target_uuid, channel) != 2) {
-      hub_log_warning("[HUB] Invalid OP_REQUEST payload from %s\n", client->id);
+      hub_log_warning("[HUB] Invalid OP_REQUEST payload from %s\n", hub_who_client(state, client));
       break;
     }
 
-    hub_log_info("[HUB] OP_REQUEST from %s for target %s in %s\n", client->id,
-            target_uuid, channel);
+    hub_log_info("[HUB] OP_REQUEST from %s for target %s in %s\n", hub_who_client(state, client),
+            hub_who(state, 'b', target_uuid), channel);
 
     // Find target bot's client connection
     hub_client_t *target = NULL;
@@ -12708,7 +13098,7 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
 
     if (!target) {
       // Target bot not connected locally - check for peer hubs
-      hub_log_info("[HUB] Target bot %s not connected locally\n", target_uuid);
+      hub_log_info("[HUB] Target %s not connected locally\n", hub_who(state, 'b', target_uuid));
 
       // Count connected peer hubs
       int peer_count = 0;
@@ -12737,7 +13127,7 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
         }
         if (req_hostmask[0] == '\0') {
           hub_log_warning("[HUB] No hostmask for requester %s — cannot forward OP_REQUEST\n",
-                  client->id);
+                  hub_who_client(state, client));
           peer_count = 0; // fall through to OP_FAILED
         }
 
@@ -12765,28 +13155,9 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
 
       if (peer_count == 0) {
         // No peers available or table full - send OP_FAILED
-        unsigned char plain[MAX_BUFFER];
-        unsigned char buffer[MAX_BUFFER];
-        unsigned char tag[GCM_TAG_LEN];
-
-        plain[0] = CMD_OP_FAILED;
-        const char *reason = "Target bot not connected";
-        int reason_len = (int)strlen(reason);
-        uint32_t net_len_inner = htonl((uint32_t)reason_len);
-        memcpy(&plain[1], &net_len_inner, 4);
-        memcpy(&plain[5], reason, (size_t)reason_len);
-
-        int enc_len = aes_gcm_encrypt(plain, 5 + reason_len,
-                                      client->session_key, buffer + 4, tag);
-        if (enc_len > 0) {
-          memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-          uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-          memcpy(buffer, &net_len, 4);
-          if (write(client->fd, buffer, (size_t)(4 + enc_len + GCM_TAG_LEN)) < 0) {
-            hub_log_warning("[HUB] Failed to send OP_FAILED response to %s\n",
-                    client->id);
-          }
-        }
+        if (!send_cmd_to_bot(state, client, CMD_OP_FAILED, "Target bot not connected"))
+          hub_log_warning("[HUB] Failed to send OP_FAILED response to %s\n",
+                  hub_who_client(state, client));
       }
       break;
     }
@@ -12808,22 +13179,10 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     }
 
     if (requester_hostmask[0] == '\0') {
-      hub_log_warning("[HUB] No hostmask stored for requesting bot %s\n", client->id);
-      unsigned char plain[MAX_BUFFER], buffer[MAX_BUFFER], tag[GCM_TAG_LEN];
-      plain[0] = CMD_OP_FAILED;
-      const char *reason = "Hostmask not yet stored";
-      int rlen = (int)strlen(reason);
-      uint32_t nlen = htonl((uint32_t)rlen);
-      memcpy(&plain[1], &nlen, 4);
-      memcpy(&plain[5], reason, (size_t)rlen);
-      int enc_len = aes_gcm_encrypt(plain, 5 + rlen, client->session_key, buffer + 4, tag);
-      if (enc_len > 0) {
-        memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-        uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-        memcpy(buffer, &net_len, 4);
-        if (write(client->fd, buffer, (size_t)(4 + enc_len + GCM_TAG_LEN)) < 0)
-          hub_log_warning("[HUB] Failed to send OP_FAILED to bot %s\n", client->id);
-      }
+      hub_log_warning("[HUB] No hostmask stored for requesting %s\n",
+                      hub_who_client(state, client));
+      if (!send_cmd_to_bot(state, client, CMD_OP_FAILED, "Hostmask not yet stored"))
+        hub_log_warning("[HUB] Failed to send OP_FAILED to %s\n", hub_who_client(state, client));
       break;
     }
 
@@ -12833,28 +13192,9 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     snprintf(grant_payload, sizeof(grant_payload), "%s|%s", requester_hostmask,
              channel);
 
-    unsigned char plain[MAX_BUFFER];
-    unsigned char buffer[MAX_BUFFER];
-    unsigned char tag[GCM_TAG_LEN];
-
-    plain[0] = CMD_OP_GRANT;
-    int pay_len = (int)strlen(grant_payload);
-    uint32_t net_pay_len = htonl((uint32_t)pay_len);
-    memcpy(&plain[1], &net_pay_len, 4);
-    memcpy(&plain[5], grant_payload, (size_t)pay_len);
-
-    int enc_len = aes_gcm_encrypt(plain, 5 + pay_len, target->session_key,
-                                  buffer + 4, tag);
-    if (enc_len > 0) {
-      memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-      uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-      memcpy(buffer, &net_len, 4);
-
-      if (write(target->fd, buffer, (size_t)(4 + enc_len + GCM_TAG_LEN)) > 0) {
-        hub_log_info("[HUB] Forwarded OP_GRANT to %s: grant ops to %s in %s\n",
-                target_uuid, requester_hostmask, channel);
-      }
-    }
+    if (send_cmd_to_bot(state, target, CMD_OP_GRANT, grant_payload))
+      hub_log_info("[HUB] Forwarded OP_GRANT to %s: grant ops to %s in %s\n",
+              hub_who(state, 'b', target_uuid), requester_hostmask, channel);
   } break;
 
   case CMD_CHAN_REQUEST:
@@ -12885,36 +13225,21 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     /* Payload: nick|#channel — broadcast to all other bots, forward to peers */
     char inv_nick[64], inv_chan[64];
     if (sscanf(payload, "%63[^|]|%63s", inv_nick, inv_chan) != 2) {
-      hub_log_warning("[HUB] Invalid INVITE_REQUEST payload from %s\n", client->id);
+      hub_log_warning("[HUB] Invalid INVITE_REQUEST payload from %s\n",
+                      hub_who_client(state, client));
       break;
     }
     hub_log_info("[HUB] INVITE_REQUEST from %s: invite %s into %s\n",
-            client->id, inv_nick, inv_chan);
+            hub_who_client(state, client), inv_nick, inv_chan);
 
     /* Broadcast to all other connected bots */
-    unsigned char plain[MAX_BUFFER], inv_buf[MAX_BUFFER], inv_tag[GCM_TAG_LEN];
-    int inv_pay_len = (int)strlen(payload);
-    plain[0] = (unsigned char)CMD_INVITE_REQUEST;
-    uint32_t inv_net_pay = htonl((uint32_t)inv_pay_len);
-    memcpy(&plain[1], &inv_net_pay, 4);
-    memcpy(&plain[5], payload, (size_t)inv_pay_len);
-
     for (int i = 0; i < state->client_count; i++) {
       hub_client_t *bc = state->clients[i];
       if (bc->type == CLIENT_BOT && bc->authenticated &&
-          bc->fd != client->fd) {
-        int enc_len = aes_gcm_encrypt(plain, 5 + inv_pay_len,
-                                      bc->session_key, inv_buf + 4, inv_tag);
-        if (enc_len > 0) {
-          memcpy(inv_buf + 4 + enc_len, inv_tag, GCM_TAG_LEN);
-          uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-          memcpy(inv_buf, &net_len, 4);
-          if (write(bc->fd, inv_buf, (size_t)(4 + enc_len + GCM_TAG_LEN)) <= 0) {
-            hub_log_warning("[HUB] Failed to forward INVITE_REQUEST to bot %s\n",
-                    bc->id);
-          }
-        }
-      }
+          bc->fd != client->fd &&
+          !send_cmd_to_bot(state, bc, CMD_INVITE_REQUEST, payload))
+        hub_log_warning("[HUB] Failed to forward INVITE_REQUEST to %s\n",
+                hub_who_client(state, bc));
     }
 
     /* Forward to peer hubs via mesh sync */
@@ -12932,18 +13257,32 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     char target_uuid[64];
     char *pipe = strchr(payload, '|');
     if (!pipe) {
-      hub_log_warning("[HUB] Invalid CMD_BOT_RELAY payload from %s\n", client->id);
+      hub_log_warning("[HUB] Invalid CMD_BOT_RELAY payload from %s\n",
+                      hub_who_client(state, client));
       break;
     }
     size_t uuid_len = (size_t)(pipe - payload);
     if (uuid_len == 0 || uuid_len >= sizeof(target_uuid)) {
-      hub_log_warning("[HUB] CMD_BOT_RELAY bad UUID len from %s\n", client->id);
+      hub_log_warning("[HUB] CMD_BOT_RELAY bad UUID len from %s\n", hub_who_client(state, client));
       break;
     }
     memcpy(target_uuid, payload, uuid_len);
     target_uuid[uuid_len] = '\0';
 
-    hub_log_debug("[HUB] CMD_BOT_RELAY from %s to %s\n", client->id, target_uuid);
+    time_t rnow = time(NULL);
+    if (client->relay_window != rnow) {
+      client->relay_window = rnow;
+      client->relay_count = 0;
+    }
+    if (++client->relay_count > BOT_RELAY_PER_SEC) {
+      if (client->relay_count == BOT_RELAY_PER_SEC + 1)
+        hub_log_warning("[HUB] CMD_BOT_RELAY: %s sends over %d a second — dropping the rest\n",
+                        hub_who_client(state, client), BOT_RELAY_PER_SEC);
+      break;
+    }
+
+    hub_log_debug("[HUB] CMD_BOT_RELAY from %s to %s\n", hub_who_client(state, client),
+                  hub_who(state, 'b', target_uuid));
 
     hub_client_t *target = bot_relay_local_target(state, target_uuid);
     if (target) {
@@ -12960,7 +13299,7 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
               strcmp(state->bots[i].uuid, target_uuid) == 0;
     if (!known) {
       hub_log_warning("[HUB] CMD_BOT_RELAY: target %s is not a known bot\n",
-              target_uuid);
+              hub_who(state, 'b', target_uuid));
       break;
     }
     char request_id[64];
@@ -12970,10 +13309,10 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
                                  client->id, target_uuid, pipe + 1, -1);
     if (sent == 0)
       hub_log_warning("[HUB] CMD_BOT_RELAY: target %s not connected and no peer "
-              "to forward to\n", target_uuid);
+              "to forward to\n", hub_who(state, 'b', target_uuid));
     else
       hub_log_debug("[HUB] CMD_BOT_RELAY: %s not local — forwarded (id:%s) to "
-              "%d peer(s)\n", target_uuid, request_id, sent);
+              "%d peer(s)\n", hub_who(state, 'b', target_uuid), request_id, sent);
   } break;
   }
 }
@@ -13016,7 +13355,7 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client,
    * upper bound (see hub.h), so hub_generate_bot_payload never truncates. */
   char *payload = malloc(MAX_CONFIG_PAYLOAD);
   if (!payload) {
-    hub_log_error("[HUB] send_config_to_bot: OOM for %s\n", client->id);
+    hub_log_error("[HUB] send_config_to_bot: OOM for %s\n", hub_who_client(state, client));
     return;
   }
 
@@ -13027,7 +13366,7 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client,
 
   int len = (int)strlen(payload);
   if (len == 0) {
-    hub_log_warning("[HUB] No config to send to %s\n", client->id);
+    hub_log_warning("[HUB] No config to send to %s\n", hub_who_client(state, client));
     free(payload);
     return;
   }
@@ -13042,7 +13381,8 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client,
     return;
   }
 
-  hub_log_debug("[HUB-SYNC] Queueing config to %s (%d bytes)\n", client->id, len);
+  hub_log_debug("[HUB-SYNC] Queueing config to %s (%d bytes)\n", hub_who_client(state, client),
+                len);
 
   /* Bot config push goes through the bot-client's BULK lane.  The encrypt
    * path knows to apply htonl() to the inner length only for CMD_CONFIG_DATA
@@ -13076,10 +13416,10 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
   // Process at most 8 packets per call so the event loop stays fair across
   // connections — prevents one backlogged peer from starving bot auth.
   int packets_this_call = 0;
-  while (client->recv_len >= 4 && packets_this_call < 8) {
+  while (client->recv_len - client->recv_off >= 4 && packets_this_call < 8) {
     packets_this_call++;
     uint32_t net_len;
-    memcpy(&net_len, client->recv_buf, 4);
+    memcpy(&net_len, client->recv_buf + client->recv_off, 4);
     int packet_len = (int)ntohl(net_len);
 
     // ADDED: Enhanced bounds checking. D2: bound against the client's actual
@@ -13094,11 +13434,11 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
       return false;
     }
 
-    if (client->recv_len < (4 + packet_len)) {
+    if (client->recv_len - client->recv_off < (4 + packet_len)) {
       return true; // Need more data
     }
 
-    unsigned char *data = client->recv_buf + 4;
+    unsigned char *data = client->recv_buf + client->recv_off + 4;
 
     // ========================================================================
     // SSH CONSOLE (docs/console.md): plaintext op || payload from the console
@@ -13226,9 +13566,9 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               }
             }
             if (peer_idx < 0 || !state->peers[peer_idx].has_pubkey) {
-              hub_log_warning("[HUB] v3 peer auth: no pubkey on file for uuid %s "
+              hub_log_warning("[HUB] v3 peer auth: no pubkey on file for %s "
                       "(from %s) — add the peer with its 88-char pubkey.\n",
-                      peer_uuid, client->ip);
+                      hub_who(state, 'h', peer_uuid), client->ip);
               record_failed_auth(state, client->ip);
               secure_wipe(plain, sizeof(plain));
               hub_disconnect_client(state, client);
@@ -13266,8 +13606,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             free(sig);
 
             if (!sig_ok) {
-              hub_log_warning("[HUB] v3 peer auth: signature verify FAILED for uuid %s "
-                      "(from %s)\n", peer_uuid, client->ip);
+              hub_log_warning("[HUB] v3 peer auth: signature verify FAILED for %s "
+                      "(from %s)\n", hub_who(state, 'h', peer_uuid), client->ip);
               record_failed_auth(state, client->ip);
               secure_wipe(plain, sizeof(plain));
               hub_disconnect_client(state, client);
@@ -13277,10 +13617,27 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             /* Freshness window (±60 s). */
             time_t client_ts = (time_t)strtoll(ts_str, NULL, 10);
             time_t now_v2 = time(NULL);
-            if (llabs((long long)(now_v2 - client_ts)) > 60) {
-              hub_log_warning("[HUB] v3 peer auth: timestamp skew %lds (max 60) for %s\n",
-                      (long)(now_v2 - client_ts), peer_uuid);
+            /* a negative stamp is as stale as it gets; for one >= 0 the
+             * difference cannot overflow */
+            long long skew = client_ts < 0 ? LLONG_MAX : (long long)(now_v2 - client_ts);
+            if (llabs(skew) > 60) {
+              hub_log_warning("[HUB] v3 peer auth: timestamp skew %llds (max 60) for %s\n",
+                      skew, hub_who(state, 'h', peer_uuid));
               record_failed_auth(state, client->ip);
+              secure_wipe(plain, sizeof(plain));
+              hub_disconnect_client(state, client);
+              return false;
+            }
+            /* Review 7b: the sealed box opens with the hello's ephemeral key
+             * (its first 32 bytes); seen inside the window, it is replayed. */
+            if (hello_replayed(state, data)) {
+              hub_log_warning("[HUB] v3 peer auth: replayed hello for %s from %s — refused\n",
+                              hub_who(state, 'h', peer_uuid), client->ip);
+              secure_wipe(plain, sizeof(plain));
+              hub_disconnect_client(state, client);
+              return false;
+            }
+            if (!peer_link_tie(state, peer_idx, client)) {
               secure_wipe(plain, sizeof(plain));
               hub_disconnect_client(state, client);
               return false;
@@ -13289,6 +13646,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             /* Accept. */
             client->type = CLIENT_HUB;
             client->authenticated = true;
+            hub_known_ip_note(state, client->ip);
             /* D2: grow buffers — peers exchange bulk anti-entropy sync. */
             if (!hub_client_promote_buffers(client)) {
               hub_log_error("[HUB] Buffer promotion OOM for peer %s — "
@@ -13313,11 +13671,13 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             client->id[sizeof(client->id) - 1] = 0;
 
             hub_log_info("[HUB] v3 Peer authenticated by Ed25519 signature: %s (%s)\n",
-                    peer_name[0] ? peer_name : client->ip, peer_uuid);
+                    peer_name[0] ? peer_name : client->ip, hub_who(state, 'h', peer_uuid));
 
             /* If this process is the product of an upgrade this peer drove,
              * close that run out now that there is a peer to tell. */
             hub_upgrade_report_pending(state, client);
+
+            hub_link_offer(state, client, peer_uuid);
 
             /* Initial full state sync to the newly authenticated peer. */
             {
@@ -13376,12 +13736,19 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
 
         memcpy(tag, data + packet_len - GCM_TAG_LEN, GCM_TAG_LEN);
 
-        int pl = aes_gcm_decrypt(data, packet_len - GCM_TAG_LEN,
-                                 client->session_key, plain, tag);
+        /* Review 6: on a sequenced link the frame must be the next one. */
+        unsigned char aad[HUB_LINK_AAD_LEN];
+        bool seq = client->link_rx_seq;
+        if (seq) link_aad(client->link_dir_rx, client->link_rx_ctr, aad);
+        int pl = aes_gcm_decrypt_aad(data, packet_len - GCM_TAG_LEN, seq ? aad : NULL,
+                                     seq ? HUB_LINK_AAD_LEN : 0, client->session_key,
+                                     plain, tag);
 
         if (pl <= 0) {
-          hub_log_warning("[HUB] GCM tag verification failed from authenticated client %s\n",
-                  client->ip);
+          hub_log_warning("[HUB] GCM tag verification failed from authenticated client %s%s\n",
+                  client->ip, seq ? " (replayed, reordered or forged frame)" : "");
+        } else if (seq) {
+          client->link_rx_ctr++;
         }
 
         if (pl > 0) {
@@ -13414,7 +13781,10 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             plain[pl] = 0;
             char *payload_ptr = (char *)plain + 5;
 
-            if (client->type == CLIENT_ADMIN) {
+            if (cmd == CMD_LINK_SEQ &&
+                (client->type == CLIENT_BOT || client->type == CLIENT_HUB)) {
+              link_seq_recv(state, client, payload_ptr);
+            } else if (client->type == CLIENT_ADMIN) {
               if (!handle_admin_command(state, client, cmd, payload_ptr,
                                         pl >= 5 ? pl - 5 : 0)) {
                 secure_wipe(plain, (size_t)packet_len + 1);
@@ -13440,8 +13810,13 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
               }
             } else if (client->type == CLIENT_HUB) {
               if (cmd == CMD_PEER_SYNC || cmd == CMD_PEER_BCAST) {
-                process_peer_sync(state, payload_ptr, client->fd,
-                                  cmd == CMD_PEER_BCAST);
+                /* Not read until this peer's version is known current:
+                 * hub_peer_sync_release asks for it again then. */
+                if (peer_version_level(state, client) == 2)
+                  process_peer_sync(state, payload_ptr, client->fd,
+                                    cmd == CMD_PEER_BCAST);
+                else
+                  client->sync_held = true;
               } else if (cmd == CMD_MESH_STATE) {
                 process_mesh_state(state, client, payload_ptr);
               } else if (cmd == CMD_BOT_ROSTER) {
@@ -13452,6 +13827,7 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                   hub_disconnect_client(state, client);
                   return false;
                 }
+                hub_peer_sync_release(state, client);
               } else if (cmd == CMD_OP_FORWARD_REQUEST) {
                 process_forward_op_request(state, client, payload_ptr);
               } else if (cmd == CMD_OP_FORWARD_GRANT) {
@@ -13532,19 +13908,21 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
 
         secure_wipe(plain, (size_t)packet_len + 1);
         free(plain);
+      } else {
+        /* Too short to hold a GCM tag: never a frame we sent, so the stream
+         * is not ours (or is out of step) -- drop, as on a bad tag. */
+        hub_log_warning("[HUB] Frame too short from authenticated client %s "
+                        "(len=%d) — dropping\n", client->ip, packet_len);
+        hub_disconnect_client(state, client);
+        return false;
       }
     }
 
     packet_consumed:;
-    // Remove processed packet from buffer
-    int consumed = 4 + packet_len;
-    int remaining = client->recv_len - consumed;
-
-    if (remaining > 0) {
-      memmove(client->recv_buf, client->recv_buf + consumed, (size_t)remaining);
-    }
-
-    client->recv_len = remaining;
+    /* Step past the frame; the reader compacts the buffer only when it is
+     * full (a memmove per frame made a backlog quadratic). */
+    client->recv_off += 4 + packet_len;
+    if (client->recv_off >= client->recv_len) client->recv_off = client->recv_len = 0;
   }
 
   return true;
@@ -13608,13 +13986,12 @@ void hub_console_note_login(hub_state_t *state, const char *name, const char *ip
 }
 
 /* docs/console.md §3.3 "status": one line, fields in a fixed order.  `tree`
- * is the current hub_build_tree output: bots online are the distinct B rows,
- * and the mesh is split when any hub row is offline. */
+ * is the current hub_build_tree output: hubs are its H rows (this hub, its
+ * peers and the hubs beyond them), bots online are the distinct B rows, and
+ * the mesh is split when any hub row is offline. */
 void hub_console_status_line(hub_state_t *state, const char *tree, char *out,
                              size_t out_size) {
-  int peers_up = 0;
-  for (int p = 0; p < state->peer_count; p++)
-    if (peer_is_linked(state, &state->peers[p])) peers_up++;
+  int hubs_up = 0, hubs_total = 0;
   int bots_total = 0;
   for (int i = 0; i < state->bot_count; i++)
     if (state->bots[i].is_active) bots_total++;
@@ -13635,7 +14012,11 @@ void hub_console_status_line(hub_state_t *state, const char *tree, char *out,
       for (char *t = strtok_r(row, "|", &save); t && nf < 9;
            t = strtok_r(NULL, "|", &save))
         snprintf(f[nf++], sizeof(f[0]), "%s", t);
-      if (nf >= 5 && strcmp(f[0], "H") == 0 && strcmp(f[4], "0") == 0) split = true;
+      if (nf >= 5 && strcmp(f[0], "H") == 0) {
+        hubs_total++;
+        if (strcmp(f[4], "0") == 0) split = true;
+        else hubs_up++;
+      }
       if (nf >= 4 && strcmp(f[0], "B") == 0) {
         bool dup = false;
         for (int k = 0; k < nseen && !dup; k++) dup = strcmp(seen[k], f[3]) == 0;
@@ -13659,10 +14040,10 @@ void hub_console_status_line(hub_state_t *state, const char *tree, char *out,
     snprintf(upg, sizeof(upg), "%d/%d", done, total);
   }
   snprintf(out, out_size,
-           "name=%s|peers=%d/%d|bots=%d/%d|upg=%s|frozen=%d|rollup=%d|split=%d|"
+           "name=%s|hubs=%d/%d|bots=%d/%d|upg=%s|frozen=%d|rollup=%d|split=%d|"
            "loglevel=%d|consolelevel=%d",
            state->hub_friendly_name[0] ? state->hub_friendly_name : "hub",
-           peers_up, state->peer_count, bots_on, bots_total, upg,
+           hubs_up, hubs_total, bots_on, bots_total, upg,
            hub_config_frozen(state) ? 1 : 0, state->rollup.active ? 1 : 0,
            split ? 1 : 0, state->log_level, state->console_log_level);
 }

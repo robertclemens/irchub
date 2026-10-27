@@ -420,7 +420,7 @@ typedef struct {
 
 typedef struct {
   char name[64];
-  int  peers_up, peers_total, bots_on, bots_total;
+  int  hubs_up, hubs_total, bots_on, bots_total;
   char upg[24];
   bool frozen, rollup, split;
   int  loglevel, consolelevel;
@@ -701,6 +701,25 @@ static const char *flag_word(char f) {
   }
 }
 
+/* The commands flag f allows, from CMD_FLAGS: "bot add, del · ban add".
+ * "a/o" rows count for a and for o. */
+static void flag_cmds(char f, char *out, size_t cap) {
+  size_t o = 0;
+  const char *prev = NULL;
+  out[0] = '\0';
+  for (int i = 0; i < NCMDFLAGS; i++) {
+    const char *fl = CMD_FLAGS[i].flag;
+    bool hit = !strcmp(fl, "a/o") ? f == 'a' || f == 'o' : fl[0] == f && !fl[1];
+    if (!hit || o + 1 >= cap) continue;
+    bool same = prev && !strcmp(prev, CMD_FLAGS[i].cmd);
+    int w = same ? snprintf(out + o, cap - o, ", %s", CMD_FLAGS[i].sub)
+                 : snprintf(out + o, cap - o, "%s%s %s", o ? " · " : "", CMD_FLAGS[i].cmd,
+                            CMD_FLAGS[i].sub);
+    if (w > 0) o += (size_t)w < cap - o ? (size_t)w : cap - o - 1;
+    prev = CMD_FLAGS[i].cmd;
+  }
+}
+
 /* help <group> <command> (§2.2): each argument, then examples that run as
  * typed.  args: "name\ttext" lines; examples: one per line. */
 #define EX_UUID "00010203-0405-4607-8809-0a0b0c0d0e0f"
@@ -769,7 +788,7 @@ static const struct {
    "setting\tname, bindip, port, pubkey or autopurge; alone it shows them all. ssh and conn "
    "are this hub's connection limits: hub set ssh | hub set conn show them; ssh <name> "
    "<value|default> changes one (ssh: preauth preauthip sessions grace authtries idle "
-   "authfail connect block cmdrate; conn: perip churn authfail). N:S is N per S seconds; "
+   "authfail connect block cmdrate; conn: perip churn authfail startups). N:S is N per S seconds; "
    "block doubles per repeat within 24 h up to 24 h. A change applies to the next "
    "connection\n"
    "value\tname: this hub's name · bindip: the address it listens on · port: 1-65535 · "
@@ -827,8 +846,8 @@ static const struct {
    "key\ttheir 88-character public key (keygen's <stamp>_<name>.public.b64)\n"
    "mask\ta first usermask, nick!user@host (* and ? match)\n"
    "flags\tan admin: +a for a full admin (every command), or the letters of what they may "
-   "change: b bots, c channels, h hub, o opers, u upgrades (+chu); every admin may log in "
-   "and view everything\n"
+   "change: b bots, c channels, h hub, o opers, u upgrades (+chu; listed below); every "
+   "admin may log in and view everything\n"
    "channels\tan oper: * for every channel, or the channels, comma-separated (#ircbot,#dev); "
    "on each they may op, invite, unban, key",
    "user add admin robert " EX_KEY " robert!*@* +a\n"
@@ -842,7 +861,7 @@ static const struct {
    "key|flags\tthe setting: key (anyone's; your own needs no flag) or flags (an admin's, "
    "needs +a)\n"
    "value\tkey: their new 88-character public key (asks y/N) · flags: +c-u adds and removes, "
-   "chu or +a replaces them all",
+   "chu or +a replaces them all (the letters are listed below)",
    "user set alice key " EX_KEY "\nuser set dana flags +b-u\nuser set dana flags +a"},
   {"user", "chan",
    "add|del\tgive the channel, or take it away\n"
@@ -1381,7 +1400,7 @@ static void parse_status(console_ui_t *ui, const char *data) {
     *eq = '\0';
     const char *v = eq + 1;
     if (!strcmp(f, "name")) console_sanitize(v, strlen(v), st.name, sizeof(st.name));
-    else if (!strcmp(f, "peers")) sscanf(v, "%d/%d", &st.peers_up, &st.peers_total);
+    else if (!strcmp(f, "hubs")) sscanf(v, "%d/%d", &st.hubs_up, &st.hubs_total);
     else if (!strcmp(f, "bots")) sscanf(v, "%d/%d", &st.bots_on, &st.bots_total);
     else if (!strcmp(f, "upg")) console_sanitize(v, strlen(v), st.upg, sizeof(st.upg));
     else if (!strcmp(f, "frozen")) st.frozen = atoi(v) != 0;
@@ -1507,7 +1526,7 @@ static void greet_status(console_ui_t *ui) {
   char l1[256], l2[64];
   const char *dot = fmt_glyph(&c, G_DOT);
   usnprintf(l1, sizeof(l1), " hubs %d/%d up %s bots %d/%d online %s log file %s, console %s",
-            ui->st.peers_up, ui->st.peers_total, dot, ui->st.bots_on, ui->st.bots_total, dot,
+            ui->st.hubs_up, ui->st.hubs_total, dot, ui->st.bots_on, ui->st.bots_total, dot,
             ui->st.loglevel >= 0 && ui->st.loglevel <= 4 ? LEVEL_WORD[ui->st.loglevel] : "?",
             ui->st.consolelevel >= 0 && ui->st.consolelevel <= 4 ? LEVEL_WORD[ui->st.consolelevel] : "?");
   usnprintf(l2, sizeof(l2), " type help for commands");
@@ -1806,6 +1825,25 @@ static void help_command(const fmt_ctx_t *c, flines_t *f, const cmd_def_t *d) {
       usnprintf(line, sizeof(line), "   %-13s %-8s %s", n, def, what);
       flines_add(f, RL_NORMAL, line);
     }
+  }
+  /* user add / user set: what each admin flag allows (from CMD_FLAGS) */
+  if (!strcmp(d->cmd, "user") && d->sub && (!strcmp(d->sub, "add") || !strcmp(d->sub, "set"))) {
+    flines_add(f, RL_NORMAL, "");
+    flines_add(f, RL_HEAD, " Admin flags: letter, name, what it lets the admin change");
+    static const char LETTERS[] = "abchou";
+    char cmds[512];
+    for (const char *p = LETTERS; *p; p++) {
+      flag_cmds(*p, cmds, sizeof(cmds));
+      if (*p == 'a')
+        usnprintf(line, sizeof(line), "   +a  %-10s every command; only +a: %s on an admin",
+                  flag_word('a'), cmds);
+      else
+        usnprintf(line, sizeof(line), "   +%c  %-10s %s%s", *p, flag_word(*p), cmds,
+                  *p == 'o' ? " on an oper" : "");
+      flines_add(f, RL_NORMAL, line);
+    }
+    flines_add(f, RL_NORMAL, "   no flag        log in, view everything, set your own key");
+    flines_add(f, RL_DIM, "   letters combine (+chu); +a covers them all");
   }
   if (ex) {
     flines_add(f, RL_NORMAL, "");
@@ -2425,7 +2463,7 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
         break;
       }
       if (na != 3) {
-        *why = conn ? "usage: hub set conn <perip|churn|authfail> <value|default>"
+        *why = conn ? "usage: hub set conn <perip|churn|authfail|startups> <value|default>"
                     : "usage: hub set ssh <name> <value|default>";
         return false;
       }
@@ -2866,6 +2904,12 @@ static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text
         usnprintf(v, sizeof(v), "no path: %s", rv(bpath, "err"));
         fmt_card_line(&c, &f, 6, "", v, RL_WARN);
       }
+      /* Every node already on the version and no build switch asked for: the
+       * run will move nothing, and the likely intent was name=c / name=rs. */
+      if (b_to == 0 && (!hv[0] || h_to == 0) && !strchr(pc->extra[1], '='))
+        fmt_card_line(&c, &f, 6, "",
+                      "nothing to move; to switch a node's build add =c or =rs (nodes=<name>=rs)",
+                      RL_DIM);
       emit_flines(ui, &f);
       flines_free(&f);
     }
@@ -3270,7 +3314,7 @@ static const char *hubset_words(int pos, const char *p1, const char *p2) {
   if (pos == 0) return "name bindip port pubkey autopurge ssh conn";
   if (pos == 1 && !strcasecmp(p1, "ssh"))
     return "preauth preauthip sessions grace authtries idle authfail connect block cmdrate";
-  if (pos == 1 && !strcasecmp(p1, "conn")) return "perip churn authfail";
+  if (pos == 1 && !strcasecmp(p1, "conn")) return "perip churn authfail startups";
   static const char *const own[] = {"name", "bindip", "port", "pubkey", "autopurge"};
   bool is_own = false;
   for (size_t i = 0; i < sizeof(own) / sizeof(own[0]); i++) is_own |= !strcasecmp(p1, own[i]);
@@ -4184,7 +4228,7 @@ static void status_bar(console_ui_t *ui, rowb_t *r, long long now_ms, bool pane_
   const char *hn = ui->hubname[0] ? ui->hubname : "hub";
   SEG(1, SGR_STATUS, "%s %.*s %.*s", clk, uprec(hn, 40), hn, uprec(ui->admin, 40), ui->admin);
   if (ui->st.have) {
-    SEG(2, SGR_STATUS, "hubs %d/%d", ui->st.peers_up, ui->st.peers_total);
+    SEG(2, SGR_STATUS, "hubs %d/%d", ui->st.hubs_up, ui->st.hubs_total);
     SEG(2, SGR_STATUS, "bots %d/%d", ui->st.bots_on, ui->st.bots_total);
     if (strcmp(ui->st.upg, "-")) SEG(3, SGR_WARNBG, "UPG %s", ui->st.upg);
     if (ui->st.frozen) SEG(3, SGR_ALERT, "FROZEN");

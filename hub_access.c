@@ -14,7 +14,7 @@
 #include <string.h>
 #include <strings.h>
 
-static bool uuid_shape(const char *u) {
+bool hub_uuid_shape(const char *u) {
   if (!u || strlen(u) != 36) return false;
   for (int i = 0; i < 36; i++) {
     if (i == 8 || i == 13 || i == 18 || i == 23) {
@@ -81,6 +81,7 @@ bool hub_uflags_edit(const char *cur, const char *spec, char *out, size_t cap) {
  * 'a' beats 'a', then the shorter string, then the byte-wise smaller), so
  * every node picks the same side and a race never grants. */
 bool hub_uflags_accepts(time_t in_ts, const char *in, time_t cur_ts, const char *cur) {
+  if (hub_ts_ahead(in_ts)) return false;
   if (in_ts != cur_ts) return in_ts > cur_ts;
   bool ia = strchr(in, 'a') != NULL, ca = strchr(cur, 'a') != NULL;
   if (ia != ca) return !ia;
@@ -120,13 +121,14 @@ hub_uchan_record_t *hub_uchan_find(hub_state_t *state, const char *uuid, const c
 /* Store a uf| if it wins LWW.  true = stored (a change). */
 bool hub_uflag_put(hub_state_t *state, const char *uuid, const char *flags, time_t ts) {
   char canon[USER_FLAGS_MAX + 1];
-  if (!uuid_shape(uuid) || !hub_uflags_canon(flags, canon, sizeof(canon)) || ts <= 0)
+  if (!hub_uuid_shape(uuid) || !hub_uflags_canon(flags, canon, sizeof(canon)) || ts <= 0 ||
+      hub_ts_ahead(ts))
     return false;
   hub_uflag_record_t *r = hub_uflag_find(state, uuid);
   if (!r) {
     if (state->uflag_record_count >= MAX_HUB_USER_FLAGS) {
       hub_log_warning("[ACCESS] Flag table full (%d): uf| for %s dropped\n",
-                      MAX_HUB_USER_FLAGS, uuid);
+                      MAX_HUB_USER_FLAGS, hub_who(state, 'u', uuid));
       return false;
     }
     r = &state->uflag_records[state->uflag_record_count++];
@@ -134,6 +136,13 @@ bool hub_uflag_put(hub_state_t *state, const char *uuid, const char *flags, time
     snprintf(r->uuid, sizeof(r->uuid), "%s", uuid);
   } else if (!hub_uflags_accepts(ts, canon, r->timestamp, r->flags)) {
     return false;
+  }
+  /* a drop of 'a' is remembered for the admin floor */
+  if (strchr(r->flags, 'a') && !strchr(canon, 'a')) {
+    int k = state->adrop_next;
+    state->adrop_next = (k + 1) % ADMIN_DROP_LOG;
+    snprintf(state->adrop[k].uuid, sizeof(state->adrop[k].uuid), "%s", uuid);
+    state->adrop[k].ts = ts;
   }
   snprintf(r->flags, sizeof(r->flags), "%s", canon);
   r->timestamp = ts;
@@ -144,14 +153,15 @@ bool hub_uflag_put(hub_state_t *state, const char *uuid, const char *flags, time
 /* Store a uc| if it wins LWW.  true = stored (a change). */
 bool hub_uchan_put(hub_state_t *state, const char *uuid, const char *chan, bool active,
                    time_t ts) {
-  if (!uuid_shape(uuid) || !hub_uchan_name_ok(chan) || ts <= 0) return false;
+  if (!hub_uuid_shape(uuid) || !hub_uchan_name_ok(chan) || ts <= 0 || hub_ts_ahead(ts))
+    return false;
   hub_uchan_record_t *r = hub_uchan_find(state, uuid, chan);
   if (!r) {
     /* a tombstone older than the last purge is not re-created */
     if (!active && hub_purge_floor_blocks(state, ts)) return false;
     if (state->uchan_record_count >= MAX_HUB_CHAN_BINDS) {
       hub_log_warning("[ACCESS] Binding table full (%d): uc| %s for %s dropped\n",
-                      MAX_HUB_CHAN_BINDS, chan, uuid);
+                      MAX_HUB_CHAN_BINDS, chan, hub_who(state, 'u', uuid));
       return false;
     }
     r = &state->uchan_records[state->uchan_record_count++];
@@ -200,24 +210,6 @@ int hub_user_chan_count(hub_state_t *state, const char *uuid, bool *global) {
     if (global && strcmp(r->chan, "*") == 0) *global = true;
   }
   return n;
-}
-
-/* A user an older node would over-trust (§3.2): an admin whose uf| is not
- * exactly "a", or an oper with uc| records but no live "*".  A user with no
- * records yet is not: hub_access_migrate makes it +a / * at the end of the
- * batch that brought it, which is what an older node assumes anyway. */
-bool hub_user_restricted(hub_state_t *state, const hub_user_record_t *u) {
-  if (!u || !u->is_active) return false;
-  if (u->type == 'a') {
-    hub_uflag_record_t *f = hub_uflag_find(state, u->uuid);
-    return f && strcmp(f->flags, "a") != 0;
-  }
-  bool any = false;
-  for (int i = 0; i < state->uchan_record_count && !any; i++)
-    any = strcmp(state->uchan_records[i].uuid, u->uuid) == 0;
-  bool global = false;
-  hub_user_chan_count(state, u->uuid, &global);
-  return any && !global;
 }
 
 int hub_format_uflag(const hub_uflag_record_t *r, char *buf, size_t cap) {
@@ -274,8 +266,9 @@ bool hub_access_ingest(hub_state_t *state, char kind, const char *body, bool nee
 }
 
 /* §3.3: every live admin without a uf| becomes "a", every live oper without
- * any uc| becomes "*" -- what they could do before flags existed.  Run after
- * config load and after every ingest batch.
+ * any uc| becomes "*".  This is how a user written without access records
+ * gets its default (-setup's first admin is one); run after config load and
+ * after every ingest batch.
  *
  * Stamped USER_ACCESS_MIGRATE_TS (1), never "now": a node that holds a user
  * but not yet its records (it just upgraded, or the records are still on the
@@ -414,120 +407,6 @@ bool hub_access_append(hub_state_t *state, char *buf, int cap, int *off,
   return true;
 }
 
-/* ---- Older nodes (plan §3.2, T2) -----------------------------------------
- * A peer hub whose version is not known yet (or older than MESH_MIN_VERSION,
- * its link being refused) may not know uf| / uc|: it would treat a restricted admin as full and a
- * channel-bound oper as global.  So:
- *   - it never gets uf| / uc| lines;
- *   - it sees each user at hub_access_user_ts (the newest of the user record
- *     and its access records), so a later change always reaches it;
- *   - a restricted user reaches it as a tombstone ("tomb" mode: a node whose
- *     version we know to be older) or not at all (a node whose version we do
- *     not know yet -- a tombstone to a node that turns out to be new would
- *     delete the user there), and never with its masks;
- *   - whatever such a node sends about a restricted user is ignored
- *     (hub_access_from_old_ok), so a tombstone it holds never comes back. */
-
-/* The newest stamp of a user's own record and its uf| / uc| records. */
-time_t hub_access_user_ts(hub_state_t *state, const hub_user_record_t *u) {
-  time_t ts = u->timestamp;
-  hub_uflag_record_t *f = hub_uflag_find(state, u->uuid);
-  if (f && f->timestamp > ts) ts = f->timestamp;
-  for (int i = 0; i < state->uchan_record_count; i++) {
-    const hub_uchan_record_t *r = &state->uchan_records[i];
-    if (strcmp(r->uuid, u->uuid) == 0 && r->timestamp > ts) ts = r->timestamp;
-  }
-  return ts;
-}
-
-/* u's a|/o| line for an older node.  0 = left out (a restricted user and not
- * tomb), else as hub_format_user_record. */
-int hub_format_user_for_old(hub_state_t *state, const hub_user_record_t *u, bool tomb,
-                            char *buf, size_t cap) {
-  bool restricted = hub_user_restricted(state, u);
-  if (restricted && !tomb) {
-    if (cap) buf[0] = '\0';
-    return 0;
-  }
-  hub_user_record_t c = *u;
-  c.timestamp = hub_access_user_ts(state, u);
-  if (restricted) c.is_active = false;
-  return hub_format_user_record(&c, buf, cap);
-}
-
-/* A record an older node sent about user uuid may be taken in: not about a
- * restricted user. */
-bool hub_access_from_old_ok(hub_state_t *state, const char *uuid) {
-  for (int i = 0; i < state->user_record_count; i++)
-    if (strcmp(state->user_records[i].uuid, uuid) == 0)
-      return !hub_user_restricted(state, &state->user_records[i]);
-  return true;
-}
-
-static hub_user_record_t *user_by_uuid(hub_state_t *state, const char *uuid) {
-  for (int i = 0; i < state->user_record_count; i++)
-    if (strcmp(state->user_records[i].uuid, uuid) == 0) return &state->user_records[i];
-  return NULL;
-}
-
-/* A sync payload rewritten for an older hub: uf| / uc| / rv| / hs| and a
- * bot's b|<uuid>|hl| dropped (an older hub's parser turns an unknown rv| or
- * hs| line into a phantom bot; its whitelist refuses hl), a| / o|
- * re-stamped (hub_format_user_for_old), m| of a restricted user dropped;
- * every other line as it was.  NULL on out of memory.  The result is never
- * longer than USER_LINE_MAX per user line plus the input. */
-char *hub_access_downgrade(hub_state_t *state, const char *payload, bool tomb) {
-  size_t in_len = strlen(payload);
-  size_t cap = in_len + (size_t)state->user_record_count * USER_LINE_MAX + 1;
-  char *out = malloc(cap);
-  if (!out) return NULL;
-  size_t o = 0;
-  for (const char *p = payload; *p;) {
-    const char *nl = strchr(p, '\n');
-    size_t ll = nl ? (size_t)(nl - p) : strlen(p);
-    const char *next = nl ? nl + 1 : p + ll;
-    if (ll == 0) {
-      p = next;
-      continue;
-    }
-    bool keep = true;
-    if (ll > 3 && p[0] == 'u' && (p[1] == 'f' || p[1] == 'c') && p[2] == '|') {
-      keep = false;
-    } else if (ll > 3 && ((p[0] == 'r' && p[1] == 'v') || (p[0] == 'h' && p[1] == 's')) &&
-               p[2] == '|') {
-      keep = false;
-    } else if (ll > 41 && p[0] == 'b' && p[1] == '|' && p[38] == '|' &&
-               !memcmp(p + 39, "hl|", 3)) {
-      keep = false; /* a bot's hub list: an older hub's whitelist refuses it */
-    } else if (ll > 38 && (p[0] == 'a' || p[0] == 'o' || p[0] == 'm') && p[1] == '|' &&
-               p[38] == '|') {
-      char uuid[37];
-      memcpy(uuid, p + 2, 36);
-      uuid[36] = '\0';
-      hub_user_record_t *u = user_by_uuid(state, uuid);
-      if (u && p[0] == 'm') {
-        keep = !hub_user_restricted(state, u);
-      } else if (u) {
-        char line[USER_LINE_MAX];
-        int w = hub_format_user_for_old(state, u, tomb, line, sizeof(line));
-        if (w > 0 && w < (int)sizeof(line) && o + (size_t)w < cap) {
-          memcpy(out + o, line, (size_t)w);
-          o += (size_t)w;
-        }
-        keep = false;
-      }
-    }
-    if (keep && o + ll + 1 < cap) {
-      memcpy(out + o, p, ll);
-      o += ll;
-      out[o++] = '\n';
-    }
-    p = next;
-  }
-  out[o] = '\0';
-  return out;
-}
-
 /* ---- Console helpers (T4) ------------------------------------------------ */
 
 /* A user's live bindings as the console shows them: "*" when global, else
@@ -613,4 +492,109 @@ int hub_access_chan_change(hub_state_t *state, const char *uuid, bool add, const
   }
 #undef UC_EMIT
   return n;
+}
+
+static bool adrop_match(const hub_state_t *state, const char *uuid, time_t ts) {
+  for (int i = 0; i < ADMIN_DROP_LOG; i++)
+    if (state->adrop[i].ts == ts && strcmp(state->adrop[i].uuid, uuid) == 0) return true;
+  return false;
+}
+
+/* The admin floor.  A hub refuses to remove the last +a admin itself
+ * (last_full_admin), but two hubs can each remove a different one before
+ * they sync, and a hubless bot can push a removal.  When no active admin
+ * holds +a, every +a removal stamped within ADMIN_FLOOR_WINDOW of the newest
+ * one is undone: a deleted admin comes back with the masks dropped with it,
+ * an admin that lost 'a' is "a" again -- each at its removal stamp + 1.  Every hub
+ * holds the same records by then, so each writes the same records and the
+ * mesh agrees; the stamps beat the removals everywhere.  A flag drop is
+ * known only from adrop[] (the uf| no longer says it held 'a'). */
+char *hub_admin_floor_restore(hub_state_t *state, const char *from_label, int *restored) {
+  *restored = 0;
+  char from[HUB_WHO_MAX];   /* hub_who's rotating slots must not overwrite it */
+  snprintf(from, sizeof(from), "%s", from_label ? from_label : "?");
+  int cand[MAX_HUB_USER_RECORDS];
+  time_t cts[MAX_HUB_USER_RECORDS];
+  int nc = 0;
+  time_t newest = 0;
+  for (int i = 0; i < state->user_record_count; i++) {
+    const hub_user_record_t *u = &state->user_records[i];
+    if (u->type != 'a') continue;
+    const bool has_a = strchr(hub_user_flags(state, u->uuid), 'a') != NULL;
+    if (u->is_active && has_a) {
+      state->floor_warned = false;
+      return NULL;                      /* a full admin is left */
+    }
+    const hub_uflag_record_t *fr = hub_uflag_find(state, u->uuid);
+    const bool dropped = !has_a && fr && adrop_match(state, u->uuid, fr->timestamp);
+    if (!(dropped || (has_a && !u->is_active))) continue;
+    time_t t = u->is_active ? 0 : u->timestamp;
+    if (dropped && fr->timestamp > t) t = fr->timestamp;
+    cand[nc] = i;
+    cts[nc++] = t;
+    if (t > newest) newest = t;
+  }
+  if (nc == 0) {
+    if (!state->floor_warned)
+      hub_log_warning("[ADMIN] No full admin (+a) is left after %s, and no recent +a "
+                      "removal to undo\n", from);
+    state->floor_warned = true;
+    return NULL;
+  }
+  size_t cap = (size_t)nc * (USER_LINE_MAX + UF_LINE_MAX) +
+               (size_t)MAX_HUB_USER_MASKS * MASK_LINE_MAX + 1;
+  char *out = malloc(cap);
+  if (!out) return NULL;
+  size_t o = 0;
+  out[0] = '\0';
+  for (int c = 0; c < nc; c++) {
+    if (cts[c] < newest - ADMIN_FLOOR_WINDOW) continue;
+    hub_user_record_t *u = &state->user_records[cand[c]];
+    const bool was_del = !u->is_active;
+    bool lost_a = false;
+    if (was_del) {
+      const time_t del_ts = u->timestamp;
+      u->is_active = true;
+      u->timestamp = hub_ts_add(del_ts, 1);
+      char line[USER_LINE_MAX];
+      int w = hub_format_user_record(u, line, sizeof(line));
+      if (w > 0 && (size_t)w < sizeof(line) && o + (size_t)w < cap) {
+        memcpy(out + o, line, (size_t)w);
+        o += (size_t)w;
+      }
+      /* the masks this delete dropped (DEL_ADMIN stamps them with it) */
+      for (int m = 0; m < state->mask_record_count; m++) {
+        hub_mask_record_t *mr = &state->mask_records[m];
+        if (mr->is_active || strcmp(mr->uuid, u->uuid) != 0 || mr->timestamp < del_ts - 2 ||
+            mr->timestamp > hub_ts_add(del_ts, 2))
+          continue;
+        mr->is_active = true;
+        mr->timestamp = hub_ts_add(mr->timestamp, 1);
+        w = snprintf(out + o, cap - o, "m|%s|%s|add|%lld|%lld\n", mr->uuid, mr->mask,
+                     (long long)mr->last_used, (long long)mr->timestamp);
+        if (w > 0 && (size_t)w < cap - o) o += (size_t)w;
+      }
+    }
+    if (!strchr(hub_user_flags(state, u->uuid), 'a')) {
+      /* back to "a": it held 'a', which covers every other letter */
+      hub_uflag_record_t *fr = hub_uflag_find(state, u->uuid);
+      if (fr && hub_uflag_put(state, u->uuid, "a", hub_ts_add(fr->timestamp, 1))) {
+        lost_a = true;
+        char line[UF_LINE_MAX];
+        int w = hub_format_uflag(fr, line, sizeof(line));
+        if (w > 0 && (size_t)w < sizeof(line) && o + (size_t)w < cap) {
+          memcpy(out + o, line, (size_t)w);
+          o += (size_t)w;
+        }
+      }
+    }
+    out[o] = '\0';
+    (*restored)++;
+    hub_log_warning("[ADMIN] No full admin (+a) was left after %s: restored %s (%s)\n", from,
+                    hub_who(state, 'u', u->uuid),
+                    was_del && lost_a ? "deleted, lost +a" : was_del ? "deleted" : "lost +a");
+  }
+  state->config_dirty = true;
+  state->floor_warned = false;
+  return out;
 }

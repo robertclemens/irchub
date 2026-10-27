@@ -78,7 +78,7 @@ bool hub_gsetting_ingest(hub_state_t *state, const char *rest, bool *changed) {
   if (end == p1 + 1 || *end != '|' || errno || v < 0 || v > g->max) return false;
   const char *ts_s = end + 1;
   long long ts = strtoll(ts_s, &end, 10);
-  if (end == ts_s || *end || ts <= 0) return false;
+  if (end == ts_s || *end || ts <= 0 || hub_ts_ahead((time_t)ts)) return false;
   time_t *cur_ts = gs_ts(state, g);
   int *cur = gs_val(state, g);
   if ((time_t)ts > *cur_ts || ((time_t)ts == *cur_ts && (int)v > *cur)) {
@@ -162,7 +162,7 @@ bool hub_revoke_merge(hub_state_t *state, const hub_revoked_t *in) {
         return false;
       hub_log_warning("[REVOKE] Revoke list full (%d): dropping the oldest, %s (%s); "
                       "it can no longer be wiped if it connects\n",
-                      MAX_REVOKED, state->revoked[old].uuid,
+                      MAX_REVOKED, hub_who(state, 'b', state->revoked[old].uuid),
                       state->revoked[old].nick[0] ? state->revoked[old].nick : "no nick");
       state->revoked[old] = state->revoked[--state->revoked_count];
     }

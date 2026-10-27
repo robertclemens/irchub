@@ -274,9 +274,19 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb,
   return realsize;
 }
 
-static size_t write_file_callback(void *ptr, size_t size, size_t nmemb,
-                                  FILE *stream) {
-  return fwrite(ptr, size, nmemb, stream);
+/* An archive download, counted: CURLOPT_MAXFILESIZE_LARGE only sees a
+ * declared Content-Length on older curl (Rocky 8). */
+typedef struct {
+  FILE *fp;
+  curl_off_t n;
+} capped_file_t;
+
+static size_t write_file_callback(void *ptr, size_t size, size_t nmemb, void *userp) {
+  capped_file_t *cf = (capped_file_t *)userp;
+  size_t real = size * nmemb;
+  if (cf->n + (curl_off_t)real > (curl_off_t)HUB_UPDATE_MAX_ARCHIVE) return 0;
+  cf->n += (curl_off_t)real;
+  return fwrite(ptr, 1, real, cf->fp);
 }
 
 /* A statically linked release binary carries the CA-bundle path of the distro
@@ -368,8 +378,9 @@ static bool download_file(const char *url, const char *outfile) {
     return false;
   }
   curl_common(h, url);
+  capped_file_t cf = {fp, 0};
   curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_file_callback);
-  curl_easy_setopt(h, CURLOPT_WRITEDATA, fp);
+  curl_easy_setopt(h, CURLOPT_WRITEDATA, &cf);
   curl_easy_setopt(h, CURLOPT_MAXFILESIZE_LARGE,
                    (curl_off_t)HUB_UPDATE_MAX_ARCHIVE);
   CURLcode res = curl_easy_perform(h);
@@ -453,15 +464,29 @@ const char *hub_update_bot_root(void) {
   return HUB_BOT_RELEASE_BASE;
 }
 
+/* An https:// URL whose host is exactly github.com, githubusercontent.com or
+ * a subdomain of it (raw. for manifests; downloads redirect to objects.).
+ * "Contains github.com" let https://evil.example/github.com through; userinfo
+ * (github.com@evil.example) is refused outright. */
+static bool url_host_trusted(const char *url) {
+  if (strncmp(url, "https://", 8) != 0) return false;
+  const char *h = url + 8;
+  size_t n = strcspn(h, "/:?#@");
+  if (h[n] == '@') return false;
+  static const char gh[] = "github.com", ghu[] = "githubusercontent.com";
+  if (n == sizeof(gh) - 1 && strncasecmp(h, gh, n) == 0) return true;
+  if (n == sizeof(ghu) - 1 && strncasecmp(h, ghu, n) == 0) return true;
+  return n > sizeof(ghu) && h[n - sizeof(ghu)] == '.' &&
+         strncasecmp(h + n - (sizeof(ghu) - 1), ghu, sizeof(ghu) - 1) == 0;
+}
+
 static bool validate_url(const char *url) {
   if (!url) return false;
   /* Reject shell metacharacters regardless of source. */
   if (strpbrk(url, ";|&`$")) return false;
   const char *ebase = hub_update_env_base();
   if (ebase && strncmp(url, ebase, strlen(ebase)) == 0) return true;
-  if (strncmp(url, "https://", 8) != 0) return false;
-  return strstr(url, "github.com") != NULL ||
-         strstr(url, "githubusercontent.com") != NULL;
+  return url_host_trusted(url);
 }
 
 /* Keep [A-Za-z0-9._-]; the result must end in ".tar.gz". */
@@ -1235,10 +1260,10 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
   /* Run the NEW binary's -selftest before anything is swapped: CPU, libraries
    * and this very config, checked by the build that would have to run on
    * them; a source build is checked by the script.  A target older than
-   * MESH_MIN_VERSION cannot read this config (PBKDF2 600k) at all. */
+   * MESH_MIN_VERSION would be refused by every peer and bot. */
   if (hub_update_version_cmp(target_ver, MESH_MIN_VERSION) < 0) {
     remove(archive);
-    *err = "target predates " MESH_MIN_VERSION " and cannot read this config";
+    *err = "target predates " MESH_MIN_VERSION ", the oldest the mesh links with";
     return false;
   }
   if (strcasecmp(row.kind, "bin") == 0) {

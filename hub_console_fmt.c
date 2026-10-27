@@ -1642,7 +1642,13 @@ static void render_hub_show(const fmt_ctx_t *ctx, const crec_t *h, flines_t *out
   fmt_card_line(ctx, out, L, "key", rvs(h, "fp") ? rv(h, "fp") : GL(G_DASH), RL_NORMAL);
   snprintf(v, sizeof(v), "ssh-ed25519 %s", rvs(h, "ssh_fp") ? rv(h, "ssh_fp") : "?");
   fmt_card_line(ctx, out, L, "ssh host key", v, RL_NORMAL);
-  snprintf(v, sizeof(v), "%lld / %lld up", rvi(h, "peers_up", 0), rvi(h, "peers", 0));
+  /* direct links (with the total only when some are down), then the mesh */
+  const long long pu = rvi(h, "peers_up", 0), pt = rvi(h, "peers", 0);
+  int vn = pu == pt ? snprintf(v, sizeof(v), "%lld linked", pu)
+                    : snprintf(v, sizeof(v), "%lld / %lld linked", pu, pt);
+  if (rv(h, "hubs") && vn > 0 && (size_t)vn < sizeof(v))
+    snprintf(v + vn, sizeof(v) - (size_t)vn, " %s %lld / %lld on the network", GL(G_DOT),
+             rvi(h, "hubs_up", 0), rvi(h, "hubs", 0));
   fmt_card_line(ctx, out, L, "hubs", v, RL_NORMAL);
   snprintf(v, sizeof(v), "%lld here %s %lld / %lld on the network", rvi(h, "bots_here", 0),
            GL(G_DOT), rvi(h, "bots_online", 0), rvi(h, "bots", 0));
@@ -1660,8 +1666,8 @@ static void render_hub_show(const fmt_ctx_t *ctx, const crec_t *h, flines_t *out
   fmt_card_line(ctx, out, L, "give to", v, RL_DIM);
   static const char *const known[] = {"name", "uuid", "ver", "base", "started", "bind_ip", "port",
                                       "pending_bind_ip", "pending_port", "key", "fp", "ssh_fp",
-                                      "peers_up", "peers", "bots_here", "bots_online", "bots",
-                                      "autopurge", "log_file", "log_console", "log_size", NULL};
+                                      "peers_up", "peers", "hubs_up", "hubs", "bots_here",
+                                      "bots_online", "bots", "autopurge", "log_file", "log_console", "log_size", NULL};
   unknown_keys(ctx, out, h, known, L);
 }
 
@@ -1705,6 +1711,8 @@ static const struct {
   {"conn", "perip", "connections at once from one address, bots, hubs and SSH (2-64)"},
   {"conn", "churn", "new connections per address, N:S[:B], then blocked B seconds"},
   {"conn", "authfail", "failed logins per address, N:S[:B], then blocked B seconds"},
+  {"conn", "startups", "logins in progress, S:R[:F]: from S, unknown addresses refused R%, "
+   "rising to all at F"},
 };
 
 static void render_limits(const fmt_ctx_t *ctx, const crec_t *h, flines_t *out) {
@@ -1734,7 +1742,7 @@ static void render_limits(const fmt_ctx_t *ctx, const crec_t *h, flines_t *out) 
   tbl_free(&t);
   rule_line(ctx, out);
   line(out, RL_DIM, "  a change applies to the next connection; logins in progress keep theirs");
-  hint(out, conn ? "hub set conn <perip|churn|authfail> <value|default>"
+  hint(out, conn ? "hub set conn <perip|churn|authfail|startups> <value|default>"
                  : "hub set ssh <name> <value|default> · hub set conn shows the shared limits");
 }
 
@@ -1920,6 +1928,7 @@ static const char *const OPNAME[256] = {
  [0x74] = "CMD_CHAN_ELECT_DONE", [0x75] = "CMD_ADMIN_INVITE_USER",
  [0x76] = "CMD_ADMIN_CHAN_MODE", [0x77] = "CMD_ADMIN_CHAN_SET", [0x78] = "CMD_ADMIN_BAN",
  [0x79] = "CMD_ADMIN_NET_SET", [0x7A] = "CMD_ADMIN_SET_SSH", [0x7B] = "CMD_CHAN_EVENT", [0x7C] = "CMD_ADMIN_USER_ACCESS", [0x7D] = "CMD_USER_CHAN_REQUEST", [0x7E] = "CMD_USER_CHAN_RESULT", [0x7F] = "CMD_BOT_RETIRE", [0x80] = "CMD_BOT_RETIRE_ACK", [0x81] = "CMD_ADMIN_LIST_REVOKED", [0x82] = "CMD_ADMIN_PEER_REFS",
+ [0x83] = "CMD_LINK_SEQ",
 };
 
 static unsigned long long rvu(const crec_t *r, const char *k) {
@@ -3135,6 +3144,11 @@ static int node_rank(const char *st) {
   return 4;
 }
 
+/* A status row's group: a node already on the target sits with the done. */
+static int upg_row_rank(const crec_t *n) {
+  return rvb(n, "already") ? 3 : node_rank(rv(n, "state"));
+}
+
 /* "2.4.8 → 2.5.0 → 2.5.1" from a plan record's <p>_from / <p>_path. */
 static void plan_path_line(const fmt_ctx_t *ctx, const crec_t *pl, const char *p, char *out,
                            size_t cap) {
@@ -3241,14 +3255,22 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
   if (sel > 0) snprintf(v, sizeof(v), "%lld node%s named", sel, sel == 1 ? "" : "s");
   else snprintf(v, sizeof(v), "no (whole network)");
   fmt_card_line(ctx, out, L, "selective", v, RL_NORMAL);
-  int done = 0, failed = 0, waiting = 0, total = 0;
+  /* A hub a bots-only run never moves (idle) is not part of the count or the
+   * table -- one line says how many relayed it; a node already on the target
+   * (already) is a no-op, counted apart from the failures. */
+  int done = 0, already = 0, failed = 0, waiting = 0, total = 0, idle = 0;
   for (int i = 0; i < rep->n; i++) {
     const crec_t *n = &rep->r[i];
     if (strcmp(n->type, "node")) continue;
-    int k = node_rank(rv(n, "state"));
+    if (rvb(n, "idle")) {
+      idle++;
+      continue;
+    }
+    int k = upg_row_rank(n);
     if (k == 4) continue;
     total++;
-    if (k == 3) done++;
+    if (rvb(n, "already")) already++;
+    else if (k == 3) done++;
     else if (k == 1) failed++;
     else waiting++;
   }
@@ -3256,10 +3278,16 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
   int bar = 24, fill = total ? done * bar / total : 0;
   sb_rep(&s, GL(G_FULL), fill);
   sb_rep(&s, GL(G_EMPTY), bar - fill);
-  sb_addf(&s, "  %d / %d done %s %d failed %s %d waiting", done, total, GL(G_DOT), failed, GL(G_DOT),
-          waiting);
+  sb_addf(&s, "  %d / %d done", done, total);
+  if (already) sb_addf(&s, " %s %d already on it", GL(G_DOT), already);
+  sb_addf(&s, " %s %d failed %s %d waiting", GL(G_DOT), failed, GL(G_DOT), waiting);
   fmt_card_line(ctx, out, L, "progress", s.p, RL_NORMAL);
   sb_free(&s);
+  if (idle) {
+    snprintf(v, sizeof(v), "not moving: %d hub%s relayed the run to %s bots", idle,
+             idle == 1 ? "" : "s", idle == 1 ? "its" : "their");
+    fmt_card_line(ctx, out, L, "hubs", v, RL_NORMAL);
+  }
   if (ru) fmt_card_line(ctx, out, L, "roll-up", plan, RL_NORMAL);
   if (rvs(r, "summary")) fmt_card_line(ctx, out, L, "summary", rv(r, "summary"), RL_NORMAL);
   if (rvb(r, "frozen")) fmt_card_line(ctx, out, L, "frozen", "yes (until the run ends)", RL_WARN);
@@ -3270,15 +3298,16 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
   for (int rank = 0; rank <= 4; rank++)
     for (int i = 0; i < rep->n; i++) {
       const crec_t *n = &rep->r[i];
-      if (strcmp(n->type, "node") || node_rank(rv(n, "state")) != rank) continue;
+      if (strcmp(n->type, "node") || rvb(n, "idle") || upg_row_rank(n) != rank) continue;
       char code[32];
       if (rvs(n, "want")) snprintf(code, sizeof(code), "%s %s %s", rvs(n, "base") ? rv(n, "base") : "?",
                                    GL(G_ARROW), rv(n, "want"));
       else snprintf(code, sizeof(code), "%s", rvs(n, "base") ? rv(n, "base") : "");
+      const char *st = rvb(n, "already") ? "on target" : rv(n, "state");
       const char *cells[8] = {rv(n, "kind"), rvs(n, "name") ? rv(n, "name") : rv(n, "uuid"),
-                              rv(n, "state"), rv(n, "from"), rv(n, "to"), code, rv(n, "uuid"),
+                              st, rv(n, "from"), rv(n, "to"), code, rv(n, "uuid"),
                               rv(n, "reason")};
-      tbl_row(ctx, &t, rank == 1 ? RL_WARN : rank == 4 ? RL_DIM : RL_NORMAL, rv(n, "state"), cells);
+      tbl_row(ctx, &t, rank == 1 ? RL_WARN : rank == 4 ? RL_DIM : RL_NORMAL, st, cells);
     }
   if (t.nr) {
     flines_add(out, RL_NORMAL, "");
@@ -3313,9 +3342,10 @@ static int ver_cmp(const char *a, const char *b) {
   return 0;
 }
 
-/* Only the releases newer than the oldest version a node of that product
- * runs: those are the ones a run can still move a node to.  The nodes list
- * below shows what each node runs. */
+/* Only the releases at or above the oldest version a node of that product
+ * runs: those are the ones a run can still move a node to — the running one
+ * included, which is what a switch between the C and Rust builds (name=c /
+ * name=rs) targets.  The nodes list below shows what each node runs. */
 static void render_upg_releases(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   for (int prod = 0; prod < 2; prod++) {
     const char *p = prod == 0 ? "bot" : "hub";
@@ -3336,7 +3366,7 @@ static void render_upg_releases(const fmt_ctx_t *ctx, const creply_t *rep, fline
       const crec_t *r = &rep->r[i];
       if (strcmp(r->type, "rel") || !rv(r, "product") || strcmp(rv(r, "product"), p)) continue;
       listed++;
-      if (oldest && rv(r, "ver") && ver_cmp(rv(r, "ver"), oldest) <= 0) continue;
+      if (oldest && rv(r, "ver") && ver_cmp(rv(r, "ver"), oldest) < 0) continue;
       char bases[32];
       snprintf(bases, sizeof(bases), "%s", rv(r, "bases") ? rv(r, "bases") : "");
       sb_t bb = {0};
@@ -3346,7 +3376,7 @@ static void render_upg_releases(const fmt_ctx_t *ctx, const creply_t *rep, fline
       sb_free(&bb);
     }
     if (t.nr) tbl_render(ctx, out, &t);
-    else if (listed) line(out, RL_DIM, "  (none newer than %s, the oldest %s version running)", oldest, p);
+    else if (listed) line(out, RL_DIM, "  (none at or above %s, the oldest %s version running)", oldest, p);
     else line(out, RL_DIM, "  (no releases listed)");
     if (t.nr && listed > t.nr)
       line(out, RL_DIM, "  %d older release%s not shown (every %s runs %s or later)", listed - t.nr,
@@ -3392,6 +3422,7 @@ static void render_upg_releases(const fmt_ctx_t *ctx, const creply_t *rep, fline
   tbl_render(ctx, out, &t);
   tbl_free(&t);
   line(out, RL_DIM, "  start a run: upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>]");
+  line(out, RL_DIM, "  switch a node between the C and Rust builds: nodes=<name>=c or nodes=<name>=rs");
 }
 
 static void render_upg_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {

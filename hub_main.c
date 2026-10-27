@@ -436,13 +436,14 @@ static void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
         }
     }
 
-    unsigned char enc[MAX_BUFFER];
+    /* enc[0..3] is the frame length: the frame goes out in one write */
+    unsigned char enc[4 + MAX_BUFFER];
     static const unsigned char PEER_INFO[] = "irchub-peer-session-v1";
     const unsigned char *seal_target = peer->x25519_pub;
     int enc_len = hub_seal_send(seal_target,
                                 pack, msg_len + 1,
                                 PEER_INFO, sizeof(PEER_INFO) - 1,
-                                enc, sizeof(enc), c->session_key);
+                                enc + 4, sizeof(enc) - 4, c->session_key);
     secure_wipe(pack, sizeof(pack));
 
     if (enc_len <= 0) {
@@ -452,8 +453,8 @@ static void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
     }
 
     uint32_t net_len = htonl((uint32_t)enc_len);
-    if (write(c->fd, &net_len, 4) != (ssize_t)4 ||
-        write(c->fd, enc, (size_t)enc_len) != (ssize_t)enc_len) {
+    memcpy(enc, &net_len, 4);
+    if (write(c->fd, enc, (size_t)(4 + enc_len)) != (ssize_t)(4 + enc_len)) {
         hub_log_warning("[PEER] Handshake write failed\n");
         hub_disconnect_client(state, c);
         return;
@@ -469,6 +470,7 @@ static void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
         return;
     }
     hub_log_info("[PEER] Handshake complete with %s\n", c->ip);
+    hub_link_offer(state, c, peer->uuid);
     /* If this process is the product of an upgrade a peer drove, close that
      * run out now that there is a peer to tell (no-op otherwise). */
     hub_upgrade_report_pending(state, c);
@@ -494,31 +496,10 @@ static void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
     hub_activity_send_bans(state, c);
 }
 
-static bool send_ping(hub_client_t *c) {
-    unsigned char buffer[MAX_BUFFER];
-    unsigned char plain[16];
-    unsigned char tag[GCM_TAG_LEN];
-    
-    plain[0] = CMD_PING;
-    uint32_t zero = 0;
-    memcpy(&plain[1], &zero, 4);
-    
-    int enc_len = aes_gcm_encrypt(plain, 5, c->session_key, buffer + 4, tag);
-    if (enc_len > 0) {
-        memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-        int packet_len = enc_len + GCM_TAG_LEN;
-        uint32_t net_len = htonl((uint32_t)packet_len);
-        memcpy(buffer, &net_len, 4);
-        
-        ssize_t sent = send(c->fd, buffer, (size_t)(4 + packet_len), MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (sent != (ssize_t)(4 + packet_len)) {
-            if (IO_WOULD_BLOCK(errno)) {
-                return true; // peer send buffer full but connection alive; skip ping
-            }
-            return false;
-        }
-    }
-    return true;
+/* Queued like every frame after the handshake: a ping sent straight to the
+ * socket landed inside a part-sent sync frame and broke the link. */
+static bool send_ping(hub_state_t *state, hub_client_t *c) {
+    return hub_client_send(state, c, CMD_PING, NULL);
 }
 
 static void hub_maintenance(hub_state_t *state) {
@@ -641,6 +622,16 @@ static void hub_maintenance(hub_state_t *state) {
                 i--;
                 continue;
             }
+            /* Output queued and none of it taken for WRITE_STALL_TIMEOUT: the
+             * other end stopped reading (14b).  It reconnects once healthy. */
+            if (peer_has_pending_writes(c) && c->write_wait_since > 0 &&
+                (now - c->write_wait_since) > WRITE_STALL_TIMEOUT) {
+                hub_log_warning("[HUB] %s took no output for %lds — dropping\n",
+                                hub_who_client(state, c), (long)(now - c->write_wait_since));
+                hub_disconnect_client(state, c);
+                i--;
+                continue;
+            }
             /* D4: reap connections that never authenticated within the pre-auth
              * window. Uses connected_at (not last_seen) so a slowloris that
              * dribbles bytes to keep last_seen fresh is still dropped. Outbound
@@ -649,8 +640,8 @@ static void hub_maintenance(hub_state_t *state) {
             if (!c->authenticated && c->type != CLIENT_HUB &&
                 (now - c->connected_at) > PREAUTH_TIMEOUT_SEC) {
                 if (c->bot_auth_state == BOT_AUTH_QUARANTINE)
-                    hub_log_info("[REVOKE] Revoked bot %s did not answer the wipe (an "
-                                 "older build?); closed\n", c->id);
+                    hub_log_info("[REVOKE] Revoked %s did not answer the wipe (an "
+                                 "older build?); closed\n", hub_who_client(state, c));
                 else
                     hub_log_warning("[HUB] Pre-auth timeout for %s (%lds, no handshake) — "
                             "dropping\n", c->ip, (long)(now - c->connected_at));
@@ -660,14 +651,14 @@ static void hub_maintenance(hub_state_t *state) {
             }
             /* A deleted bot told CMD_BOT_RETIRE that never answered. */
             if (c->retiring && (now - c->retire_sent) > RETIRE_GRACE_SEC) {
-                hub_log_info("[REVOKE] Deleted bot %s did not answer the wipe; closed\n",
-                             c->id);
+                hub_log_info("[REVOKE] Deleted %s did not answer the wipe; closed\n",
+                             hub_who_client(state, c));
                 hub_disconnect_client(state, c);
                 i--;
                 continue;
             }
             if (c->authenticated && (now - c->last_seen) > PING_INTERVAL) {
-                if (!send_ping(c)) {
+                if (!send_ping(state, c)) {
                     hub_log_warning("[HUB] Ping failed to %s. Disconnecting.\n", c->ip);
                     hub_disconnect_client(state, c);
                     i--;
@@ -678,6 +669,8 @@ static void hub_maintenance(hub_state_t *state) {
     }
 }
 
+static bool peer_dialing(const hub_state_t *state, const char *uuid);
+
 static void hub_check_peers(hub_state_t *state) {
     time_t now = time(NULL);
 
@@ -685,61 +678,123 @@ static void hub_check_peers(hub_state_t *state) {
     state->last_peer_check = now;
 
     for (int i = 0; i < state->peer_count; i++) {
-        if (!state->peers[i].connected) {
-            hub_log_debug("[PEER] Attempting to connect to %s:%d...\n", 
-                   state->peers[i].ip, state->peers[i].port);
-            
-            int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-            if (sockfd < 0) continue;
+        if (state->peers[i].connected || peer_dialing(state, state->peers[i].uuid))
+            continue;
+        hub_log_debug("[PEER] Attempting to connect to %s:%d...\n",
+                      state->peers[i].ip, state->peers[i].port);
 
-            struct timeval timeout;
-            timeout.tv_sec = CONNECT_TIMEOUT;
-            timeout.tv_usec = 0;
-            
-            if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
-                          sizeof(timeout)) < 0) {
-                hub_log_error("[HUB] setsockopt failed\n");
-            }
-
-            struct sockaddr_in peer_addr;
-            peer_addr.sin_family = AF_INET;
-            peer_addr.sin_port = htons((uint16_t)state->peers[i].port);
-            inet_pton(AF_INET, state->peers[i].ip, &peer_addr.sin_addr);
-
-            if (connect(sockfd, (struct sockaddr*)&peer_addr, sizeof(peer_addr)) == 0) {
-                if (state->client_count < MAX_CLIENTS) {
-                    hub_client_t *c = calloc(1, sizeof(hub_client_t));
-                    /* D2: outbound peers immediately exchange bulk anti-entropy
-                     * sync, so allocate full-size buffers up front. */
-                    if (!c || !hub_client_alloc_buffers(c, MAX_BUFFER)) {
-                        free(c);
-                        close(sockfd);
-                        continue;
-                    }
-
-                    c->fd = sockfd;
-                    c->conn_serial = hub_next_conn_serial();
-                    snprintf(c->ip, sizeof(c->ip), "%s", state->peers[i].ip);
-                    c->type = CLIENT_HUB;
-                    c->last_seen = time(NULL);
-                    c->connected_at = c->last_seen;  /* D4 (exempt: CLIENT_HUB) */
-                    c->last_pong_sent = 0;
-                    state->clients[state->client_count++] = c;
-                    
-                    state->peers[i].connected = true;
-                    state->peers[i].fd = sockfd;
-                    state->mesh_state_dirty = true;
-                    hub_peer_handshake(state, c, &state->peers[i]);
-                } else {
-                    close(sockfd);
-                    hub_log_warning("[PEER] Client limit reached.\n");
-                }
-            } else {
-                hub_log_warning("[PEER] Failed to connect to %s:%d\n", 
-                       state->peers[i].ip, state->peers[i].port);
-                close(sockfd);
-            }
+        /* Review 16: non-blocking, finished by hub_finish_dials from the
+         * main loop; a blocking connect() froze the hub for up to
+         * CONNECT_TIMEOUT per unreachable peer. */
+        int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd < 0) continue;
+        int fl = fcntl(sockfd, F_GETFL, 0);
+        if (fl < 0 || fcntl(sockfd, F_SETFL, fl | O_NONBLOCK) < 0) {
+            close(sockfd);
+            continue;
         }
+
+        struct sockaddr_in peer_addr;
+        memset(&peer_addr, 0, sizeof(peer_addr));
+        peer_addr.sin_family = AF_INET;
+        peer_addr.sin_port = htons((uint16_t)state->peers[i].port);
+        if (inet_pton(AF_INET, state->peers[i].ip, &peer_addr.sin_addr) != 1) {
+            hub_log_warning("[PEER] Bad address %s for peer %s\n", state->peers[i].ip,
+                            hub_who(state, 'h', state->peers[i].uuid));
+            close(sockfd);
+            continue;
+        }
+        if (connect(sockfd, (struct sockaddr *)&peer_addr, sizeof(peer_addr)) != 0 &&
+            errno != EINPROGRESS) {
+            hub_log_warning("[PEER] Failed to connect to %s:%d\n",
+                            state->peers[i].ip, state->peers[i].port);
+            close(sockfd);
+            continue;
+        }
+        if (state->client_count >= MAX_CLIENTS) {
+            close(sockfd);
+            hub_log_warning("[PEER] Client limit reached.\n");
+            continue;
+        }
+        hub_client_t *c = calloc(1, sizeof(hub_client_t));
+        /* D2: outbound peers immediately exchange bulk anti-entropy sync, so
+         * allocate full-size buffers up front. */
+        if (!c || !hub_client_alloc_buffers(c, MAX_BUFFER)) {
+            free(c);
+            close(sockfd);
+            continue;
+        }
+        c->fd = sockfd;
+        c->conn_serial = hub_next_conn_serial();
+        snprintf(c->ip, sizeof(c->ip), "%s", state->peers[i].ip);
+        c->type = CLIENT_HUB;
+        /* Named as an inbound peer is once it authenticates, so what logs a
+         * link's id names this one too. */
+        snprintf(c->id, sizeof(c->id), "%s",
+                 state->peers[i].friendly_name[0] ? state->peers[i].friendly_name : "HUB-PEER");
+        c->last_seen = now;
+        c->connected_at = now;  /* D4 (exempt: CLIENT_HUB) */
+        c->dialing = true;
+        c->dial_started = now;
+        snprintf(c->dial_uuid, sizeof(c->dial_uuid), "%s", state->peers[i].uuid);
+        state->clients[state->client_count++] = c;
+    }
+}
+
+/* A dial to the peer with this uuid is in flight. */
+static bool peer_dialing(const hub_state_t *state, const char *uuid) {
+    for (int i = 0; i < state->client_count; i++)
+        if (state->clients[i]->dialing && strcmp(state->clients[i]->dial_uuid, uuid) == 0)
+            return true;
+    return false;
+}
+
+/* Review 16: finish the dials hub_check_peers started.  Writable means the
+ * connect() is done: SO_ERROR says how.  Up, the socket goes back to
+ * blocking with the SO_SNDTIMEO the old blocking dial had (everything after
+ * the connect is as before) and the HUBv3 handshake runs, unless the peer
+ * linked to us meanwhile (then this dial is not needed).  Past
+ * CONNECT_TIMEOUT it is given up, as the blocking connect gave up. */
+static void hub_finish_dials(hub_state_t *state, fd_set *write_fds) {
+    time_t now = time(NULL);
+    for (int i = 0; i < state->client_count; i++) {
+        hub_client_t *c = state->clients[i];
+        if (!c->dialing) continue;
+        int p = -1;
+        for (int k = 0; k < state->peer_count && p < 0; k++)
+            if (strcmp(state->peers[k].uuid, c->dial_uuid) == 0) p = k;
+        bool ready = fd_isset(c->fd, write_fds);
+        if (!ready && now - c->dial_started <= CONNECT_TIMEOUT && p >= 0) continue;
+        int err = 0;
+        socklen_t el = sizeof(err);
+        if (ready && getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0) err = errno;
+        c->dialing = false;
+        if (p < 0 || state->peers[p].connected) {
+            /* the peer was deleted, or it linked to us first */
+            hub_disconnect_client(state, c);
+            i--;
+            continue;
+        }
+        if (!ready || err != 0) {
+            hub_log_warning("[PEER] Failed to connect to %s:%d%s%s\n", state->peers[p].ip,
+                            state->peers[p].port, ready ? ": " : " (timed out)",
+                            ready ? strerror(err) : "");
+            hub_disconnect_client(state, c);
+            i--;
+            continue;
+        }
+        int fl = fcntl(c->fd, F_GETFL, 0);
+        struct timeval timeout = {CONNECT_TIMEOUT, 0};
+        if (fl < 0 || fcntl(c->fd, F_SETFL, fl & ~O_NONBLOCK) < 0 ||
+            setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0)
+            hub_log_error("[HUB] socket options failed for %s\n", c->ip);
+        c->last_seen = now;
+        state->peers[p].connected = true;
+        state->peers[p].fd = c->fd;
+        state->mesh_state_dirty = true;
+        int before = state->client_count;
+        hub_peer_handshake(state, c, &state->peers[p]);
+        if (state->client_count < before) i--;  /* the handshake dropped it */
     }
 }
 
@@ -1045,6 +1100,7 @@ static int run_identity(hub_state_t *state, char *password) {
     bool ok = hub_config_load(state, password);
     secure_wipe(password, MAX_PASS);
     OPENSSL_cleanse(state->config_pass, sizeof(state->config_pass));
+    hub_config_key_forget(state);
     /* The public key is derived from the private key, not taken from the
      * stored pub| copy: that is what peers and bots must pin. */
     unsigned char priv64[64], pub64[64];
@@ -1192,6 +1248,7 @@ int main(int argc, char *argv[]) {
         bool ok = hub_config_load(&state, pw);
         secure_wipe(pw, sizeof(pw));
         OPENSSL_cleanse(state.config_pass, sizeof(state.config_pass));
+        hub_config_key_forget(&state);
         OPENSSL_cleanse(state.hub_ed25519_priv, sizeof(state.hub_ed25519_priv));
         OPENSSL_cleanse(state.hub_x25519_priv, sizeof(state.hub_x25519_priv));
         if (!ok) {
@@ -1417,6 +1474,7 @@ int main(int argc, char *argv[]) {
 
         hub_config_write(&state);
         secure_wipe(state.config_pass, sizeof(state.config_pass));
+        hub_config_key_forget(&state);
         printf("Done.\n");
 
         secure_wipe(state.hub_ed25519_priv, 32);
@@ -1476,10 +1534,6 @@ int main(int argc, char *argv[]) {
 
     if (identity_mode) return run_identity(&state, _hub_plain_pass);
 
-    /* The pre-2.5.0 pass file 2.5.0 kept for its own rollback: nothing reads
-     * it any more. */
-    remove(HUB_PASS_PREV_FILE);
-
     fflush(stdout); /* or the buffered lines are written again by the fork */
     daemonize();
 
@@ -1531,6 +1585,7 @@ int main(int argc, char *argv[]) {
     if (!hub_config_load(&state, _hub_plain_pass)) {
         secure_wipe(_hub_plain_pass, sizeof(_hub_plain_pass));
         OPENSSL_cleanse(state.config_pass, sizeof(state.config_pass));
+        hub_config_key_forget(&state);
         printf("Config load failed. Run -setup.\n");
         if (log_fp) fprintf(log_fp, "Config load failed.\n");
         remove(HUB_PID_FILE);
@@ -1630,6 +1685,12 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < state.client_count; i++) {
             hub_client_t *c = state.clients[i];
             if (c->fd > 0) {
+                /* A dial in flight: only its writability (hub_finish_dials). */
+                if (c->dialing) {
+                    FD_SET(c->fd, &write_fds);
+                    if (c->fd > max_fd) max_fd = c->fd;
+                    continue;
+                }
                 /* Not read until its first bytes are known (see below). */
                 if (c->sniff_pending) {
                     sniffing = true;
@@ -1667,6 +1728,10 @@ int main(int argc, char *argv[]) {
         if (sniffing && tv.tv_usec > 10 * 1000) tv.tv_usec = 10 * 1000;
         if (select(max_fd + 1, &read_fds, &write_fds, NULL, &tv) < 0) continue;
 
+        /* Dials whose connect() finished (or timed out) first: a finished
+         * one is a peer whose handshake goes out now. */
+        hub_finish_dials(&state, &write_fds);
+
         /* ---- Drain writable peers FIRST.  This keeps URGENT op-flow
          * traffic prompt and prevents queues from accumulating across the
          * read pass (which can itself enqueue more outbound traffic). ---- */
@@ -1690,6 +1755,8 @@ int main(int argc, char *argv[]) {
                 if (!check_ip_access_lists(&state, incoming_ip)) {
                     hub_log_warning("[HUB] Connection from %s rejected (access control)\n", incoming_ip);
                     close(new_fd);
+                } else if (!hub_startup_admit(&state, incoming_ip)) {
+                    close(new_fd);   /* logged inside, at most once a minute */
                 } else if (!is_ip_allowed(&state, incoming_ip)) {
                     hub_log_warning("[HUB] Connection from %s rejected (rate limit)\n", incoming_ip);
                     close(new_fd);
@@ -1765,6 +1832,14 @@ int main(int argc, char *argv[]) {
             if (c->fd <= 0 || c->sniff_pending) continue;
 
             if (fd_isset(c->fd, &read_fds)) {
+                /* Frames are consumed by moving recv_off; the buffer is
+                 * compacted only once it has no room left to read into. */
+                if (c->recv_off > 0 && c->recv_len == c->recv_cap) {
+                    memmove(c->recv_buf, c->recv_buf + c->recv_off,
+                            (size_t)(c->recv_len - c->recv_off));
+                    c->recv_len -= c->recv_off;
+                    c->recv_off = 0;
+                }
                 int space = c->recv_cap - c->recv_len;  /* D2: per-client cap */
 
                 if (space > 0) {
@@ -1826,6 +1901,7 @@ int main(int argc, char *argv[]) {
     secure_wipe(state.hub_ed25519_priv, 32);
     secure_wipe(state.hub_x25519_priv,  32);
     OPENSSL_cleanse(state.config_pass,   sizeof(state.config_pass));
+    hub_config_key_forget(&state);
     munlock(state.config_pass, sizeof(state.config_pass));
 
     unlink(HUB_PID_FILE);

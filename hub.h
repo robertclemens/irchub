@@ -61,8 +61,8 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define HEADER_SIZE 4
 #define MAX_PENDING_OP_REQUESTS 500
 /* PBKDF2-HMAC-SHA256 rounds for the .irchub.cnf and .irchub.pass keys
- * (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; releases
- * after it carry min_from 2.5.0, so only this count is read. */
+ * (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; every
+ * release since carries min_from 2.5.0 or later, so only this count is read. */
 #define PBKDF2_ITERATIONS 600000
 /* A bot that knows admin flags and oper channel bindings (uf| / uc|) says
  * "v|3" at the head of its full CMD_CONFIG_PUSH (docs/passwordless.md §3.4);
@@ -72,9 +72,9 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define BOT_PROTO_USER_FLAGS 3
 /* The oldest bot or hub this hub links with (2.5.1 plan D1 / D4): a bot's
  * CMD_BOT_PRESENCE or a direct peer's roster header below it drops the link
- * with a "upgrade it by hand" line.  2.5.0 moved every file to PBKDF2 600k,
- * which is all 2.5.1 reads. */
-#define MESH_MIN_VERSION "2.5.0"
+ * with a "upgrade it by hand" line.  2.5.2 raised it to 2.5.1: every node
+ * reads only PBKDF2 600k files, reports K|, and has dropped .pass.prev. */
+#define MESH_MIN_VERSION "2.5.1"
 #define KEY_FP_LEN 19              /* "ab12:cd34:ef56:7890" */
 #define HUB_PID_FILE ".irchub.pid"
 #define HUB_PASS_FILE ".irchub.pass"
@@ -119,6 +119,21 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define CHURN_WINDOW_SEC 10
 #define CHURN_MAX_CONNS  30
 #define CHURN_BLOCK_SEC  30
+
+/* 13b — connections not yet authenticated (MaxStartups-style random early
+ * drop, `hub set conn startups S:R:F`).  Below S of them every new one is
+ * taken; from S, a new one from an unknown address is refused with
+ * probability R%, rising linearly to 100% at F.  A known address — a
+ * configured peer, a bot in the roster, a bot or peer that authenticated
+ * here within KNOWN_IP_MEMORY, a recent console login — skips the gate, and
+ * so does the rate-limit table being full of live entries, which refuses
+ * an unknown address instead of letting it through untracked. */
+#define STARTUPS_DEF_START 20
+#define STARTUPS_DEF_RATE  30
+#define STARTUPS_DEF_FULL  50
+#define MAX_KNOWN_IPS      256
+#define KNOWN_IP_MEMORY    86400
+#define STARTUP_LOG_EVERY  60     /* one refusal warning per this, with a count */
 /* PURGE loop suppression.  A purge is flooded to every peer and forwarded on,
  * so on a big mesh each hub sees many copies, some of them minutes late when
  * peer queues back up.  An id is random and never reused, so it is remembered
@@ -152,7 +167,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * the Makefile; -D-overridable so a release build can stamp its own version
  * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
 #ifndef HUB_VERSION
-#define HUB_VERSION "2.5.1"
+#define HUB_VERSION "2.5.2"
 #endif
 
 /* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
@@ -203,7 +218,6 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 /* Retained previous binary/config, kept (not deleted) after an upgrade so
  * CMD_UPGRADE_ABORT can put this hub back. */
 #define HUB_UPGRADE_PREV_SUFFIX ".prev"
-#define HUB_PASS_PREV_FILE HUB_PASS_FILE HUB_UPGRADE_PREV_SUFFIX /* 2.5.0's rollback copy: removed at start */
 /* The upgrade script's startup watchdog: how long the new build's daemon has
  * to be up and alive before the script keeps it (see write_upgrade_script). */
 #define UPGRADE_WATCH_SECS 20
@@ -388,10 +402,9 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  *   DO         hub->bot  eid|kind|channel|requester|nick|hostmask
  *   DONE       bot->hub  eid|ok|detail or eid|fail|detail
  *   ELECT_FWD  hub->hub  eid|origin_hub|kind|channel|requester|nick|hostmask|origin_ts
- *   ELECT_ACK  hub->hub  eid|hub_uuid|hub_name|asked|ready|silent (silent: 0
- *              from 2.5.1; a 2.5.0 hub's count is read and ignored)
- *   ELECT_DO   hub->hub  eid|hub_uuid|elect (a 2.5.0 origin's "legacy" is
- *              ignored)
+ *   ELECT_ACK  hub->hub  eid|hub_uuid|hub_name|asked|ready|0 (the last field
+ *              is a reserved slot, always 0 and never read)
+ *   ELECT_DO   hub->hub  eid|hub_uuid|elect
  *   ELECT_DONE hub->hub  eid|hub_uuid|hub_name|bot_uuid|bot_nick|status|detail
  * kind = op / invite / unban / key; requester = a bot uuid, or ADMIN. */
 #define CMD_CHAN_PROBE       0x6D
@@ -457,6 +470,23 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * hub "<uuid|name>"; the reply names the hubs that link to it and the bots
  * whose hl| list holds it. */
 #define CMD_ADMIN_PEER_REFS    0x82
+/* Review 6: link framing with a sequence (bot<->hub and hub<->hub).  After a
+ * link authenticates each side sends "offer"; the side that sees the other's
+ * offer answers "go", and every frame it seals after its go carries
+ * HUB_LINK_AAD_LEN bytes of AAD: "LNK1" || direction || 64-bit counter (big
+ * endian, from 0, not sent).  The counter makes a replayed or reordered
+ * frame fail its tag, the direction byte a reflected one (H hub->bot, B
+ * bot->hub; between hubs L from the lower uuid, G from the greater).  A
+ * 2.5.1 node ignores the offer and the link keeps the old framing; one that
+ * says it is HUB_LINK_SEQ_VERSION or newer without having offered is dropped
+ * (a stripped offer).  2.5.3 drops the old framing. */
+#define CMD_LINK_SEQ           0x83
+#define HUB_LINK_AAD_LEN 13
+#define HUB_LINK_SEQ_VERSION "2.5.2"
+/* Review 7: ephemeral keys of the HUBv3 hellos accepted in the last
+ * HELLO_SEEN_SECS (the hello's freshness window); a repeat is a replay. */
+#define HELLO_SEEN_MAX  128
+#define HELLO_SEEN_SECS 60
 #define MAX_REVOKED           1024 /* revoke list ceiling; oldest dropped past it */
 #define RETIRE_GRACE_SEC      10   /* s an online bot gets to answer CMD_BOT_RETIRE */
 #define USER_CHAN_RID_MAX     32   /* rid bytes, [A-Za-z0-9-]              */
@@ -506,6 +536,17 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * Payload: id|origin_ts|sender_uuid|target_uuid|cipher:tag */
 #define CMD_BOT_RELAY_FWD 0x65
 #define BOT_RELAY_FWD_TTL 30 /* seconds a forwarded relay stays deliverable */
+/* CMD_BOT_RELAY a local bot may send per second; the rest are dropped.  Each
+ * one not for a local bot goes to every peer, so one bot could fill them. */
+#define BOT_RELAY_PER_SEC 20
+/* A client with output queued that takes no byte of it for this long is
+ * dropped: a bot or peer that stopped reading only looks connected. */
+#define WRITE_STALL_TIMEOUT 60
+/* A full DELTA/BULK lane's drop warning: one line per client this often. */
+#define QUEUE_DROP_LOG_EVERY 60
+/* A bot whose new session replaces a live one more often than this in an
+ * hour is warned about: two processes with one key, or a stolen key. */
+#define BOT_REPLACE_WARN_PER_HOUR 3
 
 /* Drop the roll-up plan mesh-wide.  Every hub that followed a run keeps that
  * run's plan in its own .irchub.cnf (a hub-local `rollup|` line) and walks any
@@ -718,6 +759,11 @@ typedef struct {
 #define MAX_BOT_ENTRIES 64
 
 #define MAX_HUB_USER_RECORDS 40   // max combined admin + oper records
+/* The admin floor (hub_admin_floor_restore): +a removals stamped within
+ * this many seconds of the newest one are one race and are all undone; the
+ * ring of remembered 'a' flag drops. */
+#define ADMIN_FLOOR_WINDOW   60
+#define ADMIN_DROP_LOG       16
 #define MAX_HUB_USER_MASKS   200  // max total usermask records across all users
 /* Admin flags and oper channel bindings (user_flags plan §3.1).  The letters
  * in their canonical order: a full, b bots, c channels, h hub, o opers,
@@ -1203,6 +1249,7 @@ typedef struct {
   int perip;                    /* connections at once from one address      */
   int churn_n, churn_s, churn_block;  /* new connections per window -> block */
   int fail_n, fail_s, fail_block;     /* failed logins per window -> block   */
+  int startups_start, startups_rate, startups_full;  /* 13b random early drop */
 } hub_conn_cfg_t;
 
 /* Built-ins (the former compile-time constants). */
@@ -1327,6 +1374,24 @@ typedef struct {
   client_type_t type;
   time_t last_seen;
   time_t last_pong_sent;
+  time_t relay_window;          /* second the relay count is for         */
+  int relay_count;              /* CMD_BOT_RELAY in that second           */
+  time_t write_wait_since;      /* output queued, no byte taken since     */
+  time_t drop_logged;           /* last queue-drop warning for this client */
+  int drop_unlogged;            /* drops since, not yet in a warning       */
+  bool superseded;              /* a newer session of this bot replaced it */
+  /* Review 6 (CMD_LINK_SEQ): its offer seen, our go queued / sealed, its go
+   * seen; the counters of the frames sealed / opened since. */
+  bool link_offered;
+  bool link_go_queued;
+  char link_dir_tx;             /* direction bytes of our / its frames      */
+  char link_dir_rx;
+  bool link_tx_seq;
+  bool link_rx_seq;
+  uint64_t link_tx_ctr;
+  uint64_t link_rx_ctr;
+  time_t replace_window;        /* start of the hour replace_count is for  */
+  int replace_count;            /* live sessions of this bot replaced      */
   time_t connected_at;             // D4: when the socket was accepted/created
   bool inbound;                    // accepted on the listener (subject to the IP lists)
   /* bot del of this connected bot: CMD_BOT_RETIRE sent at retire_sent; every
@@ -1351,9 +1416,20 @@ typedef struct {
    * handed to the console thread untouched. */
   bool sniff_pending;
   long long sniff_deadline_ms;
+  /* Review 16: an outbound peer link whose non-blocking connect() is still
+   * in flight (since dial_started), to the peer with uuid dial_uuid.  Only
+   * its writability is watched; hub_finish_dials completes it. */
+  bool dialing;
+  time_t dial_started;
+  char dial_uuid[64];
   /* Set by a handler that found this bot or peer below MESH_MIN_VERSION (or
    * a push below BOT_PROTO_USER_FLAGS): the dispatch then drops the link. */
   bool refused;
+  /* A peer whose version is not known yet: no config sync goes to it and
+   * none from it is taken in (hub_peer_enqueue_sync / process_peer_sync)
+   * until its first roster names a version at MESH_MIN_VERSION or newer;
+   * then hub_peer_sync_release sends a full sync and asks for one. */
+  bool sync_held;
   /* CMD_CHAN_EVENT rate limit for this connection (CHAN_EVENT_MAX_PER_WINDOW
    * per CHAN_EVENT_WINDOW seconds); dropped events are counted. */
   time_t chan_ev_window;
@@ -1370,6 +1446,7 @@ typedef struct {
   unsigned char bot_eph_x25519_pub[32];
   bool bot_eph_priv_set;
   int recv_len;
+  int recv_off;                 /* unread data is recv_buf[recv_off..recv_len) */
 
   /* ---- Outbound queue (per-lane FIFOs, drained on POLLOUT) ---- */
   queue_lane_t out_lanes[LANE_COUNT];
@@ -1447,7 +1524,7 @@ typedef struct {
   char uuid[64];
   char name[64];
   int  fd;                               /* the peer its answer came from */
-  int  asked, ready, silent;
+  int  asked, ready;
   bool tried;
 } chan_elect_hub_t;
 
@@ -1570,6 +1647,18 @@ typedef struct {
    * The real defences are OS-level: ptrace_scope, process isolation, and
    * filesystem permissions on the config file itself. */
   char config_pass[128];
+  /* Review 23: the config key, derived once (the load, else the first write)
+   * and reused with the salt it was derived with; every write takes a fresh
+   * IV.  A 600k-round PBKDF2 per write stalled the event loop ~0.5 s.  Reset
+   * by hub_set_config_pass (a new password derives anew); mlock'd with
+   * config_pass, wiped at shutdown. */
+  unsigned char cfg_key[32];
+  unsigned char cfg_key_salt[SALT_SIZE];
+  bool cfg_key_set;
+  /* Review 7: the hello replay cache (HELLO_SEEN_MAX, a ring). */
+  unsigned char hello_seen[HELLO_SEEN_MAX][32];
+  time_t hello_seen_at[HELLO_SEEN_MAX];
+  int hello_seen_next;
 
   unsigned char hub_ed25519_priv[32];
   unsigned char hub_ed25519_pub[32];
@@ -1603,6 +1692,12 @@ typedef struct {
   int mask_record_count;
   hub_uflag_record_t uflag_records[MAX_HUB_USER_FLAGS];
   int uflag_record_count;
+  /* uf| changes that took 'a' away, as (uuid, the new uf| stamp): the uf|
+   * no longer says it held 'a', and the admin floor must know
+   * (hub_admin_floor_restore).  Memory only, a ring. */
+  struct { char uuid[37]; time_t ts; } adrop[ADMIN_DROP_LOG];
+  int adrop_next;
+  bool floor_warned;   /* "no full admin, nothing to restore" logged once */
   hub_uchan_record_t uchan_records[MAX_HUB_CHAN_BINDS];
   int uchan_record_count;
 
@@ -1673,6 +1768,11 @@ typedef struct {
   hub_conn_cfg_t conn_cfg;               /* hub set ssh / hub set conn      */
   ssh_ip_t       ssh_ips[MAX_SSH_IPS];   /* D26: SSH-only failure table     */
   int            ssh_ip_count;
+  /* 13b: addresses a bot or peer authenticated from (hub_known_ip_note). */
+  struct { char ip[64]; time_t last_ok; } known_ips[MAX_KNOWN_IPS];
+  int            known_ip_count;
+  time_t         startup_logged;         /* last refusal warning            */
+  int            startup_unlogged;       /* refusals since, not yet logged  */
 
   int purge_days_setting;  // Days threshold for tombstone purge (0 = disabled)
   time_t purge_days_ts;    // hs|autopurge stamp (LWW across hubs)
@@ -1793,6 +1893,10 @@ bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);
 /* hub_config_write() is a no-op while this is set (-selftest). */
 extern bool g_hub_config_readonly;
+/* true while hub_config_load runs: stamps on disk are this hub's own record
+ * and are kept whatever the clock says (a box booting with its clock in the
+ * past must not drop its config), so hub_ts_ahead lets them through. */
+extern bool g_hub_config_loading;
 
 /* a|/o| record codec (docs/passwordless.md §3.1), shared by config load,
  * peer sync and bot pushes: uuid|name|pubkey|act|seen|ts|.  pubkey may be
@@ -1806,7 +1910,24 @@ int hub_format_user_record(const hub_user_record_t *u, char *buf, size_t len);
  * never replicate (a removed admin staying active elsewhere). */
 static inline time_t hub_lww_next_ts(time_t prev) {
   time_t now = time(NULL);
-  return now > prev ? now : prev + 1;
+  return now > prev ? now : prev < LLONG_MAX ? prev + 1 : prev;
+}
+
+/* A replicated record's stamp may run at most LWW_MAX_FUTURE past this
+ * node's clock.  Linked nodes agree within the 60 s handshake window, so a
+ * stamp beyond it is hostile or broken: refused on every store, it can neither
+ * win LWW for good nor run the stamp arithmetic past LLONG_MAX.  The margin
+ * leaves room for hub_lww_next_ts stepping past now under a burst of edits.
+ * Hub-side only: bots take records from their hub, which already refused. */
+#define LWW_MAX_FUTURE 3600
+static inline bool hub_ts_ahead(time_t ts) {
+  return !g_hub_config_loading && ts > time(NULL) + LWW_MAX_FUTURE;
+}
+
+/* t + d for stamp arithmetic, stopping at LLONG_MAX (a stamp loaded from a
+ * config written before LWW_MAX_FUTURE may sit there). */
+static inline time_t hub_ts_add(time_t t, time_t d) {
+  return t > LLONG_MAX - d ? LLONG_MAX : t + d;
 }
 
 /* LWW acceptance for a replicated add/del record: a strictly newer stamp wins,
@@ -1818,6 +1939,7 @@ static inline time_t hub_lww_next_ts(time_t prev) {
  * Mirrored in ircbot bot.h (lww_accepts) -- the rule must match on both. */
 static inline bool hub_lww_accepts(time_t in_ts, bool in_active,
                                    time_t cur_ts, bool cur_active) {
+  if (hub_ts_ahead(in_ts)) return false;
   return in_ts > cur_ts || (in_ts == cur_ts && cur_active && !in_active);
 }
 
@@ -1827,6 +1949,7 @@ static inline bool hub_lww_accepts(time_t in_ts, bool in_active,
  * policy.  Mirrored in ircbot bot.h (opt_accepts). */
 static inline bool hub_opt_accepts(time_t in_ts, const char *in_flags,
                                    time_t cur_ts, const char *cur_flags) {
+  if (hub_ts_ahead(in_ts)) return false;
   return in_ts > cur_ts ||
          (in_ts == cur_ts && strcmp(in_flags, cur_flags) > 0);
 }
@@ -1882,9 +2005,19 @@ int aes_gcm_decrypt(const unsigned char *input, int input_len,
 int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
                     const unsigned char *key, unsigned char *output,
                     unsigned char *tag);
+int aes_gcm_decrypt_aad(const unsigned char *input, int input_len,
+                        const unsigned char *aad, int aad_len,
+                        const unsigned char *key, unsigned char *output,
+                        unsigned char *tag);
+int aes_gcm_encrypt_aad(const unsigned char *plain, int plain_len,
+                        const unsigned char *aad, int aad_len,
+                        const unsigned char *key, unsigned char *output,
+                        unsigned char *tag);
 
 // Rate limiting and IP access control functions
 bool is_ip_allowed(hub_state_t *state, const char *ip);
+bool hub_startup_admit(hub_state_t *state, const char *ip);
+void hub_known_ip_note(hub_state_t *state, const char *ip);
 /* D2: allocate a client's recv/writing buffers at `size` (and writing at
  * size+64). Returns false on OOM. Used at accept/connect time. */
 bool hub_client_alloc_buffers(hub_client_t *c, int size);
@@ -1914,6 +2047,19 @@ bool hub_parse_uint(const char *s, unsigned long max, unsigned long *out);
  * a whole record ("x|203.0.113.77|0" after a newline).  Applied to
  * SET_HUB_NAME, the setup wizard and names learned from peers. */
 bool hub_name_valid(const char *name);
+/* "8-4-4-4-12" hex: the shape of every node and user uuid. */
+bool hub_uuid_shape(const char *u);
+/* Log labels (any log line naming a node or user by uuid names it too):
+ * "bot bunny_ (<uuid>)", "hub hubtbl (<uuid>)", "admin robert (<uuid>)",
+ * "oper x (<uuid>)"; a name nobody knows reads "?", so "bot ? (<uuid>)".
+ * kind: 'b' bot, 'h' hub, 'u' admin/oper, 0 = whichever knows the uuid.
+ * hub_who_client labels a connection: a bot by its uuid, a peer by its name
+ * and uuid, a console by its admin.  Both return one of HUB_WHO_SLOTS
+ * rotating thread-local buffers, so one log line can carry several labels. */
+#define HUB_WHO_SLOTS 4
+#define HUB_WHO_MAX   160
+const char *hub_who(const hub_state_t *state, char kind, const char *uuid);
+const char *hub_who_client(const hub_state_t *state, const hub_client_t *c);
 /* list: 'w' (allow) or 'x' (deny).  Add refuses a duplicate (same network
  * and prefix) or a full list; remove matches the same way. */
 typedef enum { IP_ACL_ADDED, IP_ACL_DUPLICATE, IP_ACL_FULL, IP_ACL_BAD_LIST } ip_acl_add_t;
@@ -2153,28 +2299,26 @@ const char *hub_user_flags(hub_state_t *state, const char *uuid);
 bool hub_user_has_flag(hub_state_t *state, const char *uuid, char flag);
 bool hub_user_chan_ok(hub_state_t *state, const char *uuid, const char *chan);
 int hub_user_chan_count(hub_state_t *state, const char *uuid, bool *global);
-bool hub_user_restricted(hub_state_t *state, const hub_user_record_t *u);
 int hub_format_uflag(const hub_uflag_record_t *r, char *buf, size_t cap);
 int hub_format_uchan(const hub_uchan_record_t *r, char *buf, size_t cap);
 bool hub_access_ingest(hub_state_t *state, char kind, const char *body, bool need_user,
                        bool *changed);
 int hub_access_migrate(hub_state_t *state);
+/* After a peer sync or bot push: no active admin holding +a → undo the +a
+ * removals of the race.  Returns the sync lines for the peers (malloc'd) or
+ * NULL; *restored = admins brought back.  from labels the log line. */
+char *hub_admin_floor_restore(hub_state_t *state, const char *from, int *restored);
 void hub_access_remap_uuid(hub_state_t *state, const char *from, const char *to);
 void hub_access_prune(hub_state_t *state);
 int hub_access_purge(hub_state_t *state, time_t cutoff);
 bool hub_access_append(hub_state_t *state, char *buf, int cap, int *off,
                        bool (*keep)(hub_state_t *, const char *uuid, void *), void *arg);
-time_t hub_access_user_ts(hub_state_t *state, const hub_user_record_t *u);
-int hub_format_user_for_old(hub_state_t *state, const hub_user_record_t *u, bool tomb,
-                            char *buf, size_t cap);
-bool hub_access_from_old_ok(hub_state_t *state, const char *uuid);
-char *hub_access_downgrade(hub_state_t *state, const char *payload, bool tomb);
 void hub_user_chans(hub_state_t *state, const char *uuid, char *out, size_t cap);
 time_t hub_access_next_ts(hub_state_t *state, const char *uuid);
 int hub_access_chan_change(hub_state_t *state, const char *uuid, bool add, const char *chan,
                            char *out, size_t cap);
-/* hub_logic.c: one sync payload onto peer c's queue, downgraded for a peer
- * that does not know uf| / uc| (every sync to a peer goes through it). */
+/* hub_logic.c: one sync payload onto peer c's queue, or held while c's
+ * version is not known (every sync to a peer goes through it). */
 void hub_peer_enqueue_sync(hub_state_t *state, hub_client_t *c, uint8_t op, lane_t lane,
                            const char *payload, const char *coalesce, uint64_t seq);
 
@@ -2322,6 +2466,10 @@ void queued_msg_free(queued_msg_t *m);
  * passed-in m).  Returns true on success.  On URGENT lane overflow, returns
  * false and the caller should treat the peer as failed. */
 bool peer_enqueue(hub_client_t *peer, queued_msg_t *m);
+/* A frame to a linked bot or peer: LANE_URGENT, drained at once (never a
+ * direct write).  false = not queued. */
+bool hub_client_send(hub_state_t *state, hub_client_t *c, uint8_t cmd,
+                     const char *payload);
 
 /* Drain queued messages to the socket; called when select() reports
  * writable.  Encrypts each message with peer->session_key just before send,
@@ -2393,6 +2541,8 @@ bool hub_console_ssh_admit(hub_state_t *state, const char *ip);
 void hub_console_note_login(hub_state_t *state, const char *name, const char *ip);
 
 void hub_set_config_pass(hub_state_t *s, const char *pass);
+void hub_link_offer(hub_state_t *state, hub_client_t *c, const char *peer_uuid);
+void hub_config_key_forget(hub_state_t *s);
 void hub_get_config_pass(const hub_state_t *s, char *out, size_t len);
 void secure_wipe(void *ptr, size_t len);
 void generate_uuid_v4(char *buffer, size_t len);

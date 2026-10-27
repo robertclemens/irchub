@@ -287,9 +287,12 @@ bool hub_crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
 }
 
 // --- AES-256-GCM ---
-int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
-                    const unsigned char *key, unsigned char *plaintext,
-                    unsigned char *tag) {
+/* `aad` (aad_len bytes, NULL for none) is authenticated, not sent: the link
+ * frames' direction and counter (review 6, hub_link_aad). */
+int aes_gcm_decrypt_aad(const unsigned char *input_buffer, int input_len,
+                        const unsigned char *aad, int aad_len,
+                        const unsigned char *key, unsigned char *plaintext,
+                        unsigned char *tag) {
     EVP_CIPHER_CTX *ctx = NULL;
     int len, plaintext_len;
     unsigned char iv[GCM_IV_LEN];
@@ -308,6 +311,7 @@ int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
     if (!EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto err;
     if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL)) goto err;
     if (!EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv)) goto err;
+    if (aad && aad_len > 0 && !EVP_DecryptUpdate(ctx, NULL, &len, aad, aad_len)) goto err;
 
     if (!EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len)) goto err;
     plaintext_len = len;
@@ -331,9 +335,16 @@ err:
     return -1;
 }
 
-int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
-                    const unsigned char *key, unsigned char *output,
+int aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
+                    const unsigned char *key, unsigned char *plaintext,
                     unsigned char *tag) {
+    return aes_gcm_decrypt_aad(input_buffer, input_len, NULL, 0, key, plaintext, tag);
+}
+
+int aes_gcm_encrypt_aad(const unsigned char *plain, int plain_len,
+                        const unsigned char *aad, int aad_len,
+                        const unsigned char *key, unsigned char *output,
+                        unsigned char *tag) {
     EVP_CIPHER_CTX *ctx = NULL;
     int len, ciphertext_len;
     unsigned char iv[GCM_IV_LEN];
@@ -344,6 +355,7 @@ int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
     if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto err;
     if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL)) goto err;
     if (1 != EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv)) goto err;
+    if (aad && aad_len > 0 && 1 != EVP_EncryptUpdate(ctx, NULL, &len, aad, aad_len)) goto err;
 
     memcpy(output, iv, GCM_IV_LEN);
     unsigned char *cipher_ptr = output + GCM_IV_LEN;
@@ -364,3 +376,8 @@ err:
     return -1;
 }
 
+int aes_gcm_encrypt(const unsigned char *plain, int plain_len,
+                    const unsigned char *key, unsigned char *output,
+                    unsigned char *tag) {
+    return aes_gcm_encrypt_aad(plain, plain_len, NULL, 0, key, output, tag);
+}
