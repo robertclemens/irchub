@@ -1,4 +1,4 @@
-#include "hub.h"
+#include "hub_uhist.h"
 #include <fcntl.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -171,6 +171,91 @@ int hub_format_user_record(const hub_user_record_t *u, char *buf, size_t len) {
 bool g_hub_config_readonly = false;
 bool g_hub_config_loading = false;
 
+/* One plan as a line, for uplan|, uplanr| and CMD_UPGRADE_PLAN alike:
+ *   bot_target|hub_target|variant|kind|step|run_id|started|progressed|bot_from|
+ *   hub_from|bot_path|hub_path|sel|reruns|self_target|hold_rerun|hold_uuid|
+ *   hold_ver|last_run|driver|rev|single|active|left|hold|summary|driver_name
+ * Every field but the last passes hub_upgrade_plan_field_ok, here and on the way
+ * in, so the line can never split or inject another; hold is free text from
+ * upgrade_clean; summary likewise.  driver_name is written empty when it would
+ * not pass, so a name can never keep a plan off the wire.  A 13-field line is a
+ * 2.5.1 roll-up plan. */
+int hub_plan_format(const upgrade_plan_t *pl, char *out, size_t cap) {
+  const char *const fields[] = {pl->bot_target, pl->hub_target, pl->variant, pl->kind,
+                                pl->run_id, pl->bot_from, pl->hub_from, pl->sel,
+                                pl->self_target, pl->hold_uuid, pl->hold_ver, pl->last_run,
+                                pl->driver, pl->left};
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+    if (!hub_upgrade_plan_field_ok(fields[i])) return -1;
+  if (strpbrk(pl->hold, "|\r\n") || strpbrk(pl->summary, "|\r\n")) return -1;
+  const char *dn = hub_upgrade_plan_field_ok(pl->driver_name) ? pl->driver_name : "";
+  char bp[MAX_UPGRADE_STEPS * 65], hp[MAX_UPGRADE_STEPS * 65];
+  plan_path_join(&pl->bot_path[0][0], pl->bot_steps, bp, sizeof(bp));
+  plan_path_join(&pl->hub_path[0][0], pl->hub_steps, hp, sizeof(hp));
+  int w = snprintf(out, cap,
+                   "%s|%s|%s|%s|%d|%s|%lld|%lld|%s|%s|%s|%s|%s|%d|%s|%d|%s|%s|%s|%s|%lld|%d|%d|%s|%s|%s|%s",
+                   pl->bot_target, pl->hub_target, pl->variant, pl->kind, pl->step, pl->run_id,
+                   (long long)pl->started, (long long)pl->progressed, pl->bot_from, pl->hub_from,
+                   bp, hp, pl->sel, pl->reruns, pl->self_target, pl->hold_rerun ? 1 : 0,
+                   pl->hold_uuid, pl->hold_ver, pl->last_run, pl->driver, pl->rev,
+                   pl->single ? 1 : 0, pl->active ? 1 : 0, pl->left, pl->hold, pl->summary, dn);
+  return w > 0 && (size_t)w < cap ? w : -1;
+}
+
+/* False, with *pl undefined, unless the whole line is sound. */
+bool hub_plan_parse(const char *body, upgrade_plan_t *pl) {
+  /* 13 fields: a 2.5.1 roll-up plan; 25: before the stop reason; 26: before the
+   * driver's name; 27: now. */
+  const char *f[27];
+  size_t fl[27];
+  int n = split_fields(body, f, fl, 27);
+  memset(pl, 0, sizeof(*pl));
+  if ((n != 13 && n != 25 && n != 26 && n != 27) || fl[0] == 0) return false;
+  struct { int at; char *dst; size_t cap; } out[] = {
+      {0, pl->bot_target, sizeof(pl->bot_target)}, {1, pl->hub_target, sizeof(pl->hub_target)},
+      {2, pl->variant, sizeof(pl->variant)},       {3, pl->kind, sizeof(pl->kind)},
+      {5, pl->run_id, sizeof(pl->run_id)},         {8, pl->bot_from, sizeof(pl->bot_from)},
+      {9, pl->hub_from, sizeof(pl->hub_from)},     {12, pl->sel, sizeof(pl->sel)},
+      {14, pl->self_target, sizeof(pl->self_target)}, {16, pl->hold_uuid, sizeof(pl->hold_uuid)},
+      {17, pl->hold_ver, sizeof(pl->hold_ver)},    {18, pl->last_run, sizeof(pl->last_run)},
+      {19, pl->driver, sizeof(pl->driver)},        {23, pl->left, sizeof(pl->left)},
+      {24, pl->hold, sizeof(pl->hold)},           {25, pl->summary, sizeof(pl->summary)},
+      {26, pl->driver_name, sizeof(pl->driver_name)}};
+  for (size_t i = 0; i < sizeof(out) / sizeof(out[0]); i++) {
+    if (out[i].at >= n) continue;
+    if (fl[out[i].at] >= out[i].cap) return false;
+    memcpy(out[i].dst, f[out[i].at], fl[out[i].at]);
+    out[i].dst[fl[out[i].at]] = '\0';
+    if ((out[i].at < 24 || out[i].at == 26) && !hub_upgrade_plan_field_ok(out[i].dst))
+      return false;
+  }
+  if (strpbrk(pl->hold, "\r\n") || strpbrk(pl->summary, "\r\n")) return false;
+  if (!plan_path_split(f[10], fl[10], pl->bot_path, &pl->bot_steps) ||
+      !plan_path_split(f[11], fl[11], pl->hub_path, &pl->hub_steps))
+    return false;
+  long long step = strtoll(f[4], NULL, 10);
+  pl->started = (time_t)strtoll(f[6], NULL, 10);
+  pl->progressed = (time_t)strtoll(f[7], NULL, 10);
+  pl->active = true;
+  if (n >= 25) {
+    pl->reruns = atoi(f[13]);
+    pl->hold_rerun = f[15][0] == '1';
+    pl->rev = strtoll(f[20], NULL, 10);
+    pl->single = f[21][0] == '1';
+    pl->active = f[22][0] == '1';
+  }
+  int steps = pl->bot_steps > pl->hub_steps ? pl->bot_steps : pl->hub_steps;
+  if (pl->single) return step == 0;
+  if (step < 0 || step >= steps) return false;
+  pl->step = (int)step;
+  return true;
+}
+
+/* How many writes have reached the disk.  A write that fails keeps the old file and
+ * says nothing else, so an upgrade counts these to know its flush landed. */
+static unsigned long g_config_saves = 0;
+unsigned long hub_config_saves(void) { return g_config_saves; }
+
 void hub_config_write(hub_state_t *state) {
   if (g_hub_config_readonly) return;
   int estimated_size = (int)(HUB_CONFIG_FIXED_MAX +
@@ -225,6 +310,10 @@ void hub_config_write(hub_state_t *state) {
   if (state->purge_days_setting > 0) {
     SAFE_WRITE("purge_days|%d\n", state->purge_days_setting);
   }
+  /* The last upgrade runs (hub_uhist.c): one line each, already escaped. */
+  for (int i = 0; i < state->uhist_count; i++)
+    SAFE_WRITE("uhist|%s\n", state->uhist[i].body);
+
   if (!overflow && !hub_gsetting_append(state, buffer, estimated_size, &offset))
     overflow = true;
   /* When the leader last ran the scheduled purge: a restart does not push it
@@ -265,31 +354,15 @@ void hub_config_write(hub_state_t *state) {
     }
   }
 
-  /* A multi-step upgrade this hub drives (hub-local, never replicated):
-   * uplan|bot_target|hub_target|variant|kind|step|run_id|started|progressed|
-   *       bot_from|hub_from|bot_path|hub_path|sel
-   * The hub restarts onto each step itself; this line is how it carries on.
-   * Every field passed hub_upgrade_plan_field_ok when it was set and is
-   * checked again here, so the line can never split or inject another. */
+  /* The upgrade plan: uplan| when this hub drives it, uplanr| its copy of what
+   * the driver published.  See hub_plan_format; a plan that will not format is
+   * left out rather than written half. */
   {
-    const upgrade_plan_t *pl = &state->plan;
-    if (pl->active && hub_upgrade_plan_field_ok(pl->bot_target) &&
-        hub_upgrade_plan_field_ok(pl->hub_target) &&
-        hub_upgrade_plan_field_ok(pl->variant) &&
-        hub_upgrade_plan_field_ok(pl->kind) &&
-        hub_upgrade_plan_field_ok(pl->run_id) &&
-        hub_upgrade_plan_field_ok(pl->bot_from) &&
-        hub_upgrade_plan_field_ok(pl->hub_from) &&
-        hub_upgrade_plan_field_ok(pl->sel)) {
-      char bp[MAX_UPGRADE_STEPS * 65], hp[MAX_UPGRADE_STEPS * 65];
-      plan_path_join(&pl->bot_path[0][0], pl->bot_steps, bp, sizeof(bp));
-      plan_path_join(&pl->hub_path[0][0], pl->hub_steps, hp, sizeof(hp));
-      SAFE_WRITE("uplan|%s|%s|%s|%s|%d|%s|%lld|%lld|%s|%s|%s|%s|%s\n",
-                 pl->bot_target, pl->hub_target, pl->variant, pl->kind,
-                 pl->step, pl->run_id, (long long)pl->started,
-                 (long long)pl->progressed, pl->bot_from, pl->hub_from, bp, hp,
-                 pl->sel);
-    }
+    char body[HUB_PLAN_LINE_MAX];
+    if (state->plan.active && hub_plan_format(&state->plan, body, sizeof(body)) > 0)
+      SAFE_WRITE("uplan|%s\n", body);
+    if (state->splan.driver[0] && hub_plan_format(&state->splan, body, sizeof(body)) > 0)
+      SAFE_WRITE("uplanr|%s\n", body);
   }
 
   for (int i = 0; i < state->peer_count; i++) {
@@ -542,6 +615,7 @@ void hub_config_write(hub_state_t *state) {
     saved = fclose(fp) == 0 && saved;
     saved = saved && rename(tmp, HUB_CONFIG_FILE) == 0;
     if (!saved) unlink(tmp);
+    else g_config_saves++;
   }
   if (!saved)
     hub_log_error("[HUB] Config write failed: the previous config is kept\n");
@@ -805,51 +879,22 @@ static bool config_load(hub_state_t *state, const char *password) {
           memset(r, 0, sizeof(*r));
           hub_log_warning("[CONFIG] Ignoring a malformed rollup| line\n");
         }
+      } else if (strcmp(k, "uhist") == 0) {
+        if (!hub_uhist_load_line(state, v))
+          hub_log_warning("[CONFIG] Ignoring a malformed uhist| line\n");
       } else if (strcmp(k, "uplan") == 0) {
-        /* See hub_config_write.  Dropped whole when it does not parse: no
-         * plan is better than half of one, and the admin can start again. */
-        const char *f[13];
-        size_t fl[13];
-        int n = split_fields(v, f, fl, 13);
-        upgrade_plan_t *pl = &state->plan;
-        memset(pl, 0, sizeof(*pl));
-        struct { char *dst; size_t cap; } out[13] = {
-            {pl->bot_target, sizeof(pl->bot_target)},
-            {pl->hub_target, sizeof(pl->hub_target)},
-            {pl->variant, sizeof(pl->variant)},
-            {pl->kind, sizeof(pl->kind)},
-            {NULL, 0},
-            {pl->run_id, sizeof(pl->run_id)},
-            {NULL, 0},
-            {NULL, 0},
-            {pl->bot_from, sizeof(pl->bot_from)},
-            {pl->hub_from, sizeof(pl->hub_from)},
-            {NULL, 0},
-            {NULL, 0},
-            {pl->sel, sizeof(pl->sel)}};
-        bool ok = (n == 13 && fl[0] > 0);
-        for (int i = 0; ok && i < 13; i++) {
-          if (!out[i].dst) continue;
-          if (fl[i] >= out[i].cap) ok = false;
-          else {
-            memcpy(out[i].dst, f[i], fl[i]);
-            out[i].dst[fl[i]] = '\0';
-            ok = hub_upgrade_plan_field_ok(out[i].dst);
-          }
-        }
-        if (ok)
-          ok = plan_path_split(f[10], fl[10], pl->bot_path, &pl->bot_steps) &&
-               plan_path_split(f[11], fl[11], pl->hub_path, &pl->hub_steps);
-        long long step = ok ? strtoll(f[4], NULL, 10) : -1;
-        int steps = pl->bot_steps > pl->hub_steps ? pl->bot_steps : pl->hub_steps;
-        if (ok && step >= 0 && step < steps) {
-          pl->step = (int)step;
-          pl->started = (time_t)strtoll(f[6], NULL, 10);
-          pl->progressed = (time_t)strtoll(f[7], NULL, 10);
-          pl->active = true;
-        } else {
-          memset(pl, 0, sizeof(*pl));
+        /* Dropped whole when it does not parse: no plan is better than half of
+         * one, and the admin can start again. */
+        if (!hub_plan_parse(v, &state->plan)) {
+          memset(&state->plan, 0, sizeof(state->plan));
           hub_log_warning("[CONFIG] Ignoring a malformed uplan| line\n");
+        } else {
+          state->plan.active = true;
+        }
+      } else if (strcmp(k, "uplanr") == 0) {
+        if (!hub_plan_parse(v, &state->splan)) {
+          memset(&state->splan, 0, sizeof(state->splan));
+          hub_log_warning("[CONFIG] Ignoring a malformed uplanr| line\n");
         }
       } else if (strcmp(k, "lamport_seq") == 0) {
         unsigned long long loaded_seq = 0;

@@ -1,4 +1,4 @@
-#include "hub.h"
+#include "hub_uhist.h"
 #include "hub_console.h"
 #if defined(__GLIBC__)
 #include <malloc.h>   /* for mallopt(); glibc-only, guarded like its use in main() */
@@ -292,11 +292,11 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
             hub_roster_mark_dirty(state, false); /* a whole branch just went away */
         }
     }
-    /* A bot leaving changes the tree; gossip it on the next tick rather than
+    /* A bot leaving changes the tree; gossip it now (damped) rather than
      * waiting for its roster entry to time out on the peers. */
     if (c->type == CLIENT_BOT && c->authenticated) {
         hub_roster_mark_dirty(state, true);
-        state->last_presence_gossip = 0;
+        hub_presence_event(state);
     }
 
     // 2. Close Socket
@@ -474,6 +474,7 @@ static void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
     /* If this process is the product of an upgrade a peer drove, close that
      * run out now that there is a peer to tell (no-op otherwise). */
     hub_upgrade_report_pending(state, c);
+    hub_uhist_send_digest(state, c);
     /* Send a full config sync immediately via the BULK queue.  The queue
      * enforces a per-peer byte budget (BULK_SOFT_BUDGET_BPS = 32 KB/s) so
      * simultaneous startup of all 10 hubs no longer creates a cascade that
@@ -552,6 +553,11 @@ static void hub_maintenance(hub_state_t *state) {
                 free(full_sync);
             } else {
                 hub_log_error("[MESH] OOM building anti-entropy sync\n");
+            }
+            for (int i = 0; i < state->client_count; i++) {
+                hub_client_t *pc = state->clients[i];
+                if (pc->type == CLIENT_HUB && pc->authenticated)
+                    hub_uhist_send_digest(state, pc);
             }
         }
     }
@@ -1534,6 +1540,11 @@ int main(int argc, char *argv[]) {
 
     if (identity_mode) return run_identity(&state, _hub_plain_pass);
 
+    if (hub_update_install_in_progress()) {
+        fprintf(stderr, "An upgrade is installing here; not starting\n");
+        return 0;
+    }
+    hub_update_stage_boot_clean();
     fflush(stdout); /* or the buffered lines are written again by the fork */
     daemonize();
 
@@ -1591,6 +1602,8 @@ int main(int argc, char *argv[]) {
         remove(HUB_PID_FILE);
         return 1;
     }
+    hub_uhist_boot(&state);
+    hub_plan_boot(&state);
     secure_wipe(_hub_plain_pass, sizeof(_hub_plain_pass));
 
     /* Ensure next_lamport_seq is above the time-based floor even on first

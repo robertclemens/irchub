@@ -396,7 +396,7 @@ static const char *const VIEW_NAME[V_COUNT] = {"console", "log", "network",
 typedef enum { CF_NONE = 0, CF_YN, CF_TYPE } confirm_t;
 
 /* What a request in flight was for: replies come back in order. */
-enum { RQ_USER = 0, RQ_PRE, RQ_VIEW_UPG, RQ_VIEW_STATS };
+enum { RQ_USER = 0, RQ_PRE, RQ_VIEW_UPG, RQ_VIEW_STATS, RQ_VIEW_RUN };
 
 /* A read made before a confirmation so the question can name the object
  * (D2): what it reads, and what the question is built from. */
@@ -507,6 +507,12 @@ struct console_ui {
   status_t st;
   char *tree;                   /* rows, '\n'-separated */
   char *upg_text, *stats_text;  /* view 4 / 5 replies */
+  /* View 4: the history run picked with the arrows, and its details. */
+  int  upg_sel, upg_runs;
+  char upg_sel_id[64];
+  char *run_text;
+  char run_id[64];              /* what run_text was last asked for */
+  long long run_rev;
   long long upg_at, stats_at;
   char last_upg[256];
   bool log_on;                  /* line mode: "log on" */
@@ -515,6 +521,7 @@ struct console_ui {
   /* full screen */
   int  view;
   sback_t sb[V_COUNT];          /* V_CONSOLE and V_LOG are used */
+  int view_lines[V_COUNT];      /* views 4 and 5: lines the last draw laid out */
   centry_t *ent;                /* V_CONSOLE entries, a ring */
   long long ent_first, ent_next;
   int  render_w;                /* width the console view was laid out at */
@@ -556,8 +563,8 @@ struct console_ui {
 enum bk {
   B_NONE, B_ARG, B_PIPE, B_PEER_ADD, B_HUB_SHOW, B_CHAN_ADD, B_CHAN_SET,
   B_CHAN_OP, B_OPT_SET, B_LOG_SET, B_PURGE, B_HUB_SET, B_ACL, B_USER_LIST,
-  B_USER_ADD, B_USER_SET, B_USER_MASK, B_UPG_RELEASES, B_UPG_START, B_FIXED, B_LOCAL,
-  B_CHAN_MODES, B_BAN, B_NET_SET, B_USER_CHAN
+  B_USER_ADD, B_USER_SET, B_USER_MASK, B_UPG_RELEASES, B_UPG_HISTORY, B_UPG_KEEP, B_UPG_START, B_FIXED, B_LOCAL,
+  B_CHAN_MODES, B_BAN, B_NET_SET, B_USER_CHAN, B_CHAN_KICK
 };
 
 typedef struct {
@@ -585,12 +592,12 @@ static const cmd_def_t CMDS[] = {
   {"bot", "kick", CMD_ADMIN_DISCONNECT_BOT, B_ARG, 1, 0, CF_YN, PRE_BOT_KICK, NULL, "bot kick <uuid|nick>", "drop its connection to this hub (asks y/N; it reconnects)", NULL},
   {"bot", "rekey", CMD_ADMIN_REKEY_BOT, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot rekey <uuid>", "how to rekey a bot (only the bot can)", NULL},
   {"bot", "tree", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|tree", "bot tree", "every hub and bot as a tree", NULL},
-  {"bot", "set", CMD_ADMIN_NET_SET, B_NET_SET, 0, 3, CF_NONE, 0, NULL, "bot set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default>]", "show the bot settings, or change one (every bot gets it)", NULL},
+  {"bot", "set", CMD_ADMIN_NET_SET, B_NET_SET, 0, 3, CF_NONE, 0, NULL, "bot set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default> | cron <global|nick|uuid> <on|off>]", "show the bot settings, or change one (every bot gets it; cron: every bot, or one until the next global)", NULL},
   {"hub", "show", CMD_ADMIN_GET_PUBKEY, B_HUB_SHOW, 0, 1, CF_NONE, 0, NULL, "hub show [#|uuid|name]", "this hub (identity, key, listener, counts), or one linked hub in detail", NULL},
   {"hub", "list", CMD_ADMIN_LIST_PEERS, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub list", "the other hubs, the mesh links and their health", NULL},
   {"hub", "add", CMD_ADMIN_ADD_PEER, B_PEER_ADD, 5, 0, CF_NONE, 0, NULL, "hub add <ip> <port> <uuid> <name|-> <key>", "link another hub", "uuid and key: hub show or ./irchub -id on that hub"},
   {"hub", "del", CMD_ADMIN_DEL_PEER, B_ARG, 1, 0, CF_YN, PRE_PEER_DEL, NULL, "hub del <uuid|name>", "unlink a hub from this hub only (shows which hubs and bots still list it; asks y/N)", NULL},
-  {"hub", "set", 0, B_HUB_SET, 0, 3, CF_NONE, 0, NULL, "hub set <setting> <value> | hub set ssh|conn [<name> <value|default>] | hub set <#|uuid|name> key <key>", "name, bindip, port, pubkey or autopurge; ssh and conn: this hub's connection limits (alone: the table); <hub> key: replace a linked hub's key", NULL},
+  {"hub", "set", 0, B_HUB_SET, 0, 3, CF_NONE, 0, NULL, "hub set <setting> <value> | hub set ssh|conn [<name> <value|default>] | hub set <#|uuid|name> key <key> | hub set cron <global|#|uuid|name> <on|off>", "name, bindip, port, pubkey or autopurge; ssh and conn: this hub's connection limits (alone: the table); <hub> key: replace a linked hub's key; cron: every hub, or one until the next global", NULL},
   {"hub", "sync", CMD_ADMIN_SYNC_MESH, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub sync", "send a full sync to every linked hub", NULL},
   {"hub", "stats", CMD_ADMIN_STATS, B_NONE, 0, 0, CF_NONE, 0, NULL, "hub stats", "traffic, connections and maintenance timers", NULL},
   {"hub", "rekey", CMD_ADMIN_REGEN_KEYS, B_NONE, 0, 0, CF_TYPE, 0, NULL, "hub rekey", "new hub keypair; every other hub and bot must re-learn it", NULL},
@@ -620,13 +627,18 @@ static const cmd_def_t CMDS[] = {
   {"channel", "set", CMD_ADMIN_CHAN_SET, B_CHAN_SET, 1, 48, CF_NONE, 0, NULL, "channel set <#chan|default> [+opt|-opt|<name> <value>|flood <type> <N:S|off>]", "show a channel's settings, or change them (default = the network default)", NULL},
   {"channel", "op", CMD_ADMIN_OP_USER, B_CHAN_OP, 2, 0, CF_NONE, 0, NULL, "channel op <#chan> <nick>", "have one opped bot op a user", NULL},
   {"channel", "invite", CMD_ADMIN_INVITE_USER, B_CHAN_OP, 2, 0, CF_NONE, 0, NULL, "channel invite <#chan> <nick>", "have one opped bot invite a user", NULL},
+  {"channel", "kick", CMD_ADMIN_KICK_USER, B_CHAN_KICK, 2, 0, CF_NONE, 0, NULL, "channel kick <#chan> <nick> [reason]", "have one opped bot kick a user (never a bot or authorised user)", NULL},
+  {"channel", "ban", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "channel ban <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "the same as ban add: list a ban, and one opped bot sets it now", NULL},
   {"ban", "list", CMD_ADMIN_BAN, B_BAN, 0, 1, CF_NONE, 0, NULL, "ban list [#chan|*]", "the network's listed bans (one channel, or * = every channel)", NULL},
-  {"ban", "add", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; the bots set it on the channel (never on a bot or user)", NULL},
+  {"ban", "add", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; one opped bot sets it on the channel now (never on a bot or user)", NULL},
   {"ban", "del", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban del <#chan|*> <mask>", "remove a listed ban", NULL},
   {"upgrade", "status", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_NONE, 0, "", "upgrade status", "the upgrade run on this hub", NULL},
   {"upgrade", "releases", CMD_ADMIN_UPGRADE_STATUS, B_UPG_RELEASES, 0, 0, CF_NONE, 0, NULL, "upgrade releases", "releases both products offer, and the nodes", NULL},
+  {"upgrade", "history", CMD_ADMIN_UPGRADE_STATUS, B_UPG_HISTORY, 0, 1, CF_NONE, 0, NULL, "upgrade history [<run>]", "the last upgrade runs; <run> shows one with every node", NULL},
+  {"upgrade", "keep", CMD_ADMIN_UPGRADE_STATUS, B_UPG_KEEP, 1, 1, CF_NONE, 0, NULL, "upgrade keep <1-20>", "how many runs every hub keeps (default 10)", NULL},
   {"upgrade", "start", CMD_ADMIN_UPGRADE_NET, B_UPG_START, 1, 4, CF_YN, PRE_UPG_START, NULL, "upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>]", "start a rolling network upgrade (shows the plan, asks y/N)", NULL},
   {"upgrade", "abort", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_YN, 0, "abort", "upgrade abort", "stop the run and roll back", NULL},
+  {"upgrade", "continue", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_YN, 0, "continue", "upgrade continue", "resume an upgrade on hold, leaving behind the node it waits for", NULL},
   {"upgrade", "forget", CMD_ADMIN_UPGRADE_STATUS, B_FIXED, 0, 0, CF_YN, 0, "forget", "upgrade forget", "drop the roll-up plan on every hub", NULL},
   {"display", "show", 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "display show", "this session's display settings", NULL},
   {"display", "view", 0, B_LOCAL, 1, 0, CF_NONE, 0, NULL, "display view <1-5>", "full screen: console, log, network, upgrades, stats", NULL},
@@ -669,8 +681,11 @@ static const struct {
   {"user", "mask", "a/o"}, {"user", "chan", "o"},
   {"channel", "add", "c"}, {"channel", "del", "c"},   {"channel", "mode", "c"},
   {"channel", "set", "c"}, {"channel", "op", "c"},    {"channel", "invite", "c"},
+  {"channel", "kick", "c"}, {"channel", "ban", "c"},
   {"ban", "add", "c"},     {"ban", "del", "c"},
   {"upgrade", "start", "u"}, {"upgrade", "abort", "u"}, {"upgrade", "forget", "u"},
+  {"upgrade", "continue", "u"},
+  {"upgrade", "keep", "u"},
 };
 #define NCMDFLAGS ((int)(sizeof(CMD_FLAGS) / sizeof(CMD_FLAGS[0])))
 
@@ -904,6 +919,20 @@ static const struct {
    "channel op #ops alice"},
   {"channel", "invite", "#chan\tthe channel\nnick\tthe user's current nick on IRC",
    "channel invite #ops alice"},
+  {"channel", "kick",
+   "#chan\tthe channel\nnick\tthe user's current nick on IRC (never a bot or an authorised "
+   "user)\nreason\tthe rest of the line (120 bytes; default: kicked)",
+   "channel kick #ops mallory\nchannel kick #ops mallory stop flooding"},
+  {"channel", "ban",
+   "(alias)\tthe same command as ban add, with the same arguments\n"
+   "#chan|*\tthe channel (one opped bot there sets the ban now), or * for every managed "
+   "channel (the bots set it as they sweep)\n"
+   "mask\tnick!user@host (* and ? match); refused if it would also match a bot or an "
+   "authorised user\n"
+   "min|perm\thow long it lasts (default perm)\n"
+   "sticky\tthe bots put it back at once if an op removes it from the channel\n"
+   "reason\tthe rest of the line (120 bytes)",
+   "channel ban #ops *!*@203.0.113.7\nchannel ban #ops *!*@203.0.113.7 60 spam"},
   {"ban", "list", "#chan|*\tonly that channel's bans, or * for the global ones (default: all)",
    "ban list\nban list #ops\nban list *"},
   {"ban", "add",
@@ -918,6 +947,10 @@ static const struct {
    "ban del #ops *!*@203.0.113.7"},
   {"upgrade", "status", NULL, "upgrade status"},
   {"upgrade", "releases", NULL, "upgrade releases"},
+  {"upgrade", "history", "run\tthe run, as upgrade history lists it, or the start of its id (4 or more characters)",
+   "upgrade history\nupgrade history 83aac614"},
+  {"upgrade", "keep", "n\thow many runs every hub keeps, 1 to 20; the oldest go first",
+   "upgrade keep 15"},
   {"upgrade", "start",
    "bot=<ver>\tthe bot version to move to, as upgrade releases lists it (required)\n"
    "hub=<ver>\talso move the hubs to this version (- or left out = leave them)\n"
@@ -927,6 +960,7 @@ static const struct {
    "upgrade start bot=2.4.5\nupgrade start bot=2.4.5 hub=2.4.4\n"
    "upgrade start bot=2.4.5 nodes=alpha,beta=rs"},
   {"upgrade", "abort", NULL, "upgrade abort"},
+  {"upgrade", "continue", NULL, "upgrade continue"},
   {"upgrade", "forget", NULL, "upgrade forget"},
   {"display", "show", NULL, "display show"},
   {"display", "view", "1-5\t1 console, 2 log, 3 network, 4 upgrades, 5 stats (Alt+1..5)",
@@ -1348,12 +1382,32 @@ static void ask_confirm(console_ui_t *ui, confirm_t kind, const char *want,
                         const char *question);
 static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text, size_t len);
 
+static void upg_sync_sel(console_ui_t *ui);
+
 static void on_reply(console_ui_t *ui, const char *text, size_t len) {
   if (ui->rq_n == 0) return;   /* nothing asked: ignore */
   pending_rq_t rq = ui->rq[0];
   ui->rq_n--;
   memmove(ui->rq, ui->rq + 1, sizeof(pending_rq_t) * (size_t)ui->rq_n);
 
+  if (rq.kind == RQ_VIEW_RUN) {
+    /* Answers an older pick: dropped, and the current one is asked for next. */
+    creply_t rep;
+    creply_parse(text, len, &rep);
+    const char *id = rv(&rep.res, "id");
+    if (!id || !strcmp(id, ui->upg_sel_id)) {
+      free(ui->run_text);
+      ui->run_text = malloc(len + 1);
+      if (ui->run_text) {
+        memcpy(ui->run_text, text, len);
+        ui->run_text[len] = '\0';
+      }
+    }
+    creply_free(&rep);
+    upg_sync_sel(ui);
+    ui->dirty = true;
+    return;
+  }
   if (rq.kind == RQ_VIEW_UPG || rq.kind == RQ_VIEW_STATS) {
     char **dst = rq.kind == RQ_VIEW_UPG ? &ui->upg_text : &ui->stats_text;
     free(*dst);
@@ -1362,6 +1416,7 @@ static void on_reply(console_ui_t *ui, const char *text, size_t len) {
       memcpy(*dst, text, len);
       (*dst)[len] = '\0';
     }
+    if (rq.kind == RQ_VIEW_UPG) upg_sync_sel(ui);
     ui->dirty = true;
     return;
   }
@@ -1433,6 +1488,64 @@ static void request_view(console_ui_t *ui, int kind, long long now_ms) {
   }
 }
 
+/* View 4: ask for the details of the run picked.  False when it cannot go out
+ * now; the next status or details reply tries again. */
+static bool request_run(console_ui_t *ui, const char *id) {
+  if (ui->user_busy || ui->rq_n >= MAX_PENDING_RQ) return false;
+  for (int i = 0; i < ui->rq_n; i++)
+    if (ui->rq[i].kind == RQ_VIEW_RUN) return false;
+  pending_rq_t *r = &ui->rq[ui->rq_n++];
+  memset(r, 0, sizeof(*r));
+  r->kind = RQ_VIEW_RUN;
+  char payload[96];
+  int n = snprintf(payload, sizeof(payload), "history|%s", id);
+  core_frame(ui, CMD_ADMIN_UPGRADE_STATUS, payload, (size_t)n);
+  return true;
+}
+
+/* Hold the pick to the runs the last status listed: the top row follows the
+ * newest run, any other stays on its run while newer ones arrive. */
+static void upg_sync_sel(console_ui_t *ui) {
+  ui->upg_runs = 0;
+  if (!ui->upg_text) return;
+  creply_t rep;
+  creply_parse(ui->upg_text, strlen(ui->upg_text), &rep);
+  int n = 0, at = -1;
+  for (int i = 0; i < rep.n; i++) {
+    if (strcmp(rep.r[i].type, "run")) continue;
+    if (ui->upg_sel > 0 && rv(&rep.r[i], "id") && !strcmp(rv(&rep.r[i], "id"), ui->upg_sel_id))
+      at = n;
+    n++;
+  }
+  if (at < 0) at = ui->upg_sel < n ? ui->upg_sel : n - 1;
+  ui->upg_runs = n;
+  ui->upg_sel = at < 0 ? 0 : at;
+  if (n == 0) {
+    ui->upg_sel_id[0] = ui->run_id[0] = '\0';
+    free(ui->run_text);
+    ui->run_text = NULL;
+    creply_free(&rep);
+    return;
+  }
+  for (int i = 0, k = 0; i < rep.n; i++) {
+    if (strcmp(rep.r[i].type, "run")) continue;
+    if (k++ != at) continue;
+    const char *id = rv(&rep.r[i], "id");
+    long long rev = rvi(&rep.r[i], "rev", 0);
+    if (id && strcmp(id, ui->upg_sel_id)) {
+      usnprintf(ui->upg_sel_id, sizeof(ui->upg_sel_id), "%s", id);
+      free(ui->run_text);
+      ui->run_text = NULL;
+    }
+    if (id && (strcmp(id, ui->run_id) || rev != ui->run_rev) && request_run(ui, id)) {
+      usnprintf(ui->run_id, sizeof(ui->run_id), "%s", id);
+      ui->run_rev = rev;
+    }
+    break;
+  }
+  creply_free(&rep);
+}
+
 /* Human event lines (§3, D14): pretty only; line mode with display events
  * on, the full-screen console view always. */
 static bool human_events(const console_ui_t *ui) {
@@ -1448,7 +1561,7 @@ static void human_event(console_ui_t *ui, const char *text, int kind) {
 typedef struct {
   char type;          /* H B D */
   int  depth;
-  char name[64], uuid[64], ver[24], var[8], server[72];
+  char name[64], uuid[64], ver[24], var[8], server[72], cron[48];
   bool online;
   long long started;  /* H/B: start time, D: last seen */
 } trow_t;
@@ -1900,7 +2013,7 @@ static void show_help(console_ui_t *ui, const char *topic, const cmd_def_t *one)
     if (!ui->line_mode) {
       flines_add(&f, RL_NORMAL, "");
       flines_add(&f, RL_DIM, " Keys  Alt+1..5 views, Alt+Left/Right cycle, F2 log level, F3 tree pane,");
-      flines_add(&f, RL_DIM, "       PgUp/PgDn/End scroll, Tab completes, Up/Down history, Ctrl-C cancels");
+      flines_add(&f, RL_DIM, "       PgUp/PgDn/Home/End scroll, Tab completes, Up/Down history, Ctrl-C cancels");
     }
   } else {
     int n = 0, uw = 0;
@@ -2379,8 +2492,12 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       w = usnprintf(o, cap, "ignoretime|%s", a[1]);
     } else if (!strcasecmp(a[0], "sendq") && na == 2) {
       w = usnprintf(o, cap, "sendq|%s", a[1]);
+    } else if (!strcasecmp(a[0], "cron") && na == 3) {
+      /* a nick keeps its case: lowered below only if it is the word global */
+      w = usnprintf(o, cap, "botcron|%s|%s", a[1], a[2]);
+      break;
     } else {
-      *why = "bot set flood <cmd|msg|ctcp> <N:S|off|default>, ignoretime <min|default>, or sendq <B:I|default>";
+      *why = "bot set flood <cmd|msg|ctcp> <N:S|off|default>, ignoretime <min|default>, sendq <B:I|default>, or cron <global|nick|uuid> <on|off>";
       return false;
     }
     for (char *t = o; *t; t++) *t = (char)tolower((unsigned char)*t);
@@ -2389,6 +2506,22 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
   case B_CHAN_OP:
     w = usnprintf(o, cap, "%s|%s", a[1], a[0]);   /* the hub takes nick|chan */
     break;
+  case B_CHAN_KICK: {
+    /* kick <#chan> <nick> [reason...]: nick|chan|reason, the reason being the
+     * rest of the line as typed (as ban add's) */
+    char reason[256] = "";
+    if (na > 2 && ws->line) {
+      usnprintf(reason, sizeof(reason), "%s", ws->line + ws->off[argi + 2]);
+      size_t rl = strlen(reason);
+      while (rl > 0 && reason[rl - 1] == ' ') reason[--rl] = '\0';
+      if (rl > 120 || strchr(reason, '|')) {
+        *why = "a kick reason is at most 120 bytes and has no '|'";
+        return false;
+      }
+    }
+    w = usnprintf(o, cap, "%s|%s|%s", a[1], a[0], reason);
+    break;
+  }
   case B_OPT_SET:
     w = usnprintf(o, cap, "%s", strcmp(a[0], "-") ? a[0] : "");
     break;
@@ -2452,6 +2585,15 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       *mode = FMT_MODE_HUB_SETTINGS;
       *outlen = 0;
       return true;
+    }
+    if (!strcasecmp(a[0], "cron")) {
+      if (na != 3) {
+        *why = "usage: hub set cron <global|#|uuid|name> <on|off>";
+        return false;
+      }
+      *op = CMD_ADMIN_NET_SET;
+      w = usnprintf(o, cap, "hubcron|%s|%s", a[1], a[2]);
+      break;
     }
     if (!strcasecmp(a[0], "ssh") || !strcasecmp(a[0], "conn")) {
       bool conn = !strcasecmp(a[0], "conn");
@@ -2585,6 +2727,12 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
     break;
   case B_UPG_RELEASES:
     w = usnprintf(o, cap, "releases");
+    break;
+  case B_UPG_HISTORY:
+    w = na ? usnprintf(o, cap, "history|%s", a[0]) : usnprintf(o, cap, "history");
+    break;
+  case B_UPG_KEEP:
+    w = usnprintf(o, cap, "keep|%s", a[0]);
     break;
   case B_UPG_START: {
     const char *botv = "", *hubv = "", *nodes = "";
@@ -2910,6 +3058,53 @@ static void pre_reply(console_ui_t *ui, const pending_rq_t *rq, const char *text
         fmt_card_line(&c, &f, 6, "",
                       "nothing to move; to switch a node's build add =c or =rs (nodes=<name>=rs)",
                       RL_DIM);
+      /* What history says, before anything is touched. */
+      char fast[256] = "", src[256] = "", prob[256] = "", none[256] = "", down[256] = "";
+      long long secs = 0;
+      int n_fast = 0;
+#define UPG_NAME_ADD(buf, ...) do { size_t l_ = strlen(buf); \
+    if (l_ + 2 < sizeof(buf)) usnprintf(buf + l_, sizeof(buf) - l_, __VA_ARGS__); } while (0)
+      for (int i = 0; i < rep.n; i++) {
+        const crec_t *nd = &rep.r[i];
+        if (strcmp(nd->type, "past")) continue;
+        const char *cl = rv(nd, "class") ? rv(nd, "class") : "u";
+        const char *nm = rv(nd, "name") ? rv(nd, "name") : "?";
+        if (rvs(nd, "blocked")) {
+          usnprintf(v, sizeof(v), "%s: %s", nm, rv(nd, "blocked"));
+          fmt_card_line(&c, &f, 8, "blocked", v, RL_WARN);
+        }
+        if (rvb(nd, "down")) {
+          UPG_NAME_ADD(down, "%s%s (last on %s)", down[0] ? ", " : "", nm,
+                       rv(nd, "last") ? rv(nd, "last") : "?");
+          continue;
+        }
+        long long stage = rvi(nd, "stage_src", 0);
+        if (stage > secs) secs = stage;
+        if (stage > 0) UPG_NAME_ADD(src, "%s%s (%lld s to build)", src[0] ? ", " : "", nm, stage);
+        secs += rvi(nd, "restart", 0) / 4;
+        if (*cl == 'f') n_fast++;
+        else if (*cl == 'p') UPG_NAME_ADD(prob, "%s%s%s%s", prob[0] ? ", " : "", nm,
+                                          rvs(nd, "code") ? ": " : "", rvs(nd, "code") ? rv(nd, "code") : "");
+        else if (*cl == 'u') UPG_NAME_ADD(none, "%s%s", none[0] ? ", " : "", nm);
+        (void)fast;
+      }
+#undef UPG_NAME_ADD
+      if (secs) {
+        usnprintf(v, sizeof(v), "about %lld min", secs / 60 + 1);
+        fmt_card_line(&c, &f, 8, "time", v, RL_NORMAL);
+      }
+      if (n_fast) {
+        usnprintf(v, sizeof(v), "%d node(s), quick last time", n_fast);
+        fmt_card_line(&c, &f, 8, "fast", v, RL_NORMAL);
+      }
+      if (src[0]) fmt_card_line(&c, &f, 8, "source", src, RL_NORMAL);
+      if (prob[0]) fmt_card_line(&c, &f, 8, "problem", prob, RL_WARN);
+      if (none[0]) fmt_card_line(&c, &f, 8, "no record", none, RL_DIM);
+      if (down[0]) {
+        fmt_card_line(&c, &f, 8, "down", down, RL_WARN);
+        fmt_card_line(&c, &f, 8, "", "walked up when they return; one the mesh has passed must be "
+                      "upgraded by hand", RL_DIM);
+      }
       emit_flines(ui, &f);
       flines_free(&f);
     }
@@ -3006,7 +3201,8 @@ static void run_line(console_ui_t *ui, const char *line) {
   usnprintf(words, sizeof(words), "%s%s%s", c->cmd, c->sub ? " " : "", c->sub ? c->sub : "");
   int na = ws.n - argi;
   bool rest_arg = (c->build == B_LOCAL && c->sub && !strcmp(c->sub, "filter")) ||
-                  (c->build == B_BAN && !strcmp(c->sub, "add"));
+                  (c->build == B_BAN && strcmp(c->sub, "list") && strcmp(c->sub, "del")) ||
+                  c->build == B_CHAN_KICK;
   if (na < c->nargs || (!rest_arg && na > c->nargs + c->optargs)) {
     char m[160];
     usnprintf(m, sizeof(m), "usage: %s", c->usage);
@@ -3276,6 +3472,9 @@ static const arg_comp_t ARG_COMP[] = {
   {"ban", "add", 2, CK_WORDS, "perm sticky"},
   {"ban", "add", 3, CK_WORDS, "sticky"},
   {"ban", "del", 0, CK_WORDS, "*"},
+  {"channel", "ban", 0, CK_WORDS, "*"},
+  {"channel", "ban", 2, CK_WORDS, "perm sticky"},
+  {"channel", "ban", 3, CK_WORDS, "sticky"},
   {"upgrade", "start", -1, CK_WORDS, "bot= hub= nodes="},
   {"display", "view", 0, CK_WORDS, "1 2 3 4 5"},
   {"display", "format", 0, CK_WORDS, "pretty raw"},
@@ -3566,6 +3765,7 @@ static void search_step(console_ui_t *ui, int dir) {
 }
 
 static void scroll_view(console_ui_t *ui, int dir);
+static long long sb_floor(const console_ui_t *ui, int view, int W, int H);
 
 static void set_view(console_ui_t *ui, int v, long long now_ms) {
   ui->view = (v + V_COUNT) % V_COUNT;
@@ -3644,7 +3844,17 @@ static void handle_key(console_ui_t *ui, ckey_t k, long long now_ms) {
     break;
   case K_LEFT: if (ui->in_cur > 0) ui->in_cur = prev_char(ui->in, ui->in_cur); break;
   case K_RIGHT: if (ui->in_cur < ui->in_len) ui->in_cur = next_char_off(ui->in, ui->in_len, ui->in_cur); break;
-  case K_HOME: ui->in_cur = 0; break;
+  case K_HOME:
+    /* With nothing typed, Home is End's opposite: the top of the view. */
+    if (empty && ui->in_cur == 0) {
+      if (ui->view == V_CONSOLE || ui->view == V_LOG)
+        ui->anchor[ui->view] = sb_floor(ui, ui->view, ui->cols, ui->rows - 3);
+      else if (ui->view == V_UPG || ui->view == V_STATS)
+        ui->anchor[ui->view] = -1;
+      ui->dirty = true;
+    }
+    ui->in_cur = 0;
+    break;
   case K_END:
     if (empty || ui->in_cur == ui->in_len) {
       ui->anchor[ui->view] = -1;
@@ -3660,6 +3870,20 @@ static void handle_key(console_ui_t *ui, ckey_t k, long long now_ms) {
       ui->net_sel += k.type == K_UP ? -1 : 1;
       if (ui->net_sel >= n) ui->net_sel = n - 1;
       if (ui->net_sel < 0) ui->net_sel = 0;
+      break;
+    }
+    if (ui->view == V_UPG && empty && ui->upg_runs > 0) {
+      int sel = ui->upg_sel + (k.type == K_UP ? -1 : 1);
+      if (sel >= ui->upg_runs) sel = ui->upg_runs - 1;
+      if (sel < 0) sel = 0;
+      if (sel != ui->upg_sel) {
+        /* The pick goes by index here: upg_sync_sel looks an id up, so name
+         * the row first. */
+        ui->upg_sel = sel;
+        ui->upg_sel_id[0] = '\0';
+        ui->anchor[V_UPG] = -1;
+        upg_sync_sel(ui);
+      }
       break;
     }
     if (k.type == K_UP && ui->hist_pos > 0) {
@@ -3823,6 +4047,7 @@ static const char *kind_sgr(int kind) {
   case RL_HEAD:  return "0;1";
   case RL_WARN:  return "0;33";
   case RL_DIM:   return "0;90";
+  case RL_SEL:   return SGR_SEL;
   default:       return SGR_RESET;
   }
 }
@@ -3954,6 +4179,7 @@ static int parse_tree(const char *tree, trow_t *out, int max) {
         copy_field(t.ver, sizeof(t.ver), f[6]);
         copy_field(t.var, sizeof(t.var), f[7]);
         t.started = atoll(f[8]);
+        if (nf >= 10) copy_field(t.cron, sizeof(t.cron), f[9]);
         out[n++] = t;
       } else if (t.type == 'B' && nf >= 9) {
         t.depth = atoi(f[1]);
@@ -3963,6 +4189,7 @@ static int parse_tree(const char *tree, trow_t *out, int max) {
         copy_field(t.server, sizeof(t.server), f[5]);
         copy_field(t.var, sizeof(t.var), f[7]);
         t.started = atoll(f[8]);
+        if (nf >= 10) copy_field(t.cron, sizeof(t.cron), f[9]);
         t.online = true;
         out[n++] = t;
       } else if (t.type == 'D' && nf >= 4) {
@@ -4071,11 +4298,31 @@ typedef struct {
   size_t from, to;
 } seg_t;
 
+/* The oldest line a pane may end on: the one that fills it with everything
+ * older.  Ending higher up would draw a few lines and leave the rest blank, or
+ * nothing at all when the oldest lines are filtered out. */
+static long long sb_floor(const console_ui_t *ui, int view, int W, int H) {
+  const sback_t *sb = &ui->sb[view];
+  long long last = sb->next - 1;
+  int rows = 0;
+  for (long long s = sb->first; s < sb->next; s++) {
+    const sline_t *l = sb_get(sb, s);
+    if (!sb_visible(ui, view, l)) continue;
+    last = s;
+    rows += wrap_rows(l->text, W);
+    if (rows >= H) break;
+  }
+  return last;
+}
+
 /* The rows a scrollback view shows, top to bottom, ending at its bottom line. */
 static int sb_layout(const console_ui_t *ui, int view, int W, int H, seg_t *segs) {
   const sback_t *sb = &ui->sb[view];
   int filled = 0;
-  for (long long s = sb_bottom(ui, view); s >= sb->first && filled < H; s--) {
+  long long bottom = sb_bottom(ui, view);
+  long long floor_line = sb_floor(ui, view, W, H);
+  if (bottom < floor_line) bottom = floor_line;
+  for (long long s = bottom; s >= sb->first && filled < H; s--) {
     const sline_t *l = sb_get(sb, s);
     if (!sb_visible(ui, view, l)) continue;
     size_t len = strlen(l->text);
@@ -4118,10 +4365,14 @@ static void scroll_view(console_ui_t *ui, int dir) {
       const sline_t *l = sb_get(sb, s);
       if (sb_visible(ui, v, l)) moved += wrap_rows(l->text, W);
     }
-    ui->anchor[v] = s;
+    long long floor_line = sb_floor(ui, v, W, H);
+    ui->anchor[v] = s < floor_line ? floor_line : s;
   } else {
+    /* A one-page view has nowhere to go; a longer one stops at its last page. */
     long long top = ui->anchor[v] < 0 ? 0 : ui->anchor[v];
     top += dir * (H - 1);
+    long long last = ui->view_lines[v] - H;
+    if (top > last) top = last;
     if (top <= 0) top = -1;
     ui->anchor[v] = top;
   }
@@ -4130,7 +4381,7 @@ static void scroll_view(console_ui_t *ui, int dir) {
 
 /* Views 4 and 5: the upgrade status / statistics reply, laid out by the
  * same renderer as the commands (no result line), from line anchor[view]. */
-static void view_rows(const console_ui_t *ui, int view, const char *text, int W,
+static void view_rows(console_ui_t *ui, int view, const char *text, int W,
                       int H, rowb_t *rows, int col0) {
   flines_t f = {0};
   if (!text) {
@@ -4143,10 +4394,32 @@ static void view_rows(const console_ui_t *ui, int view, const char *text, int W,
     ctx_init(ui, &c, FMT_MODE_VIEW, slog, sizeof(slog));
     c.ascii = ui->ascii;
     c.width = W;
+    if (view == V_UPG && ui->upg_sel_id[0]) c.upg_sel = ui->upg_sel_id;
     fmt_reply(&c, &rep, view == V_UPG ? "upgrade status" : "hub stats", &f);
     creply_free(&rep);
+    if (view == V_UPG && ui->upg_sel_id[0]) {
+      flines_add(&f, RL_NORMAL, "");
+      if (ui->run_text) {
+        creply_t one;
+        creply_parse(ui->run_text, strlen(ui->run_text), &one);
+        fmt_reply(&c, &one, "upgrade history", &f);
+        creply_free(&one);
+      } else {
+        flines_add(&f, RL_DIM, "(asking the hub...)");
+      }
+    }
   }
+  ui->view_lines[view] = f.n;
   long long top = ui->anchor[view] < 0 ? 0 : ui->anchor[view];
+  /* The reply can shrink under a scrolled view: never past its last page. */
+  if (top > f.n - H) top = f.n > H ? f.n - H : 0;
+  if (ui->anchor[view] < 0 && f.n > H) {
+    /* Not scrolled by hand: show the pick and as much of its details as fit. */
+    int sel = -1;
+    for (int i = 0; i < f.n && sel < 0; i++)
+      if (f.v[i].role == RL_SEL) sel = i;
+    if (sel >= 0) top = f.n - H < sel ? f.n - H : sel;
+  }
   int y = 0;
   for (int i = (int)(top < f.n ? top : f.n); i < f.n && y < H; i++, y++) {
     rb_sgr(&rows[y], kind_sgr(f.v[i].role));
@@ -4176,7 +4449,7 @@ static void net_view(console_ui_t *ui, int W, int H, rowb_t *rows, int col0) {
   int top = 0;
   if (ui->net_sel >= list_h) top = ui->net_sel - list_h + 1;
   rb_sgr(&rows[0], "0;1");
-  rb_text(&rows[0], n ? "node                            version   base  up     server / uuid"
+  rb_text(&rows[0], n ? "node                            version   base  up     cron    server / uuid"
                       : "(no tree yet)", W);
   rb_pad(&rows[0], col0 + W);
   for (int y = 1; y < list_h && top + y - 1 < n; y++) {
@@ -4192,8 +4465,12 @@ static void net_view(console_ui_t *ui, int W, int H, rowb_t *rows, int col0) {
     char age[24];
     fmt_age(t->type == 'D' ? 0 : t->started, age, sizeof(age));
     char rest[256];
-    usnprintf(rest, sizeof(rest), "%-9s %-5s %-6s %s", strcmp(t->ver, "-") ? t->ver : "",
-             strcmp(t->var, "-") ? t->var : "", age,
+    char cron[16];
+    usnprintf(cron, sizeof(cron), "%s", t->cron[0] && strcmp(t->cron, "-") ? t->cron : "-");
+    char *colon = strchr(cron, ':');
+    if (colon) *colon = '\0';
+    usnprintf(rest, sizeof(rest), "%-9s %-5s %-6s %-7s %s", strcmp(t->ver, "-") ? t->ver : "",
+             strcmp(t->var, "-") ? t->var : "", age, cron,
              t->type == 'B' ? t->server : t->uuid);
     rb_text(r, rest, W - 32);
     rb_pad(r, col0 + W);
@@ -4210,8 +4487,8 @@ static void net_view(console_ui_t *ui, int W, int H, rowb_t *rows, int col0) {
     rb_sgr(&rows[y0 + 1], "0;1"); rb_text(&rows[y0 + 1], line, W); rb_pad(&rows[y0 + 1], col0 + W);
     usnprintf(line, sizeof(line), "uuid     %s", t->uuid);
     rb_sgr(&rows[y0 + 2], SGR_RESET); rb_text(&rows[y0 + 2], line, W); rb_pad(&rows[y0 + 2], col0 + W);
-    usnprintf(line, sizeof(line), "version  %s %s   server %s", t->ver, t->var,
-             t->server[0] ? t->server : "-");
+    usnprintf(line, sizeof(line), "version  %s %s   server %s   cron %s", t->ver, t->var,
+             t->server[0] ? t->server : "-", t->cron[0] ? t->cron : "-");
     rb_text(&rows[y0 + 3], line, W); rb_pad(&rows[y0 + 3], col0 + W);
     usnprintf(line, sizeof(line), "%s  %s", t->type == 'D' ? "last seen" : "started  ", when);
     rb_text(&rows[y0 + 4], line, W); rb_pad(&rows[y0 + 4], col0 + W);
@@ -4547,6 +4824,7 @@ void ui_free(console_ui_t *ui) {
   free(ui->ent);
   free(ui->tree);
   free(ui->upg_text);
+  free(ui->run_text);
   free(ui->stats_text);
   cbuf_free(&ui->term);
   cbuf_free(&ui->core);

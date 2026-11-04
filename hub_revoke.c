@@ -12,7 +12,7 @@
  *   settings changed on two hubs at once both survive.  Newer stamp wins, on
  *   a tie the greater value. */
 
-#include "hub.h"
+#include "hub_uhist.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -30,6 +30,10 @@ typedef struct {
 static const gsetting_t GSET[] = {
     {"autopurge", 36500, offsetof(hub_state_t, purge_days_setting),
      offsetof(hub_state_t, purge_days_ts)},
+    {"upgradehistory", MAX_UPGRADE_HISTORY, offsetof(hub_state_t, uhist_keep_setting),
+     offsetof(hub_state_t, uhist_keep_ts)},
+    {"botcron", 1, offsetof(hub_state_t, bot_cron_setting), offsetof(hub_state_t, bot_cron_ts)},
+    {"hubcron", 1, offsetof(hub_state_t, hub_cron_setting), offsetof(hub_state_t, hub_cron_ts)},
 };
 #define GSET_COUNT ((int)(sizeof(GSET) / sizeof(GSET[0])))
 _Static_assert(sizeof(GSET) / sizeof(GSET[0]) <= HUB_GSETTINGS_MAX,
@@ -48,6 +52,80 @@ static const gsetting_t *gs_find(const char *name, size_t len) {
   return NULL;
 }
 
+/* ---- Production crontab settings -------------------------------------------
+ * A single node's setting travels as an hs| line of its own name, cr.<b|h>.<uuid>,
+ * and is compared the same way.  A node follows whichever is newer, its own or the
+ * global one; in the same second its own wins. */
+static int cron_rec_find(const hub_state_t *state, char kind, const char *uuid) {
+  for (int i = 0; i < state->cron_rec_count; i++)
+    if (state->cron_recs[i].kind == kind && strcmp(state->cron_recs[i].uuid, uuid) == 0)
+      return i;
+  return -1;
+}
+
+bool hub_cron_wanted(const hub_state_t *state, char kind, const char *uuid) {
+  int global = kind == 'h' ? state->hub_cron_setting : state->bot_cron_setting;
+  time_t gts = kind == 'h' ? state->hub_cron_ts : state->bot_cron_ts;
+  int i = cron_rec_find(state, kind, uuid);
+  if (i >= 0 && state->cron_recs[i].ts >= gts) return state->cron_recs[i].on != 0;
+  return global != 0;
+}
+
+/* Single-node settings a newer global one has replaced. */
+void hub_cron_prune(hub_state_t *state, char kind) {
+  time_t gts = kind == 'h' ? state->hub_cron_ts : state->bot_cron_ts;
+  int w = 0;
+  for (int i = 0; i < state->cron_rec_count; i++) {
+    if (state->cron_recs[i].kind == kind && state->cron_recs[i].ts < gts) continue;
+    if (w != i) state->cron_recs[w] = state->cron_recs[i];
+    w++;
+  }
+  state->cron_rec_count = w;
+}
+
+static bool cron_uuid_ok(const char *s, size_t n) {
+  if (n == 0 || n >= sizeof(((hub_state_t *)0)->cron_recs[0].uuid)) return false;
+  for (size_t i = 0; i < n; i++)
+    if (!isalnum((unsigned char)s[i]) && s[i] != '-') return false;
+  return true;
+}
+
+static bool cron_rec_put(hub_state_t *state, char kind, const char *uuid, int on, time_t ts,
+                         bool *changed) {
+  *changed = false;
+  time_t gts = kind == 'h' ? state->hub_cron_ts : state->bot_cron_ts;
+  if (ts < gts) return true;  /* replaced by a newer global setting */
+  int i = cron_rec_find(state, kind, uuid);
+  if (i < 0) {
+    if (state->cron_rec_count >= MAX_CRON_RECS) return false;
+    i = state->cron_rec_count++;
+    memset(&state->cron_recs[i], 0, sizeof(state->cron_recs[i]));
+    snprintf(state->cron_recs[i].uuid, sizeof(state->cron_recs[i].uuid), "%s", uuid);
+    state->cron_recs[i].kind = kind;
+  } else if (ts < state->cron_recs[i].ts ||
+             (ts == state->cron_recs[i].ts && on <= state->cron_recs[i].on)) {
+    return true;
+  }
+  state->cron_recs[i].on = on;
+  state->cron_recs[i].ts = ts;
+  state->config_dirty = true;
+  *changed = true;
+  return true;
+}
+
+/* An admin's command for one node.  `line` is what to send the peers. */
+bool hub_cron_set_one(hub_state_t *state, char kind, const char *uuid, bool on, char *line,
+                      size_t cap) {
+  int i = cron_rec_find(state, kind, uuid);
+  time_t gts = kind == 'h' ? state->hub_cron_ts : state->bot_cron_ts;
+  time_t last = i >= 0 && state->cron_recs[i].ts > gts ? state->cron_recs[i].ts : gts;
+  time_t ts = hub_lww_next_ts(last);
+  bool changed;
+  if (!cron_rec_put(state, kind, uuid, on ? 1 : 0, ts, &changed)) return false;
+  snprintf(line, cap, "hs|cr.%c.%s|%d|%lld\n", kind, uuid, on ? 1 : 0, (long long)ts);
+  return true;
+}
+
 int hub_gsetting_format(hub_state_t *state, const char *name, char *buf, size_t cap) {
   const gsetting_t *g = gs_find(name, strlen(name));
   if (!g || cap == 0) return -1;
@@ -61,6 +139,7 @@ bool hub_gsetting_set(hub_state_t *state, const char *name, int value) {
   *gs_ts(state, g) = hub_lww_next_ts(*gs_ts(state, g));
   *gs_val(state, g) = value;
   state->config_dirty = true;
+  hub_uhist_trim(state);
   return true;
 }
 
@@ -70,6 +149,22 @@ bool hub_gsetting_ingest(hub_state_t *state, const char *rest, bool *changed) {
   *changed = false;
   const char *p1 = strchr(rest, '|');
   if (!p1) return false;
+  if (strncmp(rest, "cr.", 3) == 0) {
+    char kind = rest[3];
+    const char *uuid = rest + 5;
+    if ((kind != 'b' && kind != 'h') || rest[4] != '.' || uuid >= p1 ||
+        !cron_uuid_ok(uuid, (size_t)(p1 - uuid)))
+      return false;
+    char u[64], *e;
+    snprintf(u, sizeof(u), "%.*s", (int)(p1 - uuid), uuid);
+    errno = 0;
+    long on = strtol(p1 + 1, &e, 10);
+    if (e == p1 + 1 || *e != '|' || errno || on < 0 || on > 1) return false;
+    const char *ts_c = e + 1;
+    long long t = strtoll(ts_c, &e, 10);
+    if (e == ts_c || *e || t <= 0 || hub_ts_ahead((time_t)t)) return false;
+    return cron_rec_put(state, kind, u, (int)on, (time_t)t, changed);
+  }
   const gsetting_t *g = gs_find(rest, (size_t)(p1 - rest));
   if (!g) return false;
   char *end;
@@ -86,6 +181,9 @@ bool hub_gsetting_ingest(hub_state_t *state, const char *rest, bool *changed) {
     *cur_ts = (time_t)ts;
     state->config_dirty = true;
     *changed = true;
+    hub_uhist_trim(state);
+    if (g->val_off == offsetof(hub_state_t, bot_cron_setting)) hub_cron_prune(state, 'b');
+    if (g->val_off == offsetof(hub_state_t, hub_cron_setting)) hub_cron_prune(state, 'h');
   }
   return true;
 }
@@ -95,6 +193,13 @@ bool hub_gsetting_append(hub_state_t *state, char *buf, int max_len, int *off) {
   for (int i = 0; i < GSET_COUNT; i++) {
     if (*gs_ts(state, &GSET[i]) <= 0) continue;
     int w = hub_gsetting_format(state, GSET[i].name, buf + *off, (size_t)(max_len - *off));
+    if (w < 0 || w >= max_len - *off) return false;
+    *off += w;
+  }
+  for (int i = 0; i < state->cron_rec_count; i++) {
+    int w = snprintf(buf + *off, (size_t)(max_len - *off), "hs|cr.%c.%s|%d|%lld\n",
+                     state->cron_recs[i].kind, state->cron_recs[i].uuid, state->cron_recs[i].on,
+                     (long long)state->cron_recs[i].ts);
     if (w < 0 || w >= max_len - *off) return false;
     *off += w;
   }

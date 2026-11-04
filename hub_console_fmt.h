@@ -18,7 +18,7 @@
 
 /* Line roles (the full screen colours them; line mode ignores them). */
 enum {
-  RL_NORMAL = 0, RL_CMD, RL_ERR, RL_OK, RL_TITLE, RL_WARN, RL_DIM, RL_HEAD, RL_RULE
+  RL_NORMAL = 0, RL_CMD, RL_ERR, RL_OK, RL_TITLE, RL_WARN, RL_DIM, RL_HEAD, RL_RULE, RL_SEL
 };
 
 /* ---- Parsed replies ---------------------------------------------------- */
@@ -66,6 +66,7 @@ typedef struct {
   const char *admin, *ip, *hubname;
   int         mode;        /* FMT_MODE_*: how a reply is to be shown      */
   const char *session_log; /* log show: this session's log subscription  */
+  const char *upg_sel;     /* view 4: the history run picked, or NULL     */
 } fmt_ctx_t;
 
 enum {
@@ -100,7 +101,7 @@ void fmt_count(unsigned long long n, char *out, size_t cap);
 enum {
   G_RULE = 0, G_ON, G_OFF, G_PEND, G_OK, G_ERR, G_WARN, G_BULLET, G_ELL, G_DOT,
   G_ARROW, G_TMID, G_TEND, G_TV, G_DASH, G_TIMES, G_FULL, G_EMPTY, G_OPEN,
-  G_UNKNOWN, G_COUNT
+  G_UNKNOWN, G_MID, G_COUNT
 };
 
 /* Help for one command group, or the group list (hub_console_ui.c owns the

@@ -233,6 +233,33 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 /* Per-transfer budget for manifest reads made from the event loop (PREPARE
  * answers, the admin console release list): the hub serves nothing meanwhile. */
 #define HUB_UPDATE_QUICK_TIMEOUT 8L
+/* The failback's limits, in seconds (see FAILBACK_BODY).  A source build's limit
+ * and the confirm window are the reliability plan's agreed values. */
+#define UPGRADE_INSTALL_SECS    120
+#define UPGRADE_BUILD_SECS      1800
+#define UPGRADE_CONFIRM_SECS    300
+#define UPGRADE_FAILBACK_EXPIRY 1800
+#define UPGRADE_STAGE_BEAT   20    /* a node says it is staging this often */
+#define UPGRADE_STAGE_SILENCE 90   /* a node silent this long has left the run */
+#define UPGRADE_STAGE_GATE   180   /* a prebuilt's stage limit */
+#define UPGRADE_CLASS_RECORDS 5    /* how far back a node's history is read */
+#define UPGRADE_SLOW_RESTART 120   /* slower than this usually: a slow host */
+#define UPGRADE_STAGE_FLOOR  60    /* the least a known prebuilt stage gets */
+#define UPGRADE_BUILD_FLOOR  300   /* the least a known source build gets */
+#define UPGRADE_STOP_PERCENT 25    /* more than this share failing stops everything */
+#define UPGRADE_SWAP_BACK    90    /* a staged node must be back by now */
+#define UPGRADE_STAGE_KEEP   900   /* a stage no COMMIT came for is removed */
+#define CRON_STATUS_MAX     31   /* yes, silent, manual, no, failed:<why> */
+#define CRON_HELPER_TIMEOUT 60   /* a crontab edit that takes longer is killed */
+#define CRON_CHECK_SECS     3600 /* how often a node looks at its line */
+#define CRON_SILENT_SECS    900  /* no stamp for this long: no cron daemon */
+/* What preflight asks of the disk, in bytes.  A build's own needs come from the
+ * manifest's size column; these cover what it cannot say. */
+#define UPGRADE_SPACE_MARGIN      (16ULL * 1024 * 1024)
+#define UPGRADE_SPACE_BIN_DEFAULT (64ULL * 1024 * 1024)   /* no size column     */
+#define UPGRADE_SPACE_BUILD_C     (256ULL * 1024 * 1024)  /* objects, make      */
+#define UPGRADE_SPACE_BUILD_RS    (1536ULL * 1024 * 1024) /* cargo's target dir */
+#define UPGRADE_MIN_INODES        64
 
 // Timeout Settings
 #define PING_INTERVAL 60
@@ -406,7 +433,10 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  *              is a reserved slot, always 0 and never read)
  *   ELECT_DO   hub->hub  eid|hub_uuid|elect
  *   ELECT_DONE hub->hub  eid|hub_uuid|hub_name|bot_uuid|bot_nick|status|detail
- * kind = op / invite / unban / key; requester = a bot uuid, or ADMIN. */
+ * kind = op / invite / unban / key / mode / kick / ban; requester = a bot
+ * uuid, or ADMIN.  kick: nick = the target, hostmask = the reason (may be
+ * empty).  ban: hostmask = the mask, nick empty on the hubs and "*" in DO
+ * (the bot's DO parser needs a field there). */
 #define CMD_CHAN_PROBE       0x6D
 #define CMD_CHAN_PROBE_ACK   0x6E
 #define CMD_CHAN_DO          0x6F
@@ -481,6 +511,16 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * says it is HUB_LINK_SEQ_VERSION or newer without having offered is dropped
  * (a stripped offer).  2.5.3 drops the old framing. */
 #define CMD_LINK_SEQ           0x83
+/* channel kick (2.5.3): console -> hub "nick|#chan|reason"; one elected bot
+ * kicks (CMD_CHAN_PROBE kind "kick", the reason riding the hostmask slot). */
+#define CMD_ADMIN_KICK_USER    0x84
+/* Hub<->hub: "R|<body>" one upgrade history record, "D|keep|id:rev:started,..."
+ * what the sender holds.  See hub_uhist.c. */
+#define CMD_UPGRADE_HISTORY    0x87
+#define CMD_UPGRADE_STAGE      0x88  /* Hub -> all: id, get the build ready while the old one runs */
+#define CMD_UPGRADE_PROGRESS   0x89  /* node -> Hub: id|uuid|phase|code|note */
+#define CMD_UPGRADE_PLAN       0x8A  /* Hub <-> Hub: P|plan, D|started|rev, B|started|rev|ts, C|started|ts */
+#define CMD_CRON_SET           0x8B  /* Hub -> Bot: on|off, its production crontab line */
 #define HUB_LINK_AAD_LEN 13
 #define HUB_LINK_SEQ_VERSION "2.5.2"
 /* Review 7: ephemeral keys of the HUBv3 hellos accepted in the last
@@ -700,13 +740,29 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define ROLLUP_MAX_TRIES   3    /* per node, per hub lifetime               */
 #define ROLLUP_COOLDOWN    900  /* seconds between attempts on one node     */
 #define ROLLUP_SETTLE      20   /* seconds after a node appears before we try */
+#define ROLLUP_STAGE_WAIT 3    /* READY, then this long to say it can stage */
 #define ROLLUP_TIMEOUT     300  /* give up on one attempt after this        */
+#define UPGRADE_RESULT_RELAY_MAX 640 /* longest UPGRADE_RESULT passed between hubs */
 #define MAX_ROLLUP_TRIES   64   /* nodes remembered in the attempt ledger   */
 /* A plan only exists while somebody is owed it: it is dropped as soon as every
  * registered bot and every known hub is on the target, and after this long
  * regardless -- a bot down for a day is likely coming back, one down for
  * months is not, and its admin can still run an upgrade by hand. */
 #define ROLLUP_PLAN_TTL    (7 * 86400)
+
+/* ---- Upgrade history (hub_uhist.c) --------------------------------------
+ * The last runs, one uhist| line each, replicated hub to hub.  UHIST_NODE_MAX
+ * holds a node with every string field fully %XX-escaped; the 6144 holds the
+ * header the same way (the selection is the only long field). */
+#define MAX_UPGRADE_HISTORY 20
+#define UHIST_DEFAULT_KEEP  10
+#define UHIST_NODE_FIELDS   14
+#define UHIST_HEADER_FIELDS 20
+#define UHIST_NODE_MAX      1280
+#define UHIST_LINE_MAX ((size_t)6144 + (size_t)MAX_UPGRADE_NODES * UHIST_NODE_MAX)
+/* D|keep| plus id:rev:started for every record. */
+#define UHIST_DIGEST_MAX (32 + MAX_UPGRADE_HISTORY * (64 + 20 + 20 + 3))
+#define UHIST_MIN_PREFIX    4   /* upgrade history <run>: shortest id prefix */
 
 /* ---- Multi-step upgrades (2.5.1) ---------------------------------------
  * A target a node cannot jump to directly (it sits below the release's
@@ -719,6 +775,13 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define MAX_UPGRADE_STEPS    16    /* longer paths are refused at start     */
 #define UPGRADE_PLAN_SETTLE  60    /* seconds between steps, and after boot */
 #define UPGRADE_PLAN_TTL     86400 /* a plan with no progress for this long is dropped */
+#define UPGRADE_PLAN_MESH_WAIT 300 /* how long a next step waits for the mesh to relink */
+#define UPGRADE_PLAN_RERUNS  3     /* a step cut off this often goes on hold */
+#define MAX_PLAN_LEFT        12    /* nodes one plan remembers leaving behind; then it holds again */
+/* One plan line at its caps: paths, selection, and the short fields around them. */
+#define HUB_PLAN_LINE_MAX    (MAX_UPGRADE_STEPS * 65 * 2 + MAX_UPGRADE_SELECT * 80 + MAX_PLAN_LEFT * 37 + 1536)
+#define UPGRADE_PLAN_BEAT    60    /* the driver says it is alive this often */
+#define UPGRADE_DRIVER_SILENCE 900 /* then another hub takes the plan over */
 /* An `upgrade abort` is re-sent to every peer link that comes up for this
  * long, so a planner restarting onto a step when it was typed still gets it. */
 #define UPGRADE_CANCEL_HOLD  600
@@ -741,8 +804,73 @@ typedef struct {
   time_t started;
   time_t progressed;          /* last step started or finished            */
   time_t next_at;             /* volatile: when the next step may start    */
+  time_t mesh_until;          /* volatile: stop waiting for the mesh then  */
   char   summary[192];        /* why it ended (kept after it stops)        */
+  /* Who drives it, and how many times it has changed: every hub keeps a copy
+   * (hub_state_t.splan), and the highest (started, rev) is the truth. */
+  char   driver[64];
+  char   driver_name[64];    /* its name when it published, for logs   */
+  long long rev;
+  bool   single;              /* one plain run, published but with no steps */
+  int    reruns;              /* a step cut off by restarts, and run again  */
+  char   self_target[64];     /* this hub's own swap is waiting to be seen  */
+  char   last_run[64];        /* the step that closed: who to wait for      */
+  /* A plan on hold: the network sits at its last closed step, and says why. */
+  char   hold[192];
+  bool   hold_rerun;          /* resuming runs this step again, else the next */
+  char   hold_uuid[64];       /* it resumes itself once this node ... */
+  char   hold_ver[64];        /* ... runs this */
+  char   left[MAX_PLAN_LEFT * 37 + 1]; /* comma list: upgrade continue left these behind */
 } upgrade_plan_t;
+
+/* A stored run: the line as it came, plus what the merge compares. */
+typedef struct {
+  char *body;
+  char id[64];
+  long long rev;
+  time_t started;
+} uhist_rec_t;
+
+/* A run parsed for reading or amending; never kept in the store. */
+typedef struct {
+  char kind[2];       /* b, h, s = the driver                             */
+  char state[16];
+  char uuid[64];
+  char name[64];
+  char from[64];
+  char to[64];
+  char base[8];
+  char want[8];
+  char arch[32];
+  char libc[16];
+  long long committed, back, done;
+  char reason[128];
+  /* Newer readers only; an older one stops at reason. */
+  char code[16];     /* why it did not make it: disk, net, selftest, ... */
+  char build[8];     /* bin or src */
+  long long stage_s; /* how long getting it ready took */
+} uhist_node_t;
+
+typedef struct {
+  char id[64];
+  long long rev;
+  char driver_uuid[64];
+  char driver_name[64];
+  char by[64];
+  long long started, rolling_at, ended;
+  char result[16];
+  char bot_ver[64];
+  char hub_ver[64];
+  char variant[8];
+  char kind[8];
+  char min_from[64];
+  long long plan_id;
+  int step, steps;
+  char sel[MAX_UPGRADE_SELECT * 72];
+  char summary[192];
+  uhist_node_t *nodes; /* heap; hub_uhist_view_free */
+  int node_count;
+} uhist_view_t;
 
 typedef struct {
   char request_id[64];
@@ -798,6 +926,7 @@ typedef struct {
 #define UC_LINE_MAX       160    /* uc|<uuid>|<chan>|add/del|<ts> */
 #define RV_LINE_MAX       256    /* rv|uuid|pub|pub_ts|nick|wiped|del_ts */
 #define HS_LINE_MAX       96     /* hs|<name>|<value>|<ts> */
+#define MAX_CRON_RECS     128    /* single-node cron settings: hs|cr.<b|h>.<uuid> */
 #define HUB_GSETTINGS_MAX 8      /* hs| settings the registry may hold */
 /* hl|<addr>/<fp>,...: the hubs a bot dials, pushed by the bot, stored as its
  * per-bot entry "hl" (never sent to bots).  <fp> = hex of SHA-256(the hub's
@@ -809,7 +938,7 @@ typedef struct {
 #define HK_LINE_MAX       (HL_VALUE_MAX + 64)  /* b|<uuid>|hl|<value>|<ts> */
 /* What rv| and hs| add to a bulk payload at their caps. */
 #define REVOKE_RECORDS_MAX \
-  ( MAX_REVOKED * RV_LINE_MAX + HUB_GSETTINGS_MAX * HS_LINE_MAX )
+  ( MAX_REVOKED * RV_LINE_MAX + (HUB_GSETTINGS_MAX + MAX_CRON_RECS) * HS_LINE_MAX )
 /* What uf| and uc| add to a bulk payload at their caps. */
 #define USER_ACCESS_RECORDS_MAX \
   ( MAX_HUB_USER_FLAGS * UF_LINE_MAX + MAX_HUB_CHAN_BINDS * UC_LINE_MAX )
@@ -903,6 +1032,7 @@ typedef struct { int rep; int live; } global_ban_slot_t;
     (size_t)MAX_UPGRADE_SELECT * 80 )
 #define HUB_CONFIG_FIXED_MAX \
   ( (size_t)8192 + (size_t)ROLLUP_LINE_MAX + (size_t)PLAN_LINE_MAX + \
+    (size_t)MAX_UPGRADE_HISTORY * UHIST_LINE_MAX + \
     (size_t)MAX_BOT_ENTRIES      * GLOBAK_LINE_MAX + \
     (size_t)MAX_HUB_USER_RECORDS * USER_LINE_MAX   + \
     (size_t)MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
@@ -956,6 +1086,15 @@ typedef struct { int rep; int live; } global_ban_slot_t;
  * only while the report is this fresh: past one missed gossip round it
  * forwards to everyone, as a hub that never reported links is. */
 #define SYNC_SPLIT_HORIZON_FRESH (2 * BOT_PRESENCE_INTERVAL + 10)
+/* Presence events (a bot linked or left, a peer link came up or went down) gossip at
+ * once; a burst is damped: each event gossip within PRESENCE_FLAP_WINDOW of the last
+ * doubles the hold before the next (1, 2, 4 ... PRESENCE_HOLD_MAX s), and a quiet
+ * window resets it.  Events inside a hold coalesce into one round.  A link that comes
+ * up gossips again PRESENCE_LINK_REGOSSIP later: the first round can be lost to the
+ * duplicate-link race (both ends dial, one link closes). */
+#define PRESENCE_FLAP_WINDOW   30
+#define PRESENCE_HOLD_MAX      30
+#define PRESENCE_LINK_REGOSSIP 3
 /* Tree rows: every hub node, every bot beneath one, plus the disconnected
  * tail (bounded by the bots the config knows about). */
 #define MAX_TREE_ROWS         (MAX_MESH_HUBS + MAX_PEERS + 1 + MAX_BOT_ROSTER + MAX_BOTS)
@@ -975,6 +1114,8 @@ typedef struct { int rep; int live; } global_ban_slot_t;
  * byte budget, else a full config/sync could never be enqueued.  Compile-time
  * so a future macro change that breaks the relationship fails the build rather
  * than silently dropping payloads at runtime. */
+_Static_assert(UHIST_LINE_MAX + 16 <= MAX_SYNC_PAYLOAD,
+               "one upgrade history record must fit a peer frame");
 _Static_assert(MAX_QUEUED_BYTES_PER_PEER >= MAX_BULK_PAYLOAD,
                "per-peer queue budget must hold at least one bulk payload");
 #define MAX_DELTA_SEEN            8192
@@ -1121,6 +1262,7 @@ typedef struct {
   upgrade_node_state_t state;
   char reason[128];
   time_t committed_at;
+  time_t done_at;       /* when it ended in the run (upgrade history)     */
   /* A hub node's READY says how many of ITS local bots it relayed PREPARE
    * to; the driver holds PREPARE open until that many relayed READYs are in,
    * so a peer's bots are never missed for answering a moment after it. */
@@ -1131,6 +1273,15 @@ typedef struct {
    * lands ahead of any hub it routes for: descending ready_seq is
    * deepest-first along the COMMIT routes (see hub_upgrade_tick). */
   int ready_seq;
+  /* Staging: this node said it can stage, and how that is going. */
+  bool can_stage, staged, is_src, left;
+  char stage_phase[16], stage_code[16];
+  char stage_pct[8], stage_detail[48]; /* "~60%", "120 of 200 crates": how far it has got */
+  time_t stage_sent, stage_last, staged_at;
+  int stage_limit;      /* its limit for a prebuilt, from its history */
+  int build_limit;      /* and for a source build */
+  char cls;             /* f fast, s slow, p problem, u unknown */
+  bool counted;         /* this failure has been weighed */
 } upgrade_node_t;
 
 /* One downstream node a FOLLOWER relays for.  A run reaches every hub in the
@@ -1150,12 +1301,18 @@ typedef enum {
   UPG_ROLLING,  /* committing nodes wave by wave                         */
   UPG_DONE,
   UPG_FAILED,
+  UPG_STAGING,  /* nodes getting the build ready; nothing has changed yet  */
+  UPG_PARTIAL,  /* it ran, and some nodes did not take it                  */
   UPG_ABORTED
 } upgrade_phase_t;
 
 typedef struct {
   bool   active;
   char   id[64];              /* generate_request_id()                   */
+  char   by[64];              /* the admin who typed it (upgrade history) */
+  long long plan_id;          /* its plan's `started`; 0 = a one-step run */
+  int    plan_step, plan_steps;
+  time_t rolling_at;
   char   target_ver[64];
   char   variant[8];          /* "" = keep each node's own variant       */
   char   kind[8];             /* "" = let each node pick bin/src         */
@@ -1182,6 +1339,8 @@ typedef struct {
   } select[MAX_UPGRADE_SELECT];
   int    select_count;
   char   sel_wire[MAX_UPGRADE_SELECT * 72]; /* uuid[=v],... for peers    */
+  bool   build_stopped;       /* a build was stopped: the plan holds        */
+  bool   hubs_stopped;        /* a peer hub failed: no more hubs move       */
 } pending_upgrade_t;
 
 /* The plan a completed run left behind, and the one node being walked up to
@@ -1208,12 +1367,17 @@ typedef struct {
   char   step[64];        /* the version THIS attempt installs           */
   time_t started;
   bool   committed;
+  time_t ready_at;        /* READY came: the node has a moment to say it stages */
+  bool   staging;         /* told to stage, and waiting for it */
+  time_t stage_last;
 } pending_rollup_t;
 
 typedef struct {
   char   uuid[64];
   time_t last_try;
   int    tries;
+  char   step[64];   /* the last attempt, for upgrade status */
+  char   note[128];
 } rollup_try_t;
 
 typedef struct {
@@ -1380,6 +1544,7 @@ typedef struct {
   time_t drop_logged;           /* last queue-drop warning for this client */
   int drop_unlogged;            /* drops since, not yet in a warning       */
   bool superseded;              /* a newer session of this bot replaced it */
+  bool result_relayed;          /* this link's one relayed UPGRADE_RESULT  */
   /* Review 6 (CMD_LINK_SEQ): its offer seen, our go queued / sealed, its go
    * seen; the counters of the frames sealed / opened since. */
   bool link_offered;
@@ -1470,6 +1635,10 @@ typedef struct {
   char   bot_version[ROSTER_VERSION_MAX + 1];
   char   bot_server[ROSTER_SERVER_MAX + 1];
   char   bot_variant[ROSTER_VARIANT_MAX + 1]; /* "c" / "rs", "" = unreported */
+  char   bot_cron[CRON_STATUS_MAX + 1];       /* "" = unreported */
+  int    cron_sent;                           /* last CMD_CRON_SET + 1, 0 = none */
+  bool   late_prepared;                       /* joined a run in flight already */
+  bool   plan_capable;                        /* a peer that speaks CMD_UPGRADE_PLAN */
   time_t bot_started;              /* bot's own start time, 0 = unreported  */
 
   /* SHA-256 of the last full config queued to this bot (CMD_CONFIG_DATA), so
@@ -1552,6 +1721,11 @@ typedef struct {
   int    reply_fd;
   uint64_t reply_serial;
   char   reply_rid[USER_CHAN_RID_MAX + 1];
+  /* kind "ban" (ban add / channel ban): the record just stored, for the
+   * ban.added answer the console gets when the election ends */
+  time_t ban_expires;
+  bool   ban_sticky, ban_existed;
+  char   ban_reason[BAN_REASON_MAX + 1];
 } chan_elect_t;
 
 /* One bot's live presence, as reported by the hub it is connected to.  Purely
@@ -1565,11 +1739,13 @@ typedef struct {
   char   nick[MAX_NICK];
   char   version[ROSTER_VERSION_MAX + 1];
   char   variant[ROSTER_VARIANT_MAX + 1]; /* code base: "c" / "rs" / ""  */
+  char cron[CRON_STATUS_MAX + 1];
   char   server[ROSTER_SERVER_MAX + 1];   /* the bot's IRC link           */
   time_t connected_at;                    /* bot's own start, for uptime  */
   time_t link_since;                      /* bot -> its hub link, 0 = unknown */
   char   ip[ROSTER_IP_MAX + 1];           /* bot's address as its hub sees it */
   time_t reported_at;                     /* local clock: drives the TTL  */
+  long long gen;                          /* the gossip round it came in (0 = none) */
 } bot_roster_t;
 
 /* One peer link a hub reports in its roster gossip (an l| line): a peer it is
@@ -1591,9 +1767,11 @@ typedef struct {
   time_t      started;
   char        version[ROSTER_VERSION_MAX + 1];
   char        variant[ROSTER_VARIANT_MAX + 1];
+  char        cron[CRON_STATUS_MAX + 1];
   mesh_link_t links[MAX_PEERS];
   int         link_count;
   bool        have_links;   /* it has sent an l| list (a hub that relays) */
+  time_t      links_at;     /* local clock: when that list was last applied */
   long long   gen;          /* newest gossip generation seen from it      */
   uint64_t    chunks_seen;  /* chunks of `gen` already applied (bit n)    */
   time_t      reported_at;  /* local clock: drives the TTL                */
@@ -1713,6 +1891,25 @@ typedef struct {
 
   /* The network upgrade this hub is driving, if any (one at a time). */
   pending_upgrade_t upgrade;
+  uhist_rec_t uhist[MAX_UPGRADE_HISTORY]; /* newest first (hub_uhist.c) */
+  int uhist_count;
+  int uhist_keep_setting;  /* hs|upgradehistory; 0 = UHIST_DEFAULT_KEEP */
+  time_t uhist_keep_ts;
+  /* Production crontab lines: off until an admin says otherwise.  The last
+   * command wins by timestamp, a single node's or the global one. */
+  int bot_cron_setting, hub_cron_setting;  /* hs|botcron, hs|hubcron: 0 off, 1 on */
+  time_t bot_cron_ts, hub_cron_ts;
+  struct {
+    char uuid[64];
+    char kind;  /* 'b' or 'h' */
+    int on;
+    time_t ts;
+  } cron_recs[MAX_CRON_RECS];
+  int cron_rec_count;
+  /* The plan as every hub knows it: this hub's own copy of what its driver last
+   * published, and when it last heard the driver. */
+  upgrade_plan_t splan;
+  time_t splan_seen, plan_beat;
 
   /* The upgrade this hub has agreed to take from ANOTHER hub, if any.  The
    * mesh is flat, so a hub is a follower and a driver at the same time and the
@@ -1737,6 +1934,7 @@ typedef struct {
   char   follow_sel[MAX_UPGRADE_SELECT * 72];
   bool   follow_self_ready;  /* this hub itself can take the followed run */
   time_t follow_prepared;
+  char upgrade_installed_id[64]; /* the run whose restart made this process */
   /* Nodes below this hub in the followed run's fan-out tree (its own peers'
    * subtrees).  Rebuilt for every run; see upgrade_route_t. */
   upgrade_route_t follow_routes[MAX_UPGRADE_ROUTES];
@@ -1840,6 +2038,11 @@ typedef struct {
   int          mesh_hub_count;
   long long    roster_gen;         /* last generation this hub gossiped     */
   uint32_t     gossip_link_mask;   /* peers linked at the last gossip (bit p) */
+  bool         presence_event_due; /* a presence event waits for its gossip     */
+  time_t       presence_hold_until;/* no event gossip before then (damping)     */
+  time_t       presence_last_event;/* the last event gossip                     */
+  int          presence_burst;     /* event gossips in a row inside the window  */
+  time_t       gossip_again_at;    /* a link came up: gossip once more then     */
   time_t       resync_due_at;      /* ask peers for a sync then (0 = none)  */
 
   /* Maintenance clocks of hub_maintenance() / hub_check_peers() (last run;
@@ -1891,6 +2094,7 @@ void hub_log_at(int level, const char *format, ...)
 
 bool hub_config_load(hub_state_t *state, const char *password);
 void hub_config_write(hub_state_t *state);
+unsigned long hub_config_saves(void);
 /* hub_config_write() is a no-op while this is set (-selftest). */
 extern bool g_hub_config_readonly;
 /* true while hub_config_load runs: stamps on disk are this hub's own record
@@ -2349,6 +2553,12 @@ int  hub_gsetting_format(hub_state_t *state, const char *name, char *buf, size_t
 bool hub_gsetting_set(hub_state_t *state, const char *name, int value);
 bool hub_gsetting_ingest(hub_state_t *state, const char *rest, bool *changed);
 bool hub_gsetting_append(hub_state_t *state, char *buf, int max_len, int *off);
+int hub_plan_format(const upgrade_plan_t *pl, char *out, size_t cap);
+bool hub_plan_parse(const char *body, upgrade_plan_t *pl);
+void hub_plan_boot(hub_state_t *state);
+bool hub_cron_wanted(const hub_state_t *state, char kind, const char *uuid);
+bool hub_cron_set_one(hub_state_t *state, char kind, const char *uuid, bool on, char *line, size_t cap);
+void hub_cron_prune(hub_state_t *state, char kind);
 
 /* Send PURGE|<cutoff>|<id> to every peer hub, under a fresh random id that
  * this hub records as seen.  False (nothing sent) if no id could be drawn. */
@@ -2374,6 +2584,8 @@ void hub_broadcast_mesh_state(hub_state_t *state);
  * TTL; hub_roster_mark_dirty asks for a push (`local`: one of our own bots
  * changed, pushed within BOT_TREE_COALESCE_LOCAL). */
 void hub_presence_tick(hub_state_t *state, time_t now);
+void hub_presence_event(hub_state_t *state);
+int hub_presence_hold(int burst);
 /* One step of the rolling network upgrade per maintenance tick: collect
  * READY acks, commit the next wave, time out a node that never came back.
  * A no-op unless a run is active. */
@@ -2427,6 +2639,19 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
 /* CMD_UPGRADE_ABORT: restore <exe>.prev / .irchub.cnf.prev and restart onto
  * them.  False when there is nothing retained to go back to. */
 bool hub_update_rollback(hub_state_t *state, const char *reason);
+void hub_update_failback_confirm(void);
+const char *hub_update_cron_status(void);
+void hub_update_cron_set(bool on);
+bool hub_update_cron_tick(const char *exe);
+int hub_update_cron_drop(const char *exe);
+bool hub_update_install_in_progress(void);
+bool hub_update_has_build(const char *root, const char *variant, const char *ver, const char *arch,
+                          const char *libc);
+void hub_update_stage_start(const char *exe, const char *id, const char *ver, const char *variant);
+void hub_update_stage_clear(void);
+void hub_update_stage_boot_clean(void);
+bool hub_update_stage_tick(char *id, size_t id_size, char *out, size_t out_size);
+bool hub_update_failback_note(char *out, size_t out_size);
 bool hub_upgrade_marker_write(const char *upgrade_id, const char *target_ver,
                               const char *variant);
 /* True when `s` may be one field of an upgrade plan: no '|', no line break,

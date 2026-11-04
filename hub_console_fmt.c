@@ -194,11 +194,24 @@ void flines_add(flines_t *o, int role, const char *text) {
     o->v = nv;
     o->cap = cap;
   }
-  /* trailing blanks never reach the screen */
-  size_t n = strlen(text);
-  while (n > 0 && text[n - 1] == ' ') n--;
-  char *t = dupn(text, n);
+  char *t = dupn(text, strlen(text));
   if (!t) return;
+  /* A long name cut into a fixed buffer can end mid-character: the terminal only
+   * ever gets whole ones. */
+  size_t n = 0, len = strlen(t);
+  for (size_t i = 0; i < len;) {
+    size_t k = console_utf8_len((const unsigned char *)t + i, len - i);
+    if (!k) {
+      i++;
+      continue;
+    }
+    memmove(t + n, t + i, k);
+    n += k;
+    i += k;
+  }
+  /* trailing blanks never reach the screen */
+  while (n > 0 && t[n - 1] == ' ') n--;
+  t[n] = '\0';
   o->v[o->n].text = t;
   o->v[o->n].role = role;
   o->n++;
@@ -291,10 +304,10 @@ static void sb_free(sb_t *b) {
  * ========================================================================== */
 static const char *const GLYPH_U[G_COUNT] = {
   "─", "●", "○", "◐", "✓", "✗", "▲", "•", "…", "·", "→", "├", "└", "│", "—",
-  "×", "█", "░", "▾", "?"};
+  "×", "█", "░", "▾", "?", "▓"};
 static const char *const GLYPH_A[G_COUNT] = {
   "-", "*", "o", "~", "+", "x", "!", "-", "~", "|", "->", "|", "`", "|", "-",
-  "x", "#", ".", "v", "?"};
+  "x", "#", ".", "v", "?", "+"};
 
 const char *fmt_glyph(const fmt_ctx_t *ctx, int g) {
   if (g < 0 || g >= G_COUNT) return "?";
@@ -862,6 +875,14 @@ static void bot_last_seen(const fmt_ctx_t *ctx, const crec_t *r, char *out, size
   else when_ago(ctx, rvi(r, "seen", 0), out, cap);
 }
 
+/* The CRON column: the status without its reason; show has the whole of it. */
+static void cron_word(const crec_t *r, char *out, size_t cap) {
+  const char *v = rvs(r, "cron");
+  snprintf(out, cap, "%s", v ? v : "-");
+  char *colon = strchr(out, ':');
+  if (colon) *colon = '\0';
+}
+
 static void render_bot_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   long long total = rvi(&rep->res, "total", 0), online = rvi(&rep->res, "online", 0);
   char right[96];
@@ -877,11 +898,11 @@ static void render_bot_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
   }
   static const col_t cols[] = {
     {"", 'L', 1}, {"NICK", 'L', 1}, {"UUID", 'L', 1}, {"VERSION", 'L', 1},
-    {"CODE", 'L', 1}, {"UPTIME", 'L', 1}, {"SERVER", 'L', 2}, {"HUB", 'L', 2},
+    {"CODE", 'L', 1}, {"UPTIME", 'L', 1}, {"CRON", 'L', 1}, {"SERVER", 'L', 2}, {"HUB", 'L', 2},
     {"ADDRESS", 'L', 2}, {"SINCE", 'L', 2}, {"KEY", 'L', 2}, {"AUTH", 'L', 2},
     {"LAST SEEN", 'L', 1}};
   tbl_t t;
-  tbl_init(&t, cols, 13, 0, 1, 1);
+  tbl_init(&t, cols, 14, 0, 1, 1);
   int here = 0, via = 0;
   /* version and code-base breakdowns, in first-seen order then sorted */
   char vers[64][24];
@@ -893,9 +914,11 @@ static void render_bot_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
     span_since(ctx, on ? rvi(r, "started", 0) : 0, up, sizeof(up));
     span_since(ctx, on ? rvi(r, "since", 0) : 0, since, sizeof(since));
     bot_last_seen(ctx, r, seen, sizeof(seen));
-    const char *cells[13] = {
+    char cron[16];
+    cron_word(r, cron, sizeof(cron));
+    const char *cells[14] = {
       on ? GL(G_ON) : GL(G_OFF), rv(r, "nick"), rv(r, "uuid"), rv(r, "ver"), rv(r, "base"),
-      up, rv(r, "server"), rv(r, "hub_name"), rv(r, "ip"), since,
+      up, cron, rv(r, "server"), rv(r, "hub_name"), rv(r, "ip"), since,
       rvs(r, "fp") ? rv(r, "fp") : "(no key)", rvb(r, "auth") ? "yes" : "no", seen};
     tbl_row(ctx, &t, on ? RL_NORMAL : RL_DIM, on ? "online" : "offline", cells);
     if (on) {
@@ -1465,15 +1488,31 @@ static void render_peer_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
   fmt_title(ctx, out, "Linked hubs", right);
   static const col_t cols[] = {
     {"#", 'R', 1}, {"NAME", 'L', 1}, {"ADDRESS", 'L', 1}, {"UUID", 'L', 2}, {"CODE", 'L', 2},
-    {"VERSION", 'L', 2}, {"UPTIME", 'L', 2}, {"BOTS", 'R', 1}, {"LINK", 'L', 1},
+    {"VERSION", 'L', 2}, {"UPTIME", 'L', 2}, {"CRON", 'L', 1}, {"BOTS", 'R', 1}, {"LINK", 'L', 1},
     {"KEY", 'L', 1}, {"FROM", 'L', 2}};
   tbl_t t;
-  tbl_init(&t, cols, 11, -1, 1, 1);
-  const crec_t *self = NULL;
+  tbl_init(&t, cols, 12, -1, 1, 1);
+  int peers = 0;
+  /* The hub this console is on: first, in the same columns, its LINK saying so. */
   for (int i = 0; i < rep->n; i++) {
     const crec_t *r = &rep->r[i];
-    if (!strcmp(r->type, "self")) self = r;
+    if (strcmp(r->type, "self")) continue;
+    char addr[96], bots[16], link[64], upt[32], cron[16];
+    snprintf(addr, sizeof(addr), "%s:%lld", rv(r, "bind_ip") ? rv(r, "bind_ip") : "?",
+             rvi(r, "port", 0));
+    snprintf(bots, sizeof(bots), "%lld", rvi(r, "bots", 0));
+    snprintf(link, sizeof(link), "%s this hub", GL(G_DOT));
+    span_since(ctx, rvi(r, "started", 0), upt, sizeof(upt));
+    cron_word(r, cron, sizeof(cron));
+    const char *cells[12] = {"", peer_name(r), addr, rv(r, "uuid"), rv(r, "base"), rv(r, "ver"),
+                             upt, cron, bots, link, rv(r, "fp"), NULL};
+    tbl_row(ctx, &t, RL_NORMAL, "self", cells);
+    break;
+  }
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *r = &rep->r[i];
     if (strcmp(r->type, "peer")) continue;
+    peers++;
     char nn[16], addr[96], bots[16], link[96], upt[32];
     snprintf(nn, sizeof(nn), "%lld", rvi(r, "n", 0));
     addr_of(r, addr, sizeof(addr));
@@ -1483,22 +1522,17 @@ static void render_peer_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
     span_since(ctx, rvi(r, "started", 0), upt, sizeof(upt));
     const char *from = rvs(r, "remote_ip") && rvs(r, "ip") && strcmp(rv(r, "remote_ip"), rv(r, "ip"))
                            ? rv(r, "remote_ip") : NULL;
-    const char *cells[11] = {nn, rvs(r, "name"), addr, rv(r, "uuid"), rv(r, "base"),
-                             rv(r, "ver"), upt, bots, link, rv(r, "fp"), from};
+    char cron[16];
+    cron_word(r, cron, sizeof(cron));
+    const char *cells[12] = {nn, rvs(r, "name"), addr, rv(r, "uuid"), rv(r, "base"),
+                             rv(r, "ver"), upt, cron, bots, link, rv(r, "fp"), from};
     tbl_row(ctx, &t, rvb(r, "up") ? RL_NORMAL : RL_WARN, rvb(r, "up") ? "up" : "down", cells);
   }
-  if (!t.nr) {
+  if (t.nr) tbl_render(ctx, out, &t);
+  tbl_free(&t);
+  if (!peers)
     empty_note(out, "no other hubs linked: this hub runs alone",
                "hub add <ip> <port> <uuid> <name|-> <key>");
-  } else {
-    tbl_render(ctx, out, &t);
-  }
-  tbl_free(&t);
-  if (self) {
-    line(out, RL_DIM, "  this hub: %s  %s  %s %s  %lld bots  port %lld", peer_name(self),
-         rvs(self, "uuid") ? rv(self, "uuid") : GL(G_DASH), rvs(self, "base") ? rv(self, "base") : "?",
-         rvs(self, "ver") ? rv(self, "ver") : "?", rvi(self, "bots", 0), rvi(self, "port", 0));
-  }
   if (!conf) return;
   flines_add(out, RL_NORMAL, "");
   render_mesh(ctx, rep, out);
@@ -1928,7 +1962,9 @@ static const char *const OPNAME[256] = {
  [0x74] = "CMD_CHAN_ELECT_DONE", [0x75] = "CMD_ADMIN_INVITE_USER",
  [0x76] = "CMD_ADMIN_CHAN_MODE", [0x77] = "CMD_ADMIN_CHAN_SET", [0x78] = "CMD_ADMIN_BAN",
  [0x79] = "CMD_ADMIN_NET_SET", [0x7A] = "CMD_ADMIN_SET_SSH", [0x7B] = "CMD_CHAN_EVENT", [0x7C] = "CMD_ADMIN_USER_ACCESS", [0x7D] = "CMD_USER_CHAN_REQUEST", [0x7E] = "CMD_USER_CHAN_RESULT", [0x7F] = "CMD_BOT_RETIRE", [0x80] = "CMD_BOT_RETIRE_ACK", [0x81] = "CMD_ADMIN_LIST_REVOKED", [0x82] = "CMD_ADMIN_PEER_REFS",
- [0x83] = "CMD_LINK_SEQ",
+ [0x83] = "CMD_LINK_SEQ", [0x84] = "CMD_ADMIN_KICK_USER", [0x87] = "CMD_UPGRADE_HISTORY",
+ [0x88] = "CMD_UPGRADE_STAGE", [0x89] = "CMD_UPGRADE_PROGRESS", [0x8A] = "CMD_UPGRADE_PLAN",
+ [0x8B] = "CMD_CRON_SET",
 };
 
 static unsigned long long rvu(const crec_t *r, const char *k) {
@@ -2011,7 +2047,8 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
     count_kv(&b, "  total", rvu(ld, "clients"), 0);
     count_kv(&b, "bots", rvu(ld, "bots"), 24);
     count_kv(&b, "hubs", rvu(ld, "peers"), 40);
-    count_kv(&b, "authing", rvu(ld, "authing"), 60);
+    count_kv(&b, "consoles", rvu(ld, "consoles"), 60);
+    count_kv(&b, "authing", rvu(ld, "authing"), 80);
     sb_emit(&b, out, RL_NORMAL);
   }
   sb_free(&b);
@@ -2260,17 +2297,22 @@ static const struct {
 
 static void render_option_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   const char *flags = rv(&rep->res, "flags") ? rv(&rep->res, "flags") : "";
-  char right[64], fp[40];
-  flags_phrase(flags, fp, sizeof(fp));
-  snprintf(right, sizeof(right), "flags: %s", fp);
+  char right[64];
+  /* the state reads without colour too: a mark and a word per row, and a
+   * line saying which flags are set (or that none is) */
+  if (*flags) snprintf(right, sizeof(right), "set: %s", flags);
+  else snprintf(right, sizeof(right), "no flags set");
   fmt_title(ctx, out, "Network options", right);
   static const col_t cols[] = {{"FLAG", 'L', 1}, {"STATE", 'L', 1}, {"MEANING", 'L', 2}};
   tbl_t t;
   tbl_init(&t, cols, 3, -1, 0, 1);
+  char st_on[24], st_off[24];
+  snprintf(st_on, sizeof(st_on), "%s on", GL(G_ON));
+  snprintf(st_off, sizeof(st_off), "%s off", GL(G_OFF));
   for (int i = 0; i < NOPT; i++) {
     char f[2] = {OPT_FLAGS[i].flag, 0};
     bool on = strchr(flags, OPT_FLAGS[i].flag) != NULL;
-    const char *cells[3] = {f, on ? "on" : "off", OPT_FLAGS[i].meaning};
+    const char *cells[3] = {f, on ? st_on : st_off, OPT_FLAGS[i].meaning};
     tbl_row(ctx, &t, on ? RL_NORMAL : RL_DIM, NULL, cells);
   }
   for (const char *p = flags; *p; p++) {
@@ -2278,11 +2320,18 @@ static void render_option_list(const fmt_ctx_t *ctx, const creply_t *rep, flines
     for (int i = 0; i < NOPT; i++) known |= OPT_FLAGS[i].flag == *p;
     if (known) continue;
     char f[2] = {*p, 0};
-    const char *cells[3] = {f, "on", "(unknown flag)"};
+    const char *cells[3] = {f, st_on, "(unknown flag)"};
     tbl_row(ctx, &t, RL_WARN, NULL, cells);
   }
   tbl_render(ctx, out, &t);
   tbl_free(&t);
+  if (*flags) {
+    char ph[96];
+    snprintf(ph, sizeof(ph), "set: %s   (every other flag is off)", flags);
+    effect(ctx, out, ph);
+  } else {
+    effect(ctx, out, "no flags are set: every option above is off");
+  }
   line(out, RL_DIM, "  change with option set <flags>   %s   clear with option set -", GL(G_DOT));
 }
 
@@ -2676,16 +2725,20 @@ static void render_channel_change(const fmt_ctx_t *ctx, const creply_t *rep, fli
     else snprintf(ph, sizeof(ph), "the tombstone stays until hub purge (autopurge is off)");
     effect(ctx, out, ph);
   } else {
-    bool inv = !strcmp(code, "channel.invite");
+    bool inv = !strcmp(code, "channel.invite"), kick = !strcmp(code, "channel.kick");
     snprintf(subj, sizeof(subj), "%s on %s", rv(r, "nick") ? rv(r, "nick") : "?",
              rv(r, "chan") ? rv(r, "chan") : "?");
     long long asked = rvi(r, "asked", 0), hubs = rvi(r, "hubs", 0);
     if (rvs(r, "by")) { /* one bot was picked and did it */
-      fmt_ok(ctx, inv ? "Invited" : "Opped", subj, out);
+      fmt_ok(ctx, kick ? "Kicked" : inv ? "Invited" : "Opped", subj, out);
       snprintf(ph, sizeof(ph), "%s on %s did it%s%s%s", rv(r, "by"),
                rv(r, "hub_name") ? rv(r, "hub_name") : "?", rvs(r, "detail") ? " (" : "",
                rvs(r, "detail") ? rv(r, "detail") : "", rvs(r, "detail") ? ")" : "");
       effect(ctx, out, ph);
+      if (kick) {
+        snprintf(ph, sizeof(ph), "reason: %s", rvs(r, "reason") ? rv(r, "reason") : "kicked");
+        effect(ctx, out, ph);
+      }
       snprintf(ph, sizeof(ph), "%lld bot%s asked on %lld hub%s; one acted", asked,
                asked == 1 ? "" : "s", hubs, hubs == 1 ? "" : "s");
       effect(ctx, out, ph);
@@ -3054,6 +3107,20 @@ static void render_ban_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
     effect(ctx, out, ph);
   }
   push_effects(ctx, r, out);
+  /* one channel: whether one elected bot set it now (hub 2.5.3) */
+  if (rv(r, "placed") && rvb(r, "placed")) {
+    snprintf(ph, sizeof(ph), "set on %s now by %s on %s%s%s%s", chan, rvs(r, "by") ? rv(r, "by") : "?",
+             rvs(r, "hub_name") ? rv(r, "hub_name") : "?", rvs(r, "detail") ? " (" : "",
+             rvs(r, "detail") ? rv(r, "detail") : "", rvs(r, "detail") ? ")" : "");
+    effect(ctx, out, ph);
+  } else if (rv(r, "placed") && rvb(r, "dynamic")) {
+    snprintf(ph, sizeof(ph), "not on %s now: +dynamicbans sets it only while someone it matches is there", chan);
+    effect(ctx, out, ph);
+  } else if (rv(r, "placed")) {
+    snprintf(ph, sizeof(ph), "not set on %s yet: %s; the bots set it once one is opped there", chan,
+             rvs(r, "why") ? rv(r, "why") : "no bot could");
+    warn(ctx, out, ph);
+  }
 }
 
 /* The settings a channel overrides ("bitch=1,flood join=5:60") as a person
@@ -3168,12 +3235,64 @@ static void plan_path_line(const fmt_ctx_t *ctx, const crec_t *pl, const char *p
 }
 
 /* The multi-step plan card lines (view 4 and `upgrade status`). */
+/* Every failure code has one next step. */
+static const char *upg_code_hint(const char *code) {
+  static const struct { const char *code, *hint; } hints[] = {
+      {"disk", "free some space, then upgrade start again"},
+      {"dir", "make the instance directory writable, then upgrade start again"},
+      {"exe", "the binary must belong to this user and not be immutable"},
+      {"exec", "remount the instance directory without noexec"},
+      {"tool", "install the missing tool on that host"},
+      {"net", "check that host can reach the release site"},
+      {"build", "see the build error on that host, or use a prebuilt"},
+      {"selftest", "this build cannot run on that host: try the other variant"},
+      {"sig", "the release is not what was signed: do not retry; check the release"},
+      {"hash", "the artifact does not match its manifest: do not retry; check the release"},
+      {"late", "see that host's log; it may still come back"},
+      {NULL, NULL}};
+  for (int i = 0; hints[i].code; i++)
+    if (!strcmp(hints[i].code, code)) return hints[i].hint;
+  return NULL;
+}
+
+static void upg_hints(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  (void)ctx;
+  const char *seen[16];
+  int ns = 0;
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *n = &rep->r[i];
+    if (strcmp(n->type, "node") || !rvs(n, "code")) continue;
+    const char *code = rv(n, "code"), *hint = upg_code_hint(code);
+    bool dup = false;
+    for (int k = 0; k < ns; k++) dup = dup || !strcmp(seen[k], code);
+    if (!hint || dup || ns >= 16) continue;
+    seen[ns++] = code;
+    line(out, RL_DIM, "  %s: %s", code, hint);
+  }
+}
+
+/* Roll-ups are outside history: each node's last one, here. */
+static void upg_rolled(const fmt_ctx_t *ctx, const creply_t *rep, int L, flines_t *out) {
+  char v[320], a[48];
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *n = &rep->r[i];
+    if (strcmp(n->type, "rolled")) continue;
+    fmt_when(rvi(n, "when", 0), ctx->now, a, sizeof(a));
+    snprintf(v, sizeof(v), "%s to %s, %s, %lld tries: %s", rv(n, "name") ? rv(n, "name") : "?",
+             rv(n, "step") ? rv(n, "step") : "?", a, rvi(n, "tries", 0),
+             rv(n, "note") ? rv(n, "note") : "");
+    fmt_card_line(ctx, out, L, "roll-up", v, RL_DIM);
+  }
+}
+
 static void render_upg_plan(const fmt_ctx_t *ctx, const crec_t *pl, int L, flines_t *out) {
   char v[512], a[48], b[48];
   long long step = rvi(pl, "step", 0), steps = rvi(pl, "steps", 0);
   bool active = rvb(pl, "active");
   const char *st = rv(pl, "state") ? rv(pl, "state") : "";
-  if (active && !strcmp(st, "running"))
+  if (active && !strcmp(st, "held"))
+    snprintf(v, sizeof(v), "on hold at step %lld/%lld", step, steps);
+  else if (active && !strcmp(st, "running"))
     snprintf(v, sizeof(v), "step %lld/%lld running", step, steps);
   else if (active) {
     long long nx = rvi(pl, "next", 0) - ctx->now;
@@ -3182,6 +3301,12 @@ static void render_upg_plan(const fmt_ctx_t *ctx, const crec_t *pl, int L, fline
   } else
     snprintf(v, sizeof(v), "stopped at step %lld/%lld", step, steps);
   fmt_card_line(ctx, out, L, "multi-step", v, active ? RL_NORMAL : RL_DIM);
+  if (rvs(pl, "driver_name")) {
+    fmt_span(ctx->now - rvi(pl, "heard", 0), b, sizeof(b));
+    snprintf(v, sizeof(v), "%s, last heard %s ago", rv(pl, "driver_name"), b);
+    fmt_card_line(ctx, out, L, "  driver", v, RL_NORMAL);
+  }
+  if (rvs(pl, "hold")) fmt_card_line(ctx, out, L, "  why", rv(pl, "hold"), RL_WARN);
   plan_path_line(ctx, pl, "bot", v, sizeof(v));
   if (v[0]) fmt_card_line(ctx, out, L, "  bots", v, RL_NORMAL);
   if (rvs(pl, "hub_final")) {
@@ -3194,12 +3319,15 @@ static void render_upg_plan(const fmt_ctx_t *ctx, const crec_t *pl, int L, fline
   snprintf(v, sizeof(v), "%s %s %s ago", a, GL(G_DOT), b);
   fmt_card_line(ctx, out, L, "  started", v, RL_DIM);
   if (rvs(pl, "summary")) fmt_card_line(ctx, out, L, "  ended", rv(pl, "summary"), RL_DIM);
+  if (active && !strcmp(st, "held"))
+    fmt_card_line(ctx, out, L, "", "fix it and it resumes by itself; upgrade continue goes on without it",
+                  RL_DIM);
   if (active)
     fmt_card_line(ctx, out, L, "", "upgrade abort stops the rest and rolls back only the step running",
                   RL_DIM);
 }
 
-static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+static void render_upg_current(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   const crec_t *r = &rep->res, *ru = NULL, *pl = NULL;
   for (int i = 0; i < rep->n; i++) {
     if (!strcmp(rep->r[i].type, "rollup")) ru = &rep->r[i];
@@ -3259,6 +3387,7 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
    * table -- one line says how many relayed it; a node already on the target
    * (already) is a no-op, counted apart from the failures. */
   int done = 0, already = 0, failed = 0, waiting = 0, total = 0, idle = 0;
+  int staged = 0, staging = 0, left = 0;
   for (int i = 0; i < rep->n; i++) {
     const crec_t *n = &rep->r[i];
     if (strcmp(n->type, "node")) continue;
@@ -3269,18 +3398,29 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
     int k = upg_row_rank(n);
     if (k == 4) continue;
     total++;
+    const char *ph = rvs(n, "phase") ? rv(n, "phase") : "";
     if (rvb(n, "already")) already++;
     else if (k == 3) done++;
+    else if (!strcmp(ph, "left")) left++;
     else if (k == 1) failed++;
+    else if (!strcmp(ph, "staged")) staged++;
+    else if (ph[0]) staging++;
     else waiting++;
   }
   sb_t s = {0};
-  int bar = 24, fill = total ? done * bar / total : 0;
+  /* Whole nodes only, so an estimate can never move it: done, then staged and ready to
+   * swap.  A node that left the run stays empty, and the bar stops short of full. */
+  int bar = 24, fill = total ? done * bar / total : 0, mid = total ? staged * bar / total : 0;
   sb_rep(&s, GL(G_FULL), fill);
-  sb_rep(&s, GL(G_EMPTY), bar - fill);
+  sb_rep(&s, GL(G_MID), mid);
+  sb_rep(&s, GL(G_EMPTY), bar - fill - mid);
   sb_addf(&s, "  %d / %d done", done, total);
   if (already) sb_addf(&s, " %s %d already on it", GL(G_DOT), already);
-  sb_addf(&s, " %s %d failed %s %d waiting", GL(G_DOT), failed, GL(G_DOT), waiting);
+  if (staged) sb_addf(&s, " %s %d staged", GL(G_DOT), staged);
+  if (staging) sb_addf(&s, " %s %d staging", GL(G_DOT), staging);
+  if (left) sb_addf(&s, " %s %d left", GL(G_DOT), left);
+  if (failed) sb_addf(&s, " %s %d failed", GL(G_DOT), failed);
+  if (waiting) sb_addf(&s, " %s %d waiting", GL(G_DOT), waiting);
   fmt_card_line(ctx, out, L, "progress", s.p, RL_NORMAL);
   sb_free(&s);
   if (idle) {
@@ -3291,10 +3431,11 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
   if (ru) fmt_card_line(ctx, out, L, "roll-up", plan, RL_NORMAL);
   if (rvs(r, "summary")) fmt_card_line(ctx, out, L, "summary", rv(r, "summary"), RL_NORMAL);
   if (rvb(r, "frozen")) fmt_card_line(ctx, out, L, "frozen", "yes (until the run ends)", RL_WARN);
-  static const col_t cols[] = {{"KIND", 'L', 1}, {"NODE", 'L', 1}, {"STATE", 'L', 1}, {"FROM", 'L', 1},
-                               {"TO", 'L', 1}, {"CODE", 'L', 2}, {"UUID", 'L', 2}, {"NOTE", 'L', 2}};
+  static const col_t cols[] = {{"KIND", 'L', 1}, {"NODE", 'L', 1}, {"STATE", 'L', 1}, {"TIME", 'R', 1},
+                               {"FROM", 'L', 1}, {"TO", 'L', 1}, {"CODE", 'L', 2}, {"UUID", 'L', 2},
+                               {"NOTE", 'L', 2}};
   tbl_t t;
-  tbl_init(&t, cols, 8, -1, 1, 1);
+  tbl_init(&t, cols, 9, -1, 1, 1);
   for (int rank = 0; rank <= 4; rank++)
     for (int i = 0; i < rep->n; i++) {
       const crec_t *n = &rep->r[i];
@@ -3303,10 +3444,20 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
       if (rvs(n, "want")) snprintf(code, sizeof(code), "%s %s %s", rvs(n, "base") ? rv(n, "base") : "?",
                                    GL(G_ARROW), rv(n, "want"));
       else snprintf(code, sizeof(code), "%s", rvs(n, "base") ? rv(n, "base") : "");
-      const char *st = rvb(n, "already") ? "on target" : rv(n, "state");
-      const char *cells[8] = {rv(n, "kind"), rvs(n, "name") ? rv(n, "name") : rv(n, "uuid"),
-                              st, rv(n, "from"), rv(n, "to"), code, rv(n, "uuid"),
-                              rv(n, "reason")};
+      const char *st = rvb(n, "already") ? "on target"
+                       : rvs(n, "phase") ? rv(n, "phase") : rv(n, "state");
+      /* How far a node has got belongs with what it is doing. */
+      char st_pct[32];
+      if (rvs(n, "pct") && st && (!strcmp(st, "fetching") || !strcmp(st, "building"))) {
+        snprintf(st_pct, sizeof(st_pct), "%s %s", !strcmp(st, "fetching") ? "download" : "build",
+                 rv(n, "pct"));
+        st = st_pct;
+      }
+      char secs[16] = "";
+      if (rv(n, "secs")) snprintf(secs, sizeof(secs), "%llds", rvi(n, "secs", 0));
+      const char *cells[9] = {rv(n, "kind"), rvs(n, "name") ? rv(n, "name") : rv(n, "uuid"),
+                              st, secs, rv(n, "from"), rv(n, "to"), code, rv(n, "uuid"),
+                              rvs(n, "reason") ? rv(n, "reason") : rv(n, "detail")};
       tbl_row(ctx, &t, rank == 1 ? RL_WARN : rank == 4 ? RL_DIM : RL_NORMAL, st, cells);
     }
   if (t.nr) {
@@ -3314,6 +3465,161 @@ static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_
     tbl_render(ctx, out, &t);
   }
   tbl_free(&t);
+  upg_hints(ctx, rep, out);
+  upg_rolled(ctx, rep, L, out);
+}
+
+/* ---- Upgrade history --------------------------------------------------- */
+
+static const char *upg_run_result(const crec_t *r) {
+  if (rvb(r, "stale")) return "no result";
+  return rv(r, "result") ? rv(r, "result") : "?";
+}
+
+static void upg_target_cell(const fmt_ctx_t *ctx, const crec_t *r, const char *key, char *out, size_t cap) {
+  if (rvs(r, key)) snprintf(out, cap, "%s %s", GL(G_ARROW), rv(r, key));
+  else snprintf(out, cap, "-");
+}
+
+/* "13 ok, 1 failed": what the nodes of a run came to. */
+static void upg_nodes_cell(const crec_t *r, char *out, size_t cap) {
+  bool aborted = rv(r, "result") && !strcmp(rv(r, "result"), "aborted");
+  static const struct { const char *key, *label; } parts[] = {
+      {"done", "ok"}, {"failed", "failed"}, {"unable", "unable"},
+      {"already", "on target"}, {"open", "open"}};
+  size_t o = 0;
+  out[0] = '\0';
+  for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]) && o < cap; i++) {
+    long long n = rvi(r, parts[i].key, 0);
+    if (!n) continue;
+    const char *label = parts[i].label;
+    if (aborted && !strcmp(parts[i].key, "done")) label = "rollback";
+    int w = snprintf(out + o, cap - o, "%s%lld %s", o ? ", " : "", n, label);
+    if (w < 0) break;
+    o += (size_t)w;
+  }
+  if (!out[0]) snprintf(out, cap, "-");
+}
+
+static void render_upg_runs(const fmt_ctx_t *ctx, const creply_t *rep, long long keep, flines_t *out) {
+  static const col_t cols[] = {{"WHEN", 'L', 1}, {"RUN", 'L', 1}, {"RESULT", 'L', 1}, {"BOTS", 'L', 1},
+                               {"HUBS", 'L', 1}, {"NODES", 'L', 1}, {"STEP", 'L', 2}, {"BY", 'L', 2},
+                               {"DRIVER", 'L', 2}};
+  tbl_t t;
+  tbl_init(&t, cols, 9, -1, 1, 1);
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *r = &rep->r[i];
+    if (strcmp(r->type, "run")) continue;
+    char when[48], run[12], bots[80], hubs[80], nodes[128], step[16] = "";
+    fmt_when(rvi(r, "started", 0), ctx->now, when, sizeof(when));
+    snprintf(run, sizeof(run), "%.8s", rv(r, "id") ? rv(r, "id") : "?");
+    upg_target_cell(ctx, r, "bot_ver", bots, sizeof(bots));
+    upg_target_cell(ctx, r, "hub_ver", hubs, sizeof(hubs));
+    upg_nodes_cell(r, nodes, sizeof(nodes));
+    if (rvi(r, "steps", 0) > 0)
+      snprintf(step, sizeof(step), "%lld/%lld", rvi(r, "step", 0), rvi(r, "steps", 0));
+    const char *res = upg_run_result(r);
+    const char *cells[9] = {when, run, res, bots, hubs, nodes, step, rv(r, "by"), rv(r, "driver")};
+    bool bad = !strcmp(res, "failed") || !strcmp(res, "partial") || !strcmp(res, "aborted") ||
+               !strcmp(res, "interrupted") || !strcmp(res, "no result");
+    bool picked = ctx->upg_sel && rv(r, "id") && !strcmp(ctx->upg_sel, rv(r, "id"));
+    tbl_row(ctx, &t, picked ? RL_SEL : bad ? RL_WARN : RL_NORMAL, res, cells);
+  }
+  if (t.nr) {
+    char right[48];
+    snprintf(right, sizeof(right), "keeping %lld", keep);
+    flines_add(out, RL_NORMAL, "");
+    fmt_title(ctx, out, "History", right);
+    tbl_render(ctx, out, &t);
+    hint(out, ctx->upg_sel ? "up/down picks a run; its details are below"
+                           : "upgrade history <run> shows every node");
+  }
+  tbl_free(&t);
+}
+
+static void render_upg_status(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  render_upg_current(ctx, rep, out);
+  render_upg_runs(ctx, rep, rvi(&rep->res, "keep", 0), out);
+}
+
+static void render_upg_history(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  long long keep = rvi(&rep->res, "keep", 0);
+  bool any = false;
+  for (int i = 0; i < rep->n; i++) any |= !strcmp(rep->r[i].type, "run");
+  if (any) {
+    render_upg_runs(ctx, rep, keep, out);
+    return;
+  }
+  char right[48];
+  snprintf(right, sizeof(right), "keeping %lld", keep);
+  fmt_title(ctx, out, "History", right);
+  line(out, RL_DIM, "  (no upgrade runs kept)");
+}
+
+static void render_upg_run(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  const crec_t *r = &rep->res;
+  const int L = 12;
+  char title[96], right[220], bots[80], hubs[80], a[48], b[48], v[512];
+  snprintf(title, sizeof(title), "Upgrade %s", rv(r, "id") ? rv(r, "id") : "?");
+  upg_target_cell(ctx, r, "bot_ver", bots, sizeof(bots));
+  upg_target_cell(ctx, r, "hub_ver", hubs, sizeof(hubs));
+  snprintf(right, sizeof(right), "bots %s %s hubs %s %s %s", bots, GL(G_DOT), hubs, GL(G_DOT),
+           upg_run_result(r));
+  fmt_title(ctx, out, title, right);
+  fmt_when(rvi(r, "started", 0), ctx->now, a, sizeof(a));
+  fmt_span(ctx->now - rvi(r, "started", 0), b, sizeof(b));
+  snprintf(v, sizeof(v), "%s %s %s ago", a, GL(G_DOT), b);
+  fmt_card_line(ctx, out, L, "started", v, RL_NORMAL);
+  if (rvi(r, "ended", 0) > 0) {
+    fmt_span(rvi(r, "ended", 0) - rvi(r, "started", 0), b, sizeof(b));
+    fmt_card_line(ctx, out, L, "took", b, RL_NORMAL);
+  }
+  snprintf(v, sizeof(v), "%s on %s", rvs(r, "by") ? rv(r, "by") : "(not known)",
+           rv(r, "driver") ? rv(r, "driver") : "?");
+  fmt_card_line(ctx, out, L, "by", v, RL_NORMAL);
+  fmt_card_line(ctx, out, L, "scope", rvs(r, "sel") ? rv(r, "sel") : "whole network", RL_NORMAL);
+  if (rvi(r, "steps", 0) > 0) {
+    snprintf(v, sizeof(v), "step %lld of %lld", rvi(r, "step", 0), rvi(r, "steps", 0));
+    fmt_card_line(ctx, out, L, "plan", v, RL_NORMAL);
+  }
+  if (rvs(r, "summary")) fmt_card_line(ctx, out, L, "outcome", rv(r, "summary"), RL_NORMAL);
+
+  bool aborted = rv(r, "result") && !strcmp(rv(r, "result"), "aborted");
+  static const col_t cols[] = {{"KIND", 'L', 1}, {"NODE", 'L', 1}, {"STATE", 'L', 1}, {"FROM", 'L', 1},
+                               {"TO", 'L', 1}, {"CODE", 'L', 2}, {"ARCH", 'L', 2}, {"LIBC", 'L', 2},
+                               {"TOOK", 'L', 2}, {"NOTE", 'L', 2}, {"UUID", 'L', 2}};
+  tbl_t t;
+  tbl_init(&t, cols, 11, -1, 1, 1);
+  int hidden = 0;
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *n = &rep->r[i];
+    if (strcmp(n->type, "node")) continue;
+    const char *st = rv(n, "state") ? rv(n, "state") : "?";
+    if (!strcmp(st, "idle") || !strcmp(st, "skipped")) {
+      hidden++;
+      continue;
+    }
+    if (aborted && (!strcmp(st, "done") || !strcmp(st, "committing"))) st = "rollback";
+    else if (!strcmp(st, "already")) st = "on target";
+    char code[32], took[48] = "";
+    if (rvs(n, "want") && (!rvs(n, "base") || strcmp(rv(n, "want"), rv(n, "base"))))
+      snprintf(code, sizeof(code), "%s %s %s", rvs(n, "base") ? rv(n, "base") : "?", GL(G_ARROW),
+               rv(n, "want"));
+    else snprintf(code, sizeof(code), "%s", rvs(n, "base") ? rv(n, "base") : "");
+    if (rvi(n, "done", 0) > 0 && rvi(n, "committed", 0) > 0)
+      fmt_span(rvi(n, "done", 0) - rvi(n, "committed", 0), took, sizeof(took));
+    const char *cells[11] = {rv(n, "kind"), rvs(n, "name") ? rv(n, "name") : rv(n, "uuid"), st,
+                             rv(n, "from"), rv(n, "to"), code, rv(n, "arch"), rv(n, "libc"), took,
+                             rv(n, "reason"), rv(n, "uuid")};
+    tbl_row(ctx, &t, !strcmp(st, "failed") ? RL_WARN : RL_NORMAL, st, cells);
+  }
+  if (t.nr) {
+    flines_add(out, RL_NORMAL, "");
+    tbl_render(ctx, out, &t);
+  }
+  tbl_free(&t);
+  if (hidden)
+    line(out, RL_DIM, "  %d node%s not moved by this run", hidden, hidden == 1 ? "" : "s");
 }
 
 /* Version order for the releases list: a leading v is ignored, digit runs
@@ -3468,6 +3774,14 @@ static void render_upg_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
                rvi(r, "steps", 0));
       effect(ctx, out, ph);
     }
+  } else if (!strcmp(rep->code, "upg.continued")) {
+    fmt_ok(ctx, "The upgrade on hold resumes", NULL, out);
+  } else if (!strcmp(rep->code, "cron.set")) {
+    line(out, RL_NORMAL, "Crontab line %s: %s", rv(r, "value") ? rv(r, "value") : "?",
+         rv(r, "scope") ? rv(r, "scope") : "?");
+  } else if (!strcmp(rep->code, "upg.keep")) {
+    line(out, RL_NORMAL, "Upgrade history: keeping %lld runs (was %lld)", rvi(r, "new", 0),
+         rvi(r, "old", 0));
   } else if (!strcmp(rep->code, "upg.abort_sent")) {
     long long peers = rvi(r, "peers", 0);
     fmt_ok(ctx, "No upgrade runs on this hub", NULL, out);
@@ -3827,6 +4141,8 @@ void fmt_reply(const fmt_ctx_t *ctx, const creply_t *rep, const char *words, fli
   else if (!strncmp(c, "channel.", 8)) render_channel_change(ctx, rep, out);
   else if (!strcmp(c, "upg.status")) render_upg_status(ctx, rep, out);
   else if (!strcmp(c, "upg.releases")) render_upg_releases(ctx, rep, out);
+  else if (!strcmp(c, "upg.history")) render_upg_history(ctx, rep, out);
+  else if (!strcmp(c, "upg.run")) render_upg_run(ctx, rep, out);
   else if (!strncmp(c, "upg.", 4)) render_upg_change(ctx, rep, out);
   else if (!strcmp(c, "network.tree")) render_network_tree(ctx, rep, out);
   else render_generic(ctx, rep, out);
