@@ -612,6 +612,9 @@ static void hub_upgrade_releases(hub_state_t *state, const char *payload,
 enum { HUBS_MAX = MAX_MESH_HUBS + MAX_PEERS };
 static int upgrade_hubs_missing(hub_state_t *state, char *names, size_t size);
 static int hub_reached(hub_state_t *state, const char *reached[HUBS_MAX]);
+static int rollcall_begin(hub_state_t *state, rollcall_purpose_t purpose, char *id_out);
+static bool admin_upgrade_start(hub_state_t *state, hub_client_t *client, const char *payload,
+                                bool roll_called);
 static bool hub_upgrade_plan_begin(hub_state_t *state, hub_client_t *admin,
                                    const char *target_ver, const char *variant,
                                    const char *kind, const char *min_from,
@@ -2390,6 +2393,12 @@ static int roster_frame_begin(hub_state_t *state, char *frame, int cap,
     if (cw <= 0 || cw >= cap - off) return -1;
     off += cw;
   }
+  /* This hub answers CMD_HUB_ROLLCALL: the upgrade gates may ask it. */
+  {
+    int kw = snprintf(frame + off, (size_t)(cap - off), "k|rollcall\n");
+    if (kw <= 0 || kw >= cap - off) return -1;
+    off += kw;
+  }
   if (chunk != 0) return off;
   for (int p = 0; p < state->peer_count; p++) {
     const hub_peer_config_t *peer = &state->peers[p];
@@ -2586,6 +2595,7 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
     if (o_started > 0 && mh->started > 0 && (time_t)o_started != mh->started) {
       mh->gen = -1;
       mh->chunks_seen = 0;
+      mh->rollcall = false; /* a build that lost it says so by leaving out k| */
     }
     if (gen < mh->gen) return; /* a late copy of an older round */
     uint64_t bit = (chunk >= 0 && chunk < 64) ? (1ULL << chunk) : 0;
@@ -2726,6 +2736,12 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
         snprintf(mh->cron, sizeof(mh->cron), "%s", hc);
         state->tree_dirty = true;
       }
+      continue;
+    }
+    if (strncmp(line, "k|", 2) == 0) {
+      /* What the hub whose h| header opened it can do (see CMD_HUB_ROLLCALL). */
+      if (mh && strcmp(mh->uuid, hub_uuid) == 0 && strcmp(line + 2, "rollcall") == 0)
+        mh->rollcall = true;
       continue;
     }
     if (strncmp(line, "l|", 2) == 0) {
@@ -6936,6 +6952,94 @@ static void stats_timer(reply_t *r, const char *name, long long every, time_t la
   reply_kvi(r, "in", in < 0 ? 0 : in);
 }
 
+/* upgrade start.  `roll_called`: the hubs have just answered a roll call, so
+ * the gate is passed. */
+static bool admin_upgrade_start(hub_state_t *state, hub_client_t *client, const char *payload,
+                                bool roll_called) {
+  /* Payload: target_ver|variant|kind|min_from|base|hub_ver|hub_base|sel —
+   * everything past the version is optional ("" = let each node decide).
+   * target_ver is the bots' (ircbot-releases); hub_ver is the hubs' own
+   * (irchub-releases), and an empty hub_ver leaves every hub where it is.
+   * The two base slots are no longer read: every node fetches from its own
+   * compiled-in root, the only tree its pinned key verifies.  Only the
+   * last field is a tail: the selection ("" = whole network),
+   * comma-separated name-or-uuid[=c|rs] tokens. */
+  char ver[64] = "", variant[8] = "", kind[8] = "", min_from[64] = "";
+  char hub_ver[64] = "";
+  char sel[MAX_UPGRADE_SELECT * 80] = "";
+  {
+    wire_field(payload, 0, ver, sizeof(ver));
+    wire_field(payload, 1, variant, sizeof(variant));
+    wire_field(payload, 2, kind, sizeof(kind));
+    wire_field(payload, 3, min_from, sizeof(min_from));
+    wire_field(payload, 5, hub_ver, sizeof(hub_ver));
+    wire_tail(payload, 7, sel, sizeof(sel));
+  }
+  char why[640];
+  /* One upgrade at a time, mesh-wide: every hub holds the copy of the one in flight,
+   * between its steps and on hold too, when no freeze says so. */
+  if (state->splan.active && strcmp(state->splan.driver, state->hub_uuid) != 0) {
+    snprintf(why, sizeof(why), "an upgrade to %s driven by %s is in progress", state->splan.bot_target,
+             hub_who(state, 'h', state->splan.driver));
+    return admin_err(state, client, "upg.busy", why, "upgrade status; upgrade abort stops it");
+  }
+  /* An upgrade starts with every hub present.  One that drops later is the plan's
+   * business: every hub already holds it.  The hubs are asked (a roll call); the
+   * console is answered once they have, or ROLLCALL_WAIT ran out. */
+  if (!state->upgrade.active && !state->plan.active && !roll_called) {
+    if (state->upg_start_wait.active)
+      return admin_err(state, client, "upg.busy", "another upgrade start is asking the hubs",
+                       "start again in a few seconds");
+    if (strlen(payload) < sizeof(state->upg_start_wait.payload) &&
+        rollcall_begin(state, RC_FOR_START, state->upg_start_wait.rc) == 1) {
+      state->upg_start_wait.active = true;
+      state->upg_start_wait.admin_fd = client->fd;
+      state->upg_start_wait.admin_serial = client->conn_serial;
+      snprintf(state->upg_start_wait.payload, sizeof(state->upg_start_wait.payload), "%s",
+               payload);
+      return true;
+    }
+    /* No roll call possible (an older hub, a peer that never linked): the
+     * gossip decides, as before. */
+    char gone[320];
+    int missing = upgrade_hubs_missing(state, gone, sizeof(gone));
+    if (missing > 0) {
+      snprintf(why, sizeof(why), "%d hub%s not linked: %s", missing, missing == 1 ? "" : "s",
+               gone);
+      return admin_err(state, client, "upg.hubs_missing", why,
+                       "bring it back, or remove it with hub del; then start again");
+    }
+  }
+  if (!hub_upgrade_plan_begin(state, client, ver, variant, kind, min_from,
+                              hub_ver, sel, why, sizeof(why)))
+    return admin_err(state, client, "upg.refused",
+                     strncmp(why, "ERROR: ", 7) == 0 ? why + 7 : why,
+                     "upgrade status · upgrade releases");
+  const pending_upgrade_t *u = &state->upgrade;
+  int bots = 0, hubs = 0;
+  for (int i = 0; i < u->node_count; i++) {
+    if (u->nodes[i].kind == 'b') bots++;
+    else if (u->nodes[i].kind == 'h') hubs++;
+  }
+  reply_t r;
+  reply_init(&r);
+  reply_ok(&r, "upg.started");
+  reply_kv(&r, "id", u->id);
+  reply_kv(&r, "bot_ver", u->target_ver);
+  if (u->hub_ver[0]) reply_kv(&r, "hub_ver", u->hub_ver);
+  reply_kvi(&r, "selected", u->select_count);
+  reply_kvi(&r, "bots", bots);
+  reply_kvi(&r, "peers", hubs);
+  const upgrade_plan_t *pl = &state->plan;
+  if (pl->active && strcmp(pl->run_id, u->id) == 0) {
+    reply_kvi(&r, "step", pl->step + 1);
+    reply_kvi(&r, "steps", plan_steps(pl));
+    reply_kv(&r, "bot_final", pl->bot_target);
+    if (pl->hub_target[0]) reply_kv(&r, "hub_final", pl->hub_target);
+  }
+  return send_reply(state, client, &r);
+}
+
 static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
                                  int cmd, char *payload, int payload_len) {
   char msg[512];
@@ -6968,75 +7072,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
 
   switch (cmd) {
 
-  case CMD_ADMIN_UPGRADE_NET: {
-    /* Payload: target_ver|variant|kind|min_from|base|hub_ver|hub_base|sel —
-     * everything past the version is optional ("" = let each node decide).
-     * target_ver is the bots' (ircbot-releases); hub_ver is the hubs' own
-     * (irchub-releases), and an empty hub_ver leaves every hub where it is.
-     * The two base slots are no longer read: every node fetches from its own
-     * compiled-in root, the only tree its pinned key verifies.  Only the
-     * last field is a tail: the selection ("" = whole network),
-     * comma-separated name-or-uuid[=c|rs] tokens. */
-    char ver[64] = "", variant[8] = "", kind[8] = "", min_from[64] = "";
-    char hub_ver[64] = "";
-    char sel[MAX_UPGRADE_SELECT * 80] = "";
-    if (payload) {
-      wire_field(payload, 0, ver, sizeof(ver));
-      wire_field(payload, 1, variant, sizeof(variant));
-      wire_field(payload, 2, kind, sizeof(kind));
-      wire_field(payload, 3, min_from, sizeof(min_from));
-      wire_field(payload, 5, hub_ver, sizeof(hub_ver));
-      wire_tail(payload, 7, sel, sizeof(sel));
-    }
-    char why[640];
-    /* One upgrade at a time, mesh-wide: every hub holds the copy of the one in flight,
-     * between its steps and on hold too, when no freeze says so. */
-    if (state->splan.active && strcmp(state->splan.driver, state->hub_uuid) != 0) {
-      snprintf(why, sizeof(why), "an upgrade to %s driven by %s is in progress", state->splan.bot_target,
-               hub_who(state, 'h', state->splan.driver));
-      return admin_err(state, client, "upg.busy", why, "upgrade status; upgrade abort stops it");
-    }
-    /* An upgrade starts with every hub present.  One that drops later is the plan's
-     * business: every hub already holds it. */
-    if (!state->upgrade.active && !state->plan.active) {
-      char gone[320];
-      int missing = upgrade_hubs_missing(state, gone, sizeof(gone));
-      if (missing > 0) {
-        snprintf(why, sizeof(why), "%d hub%s not linked: %s", missing, missing == 1 ? "" : "s",
-                 gone);
-        return admin_err(state, client, "upg.hubs_missing", why,
-                         "bring it back, or remove it with hub del; then start again");
-      }
-    }
-    if (!hub_upgrade_plan_begin(state, client, ver, variant, kind, min_from,
-                                hub_ver, sel, why, sizeof(why)))
-      return admin_err(state, client, "upg.refused",
-                       strncmp(why, "ERROR: ", 7) == 0 ? why + 7 : why,
-                       "upgrade status · upgrade releases");
-    const pending_upgrade_t *u = &state->upgrade;
-    int bots = 0, hubs = 0;
-    for (int i = 0; i < u->node_count; i++) {
-      if (u->nodes[i].kind == 'b') bots++;
-      else if (u->nodes[i].kind == 'h') hubs++;
-    }
-    reply_t r;
-    reply_init(&r);
-    reply_ok(&r, "upg.started");
-    reply_kv(&r, "id", u->id);
-    reply_kv(&r, "bot_ver", u->target_ver);
-    if (u->hub_ver[0]) reply_kv(&r, "hub_ver", u->hub_ver);
-    reply_kvi(&r, "selected", u->select_count);
-    reply_kvi(&r, "bots", bots);
-    reply_kvi(&r, "peers", hubs);
-    const upgrade_plan_t *pl = &state->plan;
-    if (pl->active && strcmp(pl->run_id, u->id) == 0) {
-      reply_kvi(&r, "step", pl->step + 1);
-      reply_kvi(&r, "steps", plan_steps(pl));
-      reply_kv(&r, "bot_final", pl->bot_target);
-      if (pl->hub_target[0]) reply_kv(&r, "hub_final", pl->hub_target);
-    }
-    return send_reply(state, client, &r);
-  }
+  case CMD_ADMIN_UPGRADE_NET:
+    return admin_upgrade_start(state, client, payload ? payload : "", false);
 
   case CMD_ADMIN_UPGRADE_STATUS: {
     /* "releases[|bot_ver|hub_ver|sel]": what the admin console offers to
@@ -12728,6 +12765,255 @@ static int upgrade_hubs_missing(hub_state_t *state, char *names, size_t size) {
   return missing;
 }
 
+/* ---- Hub roll call (CMD_HUB_ROLLCALL, see hub.h) ------------------------ */
+
+static hub_rollcall_t *rc_find(hub_state_t *state, const char *id) {
+  for (int i = 0; i < MAX_ROLLCALLS; i++)
+    if (state->rollcalls[i].active && strcmp(state->rollcalls[i].id, id) == 0)
+      return &state->rollcalls[i];
+  return NULL;
+}
+
+/* A free slot; a relay entry past its routing window counts as free. */
+static hub_rollcall_t *rc_alloc(hub_state_t *state, time_t now) {
+  for (int i = 0; i < MAX_ROLLCALLS; i++) {
+    hub_rollcall_t *rc = &state->rollcalls[i];
+    if (!rc->active || (!rc->origin && now - rc->started > ROLLCALL_KEEP)) {
+      memset(rc, 0, sizeof(*rc));
+      rc->from_fd = -1;
+      rc->started = now;
+      return rc;
+    }
+  }
+  return NULL;
+}
+
+static bool rc_id_ok(const char *s) {
+  size_t n = strlen(s);
+  if (n < 8 || n >= ROLLCALL_ID_LEN) return false;
+  for (size_t i = 0; i < n; i++)
+    if (!isxdigit((unsigned char)s[i])) return false;
+  return true;
+}
+
+static void rc_want(hub_rollcall_t *rc, const char *uuid, const char *name, bool *full) {
+  for (int i = 0; i < rc->want_n; i++)
+    if (strcmp(rc->want[i], uuid) == 0) return;
+  if (rc->want_n >= MAX_MESH_HUBS) {
+    *full = true;
+    return;
+  }
+  snprintf(rc->want[rc->want_n], sizeof(rc->want[0]), "%s", uuid);
+  snprintf(rc->want_name[rc->want_n], sizeof(rc->want_name[0]), "%s", name && name[0] ? name : uuid);
+  rc->want_n++;
+}
+
+/* Ask every hub known here: the configured peers and every hub the others
+ * report a link to (the same set upgrade_hubs_missing counts).  Returns 1 when
+ * the roll call is out (its end comes through rollcall_end), 0 when the gossip
+ * check has to decide instead: a configured peer that has never linked (no
+ * uuid, nobody can ask it), a known hub that has not said it answers a roll
+ * call (an older build), a full table, or no hub to ask at all. */
+static int rollcall_begin(hub_state_t *state, rollcall_purpose_t purpose, char *id_out) {
+  time_t now = time(NULL);
+  id_out[0] = '\0';
+  hub_rollcall_t *rc = rc_alloc(state, now);
+  if (!rc) return 0;
+  bool full = false;
+  for (int i = 0; i < state->peer_count; i++) {
+    const hub_peer_config_t *p = &state->peers[i];
+    if (!p->uuid[0]) return 0;
+    rc_want(rc, p->uuid, p->friendly_name[0] ? p->friendly_name : p->ip, &full);
+  }
+  for (int m = 0; m < state->mesh_hub_count; m++) {
+    const mesh_hub_t *mh = &state->mesh_hubs[m];
+    for (int l = 0; l < mh->link_count; l++) {
+      const mesh_link_t *L = &mh->links[l];
+      if (!L->uuid[0] || strcmp(L->uuid, "-") == 0 || strcmp(L->uuid, state->hub_uuid) == 0)
+        continue;
+      rc_want(rc, L->uuid, L->name, &full);
+    }
+  }
+  if (full || rc->want_n == 0) return 0;
+  for (int i = 0; i < rc->want_n; i++) {
+    const mesh_hub_t *mh = mesh_hub_find(state, rc->want[i]);
+    if (!mh || !mh->rollcall) return 0;
+  }
+  unsigned char rb[16];
+  if (RAND_bytes(rb, sizeof(rb)) != 1) return 0;
+  for (size_t i = 0; i < sizeof(rb); i++) snprintf(rc->id + 2 * i, 3, "%02x", rb[i]);
+  secure_wipe(rb, sizeof(rb));
+  (void)op_forward_seen_check_and_add(state, rc->id); /* our own, back around a cycle */
+  rc->active = true;
+  rc->origin = true;
+  rc->purpose = purpose;
+  char frame[160];
+  snprintf(frame, sizeof(frame), "%s|%s|%lld", rc->id, state->hub_uuid, (long long)now);
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_HUB && c->authenticated)
+      peer_send_urgent(state, c, CMD_HUB_ROLLCALL, frame);
+  }
+  hub_log_debug("[UPGRADE] Roll call %s: asking %d hub(s)\n", rc->id, rc->want_n);
+  snprintf(id_out, ROLLCALL_ID_LEN, "%s", rc->id);
+  return 1;
+}
+
+static void upgrade_start_resume(hub_state_t *state, int missing, const char *gone);
+
+/* The roll call is over: every hub answered, or ROLLCALL_WAIT ran out. */
+static void rollcall_end(hub_state_t *state, hub_rollcall_t *rc) {
+  char gone[320] = "";
+  size_t used = 0;
+  int missing = 0;
+  for (int i = 0; i < rc->want_n; i++) {
+    if (rc->got[i]) continue;
+    missing++;
+    if (used < sizeof(gone)) {
+      int w = snprintf(gone + used, sizeof(gone) - used, "%s%s", used ? ", " : "", rc->want_name[i]);
+      if (w > 0) used += (size_t)w;
+    }
+  }
+  hub_log_debug("[UPGRADE] Roll call %s: %d of %d hub(s) answered\n", rc->id,
+                rc->want_n - missing, rc->want_n);
+  rollcall_purpose_t purpose = rc->purpose;
+  char id[ROLLCALL_ID_LEN];
+  snprintf(id, sizeof(id), "%s", rc->id);
+  rc->active = false;
+  if (purpose == RC_FOR_START && state->upg_start_wait.active &&
+      strcmp(state->upg_start_wait.rc, id) == 0) {
+    upgrade_start_resume(state, missing, gone);
+  } else if (purpose == RC_FOR_STEP && strcmp(state->step_rollcall.rc, id) == 0) {
+    state->step_rollcall.rc[0] = '\0';
+    state->step_rollcall.outcome = missing ? 2 : 1;
+    state->step_rollcall.missing = missing;
+    state->step_rollcall.at = time(NULL);
+    snprintf(state->step_rollcall.gone, sizeof(state->step_rollcall.gone), "%s", gone);
+  }
+}
+
+/* ROLLCALL from a peer: rid|origin_uuid|origin_ts.  Pass it on, remember the
+ * way back, answer. */
+static void process_hub_rollcall(hub_state_t *state, hub_client_t *peer, const char *payload) {
+  char id[ROLLCALL_ID_LEN] = "", origin[64] = "", ts[24] = "";
+  if (!wire_field(payload, 0, id, sizeof(id)) || !wire_field(payload, 1, origin, sizeof(origin)) ||
+      !wire_field(payload, 2, ts, sizeof(ts)) || !rc_id_ok(id) || !uuid_valid(origin)) {
+    hub_log_warning("[UPGRADE] Malformed HUB_ROLLCALL from peer %s\n", peer->ip);
+    return;
+  }
+  long long t = atoll(ts); /* saturates: age only for a positive stamp */
+  long long age = t > 0 ? (long long)time(NULL) - t : 0;
+  if (t <= 0 || age > ROLLCALL_TTL || age < -ROLLCALL_TTL) return;
+  if (strcmp(origin, state->hub_uuid) == 0) return;
+  if (op_forward_seen_check_and_add(state, id)) return; /* another path got here first */
+  hub_rollcall_t *rc = rc_alloc(state, time(NULL));
+  if (rc) {
+    rc->active = true;
+    snprintf(rc->id, sizeof(rc->id), "%s", id);
+    rc->from_fd = peer->fd;
+    rc->from_serial = peer->conn_serial;
+  } else {
+    /* No way back for the hubs past this one: they read as missing and the
+     * gate refuses, which is the safe answer. */
+    hub_log_warning("[UPGRADE] Roll call table full: not passing %s on\n", id);
+  }
+  for (int i = 0; rc && i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_HUB && c->authenticated && c != peer)
+      peer_send_urgent(state, c, CMD_HUB_ROLLCALL, payload);
+  }
+  char ack[160];
+  snprintf(ack, sizeof(ack), "%s|%s", id, state->hub_uuid);
+  peer_send_urgent(state, peer, CMD_HUB_ROLLCALL_ACK, ack);
+}
+
+/* ROLLCALL_ACK: rid|hub_uuid.  The asking hub ticks it off; a relay routes it
+ * back down the link the roll call came in on. */
+static void process_hub_rollcall_ack(hub_state_t *state, hub_client_t *peer, const char *payload) {
+  char id[ROLLCALL_ID_LEN] = "", hub[64] = "";
+  if (!wire_field(payload, 0, id, sizeof(id)) || !wire_field(payload, 1, hub, sizeof(hub)) ||
+      !rc_id_ok(id) || !uuid_valid(hub)) {
+    hub_log_warning("[UPGRADE] Malformed HUB_ROLLCALL_ACK from peer %s\n", peer->ip);
+    return;
+  }
+  hub_rollcall_t *rc = rc_find(state, id);
+  if (!rc) return;
+  if (!rc->origin) {
+    if (time(NULL) - rc->started > ROLLCALL_KEEP) return;
+    for (int i = 0; i < state->client_count; i++) {
+      hub_client_t *c = state->clients[i];
+      if (c->type == CLIENT_HUB && c->authenticated && c->fd == rc->from_fd &&
+          c->conn_serial == rc->from_serial) {
+        peer_send_urgent(state, c, CMD_HUB_ROLLCALL_ACK, payload);
+        break;
+      }
+    }
+    return;
+  }
+  bool all = true;
+  for (int i = 0; i < rc->want_n; i++) {
+    if (strcmp(rc->want[i], hub) == 0) rc->got[i] = true;
+    if (!rc->got[i]) all = false;
+  }
+  if (all) rollcall_end(state, rc);
+}
+
+/* Ends the roll calls whose wait ran out and frees the relays' entries.  Runs
+ * on every maintenance pass. */
+void hub_rollcall_tick(hub_state_t *state, time_t now) {
+  for (int i = 0; i < MAX_ROLLCALLS; i++) {
+    hub_rollcall_t *rc = &state->rollcalls[i];
+    if (!rc->active) continue;
+    if (rc->origin && now - rc->started > ROLLCALL_WAIT) rollcall_end(state, rc);
+    else if (!rc->origin && now - rc->started > ROLLCALL_KEEP) rc->active = false;
+  }
+}
+
+/* The upgrade start that waited on its roll call: answer the console that
+ * asked, if it is still there. */
+static void upgrade_start_resume(hub_state_t *state, int missing, const char *gone) {
+  hub_client_t *admin = NULL;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->fd == state->upg_start_wait.admin_fd &&
+        c->conn_serial == state->upg_start_wait.admin_serial)
+      admin = c;
+  }
+  char payload[sizeof(state->upg_start_wait.payload)];
+  snprintf(payload, sizeof(payload), "%s", state->upg_start_wait.payload);
+  secure_wipe(&state->upg_start_wait, sizeof(state->upg_start_wait));
+  if (!admin) {
+    hub_log_info("[UPGRADE] The console that asked for the start is gone; nothing started\n");
+    return;
+  }
+  if (missing > 0) {
+    char why[512];
+    snprintf(why, sizeof(why), "%d hub%s did not answer: %s", missing, missing == 1 ? "" : "s",
+             gone);
+    (void)admin_err(state, admin, "upg.hubs_missing", why,
+                    "bring it back, or remove it with hub del; then start again");
+    return;
+  }
+  (void)admin_upgrade_start(state, admin, payload, true);
+}
+
+/* The step gate: every hub answered, or how many did not.  False while its
+ * roll call is still out. */
+static bool plan_hubs_answered(hub_state_t *state, int *missing, char *gone, size_t size) {
+  time_t now = time(NULL);
+  if (state->step_rollcall.outcome && now - state->step_rollcall.at <= ROLLCALL_WAIT + 2) {
+    *missing = state->step_rollcall.outcome == 2 ? state->step_rollcall.missing : 0;
+    snprintf(gone, size, "%s", state->step_rollcall.gone);
+    state->step_rollcall.outcome = 0;
+    return true;
+  }
+  state->step_rollcall.outcome = 0;
+  if (state->step_rollcall.rc[0]) return false;
+  if (rollcall_begin(state, RC_FOR_STEP, state->step_rollcall.rc) == 1) return false;
+  *missing = upgrade_hubs_missing(state, gone, size);
+  return true;
+}
+
 /* Start step `pl->step` as an ordinary run.  False when it could not start
  * (the plan is stopped with the reason). */
 static bool plan_start_step(hub_state_t *state, hub_client_t *admin,
@@ -12973,10 +13259,11 @@ static void hub_plan_tick(hub_state_t *state, time_t now) {
    * ends the plan here; upgrade start carries on from this step later. */
   {
     char gone[320], why[512];
-    int hm = upgrade_hubs_missing(state, gone, sizeof(gone));
+    int hm = 0;
+    if (!plan_hubs_answered(state, &hm, gone, sizeof(gone))) return; /* the hubs are being asked */
     if (hm > 0) {
       if (now < pl->mesh_until) return;
-      snprintf(why, sizeof(why), "step %d/%d needs every hub; %d not linked: %s; upgrade start "
+      snprintf(why, sizeof(why), "step %d/%d needs every hub; %d missing: %s; upgrade start "
                "carries on", pl->step + 1, plan_steps(pl), hm, gone);
       plan_stop(state, why);
       return;
@@ -15650,6 +15937,10 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 hub_plan_process(state, client, payload_ptr);
               } else if (cmd == CMD_UPGRADE_FORGET) {
                 process_peer_upgrade_forget(state, client, payload_ptr);
+              } else if (cmd == CMD_HUB_ROLLCALL) {
+                process_hub_rollcall(state, client, payload_ptr);
+              } else if (cmd == CMD_HUB_ROLLCALL_ACK) {
+                process_hub_rollcall_ack(state, client, payload_ptr);
               } else if (cmd == CMD_BOT_RELAY_FWD) {
                 process_peer_bot_relay(state, client, payload_ptr);
               } else if (cmd == CMD_ACTIVITY) {

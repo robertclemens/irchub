@@ -1964,7 +1964,7 @@ static const char *const OPNAME[256] = {
  [0x79] = "CMD_ADMIN_NET_SET", [0x7A] = "CMD_ADMIN_SET_SSH", [0x7B] = "CMD_CHAN_EVENT", [0x7C] = "CMD_ADMIN_USER_ACCESS", [0x7D] = "CMD_USER_CHAN_REQUEST", [0x7E] = "CMD_USER_CHAN_RESULT", [0x7F] = "CMD_BOT_RETIRE", [0x80] = "CMD_BOT_RETIRE_ACK", [0x81] = "CMD_ADMIN_LIST_REVOKED", [0x82] = "CMD_ADMIN_PEER_REFS",
  [0x83] = "CMD_LINK_SEQ", [0x84] = "CMD_ADMIN_KICK_USER", [0x87] = "CMD_UPGRADE_HISTORY",
  [0x88] = "CMD_UPGRADE_STAGE", [0x89] = "CMD_UPGRADE_PROGRESS", [0x8A] = "CMD_UPGRADE_PLAN",
- [0x8B] = "CMD_CRON_SET",
+ [0x8B] = "CMD_CRON_SET", [0x8C] = "CMD_HUB_ROLLCALL", [0x8D] = "CMD_HUB_ROLLCALL_ACK",
 };
 
 static unsigned long long rvu(const crec_t *r, const char *k) {

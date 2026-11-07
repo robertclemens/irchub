@@ -521,6 +521,9 @@ static void hub_maintenance(hub_state_t *state) {
     /* Channel-request elections: probe windows and hand-off timeouts. */
     hub_chan_elect_tick(state, now);
 
+    /* Hub roll calls (the upgrade gates): end the ones whose wait ran out. */
+    hub_rollcall_tick(state, now);
+
     /* Expired bans: one `del` per ban, self-throttled to BAN_SWEEP_INTERVAL. */
     hub_bans_sweep(state, now);
 

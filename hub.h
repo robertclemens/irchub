@@ -521,6 +521,31 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define CMD_UPGRADE_PROGRESS   0x89  /* node -> Hub: id|uuid|phase|code|note */
 #define CMD_UPGRADE_PLAN       0x8A  /* Hub <-> Hub: P|plan, D|started|rev, B|started|rev|ts, C|started|ts */
 #define CMD_CRON_SET           0x8B  /* Hub -> Bot: on|off, its production crontab line */
+
+/* ---- Hub roll call (the upgrade gates) ----------------------------------
+ * An upgrade starts, and each step of a multi-step plan starts, only with every
+ * hub present.  The gossip that says which hubs are linked is second-hand and,
+ * with damped event gossip, up to 30 s old: a hub that has just died can still
+ * look linked (nightly 2026-11-06, test_95 "hub5 down").  So the gate asks the
+ * hubs themselves.  The asking hub floods ROLLCALL to its peers; each hub passes
+ * it on (once: the shared seen_forwards ring), remembers the link it arrived on,
+ * and answers ROLLCALL_ACK back down that link; a relay routes every ACK of that
+ * roll call the same way.  A hub that has not answered within ROLLCALL_WAIT is
+ * missing.  An unanswered ACK can only make the gate refuse, never pass it.
+ *   ROLLCALL      hub->hub  rid|origin_uuid|origin_ts
+ *   ROLLCALL_ACK  hub->hub  rid|hub_uuid
+ * Hub <-> hub only.  A hub that can answer says so with a k|rollcall line in
+ * its roster gossip (older hubs skip a line they do not know).  While any hub
+ * known here has not said so, the gate keeps to the gossip it used before: an
+ * older hub neither answers nor passes the probe on, and refusing every start
+ * would leave the mesh unable to upgrade it. */
+#define CMD_HUB_ROLLCALL       0x8C
+#define CMD_HUB_ROLLCALL_ACK   0x8D
+#define ROLLCALL_WAIT          3   /* seconds the asking hub waits for the answers */
+#define ROLLCALL_TTL           30  /* a relayed roll call older than this is dropped */
+#define ROLLCALL_KEEP          10  /* seconds a relay routes the answers back */
+#define MAX_ROLLCALLS          16  /* in flight here, asked or relayed */
+#define ROLLCALL_ID_LEN        33  /* 16 random bytes in hex + NUL */
 #define HUB_LINK_AAD_LEN 13
 #define HUB_LINK_SEQ_VERSION "2.5.2"
 /* Review 7: ephemeral keys of the HUBv3 hellos accepted in the last
@@ -1728,6 +1753,23 @@ typedef struct {
   char   ban_reason[BAN_REASON_MAX + 1];
 } chan_elect_t;
 
+/* One roll call (see CMD_HUB_ROLLCALL).  As the asking hub: the hubs it waits
+ * on and which have answered.  As a relay: the link to route answers back on. */
+typedef enum { RC_FOR_START = 1, RC_FOR_STEP = 2 } rollcall_purpose_t;
+typedef struct {
+  bool   active;
+  bool   origin;
+  char   id[ROLLCALL_ID_LEN];
+  time_t started;
+  int    from_fd;                        /* relay: the peer it came from */
+  uint64_t from_serial;                  /* ...and that link's conn_serial */
+  rollcall_purpose_t purpose;            /* origin only */
+  int    want_n;
+  char   want[MAX_MESH_HUBS][64];        /* origin: uuid of every hub asked */
+  char   want_name[MAX_MESH_HUBS][64];
+  bool   got[MAX_MESH_HUBS];
+} hub_rollcall_t;
+
 /* One bot's live presence, as reported by the hub it is connected to.  Purely
  * in-memory: never written to the config, never tombstoned, never purged.  An
  * entry whose reported_at falls behind BOT_ROSTER_TTL is dropped, so a bot
@@ -1775,6 +1817,7 @@ typedef struct {
   long long   gen;          /* newest gossip generation seen from it      */
   uint64_t    chunks_seen;  /* chunks of `gen` already applied (bit n)    */
   time_t      reported_at;  /* local clock: drives the TTL                */
+  bool        rollcall;     /* its gossip carries k|rollcall: it answers one */
 } mesh_hub_t;
 
 /* Loop-prevention seen-set: highest lamport_seq observed per (origin, bot). */
@@ -1888,6 +1931,25 @@ typedef struct {
   pending_op_request_t pending_op_requests[MAX_PENDING_OP_REQUESTS];
   pending_chan_request_t pending_chan_requests[MAX_PENDING_CHAN_REQUESTS];
   chan_elect_t chan_elections[MAX_CHAN_ELECTIONS];
+  hub_rollcall_t rollcalls[MAX_ROLLCALLS];
+  /* The upgrade start waiting on its roll call (one at a time); the console
+   * is answered when the roll call ends. */
+  struct {
+    bool active;
+    char rc[ROLLCALL_ID_LEN];
+    int admin_fd;
+    uint64_t admin_serial;
+    char payload[MAX_UPGRADE_SELECT * 80 + 512];
+  } upg_start_wait;
+  /* A plan step's roll call: rc while it runs, then the outcome until the step
+   * gate reads it. */
+  struct {
+    char rc[ROLLCALL_ID_LEN];
+    int  outcome;            /* 0 none or running, 1 every hub answered, 2 some did not */
+    int  missing;
+    time_t at;               /* when the outcome came: a stale one is not read */
+    char gone[320];
+  } step_rollcall;
 
   /* The network upgrade this hub is driving, if any (one at a time). */
   pending_upgrade_t upgrade;
@@ -2659,6 +2721,7 @@ bool hub_upgrade_marker_write(const char *upgrade_id, const char *target_ver,
  * same rule gates what a follower accepts at PREPARE and what the rollup|
  * config line carries, so a peer can never split or inject a config line. */
 bool hub_upgrade_plan_field_ok(const char *s);
+void hub_rollcall_tick(hub_state_t *state, time_t now);
 /* Reads and removes the hand-off marker hub_update_commit() left behind. */
 bool hub_update_take_pending(char *id_out, size_t id_size, char *ver_out,
                              size_t ver_size, char *variant_out,

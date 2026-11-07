@@ -217,6 +217,8 @@ typedef struct csess {
   char          user[CONSOLE_NAME_MAX];
   bool          authed;
   int           refused;          /* keys refused so far */
+  int           refuse_rank;      /* how telling refuse_why is (REFUSE_*) */
+  char          refuse_why[160];  /* the most telling refusal, for the log only */
   bool          fail_sent;
   bool          have_pty, shell;
   char          term[32];
@@ -335,7 +337,17 @@ static bool rebuild_bind(void) {
 }
 
 /* ---- authentication ---- */
-static bool key_matches(const char *user, ssh_key key) {
+/* Why a key was refused, most telling last.  Only the hub's log says this: the
+ * client is told no more than "denied", whatever the reason. */
+enum { REFUSE_NONE, REFUSE_KEYTYPE, REFUSE_UNKNOWN, REFUSE_WRONG_KEY, REFUSE_OTHERS_KEY };
+
+static void refuse_note(csess_t *x, int rank, const char *why) {
+  if (rank < x->refuse_rank) return;
+  x->refuse_rank = rank;
+  snprintf(x->refuse_why, sizeof(x->refuse_why), "%s", why);
+}
+
+static bool key_matches(csess_t *x, const char *user, ssh_key key) {
   unsigned char offered[32] = {0};
   bool is_ed = ssh_key_type(key) == SSH_KEYTYPE_ED25519;
   if (is_ed) {
@@ -352,28 +364,51 @@ static bool key_matches(const char *user, ssh_key key) {
     free(blob);
     ssh_string_free_char(b64);
   }
-  /* Same work for every name: an unknown one is compared against a dummy. */
+  /* Same work for every name: an unknown one is compared against a dummy, and
+   * the offered key against every admin's (whose it is, for the log). */
   unsigned char want[32] = {0};
   bool known = false;
+  char owner[72] = "";
   pthread_mutex_lock(&g_pub_mu);
   for (int i = 0; i < g_ncreds; i++) {
     if (!known && user && strcmp(g_creds[i].name, user) == 0) {
       memcpy(want, g_creds[i].ed_pub, 32);
       known = true;
     }
+    if (is_ed && !owner[0] && CRYPTO_memcmp(g_creds[i].ed_pub, offered, 32) == 0)
+      clean_name(g_creds[i].name, owner, sizeof(owner));
   }
   pthread_mutex_unlock(&g_pub_mu);
   bool eq = CRYPTO_memcmp(want, offered, 32) == 0;
   secure_wipe(want, sizeof(want));
-  return is_ed && known && eq;
+  bool ok = is_ed && known && eq;
+  if (ok) return true;
+  char why[160];
+  if (!is_ed) {
+    refuse_note(x, REFUSE_KEYTYPE, "not an Ed25519 key");
+  } else if (owner[0]) {
+    snprintf(why, sizeof(why), known ? "the key offered belongs to admin '%s', not to this one"
+                                     : "no such admin; the key offered belongs to admin '%s'",
+             owner);
+    refuse_note(x, REFUSE_OTHERS_KEY, why);
+  } else if (known) {
+    refuse_note(x, REFUSE_WRONG_KEY, "the key offered is not this admin's");
+  } else {
+    refuse_note(x, REFUSE_UNKNOWN, "no such admin, and no admin has the key offered");
+  }
+  return false;
 }
 
 static void report_fail(csess_t *x, const char *why) {
   if (x->fail_sent || g_ctl < 0) return;
   x->fail_sent = true;
-  char name[72], msg[256];
+  char name[72], msg[384];
   clean_name(x->user, name, sizeof(name));
-  snprintf(msg, sizeof(msg), "FAIL|%s|%s|%s", x->ip, name[0] ? name : "?", why);
+  if (x->refuse_why[0])
+    snprintf(msg, sizeof(msg), "FAIL|%s|%s|%s (%s)", x->ip, name[0] ? name : "?", why,
+             x->refuse_why);
+  else
+    snprintf(msg, sizeof(msg), "FAIL|%s|%s|%s", x->ip, name[0] ? name : "?", why);
   (void)console_ctl_write(g_ctl, msg);
 }
 
@@ -382,7 +417,7 @@ static int cb_auth_pubkey(ssh_session s, const char *user, struct ssh_key_struct
   csess_t *x = ud;
   if (x->authed || x->drop) return SSH_AUTH_DENIED;
   snprintf(x->user, sizeof(x->user), "%s", user ? user : "");
-  bool ok = key_matches(user, pubkey);
+  bool ok = key_matches(x, user, pubkey);
   if (ok && signature_state == SSH_PUBLICKEY_STATE_NONE) return SSH_AUTH_SUCCESS;
   if (ok && signature_state == SSH_PUBLICKEY_STATE_VALID) {
     x->authed = true;

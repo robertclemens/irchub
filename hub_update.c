@@ -347,7 +347,8 @@ static const char *const FAILBACK_BODY[] = {
   "}\n",
   "\n",
   "tick() {\n",
-  "  read_state || finish\n",
+  "  # Another upgrade's state: it is about to replace this script, so leave it be.\n",
+  "  read_state || { [ -n \"$rid\" ] && exit 1; finish; }\n",
   "  now=$(date +%s); age=$((now - since))\n",
   "  if [ \"$now\" -ge \"$HARD\" ]; then\n",
   "    case \"$phase\" in\n",
@@ -389,7 +390,9 @@ static const char *const FAILBACK_BODY[] = {
   "  phase) take_lock \"$LOCK\" 20 && set_state \"$2\" \"$3\" \"\" ;;\n",
   "  restore) take_lock \"$LOCK\" 20 && restore \"$2\" ;;\n",
   "  done) take_lock \"$LOCK\" 20; finish ;;\n",
-  "  tick) take_lock \"$LOCK\" 2 || exit 0; tick ;;\n",
+  "  # A loop names its upgrade: a loop that outlived it stops here, touching nothing.\n",
+  "  tick) [ -n \"${2:-}\" ] && [ \"$2\" != \"$ID\" ] && exit 1\n",
+  "    take_lock \"$LOCK\" 2 || exit 0; tick ;;\n",
   "  cron-status) cron_status; rc=$?; rm -f \"$SELF\"; exit \"$rc\" ;;\n",
   "  cron-on)\n",
   "    cron_status; rc=$?\n",
@@ -2035,31 +2038,44 @@ static bool staged_selftest(const char *archive, char *err, size_t err_size) {
 static bool failback_stage(const char *exe, const char *id, bool is_bin,
                            const char *cfg, const char *pidf, const char *script,
                            const char *note) {
-  if (!failback_write(FAILBACK_FILE, exe, id, is_bin, cfg, pidf, script, note, FAILBACK_FILE))
-    return false;
   FILE *f;
-  /* The state first: a tick that finds none takes the script away again.  exec
-   * keeps this pid, so it already names the upgrade script. */
+  /* The state first: a tick that finds none takes the script away again, and
+   * the previous upgrade's loop may still tick.  Its script, finding this
+   * upgrade's state, leaves it be.  exec keeps this pid, so it already names
+   * the upgrade script. */
   remove(FAILBACK_CONFIRM);
   f = fopen(FAILBACK_STATE ".tmp", "w");
-  if (!f) {
-    remove(FAILBACK_FILE);
-    return false;
-  }
+  if (!f) return false;
   fprintf(f, "%s|installing|%lld|%d|\n", id, (long long)time(NULL), (int)getpid());
   if (fclose(f) != 0 || rename(FAILBACK_STATE ".tmp", FAILBACK_STATE) != 0) {
     remove(FAILBACK_STATE ".tmp");
-    remove(FAILBACK_FILE);
+    return false;
+  }
+  /* Then the script, whole or not at all: a tick never runs a half-written one. */
+  if (!failback_write(FAILBACK_FILE ".tmp", exe, id, is_bin, cfg, pidf, script, note,
+                      FAILBACK_FILE) ||
+      rename(FAILBACK_FILE ".tmp", FAILBACK_FILE) != 0) {
+    remove(FAILBACK_FILE ".tmp");
+    remove(FAILBACK_STATE);
     return false;
   }
   return true;
 }
 
+/* The script removes itself only while the file is still its own: a later
+ * upgrade may already have written its script there, and the hub is about to
+ * exec it (nightly 2026-11-06: the earlier script, still waiting on its loop,
+ * deleted the next one and that exec failed).  OLD_PID tells them apart: the
+ * earlier script is alive while the next is written, so the pids differ. */
+#define SELF_RM "grep -qx \"OLD_PID=$OLD_PID\" ./" HUB_UPGRADE_SCRIPT \
+                " 2>/dev/null && rm -f ./" HUB_UPGRADE_SCRIPT
+
 static bool write_upgrade_script(const hub_state_t *state, const char *kind,
                                  const char *archive, bool selftest) {
   /* 0700 at creation: no umask-dependent window on a script we are about to
    * exec. */
-  int fd = open(HUB_UPGRADE_SCRIPT, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+  /* Written beside and renamed over: a reader never sees half a script. */
+  int fd = open(HUB_UPGRADE_SCRIPT ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
                 0700);
   FILE *f = (fd >= 0) ? fdopen(fd, "w") : NULL;
   if (!f) {
@@ -2090,13 +2106,15 @@ static bool write_upgrade_script(const hub_state_t *state, const char *kind,
   fprintf(f, "  ./" FAILBACK_FILE " restore \"$1\"\n");
   fprintf(f, "  rm -rf \"$UPGRADE_DIR\" \"%s\"\n", archive);
   fprintf(f, "  wait\n");
-  fprintf(f, "  rm -f \"./" HUB_UPGRADE_SCRIPT "\"\n");
+  fprintf(f, "  %s\n", SELF_RM);
   fprintf(f, "  exit 0\n");
   fprintf(f, "}\n");
   /* The failback's loop runs through every phase, so a hung build or a new
    * build that never confirms is undone even with no cron on this host. */
   fprintf(f, "./" FAILBACK_FILE " phase installing $$\n");
-  fprintf(f, "( while ./" FAILBACK_FILE " tick; do sleep 10; done ) </dev/null >/dev/null 2>&1 &\n");
+  /* The loop names this upgrade, so it stops once a later one owns the script. */
+  fprintf(f, "FB_ID=$(cut -d'|' -f1 <\"" FAILBACK_STATE "\" 2>/dev/null)\n");
+  fprintf(f, "( while ./" FAILBACK_FILE " tick \"$FB_ID\"; do sleep 10; done ) </dev/null >/dev/null 2>&1 &\n");
   if (!is_staged)
   fprintf(f,
           "tar -xzf \"%s\" --strip-components=1 -C \"$UPGRADE_DIR\" "
@@ -2148,11 +2166,15 @@ static bool write_upgrade_script(const hub_state_t *state, const char *kind,
   fprintf(f, "./" FAILBACK_FILE " phase started $$\n");
   fprintf(f, "\"%s\" </dev/null >/dev/null 2>&1\n", exe);
   fprintf(f, "wait\n");
-  fprintf(f, "rm -f \"./" HUB_UPGRADE_SCRIPT "\"\n");
+  fprintf(f, "%s\n", SELF_RM);
   fprintf(f, "exit 0\n");
 
   (void)fchmod(fileno(f), 0700);
-  return fclose(f) == 0;
+  if (fclose(f) != 0 || rename(HUB_UPGRADE_SCRIPT ".tmp", HUB_UPGRADE_SCRIPT) != 0) {
+    remove(HUB_UPGRADE_SCRIPT ".tmp");
+    return false;
+  }
+  return true;
 }
 
 /* Run the upgrade this hub was committed to.  Returns false with *err set
@@ -2275,6 +2297,13 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
   }
   }
 
+  /* End the previous upgrade's failback before laying down anything of this
+   * one.  Its loop may be inside finish(), which edits cron for a second or
+   * more before removing the state, the script and upgrade.sh: whatever this
+   * upgrade had written by then would go with them (nightly 2026-11-06).
+   * "done" waits on the lock a tick holds, so that tick is over when it returns. */
+  failback_clear();
+
   /* Flush the live config, then snapshot the pair we may have to restore.
    * Both are copied: <exe> stays in place until the new one is renamed over it,
    * so there is never a moment with no binary there. */
@@ -2337,6 +2366,7 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
   execl("./" HUB_UPGRADE_SCRIPT, "./" HUB_UPGRADE_SCRIPT, (char *)NULL);
   /* exec failed: <exe> was never moved.  The sockets are already gone, so
    * exiting is all that is left. */
+  hub_log_info("[UPGRADE] Could not run " HUB_UPGRADE_SCRIPT ": %s\n", strerror(errno));
   failback_clear();
   remove(prev_exe);
   remove(HUB_UPGRADE_MARKER_FILE);
