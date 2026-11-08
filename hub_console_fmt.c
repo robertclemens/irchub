@@ -394,6 +394,24 @@ void fmt_when(long long ts, long long now, char *out, size_t cap) {
     snprintf(out, cap, "%04d-%02d-%02d", y, m, d);
 }
 
+/* Nov 08 14:02Z this year, 2025-12-30 14:02Z before; never for 0.  Always
+ * dated: upgrade runs span days and "today" in UTC is not the admin's day. */
+void fmt_when_dated(long long ts, long long now, char *out, size_t cap) {
+  if (ts <= 0) {
+    snprintf(out, cap, "never");
+    return;
+  }
+  long long day = floordiv(ts, 86400), sec = ts - day * 86400;
+  int y, m, d, ny, nm, nd;
+  civil(day, &y, &m, &d);
+  civil(floordiv(now, 86400), &ny, &nm, &nd);
+  int hh = (int)(sec / 3600), mm = (int)(sec / 60 % 60);
+  if (y == ny)
+    snprintf(out, cap, "%s %02d %02d:%02dZ", MONTH[m - 1], d, hh, mm);
+  else
+    snprintf(out, cap, "%04d-%02d-%02d %02d:%02dZ", y, m, d, hh, mm);
+}
+
 /* 42s, 7m, 3h 12m, 5d 03h */
 void fmt_span(long long s, char *out, size_t cap) {
   if (s < 0) s = 0;
@@ -3277,7 +3295,7 @@ static void upg_rolled(const fmt_ctx_t *ctx, const creply_t *rep, int L, flines_
   for (int i = 0; i < rep->n; i++) {
     const crec_t *n = &rep->r[i];
     if (strcmp(n->type, "rolled")) continue;
-    fmt_when(rvi(n, "when", 0), ctx->now, a, sizeof(a));
+    fmt_when_dated(rvi(n, "when", 0), ctx->now, a, sizeof(a));
     snprintf(v, sizeof(v), "%s to %s, %s, %lld tries: %s", rv(n, "name") ? rv(n, "name") : "?",
              rv(n, "step") ? rv(n, "step") : "?", a, rvi(n, "tries", 0),
              rv(n, "note") ? rv(n, "note") : "");
@@ -3314,7 +3332,7 @@ static void render_upg_plan(const fmt_ctx_t *ctx, const crec_t *pl, int L, fline
     if (!v[0]) snprintf(v, sizeof(v), "already on %s", rv(pl, "hub_final"));
     fmt_card_line(ctx, out, L, "  hubs", v, RL_NORMAL);
   }
-  fmt_when(rvi(pl, "started", 0), ctx->now, a, sizeof(a));
+  fmt_when_dated(rvi(pl, "started", 0), ctx->now, a, sizeof(a));
   fmt_span(ctx->now - rvi(pl, "started", 0), b, sizeof(b));
   snprintf(v, sizeof(v), "%s %s %s ago", a, GL(G_DOT), b);
   fmt_card_line(ctx, out, L, "  started", v, RL_DIM);
@@ -3347,7 +3365,7 @@ static void render_upg_current(const fmt_ctx_t *ctx, const creply_t *rep, flines
     fmt_title(ctx, out, "Upgrades", "no run on this hub");
     if (pl) render_upg_plan(ctx, pl, L, out);
     if (ru) {
-      fmt_when(rvi(ru, "set", 0), ctx->now, a, sizeof(a));
+      fmt_when_dated(rvi(ru, "set", 0), ctx->now, a, sizeof(a));
       fmt_span(ctx->now - rvi(ru, "set", 0), b, sizeof(b));
       snprintf(v, sizeof(v), "%s  (set %s %s %s ago)", plan, a, GL(G_DOT), b);
       fmt_card_line(ctx, out, L, "roll-up plan", v, RL_NORMAL);
@@ -3374,7 +3392,7 @@ static void render_upg_current(const fmt_ctx_t *ctx, const creply_t *rep, flines
     snprintf(right, sizeof(right), "bots %s %s %s %s", GL(G_ARROW), rv(r, "bot_ver") ? rv(r, "bot_ver") : "?",
              GL(G_DOT), rv(r, "phase") ? rv(r, "phase") : "?");
   fmt_title(ctx, out, title, right);
-  fmt_when(rvi(r, "started", 0), ctx->now, a, sizeof(a));
+  fmt_when_dated(rvi(r, "started", 0), ctx->now, a, sizeof(a));
   fmt_span(ctx->now - rvi(r, "started", 0), b, sizeof(b));
   snprintf(v, sizeof(v), "%s %s %s ago", a, GL(G_DOT), b);
   fmt_card_line(ctx, out, L, "started", v, RL_NORMAL);
@@ -3511,7 +3529,7 @@ static void render_upg_runs(const fmt_ctx_t *ctx, const creply_t *rep, long long
     const crec_t *r = &rep->r[i];
     if (strcmp(r->type, "run")) continue;
     char when[48], run[12], bots[80], hubs[80], nodes[128], step[16] = "";
-    fmt_when(rvi(r, "started", 0), ctx->now, when, sizeof(when));
+    fmt_when_dated(rvi(r, "started", 0), ctx->now, when, sizeof(when));
     snprintf(run, sizeof(run), "%.8s", rv(r, "id") ? rv(r, "id") : "?");
     upg_target_cell(ctx, r, "bot_ver", bots, sizeof(bots));
     upg_target_cell(ctx, r, "hub_ver", hubs, sizeof(hubs));
@@ -3566,7 +3584,7 @@ static void render_upg_run(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *
   snprintf(right, sizeof(right), "bots %s %s hubs %s %s %s", bots, GL(G_DOT), hubs, GL(G_DOT),
            upg_run_result(r));
   fmt_title(ctx, out, title, right);
-  fmt_when(rvi(r, "started", 0), ctx->now, a, sizeof(a));
+  fmt_when_dated(rvi(r, "started", 0), ctx->now, a, sizeof(a));
   fmt_span(ctx->now - rvi(r, "started", 0), b, sizeof(b));
   snprintf(v, sizeof(v), "%s %s %s ago", a, GL(G_DOT), b);
   fmt_card_line(ctx, out, L, "started", v, RL_NORMAL);

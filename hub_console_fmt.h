@@ -94,6 +94,7 @@ const char *fmt_glyph(const fmt_ctx_t *ctx, int g);
 const char *fmt_ascii_char(const char *s, size_t n, size_t *len);
 char *fmt_ascii(const char *s);
 void fmt_when(long long ts, long long now, char *out, size_t cap);
+void fmt_when_dated(long long ts, long long now, char *out, size_t cap);
 void fmt_span(long long secs, char *out, size_t cap);
 void fmt_bytes(unsigned long long n, char *out, size_t cap);
 void fmt_count(unsigned long long n, char *out, size_t cap);
