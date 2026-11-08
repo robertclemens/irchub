@@ -167,7 +167,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * the Makefile; -D-overridable so a release build can stamp its own version
  * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
 #ifndef HUB_VERSION
-#define HUB_VERSION "2.5.2"
+#define HUB_VERSION "2.5.3"
 #endif
 
 /* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
