@@ -213,15 +213,26 @@ static const char *const FAILBACK_BODY[] = {
   "HELD=\"\"\n",
   "\n",
   "take_lock() {\n",
-  "  i=0\n",
+  "  i=0; e=0\n",
   "  while :; do\n",
   "    if ( set -C; echo $$ >\"$1\" ) 2>/dev/null; then HELD=\"$HELD $1\"; return 0; fi\n",
   "    h=$(cat \"$1\" 2>/dev/null)\n",
+  "    # Empty: its holder may be between create and write; look once more first.\n",
+  "    if [ -z \"$h\" ] && [ \"$e\" = 0 ]; then e=1; sleep 1; continue; fi\n",
+  "    e=0\n",
   "    if [ -n \"$h\" ] && kill -0 \"$h\" 2>/dev/null; then\n",
   "      i=$((i + 1)); [ \"$i\" -ge \"$2\" ] && return 1\n",
   "      sleep 1\n",
+  "    elif ( set -C; echo $$ >\"$1.take\" ) 2>/dev/null; then\n",
+  "      # Only the holder of $1.take clears a stale $1, and only while it still\n",
+  "      # names the dead holder it saw: two waiters can never both take over.\n",
+  "      [ \"$(cat \"$1\" 2>/dev/null)\" = \"$h\" ] && rm -f \"$1\"\n",
+  "      rm -f \"$1.take\"\n",
   "    else\n",
-  "      rm -f \"$1\"\n",
+  "      t=$(cat \"$1.take\" 2>/dev/null)\n",
+  "      [ -n \"$t\" ] && ! kill -0 \"$t\" 2>/dev/null && rm -f \"$1.take\"\n",
+  "      i=$((i + 1)); [ \"$i\" -ge \"$2\" ] && return 1\n",
+  "      sleep 1\n",
   "    fi\n",
   "  done\n",
   "}\n",
@@ -567,12 +578,34 @@ static void cron_note(int rc, time_t now) {
   g_cron_ours = rc == 0;
   if (rc == 0) snprintf(next, sizeof(next), "yes");
   else if (rc == 10) snprintf(next, sizeof(next), "manual");
-  else if (rc == 11 || g_cron_wanted != 1) snprintf(next, sizeof(next), "no");
+  else if (rc == 11 || (rc == 3 && g_cron_wanted != 1)) snprintf(next, sizeof(next), "no");
   else if (rc == 3) snprintf(next, sizeof(next), "failed:no crontab tool");
   else if (rc == 4) snprintf(next, sizeof(next), "failed:unsafe path");
   else snprintf(next, sizeof(next), "failed:cannot read crontab");
   snprintf(g_cron_status, sizeof(g_cron_status), "%s", next);
-  g_cron_stat = now;
+  /* Ours: look at the stamp in this same pass, so a host whose cron is dead
+   * stays "silent" instead of reading "yes" for a minute after every check. */
+  g_cron_stat = g_cron_ours ? 0 : now;
+}
+
+/* The helper's work files are .upgrade.cron.<its pid>.*: a helper that was
+ * killed could not remove them, and they hold a copy of the crontab. */
+static void cron_work_rm(pid_t pid) {
+  char pre[48];
+  int n = snprintf(pre, sizeof(pre), ".upgrade.cron.%ld.", (long)pid);
+  if (n <= 0 || n >= (int)sizeof(pre)) return;
+  DIR *d = opendir(".");
+  if (!d) return;
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL)
+    if (strncmp(e->d_name, pre, (size_t)n) == 0) (void)unlink(e->d_name);
+  closedir(d);
+}
+
+/* Kill the helper and whatever it started (a hung crontab, a sleep): it leads
+ * a process group of its own. */
+static void cron_helper_kill(pid_t pid) {
+  if (kill(-pid, SIGKILL) != 0) kill(pid, SIGKILL);
 }
 
 /* What hub_update_cron_tick last found: yes, silent, manual, no or failed:<why>. */
@@ -594,9 +627,10 @@ bool hub_update_cron_tick(const char *exe) {
     int st = 0;
     pid_t r = waitpid(g_cron_pid, &st, WNOHANG);
     if (r == 0) {
-      if (now - g_cron_started > CRON_HELPER_TIMEOUT) kill(g_cron_pid, SIGKILL);
+      if (now - g_cron_started > CRON_HELPER_TIMEOUT) cron_helper_kill(g_cron_pid);
       return false;
     }
+    cron_work_rm(g_cron_pid);
     g_cron_pid = 0;
     remove(CRON_HELPER);
     cron_note(r > 0 && WIFEXITED(st) ? WEXITSTATUS(st) : 1, now);
@@ -610,13 +644,18 @@ bool hub_update_cron_tick(const char *exe) {
     } else {
       pid_t pid = fork();
       if (pid == 0) {
+        (void)setpgid(0, 0);
         for (int fd = 3; fd < 1024; fd++) close(fd);
         execl("./" CRON_HELPER, "./" CRON_HELPER, arg, (char *)NULL);
         _exit(127);
       }
       if (pid > 0) {
+        (void)setpgid(pid, pid);
         g_cron_pid = pid;
         g_cron_started = now;
+      } else {
+        remove(CRON_HELPER);
+        snprintf(g_cron_status, sizeof(g_cron_status), "failed:cannot start the helper");
       }
       /* Set before it finishes: an order that arrives meanwhile clears this, and
        * must not be overwritten when this child ends. */
@@ -637,8 +676,9 @@ bool hub_update_cron_tick(const char *exe) {
  * hand-written line still runs this binary, anything else could not. */
 int hub_update_cron_drop(const char *exe) {
   if (g_cron_pid > 0) {
-    kill(g_cron_pid, SIGKILL);
+    cron_helper_kill(g_cron_pid);
     (void)waitpid(g_cron_pid, NULL, 0);
+    cron_work_rm(g_cron_pid);
     g_cron_pid = 0;
   }
   if (!failback_write(CRON_HELPER, exe, "", true, HUB_CONFIG_FILE, HUB_PID_FILE, HUB_UPGRADE_SCRIPT, "",
@@ -1630,6 +1670,11 @@ static bool copy_file(const char *src, const char *dst, mode_t mode) {
  * here touches <exe>, and everything here is gone again if no COMMIT comes. */
 #define STAGE_DIR ".upgrade.stage"
 
+/* The process group of the command run_bounded runs now: in the stage child,
+ * the build (make or cargo and every compiler under it).  stage_term takes it
+ * down when the stage is stopped. */
+static volatile sig_atomic_t g_build_pgid = 0;
+
 static int run_bounded(const char *const argv[], int timeout_s, char *out, size_t out_size);
 
 static pid_t g_stage_pid = 0;
@@ -1638,7 +1683,42 @@ static char g_stage_phase[16] = "", g_stage_code[16] = "", g_stage_note[192] = "
 static time_t g_stage_started = 0, g_stage_said = 0, g_stage_done = 0;
 static bool g_stage_ready = false;
 
+#define STAGE_ASIDE STAGE_DIR ".old."
+
+/* Remove `dir` without waiting for it: a grandchild runs the rm, so init reaps
+ * it and the event loop does not sit through a cargo target/ tree.  If that
+ * cannot start, the old bounded wait. */
+static void stage_rm_detached(const char *dir) {
+  pid_t c = fork();
+  if (c == 0) {
+    pid_t g = fork();
+    if (g == 0) {
+      long maxfd = sysconf(_SC_OPEN_MAX);
+      if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+      for (int fd = 3; fd < maxfd; fd++) close(fd);
+      execl("/bin/rm", "rm", "-rf", dir, (char *)NULL);
+      _exit(127);
+    }
+    _exit(g > 0 ? 0 : 1);
+  }
+  int st = 0;
+  if (c > 0 && waitpid(c, &st, 0) == c && WIFEXITED(st) && WEXITSTATUS(st) == 0) return;
+  const char *rm[] = {"/bin/rm", "-rf", dir, NULL};
+  run_bounded(rm, 30, NULL, 0);
+}
+
+/* The stage directory goes at once: renamed aside (so a new stage can start in
+ * a clean one straight away, and nothing still writing lands in it), then
+ * removed in the background. */
 static void stage_rm(void) {
+  if (access(STAGE_DIR, F_OK) != 0) return;
+  static unsigned n = 0;
+  char aside[96];
+  snprintf(aside, sizeof(aside), STAGE_ASIDE "%ld.%u", (long)getpid(), ++n);
+  if (rename(STAGE_DIR, aside) == 0) {
+    stage_rm_detached(aside);
+    return;
+  }
   const char *rm[] = {"/bin/rm", "-rf", STAGE_DIR, NULL};
   run_bounded(rm, 30, NULL, 0);
 }
@@ -1803,6 +1883,28 @@ static void stage_child(const char *ver, const char *variant, const char *exe) {
   _exit(0);
 }
 
+/* The stage child's SIGTERM (a stop, or the daemon's death): the build's group
+ * goes first, then the child.  Only async-signal-safe calls. */
+static void stage_term(int sig) {
+  (void)sig;
+  pid_t g = (pid_t)g_build_pgid;
+  if (g > 0) kill(-g, SIGKILL);
+  _exit(1);
+}
+
+/* Stop a stage child and its build: SIGTERM lets it take the build down with
+ * it (stage_term); what is still there after a second is killed outright. */
+static void stage_stop(pid_t pid) {
+  if (kill(-pid, SIGTERM) != 0) kill(pid, SIGTERM);
+  for (int i = 0; i < 20; i++) {
+    if (waitpid(pid, NULL, WNOHANG) != 0) return;
+    struct timespec t = {0, 50 * 1000 * 1000};
+    nanosleep(&t, NULL);
+  }
+  if (kill(-pid, SIGKILL) != 0) kill(pid, SIGKILL);
+  (void)waitpid(pid, NULL, 0);
+}
+
 /* A hub's STAGE.  Starting again for the same build is a no-op, so a repeat costs
  * nothing. */
 void hub_update_stage_start(const char *exe, const char *id, const char *ver, const char *variant) {
@@ -1821,12 +1923,30 @@ void hub_update_stage_start(const char *exe, const char *id, const char *ver, co
     snprintf(g_stage_note, sizeof(g_stage_note), "could not make %s", STAGE_DIR);
     return;
   }
+  pid_t parent = getpid();
   pid_t pid = fork();
   if (pid == 0) {
-    for (int fd = 3; fd < 1024; fd++) close(fd);
+    /* A group of its own, and its own SIGTERM: the daemon's handler only sets
+     * a flag nothing here reads, so without this the death signal and a stop
+     * would be swallowed and the build would run on. */
+    (void)setpgid(0, 0);
+    signal(SIGTERM, stage_term);
+    signal(SIGINT, stage_term);
+    long maxfd = sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+    for (int fd = 3; fd < maxfd; fd++) close(fd);
     /* It goes when the daemon goes: a stage belongs to one process. */
     (void)prctl(PR_SET_PDEATHSIG, SIGTERM);
-    stage_child(ver, variant, exe);
+    if (getppid() != parent) _exit(1); /* the daemon went before prctl */
+    /* A fresh process for the stage: none of the daemon's memory (keys, the
+     * config password), threads or library locks come along.  The running
+     * build, not whatever is on disk at exe now; the group, the death signal,
+     * the closed fds and the working directory carry over the exec. */
+    const char *v = variant ? variant : "";
+    const char *a0 = exe && exe[0] ? exe : "irchub";
+    execl("/proc/self/exe", a0, "-stage", ver, v, (char *)NULL);
+    if (exe && exe[0]) execl(exe, a0, "-stage", ver, v, (char *)NULL);
+    stage_say("failed", "exec", "could not start the stage");
     _exit(1);
   }
   if (pid < 0) {
@@ -1835,13 +1955,13 @@ void hub_update_stage_start(const char *exe, const char *id, const char *ver, co
     snprintf(g_stage_note, sizeof(g_stage_note), "could not start the stage");
     return;
   }
+  (void)setpgid(pid, pid);
   g_stage_pid = pid;
 }
 
 void hub_update_stage_clear(void) {
   if (g_stage_pid > 0) {
-    kill(g_stage_pid, SIGKILL);
-    (void)waitpid(g_stage_pid, NULL, 0);
+    stage_stop(g_stage_pid);
     g_stage_pid = 0;
   }
   if (g_stage_id[0]) stage_rm();
@@ -1855,6 +1975,10 @@ bool hub_update_stage_tick(char *id, size_t id_size, char *out, size_t out_size)
   time_t now = time(NULL);
   bool changed = false;
   if (g_stage_pid > 0) {
+    /* Reap first: once the child is gone its status file is final, so a
+     * stage that says "staged" and exits between the two is not lost. */
+    int st = 0;
+    pid_t r = waitpid(g_stage_pid, &st, WNOHANG);
     char line[256];
     FILE *f = fopen(STAGE_DIR "/status", "r");
     if (f) {
@@ -1872,8 +1996,6 @@ bool hub_update_stage_tick(char *id, size_t id_size, char *out, size_t out_size)
       }
       fclose(f);
     }
-    int st = 0;
-    pid_t r = waitpid(g_stage_pid, &st, WNOHANG);
     if (r != 0) {
       g_stage_pid = 0;
       if (strcmp(g_stage_phase, "staged") == 0 && access(STAGE_DIR "/new", X_OK) == 0) {
@@ -1886,8 +2008,7 @@ bool hub_update_stage_tick(char *id, size_t id_size, char *out, size_t out_size)
       }
       changed = true;
     } else if (now - g_stage_started > UPGRADE_BUILD_SECS) {
-      kill(g_stage_pid, SIGKILL);
-      (void)waitpid(g_stage_pid, NULL, 0);
+      stage_stop(g_stage_pid);
       g_stage_pid = 0;
       snprintf(g_stage_phase, sizeof(g_stage_phase), "failed");
       snprintf(g_stage_code, sizeof(g_stage_code), "limit");
@@ -1911,9 +2032,39 @@ bool hub_update_stage_tick(char *id, size_t id_size, char *out, size_t out_size)
   return true;
 }
 
+/* -stage <ver> <variant>: the stage body in a process of its own, exec'd by
+ * hub_update_stage_start's child.  It runs in the instance directory the
+ * daemon left it in, before any config, password or pid lock is touched, and
+ * only into the empty stage directory that daemon has just made: a hand-run
+ * -stage, or one beside a live stage, is refused. */
+int hub_update_stage_main(const char *ver, const char *variant) {
+  struct stat sb;
+  if (!ver || !ver[0] || strlen(ver) >= sizeof(g_stage_ver) || !variant ||
+      lstat(STAGE_DIR, &sb) != 0 || !S_ISDIR(sb.st_mode) || sb.st_uid != getuid() ||
+      access(STAGE_DIR "/status", F_OK) == 0) {
+    fprintf(stderr, "-stage is the updater's own: a daemon runs it for its stage\n");
+    return 1;
+  }
+  signal(SIGTERM, stage_term);
+  signal(SIGINT, stage_term);
+  stage_child(ver, variant, NULL);
+  return 1; /* stage_child ends in _exit */
+}
+
+/* The last report could not be sent (no hub link, or the driver's peer link is
+ * down): say the current state again on the next tick. */
+void hub_update_stage_unsaid(void) { g_stage_said = 0; }
+
 /* A stage belongs to one process: whatever a dead one left is rubbish. */
 void hub_update_stage_boot_clean(void) {
-  if (access(STAGE_DIR, F_OK) == 0) stage_rm();
+  stage_rm();
+  /* and what an earlier process had set aside but not finished removing */
+  DIR *d = opendir(".");
+  if (!d) return;
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL)
+    if (strncmp(e->d_name, STAGE_ASIDE, sizeof(STAGE_ASIDE) - 1) == 0) stage_rm_detached(e->d_name);
+  closedir(d);
 }
 
 /* The staged build for this run, ready to swap in. */
@@ -1942,6 +2093,7 @@ static int run_bounded(const char *const argv[], int timeout_s, char *out,
     return -1;
   }
   if (pid == 0) {
+    (void)setpgid(0, 0); /* its own group: a timeout kills what it started too */
     dup2(pipefd[1], STDOUT_FILENO);
     dup2(pipefd[1], STDERR_FILENO);
     int devnull = open("/dev/null", O_RDONLY);
@@ -1960,12 +2112,18 @@ static int run_bounded(const char *const argv[], int timeout_s, char *out,
     else execvp(argv[0], av.rw);
     _exit(127);
   }
+  (void)setpgid(pid, pid);
+  g_build_pgid = (sig_atomic_t)pid;
   close(pipefd[1]);
   fcntl(pipefd[0], F_SETFL, fcntl(pipefd[0], F_GETFL) | O_NONBLOCK);
   size_t got = 0;
   int status = 0;
   bool done = false;
-  for (int waited_ms = 0; waited_ms < timeout_s * 1000; waited_ms += 100) {
+  /* Short sleeps first: most commands (an rm, a tar of a small archive) end in
+   * a few ms, and this can run on the event loop.  Then 100 ms steps. */
+  long nap_ms = 1;
+  for (long waited_ms = 0; waited_ms < (long)timeout_s * 1000; waited_ms += nap_ms,
+            nap_ms = nap_ms < 100 ? (nap_ms * 2 > 100 ? 100 : nap_ms * 2) : 100) {
     char buf[256];
     ssize_t n;
     while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
@@ -1981,13 +2139,14 @@ static int run_bounded(const char *const argv[], int timeout_s, char *out,
       done = true;
       break;
     }
-    struct timespec tick = {0, 100 * 1000 * 1000};
+    struct timespec tick = {0, nap_ms * 1000 * 1000};
     nanosleep(&tick, NULL);
   }
   if (!done) {
-    kill(pid, SIGKILL);
+    if (kill(-pid, SIGKILL) != 0) kill(pid, SIGKILL);
     waitpid(pid, &status, 0);
   }
+  g_build_pgid = 0;
   close(pipefd[0]);
   if (out) out[strcspn(out, "\r\n")] = '\0';
   if (!done) return -1;
@@ -2566,6 +2725,11 @@ void hub_update_stage_start(const char *exe, const char *id, const char *ver, co
   (void)exe; (void)id; (void)ver; (void)variant;
 }
 void hub_update_stage_clear(void) {}
+void hub_update_stage_unsaid(void) {}
+int hub_update_stage_main(const char *ver, const char *variant) {
+  (void)ver; (void)variant;
+  return 1;
+}
 void hub_update_stage_boot_clean(void) {}
 bool hub_update_stage_tick(char *id, size_t id_size, char *out, size_t out_size) {
   (void)id; (void)id_size; (void)out; (void)out_size;

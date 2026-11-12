@@ -90,9 +90,20 @@ static bool cron_uuid_ok(const char *s, size_t n) {
   return true;
 }
 
+/* A deleted node's single-node setting goes with it. */
+static void cron_rec_drop(hub_state_t *state, char kind, const char *uuid) {
+  int i = cron_rec_find(state, kind, uuid);
+  if (i < 0) return;
+  state->cron_recs[i] = state->cron_recs[--state->cron_rec_count];
+  state->config_dirty = true;
+}
+
 static bool cron_rec_put(hub_state_t *state, char kind, const char *uuid, int on, time_t ts,
                          bool *changed) {
   *changed = false;
+  /* A deleted bot is gone for good (rv| list): its setting is not kept, and a
+   * peer that still sends it cannot bring it back. */
+  if (kind == 'b' && hub_revoke_find(state, uuid)) return true;
   time_t gts = kind == 'h' ? state->hub_cron_ts : state->bot_cron_ts;
   if (ts < gts) return true;  /* replaced by a newer global setting */
   int i = cron_rec_find(state, kind, uuid);
@@ -273,6 +284,7 @@ bool hub_revoke_merge(hub_state_t *state, const hub_revoked_t *in) {
     }
     state->revoked[state->revoked_count++] = *in;
     state->config_dirty = true;
+    cron_rec_drop(state, 'b', in->uuid);
     return true;
   }
   bool changed = false;

@@ -305,10 +305,11 @@ static bool uh_merge(hub_state_t *state, const uhist_view_t *v, const char *body
   while (pos < state->uhist_count &&
          uh_order(state->uhist[pos].started, state->uhist[pos].id, (time_t)v->started, v->id) < 0)
     pos++;
-  /* It would fall straight off the end: nothing changed. */
+  /* It would fall straight off the end: nothing new is stored, but an older
+   * revision removed above is a change the caller must save and flood. */
   if (pos >= keep) {
     free(copy);
-    return false;
+    return at >= 0;
   }
   if (state->uhist_count >= MAX_UPGRADE_HISTORY) {
     uh_remove_at(state, state->uhist_count - 1);

@@ -14,6 +14,10 @@
 #include <string.h>
 #include <strings.h>
 
+/* One object for the letters, so pointer differences into it are defined
+ * (two expansions of the literal need not be the same array). */
+static const char k_flag_letters[] = USER_FLAG_LETTERS;
+
 bool hub_uuid_shape(const char *u) {
   if (!u || strlen(u) != 36) return false;
   for (int i = 0; i < 36; i++) {
@@ -30,15 +34,15 @@ bool hub_uuid_shape(const char *u) {
  * out gets them once each in canonical order.  "" is valid (no flags). */
 bool hub_uflags_canon(const char *in, char *out, size_t cap) {
   if (!in || !out || cap < USER_FLAGS_MAX + 1) return false;
-  bool have[sizeof(USER_FLAG_LETTERS)] = {false};
+  bool have[sizeof(k_flag_letters)] = {false};
   for (const char *p = in; *p; p++) {
-    const char *at = strchr(USER_FLAG_LETTERS, *p);
+    const char *at = strchr(k_flag_letters, *p);
     if (!at || !*p) return false;
-    have[at - USER_FLAG_LETTERS] = true;
+    have[at - k_flag_letters] = true;
   }
   size_t o = 0;
-  for (size_t i = 0; i < sizeof(USER_FLAG_LETTERS) - 1; i++)
-    if (have[i]) out[o++] = USER_FLAG_LETTERS[i];
+  for (size_t i = 0; i < sizeof(k_flag_letters) - 1; i++)
+    if (have[i]) out[o++] = k_flag_letters[i];
   out[o] = '\0';
   return true;
 }
@@ -55,8 +59,8 @@ bool hub_uflags_edit(const char *cur, const char *spec, char *out, size_t cap) {
   }
   char work[USER_FLAGS_MAX + 1];
   if (!hub_uflags_canon(cur ? cur : "", work, sizeof(work))) work[0] = '\0';
-  bool have[sizeof(USER_FLAG_LETTERS)] = {false};
-  for (const char *p = work; *p; p++) have[strchr(USER_FLAG_LETTERS, *p) - USER_FLAG_LETTERS] = true;
+  bool have[sizeof(k_flag_letters)] = {false};
+  for (const char *p = work; *p; p++) have[strchr(k_flag_letters, *p) - k_flag_letters] = true;
   int sign = 0;
   bool any = false;
   for (const char *p = spec; *p; p++) {
@@ -64,15 +68,15 @@ bool hub_uflags_edit(const char *cur, const char *spec, char *out, size_t cap) {
       sign = *p == '+' ? 1 : -1;
       continue;
     }
-    const char *at = strchr(USER_FLAG_LETTERS, *p);
+    const char *at = strchr(k_flag_letters, *p);
     if (!at || !sign) return false;
-    have[at - USER_FLAG_LETTERS] = sign > 0;
+    have[at - k_flag_letters] = sign > 0;
     any = true;
   }
   if (!any) return false;
   size_t o = 0;
-  for (size_t i = 0; i < sizeof(USER_FLAG_LETTERS) - 1; i++)
-    if (have[i]) out[o++] = USER_FLAG_LETTERS[i];
+  for (size_t i = 0; i < sizeof(k_flag_letters) - 1; i++)
+    if (have[i]) out[o++] = k_flag_letters[i];
   out[o] = '\0';
   return true;
 }

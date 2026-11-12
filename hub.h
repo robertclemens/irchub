@@ -903,6 +903,7 @@ typedef struct {
   char kind[8];             // "unban" | "invite" | "key"
   char channel[MAX_CHAN];
   int origin_fd;            // Peer fd the request came from, -1 if local bot
+  uint64_t origin_serial;   // ...and that link's conn_serial
   time_t timestamp;
   bool active;
 } pending_chan_request_t;
@@ -1243,6 +1244,7 @@ typedef struct {
   char target_uuid[64];    // UUID of bot that should grant ops
   char channel[MAX_CHAN];  // Channel where ops are needed
   int origin_fd;           // FD to send response back to (-1 if local bot)
+  uint64_t origin_serial;  // ...and that link's conn_serial
   time_t timestamp;        // When request was created
   bool active;             // Whether this slot is in use
 } pending_op_request_t;
@@ -1718,6 +1720,7 @@ typedef struct {
   char uuid[64];
   char name[64];
   int  fd;                               /* the peer its answer came from */
+  uint64_t serial;                       /* ...and that link's conn_serial */
   int  asked, ready;
   bool tried;
 } chan_elect_hub_t;
@@ -1727,6 +1730,7 @@ typedef struct {
   char   id[64];
   bool   origin;
   int    from_fd;
+  uint64_t from_serial;                  /* from_fd's conn_serial         */
   int    admin_fd;
   uint64_t admin_serial;                 /* admin_fd's conn_serial        */
   char   kind[8];
@@ -2712,6 +2716,8 @@ bool hub_update_has_build(const char *root, const char *variant, const char *ver
 void hub_update_stage_start(const char *exe, const char *id, const char *ver, const char *variant);
 void hub_update_stage_clear(void);
 void hub_update_stage_boot_clean(void);
+void hub_update_stage_unsaid(void);
+int hub_update_stage_main(const char *ver, const char *variant);
 bool hub_update_stage_tick(char *id, size_t id_size, char *out, size_t out_size);
 bool hub_update_failback_note(char *out, size_t out_size);
 bool hub_upgrade_marker_write(const char *upgrade_id, const char *target_ver,

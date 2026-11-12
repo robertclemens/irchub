@@ -1187,6 +1187,11 @@ int main(int argc, char *argv[]) {
          * no PID lock, no network, no config rewrite — run on a STAGED build
          * by the updater before anything is swapped. */
         if (strcmp(argv[i], "-selftest") == 0) selftest_mode = true;
+        /* -stage <ver> <variant>: the updater's own stage process (see
+         * hub_update_stage_main); no config, no password, no PID lock. */
+        if (strcmp(argv[i], "-stage") == 0)
+            return hub_update_stage_main(i + 1 < argc ? argv[i + 1] : NULL,
+                                         i + 2 < argc ? argv[i + 2] : NULL);
     }
 
     /* -selftest stays in the caller's directory: the updater runs a staged

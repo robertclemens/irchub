@@ -8740,6 +8740,16 @@ static bool op_forward_seen_check_and_add(hub_state_t *state,
   return false; /* first time seeing this */
 }
 
+/* The conn_serial of the link on `fd` now, or 0 (none: -1, or no such link).
+ * A reply table keeps it beside the fd, so an answer that comes back after
+ * the link dropped and the fd was reused never reaches the newcomer. */
+static uint64_t fd_conn_serial(const hub_state_t *state, int fd) {
+  if (fd < 0) return 0;
+  for (int i = 0; i < state->client_count; i++)
+    if (state->clients[i]->fd == fd) return state->clients[i]->conn_serial;
+  return 0;
+}
+
 static int add_pending_op_request(hub_state_t *state, const char *request_id,
                                    const char *requester_uuid,
                                    const char *target_uuid,
@@ -8759,6 +8769,7 @@ static int add_pending_op_request(hub_state_t *state, const char *request_id,
       snprintf(state->pending_op_requests[i].channel,
                sizeof(state->pending_op_requests[i].channel), "%s", channel);
       state->pending_op_requests[i].origin_fd = origin_fd;
+      state->pending_op_requests[i].origin_serial = fd_conn_serial(state, origin_fd);
       state->pending_op_requests[i].timestamp = time(NULL);
       state->pending_op_requests[i].active = true;
       return i;
@@ -9041,6 +9052,7 @@ static void process_forward_op_grant(hub_state_t *state, hub_client_t *client,
   hub_client_t *requester = NULL;
   for (int i = 0; i < state->client_count; i++) {
     if (state->clients[i]->fd == req->origin_fd &&
+        state->clients[i]->conn_serial == req->origin_serial &&
         state->clients[i]->type == CLIENT_BOT) {
       requester = state->clients[i];
       break;
@@ -9060,7 +9072,7 @@ static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
                                        char *payload) {
   (void)client; // Not used - response goes to original requester
   // Payload format: request_id|reason
-  char request_id[64], reason[256];
+  char request_id[64] = "", reason[256] = "";
 
   if (sscanf(payload, "%63[^|]|%255[^\n]", request_id, reason) < 1) {
     hub_log_warning("[HUB] Invalid OP_FORWARD_FAILED payload from peer\n");
@@ -9081,6 +9093,7 @@ static void process_forward_op_failed(hub_state_t *state, hub_client_t *client,
   hub_client_t *requester = NULL;
   for (int i = 0; i < state->client_count; i++) {
     if (state->clients[i]->fd == req->origin_fd &&
+        state->clients[i]->conn_serial == req->origin_serial &&
         state->clients[i]->type == CLIENT_BOT) {
       requester = state->clients[i];
       break;
@@ -9150,6 +9163,7 @@ static int add_pending_chan_request(hub_state_t *state, const char *request_id,
       snprintf(p->kind, sizeof(p->kind), "%s", kind);
       snprintf(p->channel, sizeof(p->channel), "%s", channel);
       p->origin_fd = origin_fd;
+      p->origin_serial = fd_conn_serial(state, origin_fd);
       p->timestamp = now;
       p->active = true;
       return i;
@@ -9375,7 +9389,7 @@ static void process_chan_reply(hub_state_t *state, hub_client_t *client,
     for (int i = 0; i < state->client_count; i++) {
       hub_client_t *c = state->clients[i];
       if (c->type == CLIENT_HUB && c->authenticated &&
-          c->fd == req->origin_fd) {
+          c->fd == req->origin_fd && c->conn_serial == req->origin_serial) {
         if (!peer_send_urgent(state, c, CMD_CHAN_FWD_REPLY, out))
           hub_log_warning("[HUB] URGENT queue full routing CHAN_REPLY to peer fd=%d\n",
                   c->fd);
@@ -9437,7 +9451,8 @@ static void process_forward_chan_reply(hub_state_t *state, hub_client_t *client,
   } else {
     for (int i = 0; i < state->client_count; i++) {
       hub_client_t *c = state->clients[i];
-      if (c->type == CLIENT_HUB && c->authenticated && c->fd == req->origin_fd) {
+      if (c->type == CLIENT_HUB && c->authenticated && c->fd == req->origin_fd &&
+          c->conn_serial == req->origin_serial) {
         peer_send_urgent(state, c, CMD_CHAN_FWD_REPLY, payload);
         hub_log_debug("[HUB] CHAN_FWD_REPLY (id:%s) relayed on toward its origin "
                 "(peer fd=%d)\n", request_id, c->fd);
@@ -9481,10 +9496,11 @@ static int ce_pick(int n) {
   return (int)(r % (uint32_t)n);
 }
 
-static hub_client_t *ce_peer(hub_state_t *state, int fd) {
+static hub_client_t *ce_peer(hub_state_t *state, int fd, uint64_t serial) {
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
-    if (c->type == CLIENT_HUB && c->authenticated && c->fd == fd) return c;
+    if (c->type == CLIENT_HUB && c->authenticated && c->fd == fd && c->conn_serial == serial)
+      return c;
   }
   return NULL;
 }
@@ -9776,7 +9792,7 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
 
 /* A relay hub's report back toward the origin. */
 static void ce_up(hub_state_t *state, chan_elect_t *e, uint8_t cmd, const char *payload) {
-  hub_client_t *p = ce_peer(state, e->from_fd);
+  hub_client_t *p = ce_peer(state, e->from_fd, e->from_serial);
   if (p) peer_send_urgent(state, p, cmd, payload);
 }
 
@@ -9802,7 +9818,7 @@ static void ce_try_hub(hub_state_t *state, chan_elect_t *e) {
       chan_elect_hub_t *h = &e->hubs[i];
       if (h->tried || h->ready <= 0 || k-- != 0) continue;
       h->tried = true;
-      hub_client_t *p = ce_peer(state, h->fd);
+      hub_client_t *p = ce_peer(state, h->fd, h->serial);
       char buf[160];
       snprintf(buf, sizeof(buf), "%s|%s|elect", e->id, h->uuid);
       if (!p || !peer_send_urgent(state, p, CMD_CHAN_ELECT_DO, buf)) break;
@@ -10060,6 +10076,7 @@ static void process_chan_elect_fwd(hub_state_t *state, hub_client_t *client,
     add_pending_chan_request(state, id, requester, kind, channel, client->fd);
   e->active = true;
   e->from_fd = client->fd;
+  e->from_serial = client->conn_serial;
   snprintf(e->id, sizeof(e->id), "%s", id);
   snprintf(e->kind, sizeof(e->kind), "%s", kind);
   snprintf(e->channel, sizeof(e->channel), "%s", channel);
@@ -10094,6 +10111,7 @@ static void process_chan_elect_ack(hub_state_t *state, hub_client_t *client,
   roster_clean(h->uuid, sizeof(h->uuid), hub);
   roster_clean(h->name, sizeof(h->name), name[0] ? name : hub);
   h->fd = client->fd;
+  h->serial = client->conn_serial;
   h->asked = atoi(a) > 0 ? atoi(a) : 0;
   h->ready = atoi(r) > 0 ? atoi(r) : 0;
   if (!e->origin) ce_up(state, e, CMD_CHAN_ELECT_ACK, payload);
@@ -10107,11 +10125,11 @@ static void process_chan_elect_do(hub_state_t *state, hub_client_t *client,
   wire_field(payload, 1, hub, sizeof(hub));
   wire_field(payload, 2, mode, sizeof(mode));
   chan_elect_t *e = id[0] ? ce_find(state, id) : NULL;
-  if (!e || e->origin || client->fd != e->from_fd) return;
+  if (!e || e->origin || client->fd != e->from_fd || client->conn_serial != e->from_serial) return;
   if (strcmp(hub, state->hub_uuid) != 0) {
     for (int i = 0; i < e->hub_n; i++)
       if (strcmp(e->hubs[i].uuid, hub) == 0) {
-        hub_client_t *p = ce_peer(state, e->hubs[i].fd);
+        hub_client_t *p = ce_peer(state, e->hubs[i].fd, e->hubs[i].serial);
         if (p) peer_send_urgent(state, p, CMD_CHAN_ELECT_DO, payload);
         return;
       }
@@ -13673,19 +13691,28 @@ static void hub_upgrade_stage_tick(hub_state_t *state) {
   char id[64], status[256], payload[400];
   if (!hub_update_stage_tick(id, sizeof(id), status, sizeof(status))) return;
   snprintf(payload, sizeof(payload), "%s|%s|%s", id, state->hub_uuid, status);
-  hub_client_t *origin = strcmp(state->follow_id, id) == 0
-                             ? upgrade_find_peer(state, state->follow_origin) : NULL;
+  bool following = strcmp(state->follow_id, id) == 0;
+  hub_client_t *origin = following ? upgrade_find_peer(state, state->follow_origin) : NULL;
   if (origin) peer_send_urgent(state, origin, CMD_UPGRADE_PROGRESS, payload);
-  else hub_upgrade_note_progress(state, payload);
+  else {
+    if (following) hub_update_stage_unsaid(); /* driver's link down: keep it owed */
+    hub_upgrade_note_progress(state, payload);
+  }
 }
 
 /* The rolling plan, one step per maintenance tick. */
 void hub_upgrade_tick(hub_state_t *state, time_t now) {
+  /* Called once per event-loop pass.  The housekeeping below is second-granular
+   * (a file probe, a walk of every bot, a roll-up settle), so it runs once a
+   * second; the plan and the run's own steps still look on every pass. */
+  static time_t last_sec = 0;
+  bool new_sec = now != last_sec;
+  last_sec = now;
   /* A hub with no peers to link to has nothing more to prove than being up. */
-  if (state->peer_count == 0) hub_update_failback_confirm();
-  hub_cron_tick(state);
+  if (new_sec && state->peer_count == 0) hub_update_failback_confirm();
+  if (new_sec) hub_cron_tick(state);
   hub_upgrade_stage_tick(state);
-  hub_rollup_tick(state, now);
+  if (new_sec) hub_rollup_tick(state, now);
   hub_plan_tick(state, now);
   pending_upgrade_t *u = &state->upgrade;
   if (!u->active) return;
@@ -14630,8 +14657,17 @@ static void hub_upgrade_releases(hub_state_t *state, const char *payload,
  * drives itself (or none), and is noted locally. */
 static void hub_upgrade_bot_report(hub_state_t *state, hub_client_t *client,
                                    int cmd, const char *payload) {
-  char id[64] = "";
+  char id[64] = "", uuid[64] = "";
   wire_field(payload, 0, id, sizeof(id));
+  wire_field(payload, 1, uuid, sizeof(uuid));
+  /* A bot reports for itself only: READY, PROGRESS and RESULT all carry the
+   * sender's uuid in field 1, so anything else is refused before it is
+   * forwarded or noted. */
+  if (strcmp(uuid, client->id) != 0) {
+    hub_log_warning("[UPGRADE] %s sent an upgrade report for another node: dropped\n",
+                    hub_who_client(state, client));
+    return;
+  }
   if (state->follow_id[0] && id[0] && strcmp(state->follow_id, id) == 0) {
     hub_client_t *origin = upgrade_find_peer(state, state->follow_origin);
     if (origin) {
@@ -14648,12 +14684,9 @@ static void hub_upgrade_bot_report(hub_state_t *state, hub_client_t *client,
     hub_upgrade_note_progress(state, payload);
     return;
   }
-  /* A bot reports for itself, and once per link: a bot sends one RESULT after
-   * a restart, so one relay per link bounds what it can make the mesh carry. */
-  char uuid[64] = "";
-  wire_field(payload, 1, uuid, sizeof(uuid));
-  if (!client->result_relayed && strcmp(uuid, client->id) == 0 &&
-      hub_upgrade_result_relay(state, NULL, payload))
+  /* Once per link: a bot sends one RESULT after a restart, so one relay per
+   * link bounds what it can make the mesh carry. */
+  if (!client->result_relayed && hub_upgrade_result_relay(state, NULL, payload))
     client->result_relayed = true;
   hub_upgrade_note_result(state, payload);
 }
