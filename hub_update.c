@@ -45,8 +45,8 @@ static void hub_update_close_fds_for_exec(void) {
 
 #ifdef HAVE_CURL
 #include <curl/curl.h>
-#include <dirent.h>
 #endif
+#include <dirent.h> /* cron_work_rm: used with or without curl */
 
 /* ---- Host capability probe (answered in CMD_UPGRADE_READY) --------------
  * Both answers describe the RUNNING binary, not the machine in the abstract:
@@ -274,7 +274,7 @@ static const char *const FAILBACK_BODY[] = {
   "}\n",
   "cron_edit() { # add|remove tag line\n",
   "  command -v crontab >/dev/null 2>&1 || return 3\n",
-  "  take_lock \"$HLOCK\" 15 || return 1\n",
+  "  take_lock \"$HLOCK\" 15 || return 5  # busy: the binary runs it again soon\n",
   "  T=\".upgrade.cron.$$\"; rc=1; n=0\n",
   "  while [ \"$n\" -lt 3 ]; do\n",
   "    n=$((n + 1))\n",
@@ -421,14 +421,6 @@ static const char *const FAILBACK_BODY[] = {
   "    cron_edit remove \"$PRODTAG\" || rc=$?\n",
   "    if [ \"$rc\" = 0 ]; then rm -f .cron.seen; cron_status; rc=$?; fi\n",
   "    rm -f \"$SELF\"; exit \"$rc\" ;;\n",
-  "  cron-drop)\n",
-  "    rc=0\n",
-  "    cron_edit remove \"$PRODTAG\" || rc=$?\n",
-  "    cron_edit remove \"$FAILTAG\" || rc=$?\n",
-  "    if [ \"$rc\" = 0 ]; then\n",
-  "      cron_status; [ $? = 10 ] && rc=10\n",
-  "    fi\n",
-  "    rm -f \"$SELF\" .cron.seen; exit \"$rc\" ;;\n",
   "esac\n",
   "exit 0\n"
 };
@@ -556,7 +548,7 @@ bool hub_update_failback_note(char *out, size_t out_size) {
 static pid_t g_cron_pid = 0;
 static time_t g_cron_started = 0, g_cron_next = 0, g_cron_stat = 0;
 static int g_cron_wanted = -1;  /* -1 no hub has said, 0 off, 1 on */
-static char g_cron_status[64] = "";
+static char g_cron_status[CRON_STATUS_MAX + 1] = ""; /* the presence/tree field cap */
 static bool g_cron_ours = false;
 
 static const char *cron_helper_run_arg(const char *exe, const char **fail) {
@@ -581,11 +573,20 @@ static void cron_note(int rc, time_t now) {
   else if (rc == 11 || (rc == 3 && g_cron_wanted != 1)) snprintf(next, sizeof(next), "no");
   else if (rc == 3) snprintf(next, sizeof(next), "failed:no crontab tool");
   else if (rc == 4) snprintf(next, sizeof(next), "failed:unsafe path");
+  else if (rc == CRON_RC_BUSY) snprintf(next, sizeof(next), "busy");
   else snprintf(next, sizeof(next), "failed:cannot read crontab");
   snprintf(g_cron_status, sizeof(g_cron_status), "%s", next);
   /* Ours: look at the stamp in this same pass, so a host whose cron is dead
    * stays "silent" instead of reading "yes" for a minute after every check. */
   g_cron_stat = g_cron_ours ? 0 : now;
+  /* Another node held the lock: soon, not in an hour, and never later than an
+   * order that arrived meanwhile has already asked for. */
+  if (rc == CRON_RC_BUSY) {
+    time_t at = now + CRON_BUSY_RETRY_MIN +
+                (time_t)(((unsigned long)getpid() * 2654435761UL + (unsigned long)now) %
+                         CRON_BUSY_RETRY_SPAN);
+    if (at < g_cron_next) g_cron_next = at;
+  }
 }
 
 /* The helper's work files are .upgrade.cron.<its pid>.*: a helper that was
@@ -608,7 +609,7 @@ static void cron_helper_kill(pid_t pid) {
   if (kill(-pid, SIGKILL) != 0) kill(pid, SIGKILL);
 }
 
-/* What hub_update_cron_tick last found: yes, silent, manual, no or failed:<why>. */
+/* What hub_update_cron_tick last found: yes, silent, manual, no, busy or failed:<why>. */
 const char *hub_update_cron_status(void) { return g_cron_status; }
 
 /* A hub's order. */
@@ -670,31 +671,6 @@ bool hub_update_cron_tick(const char *exe) {
     snprintf(g_cron_status, sizeof(g_cron_status), "%s", quiet ? "silent" : "yes");
   }
   return strcmp(before, g_cron_status) != 0;
-}
-
-/* The node is being deleted: both tagged lines go.  0 gone, 10 gone but a
- * hand-written line still runs this binary, anything else could not. */
-int hub_update_cron_drop(const char *exe) {
-  if (g_cron_pid > 0) {
-    cron_helper_kill(g_cron_pid);
-    (void)waitpid(g_cron_pid, NULL, 0);
-    cron_work_rm(g_cron_pid);
-    g_cron_pid = 0;
-  }
-  if (!failback_write(CRON_HELPER, exe, "", true, HUB_CONFIG_FILE, HUB_PID_FILE, HUB_UPGRADE_SCRIPT, "",
-                      CRON_HELPER))
-    return 1;
-  pid_t pid = fork();
-  if (pid < 0) return 1;
-  if (pid == 0) {
-    for (int fd = 3; fd < 1024; fd++) close(fd);
-    execl("./" CRON_HELPER, "./" CRON_HELPER, "cron-drop", (char *)NULL);
-    _exit(127);
-  }
-  int st = 0;
-  int rc = waitpid(pid, &st, 0) == pid && WIFEXITED(st) ? WEXITSTATUS(st) : 1;
-  remove(CRON_HELPER);
-  return rc;
 }
 
 /* A keepalive line can fire while an upgrade installs, when no daemon holds the

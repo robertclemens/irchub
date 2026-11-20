@@ -266,10 +266,12 @@ static void uh_rec_free(uhist_rec_t *r) {
 }
 
 static void uh_remove_at(hub_state_t *state, int i) {
+  int n = state->uhist_count;
+  if (i < 0 || i >= n || n > MAX_UPGRADE_HISTORY) return;
   uh_rec_free(&state->uhist[i]);
-  for (int j = i + 1; j < state->uhist_count; j++) state->uhist[j - 1] = state->uhist[j];
-  state->uhist_count--;
-  memset(&state->uhist[state->uhist_count], 0, sizeof(state->uhist[0]));
+  memmove(&state->uhist[i], &state->uhist[i + 1], (size_t)(n - i - 1) * sizeof(state->uhist[0]));
+  memset(&state->uhist[n - 1], 0, sizeof(state->uhist[0]));
+  state->uhist_count = n - 1;
 }
 
 void hub_uhist_trim(hub_state_t *state) {

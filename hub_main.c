@@ -274,8 +274,16 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
     if (c->internal) hub_chan_elect_forget_admin(state, c);
 
     /* fd -1: a socket handed to the SSH console, not a disconnect */
-    if (c->fd >= 0)
-        hub_log_info("[HUB] Disconnecting client %s (FD: %d)\n", c->ip, c->fd);
+    if (c->fd >= 0) {
+        /* An authenticated bot or peer hub by name and uuid (a dropped peer
+         * read "client 127.0.0.1"); consoles and unauthenticated sockets have
+         * only their address. */
+        if (c->authenticated && (c->type == CLIENT_BOT || c->type == CLIENT_HUB))
+            hub_log_info("[HUB] Disconnecting %s at %s (FD: %d)\n",
+                         hub_who_client(state, c), c->ip, c->fd);
+        else
+            hub_log_info("[HUB] Disconnecting client %s (FD: %d)\n", c->ip, c->fd);
+    }
 
     decrement_active_connections(state, c->ip);
 
@@ -471,6 +479,9 @@ static void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
     }
     hub_log_info("[PEER] Handshake complete with %s\n", c->ip);
     hub_link_offer(state, c, peer->uuid);
+    /* hub_p2_link_up waits for the first frame back (peer_heard): a hub that
+     * is frozen still accepts the TCP connect, and must not look linked. */
+    hub_roster_send_to_peer(state, c); /* our k|rollcall + bots, past the damping */
     /* If this process is the product of an upgrade a peer drove, close that
      * run out now that there is a peer to tell (no-op otherwise). */
     hub_upgrade_report_pending(state, c);
@@ -500,7 +511,9 @@ static void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
 /* Queued like every frame after the handshake: a ping sent straight to the
  * socket landed inside a part-sent sync frame and broke the link. */
 static bool send_ping(hub_state_t *state, hub_client_t *c) {
-    return hub_client_send(state, c, CMD_PING, NULL);
+    char tp[32]; /* a bot's ping carries its tree hash (hub_tree_ping_payload) */
+    hub_tree_ping_payload(state, c, tp, sizeof(tp));
+    return hub_client_send(state, c, CMD_PING, tp[0] ? tp : NULL);
 }
 
 static void hub_maintenance(hub_state_t *state) {
@@ -625,7 +638,13 @@ static void hub_maintenance(hub_state_t *state) {
             /* An SSH console has no pings: the console thread owns its idle
              * timeout, and the socketpair closes when the session does. */
             if (c->internal) continue;
-            if ((now - c->last_seen) > CLIENT_TIMEOUT) {
+            /* Phase 3: a v2 peer link lives on the 15 s digest, so it is dropped
+             * after P2_LINK_TIMEOUT (3 missed digests) rather than CLIENT_TIMEOUT. */
+            bool p2_keepalive = hub_p2_digest_keepalive(state, c);
+            /* A dialled peer link that has not answered gets no longer either. */
+            bool unheard = c->type == CLIENT_HUB && c->authenticated && !c->peer_heard;
+            time_t idle_limit = (p2_keepalive || unheard) ? P2_LINK_TIMEOUT : CLIENT_TIMEOUT;
+            if ((now - c->last_seen) > idle_limit) {
                 hub_log_warning("[HUB] Client %s timed out.\n", c->ip);
                 hub_disconnect_client(state, c);
                 i--;
@@ -666,7 +685,9 @@ static void hub_maintenance(hub_state_t *state) {
                 i--;
                 continue;
             }
-            if (c->authenticated && (now - c->last_seen) > PING_INTERVAL) {
+            /* Phase 3: no ping on a v2 peer link — its 15 s digest is the
+             * keepalive; other clients keep the 60 s ping. */
+            if (c->authenticated && !p2_keepalive && (now - c->last_seen) > PING_INTERVAL) {
                 if (!send_ping(state, c)) {
                     hub_log_warning("[HUB] Ping failed to %s. Disconnecting.\n", c->ip);
                     hub_disconnect_client(state, c);
@@ -1612,6 +1633,7 @@ int main(int argc, char *argv[]) {
     }
     hub_uhist_boot(&state);
     hub_plan_boot(&state);
+    hub_p2_init(&state); /* bumps the boot counter: after the config gave us our uuid */
     secure_wipe(_hub_plain_pass, sizeof(_hub_plain_pass));
 
     /* Ensure next_lamport_seq is above the time-based floor even on first

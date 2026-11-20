@@ -814,7 +814,7 @@ static bool config_load(hub_state_t *state, const char *password) {
         state->log_max_size = (int)(sz < HUB_LOG_SIZE_MIN ? HUB_LOG_SIZE_MIN
                                     : sz > HUB_LOG_SIZE_MAX ? HUB_LOG_SIZE_MAX
                                                             : sz);
-      } else if (strcmp(k, "purge_days") == 0) {
+      } else if (strcmp(k, HUB_CONFIG_PURGE_DAYS_KEY) == 0) {
         /* Pre-hs| layout; an hs|autopurge line (stamped) wins over it. */
         if (state->purge_days_ts == 0) {
           state->purge_days_setting = atoi(v);

@@ -14,7 +14,7 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client,
                                bool force);
 static void hub_broadcast_config_to_bots(hub_state_t *state, const char *config_line);
 static void roster_evict_moved(hub_state_t *state, const char *bot_uuid,
-                               const char *keep_hub, time_t since);
+                               const char *keep_hub, time_t since, uint64_t link_ord);
 
 /* ==========================================================================
  * '|'-delimited wire fields
@@ -35,7 +35,8 @@ hub_stats_t g_hub_stats;
 /* A config push that never reaches its bot must not stand as "sent", or the
  * next identical broadcast would be skipped and the bot left behind. */
 static void cfg_push_lost(hub_client_t *c, const queued_msg_t *m) {
-  if (m->cmd == CMD_BOT_TREE) c->tree_sent_valid = false; /* same for a tree */
+  if (m->cmd == CMD_BOT_TREE || m->cmd == CMD_BOT_TREE_DELTA)
+    c->tree_sent_valid = false; /* a tree or delta that never landed: resend whole */
   if (m->cmd != CMD_CONFIG_DATA) return;
   c->cfg_sent_valid = false;
   g_hub_stats.cfg_lost++;
@@ -526,46 +527,6 @@ uint64_t hub_next_lamport_seq(hub_state_t *state) {
   return state->next_lamport_seq;
 }
 
-bool hub_delta_seen_check_and_update(hub_state_t *state,
-                                     const char *origin_hub_uuid,
-                                     const char *bot_uuid,
-                                     uint64_t seq) {
-  if (!state || !origin_hub_uuid || !bot_uuid) return true;
-  if (origin_hub_uuid[0] == '\0' || bot_uuid[0] == '\0') return true;
-
-  for (int i = 0; i < state->delta_seen_count; i++) {
-    delta_seen_t *e = &state->delta_seen[i];
-    if (strcmp(e->origin_hub_uuid, origin_hub_uuid) == 0 &&
-        strcmp(e->bot_uuid, bot_uuid) == 0) {
-      if (seq <= e->max_seq_seen) return false;
-      e->max_seq_seen = seq;
-      e->last_seen_at = time(NULL);
-      return true;
-    }
-  }
-
-  /* Insert new.  If full, LRU-evict oldest. */
-  if (state->delta_seen_count >= MAX_DELTA_SEEN) {
-    int oldest = 0;
-    time_t oldest_at = state->delta_seen[0].last_seen_at;
-    for (int i = 1; i < state->delta_seen_count; i++) {
-      if (state->delta_seen[i].last_seen_at < oldest_at) {
-        oldest = i;
-        oldest_at = state->delta_seen[i].last_seen_at;
-      }
-    }
-    /* Move-from-end into oldest slot (don't shift the array). */
-    state->delta_seen[oldest] = state->delta_seen[state->delta_seen_count - 1];
-    state->delta_seen_count--;
-  }
-
-  delta_seen_t *e = &state->delta_seen[state->delta_seen_count++];
-  snprintf(e->origin_hub_uuid, sizeof(e->origin_hub_uuid), "%s", origin_hub_uuid);
-  snprintf(e->bot_uuid,        sizeof(e->bot_uuid),        "%s", bot_uuid);
-  e->max_seq_seen = seq;
-  e->last_seen_at = time(NULL);
-  return true;
-}
 /* ========================================================================== */
 
 
@@ -1722,7 +1683,7 @@ bool handle_bot_authentication(hub_state_t *state, hub_client_t *client,
     /* A new bot joins the tree: gossip and push on the next tick instead of
      * leaving it invisible to the mesh until the periodic refresh. */
     hub_roster_mark_dirty(state, true);
-    roster_evict_moved(state, client->id, state->hub_uuid, 0);
+    roster_evict_moved(state, client->id, state->hub_uuid, 0, 0);
     hub_presence_event(state);
 
     hub_log_info("[HUB] %s authenticated (Curve25519)\n", hub_who_client(state, client));
@@ -2145,21 +2106,34 @@ static const hub_client_t *roster_local_bot(const hub_state_t *state, const char
 }
 
 /* A bot has one hub link at a time: entries for it under any other hub than
- * `keep_hub` that linked before `since` describe where it was.  `since` 0 drops
- * them all (the bot is linked here now). */
+ * `keep_hub` that are older than this sighting describe where it was.  `since`
+ * 0 (with link_ord 0) drops them all — an authoritative local link.  Phase 4:
+ * when both this sighting and the old entry carry a link-order counter the
+ * counter decides (a strictly larger one is newer); otherwise it falls back to
+ * the hubs' `link_since` clocks, as before. */
 static void roster_evict_moved(hub_state_t *state, const char *bot_uuid,
-                               const char *keep_hub, time_t since) {
+                               const char *keep_hub, time_t since, uint64_t link_ord) {
   for (int i = 0; i < state->roster_count;) {
     bot_roster_t *e = &state->roster[i];
-    if (strcmp(e->bot_uuid, bot_uuid) == 0 && strcmp(e->hub_uuid, keep_hub) != 0 &&
-        (since == 0 || (e->link_since > 0 && e->link_since < since))) {
-      hub_log_debug("[PRESENCE] %s moved off %s\n", hub_who(state, 'b', e->bot_uuid),
-                    hub_who(state, 'h', e->hub_uuid));
-      state->roster[i] = state->roster[--state->roster_count];
-      state->tree_dirty = true;
+    if (strcmp(e->bot_uuid, bot_uuid) != 0 || strcmp(e->hub_uuid, keep_hub) == 0) {
+      i++;
       continue;
     }
-    i++;
+    bool older;
+    if (since == 0 && link_ord == 0)
+      older = true;
+    else if (link_ord > 0 && e->link_ord > 0)
+      older = e->link_ord < link_ord;
+    else
+      older = e->link_since > 0 && since > 0 && e->link_since < since;
+    if (!older) {
+      i++;
+      continue;
+    }
+    hub_log_debug("[PRESENCE] %s moved off %s\n", hub_who(state, 'b', e->bot_uuid),
+                  hub_who(state, 'h', e->hub_uuid));
+    state->roster[i] = state->roster[--state->roster_count];
+    state->tree_dirty = true;
   }
 }
 
@@ -2185,10 +2159,18 @@ static void roster_round_done(hub_state_t *state, const mesh_hub_t *mh, int last
 static void roster_upsert(hub_state_t *state, const bot_roster_t *in) {
   /* A deleted bot, reported by a hub that has not heard yet. */
   if (hub_revoke_find(state, in->bot_uuid)) return;
-  /* Linked here since before that report: it is where the bot was. */
+  /* The bot is linked here now and this report is older: it is where it was.
+   * Phase 4: the bot's link-order counter decides when both sightings carry it,
+   * else the hub clocks (its link time vs our local connect time). */
   const hub_client_t *here = roster_local_bot(state, in->bot_uuid);
-  if (here && in->link_since > 0 && in->link_since <= here->connected_at) return;
-  if (in->link_since > 0) roster_evict_moved(state, in->bot_uuid, in->hub_uuid, in->link_since);
+  if (here) {
+    bool incoming_older = (in->link_ord > 0 && here->bot_link_ord > 0)
+                              ? in->link_ord <= here->bot_link_ord
+                              : (in->link_since > 0 && in->link_since <= here->connected_at);
+    if (incoming_older) return;
+  }
+  if (in->link_since > 0 || in->link_ord > 0)
+    roster_evict_moved(state, in->bot_uuid, in->hub_uuid, in->link_since, in->link_ord);
   for (int i = 0; i < state->roster_count; i++) {
     bot_roster_t *e = &state->roster[i];
     if (strcmp(e->hub_uuid, in->hub_uuid) != 0 ||
@@ -2201,7 +2183,13 @@ static void roster_upsert(hub_state_t *state, const bot_roster_t *in) {
                    strcmp(e->variant, in->variant) != 0 ||
                    strcmp(e->server, in->server) != 0 ||
                    e->connected_at != in->connected_at;
+    /* Phase 4: a report with no counter (a p2 reconcile, which does not carry
+     * it this release) must not wipe one the legacy gossip already learned. */
+    uint64_t keep_ord = e->link_ord;
     *e = *in;
+    if (in->link_ord == 0 && keep_ord > 0) e->link_ord = keep_ord;
+    e->p2_stamp = state->p2 ? ++state->p2->stamp_ctr : 0;
+    hub_p2_roster_touched(state, in->hub_uuid);
     if (changed) state->tree_dirty = true;
     return;
   }
@@ -2210,8 +2198,95 @@ static void roster_upsert(hub_state_t *state, const bot_roster_t *in) {
             MAX_BOT_ROSTER, hub_who(state, 'b', in->bot_uuid));
     return;
   }
-  state->roster[state->roster_count++] = *in;
+  state->roster[state->roster_count] = *in;
+  state->roster[state->roster_count++].p2_stamp = state->p2 ? ++state->p2->stamp_ctr : 0;
+  hub_p2_roster_touched(state, in->hub_uuid);
   state->tree_dirty = true;
+}
+
+static void bot_nick_from_config(hub_state_t *state, const char *uuid, char *out, size_t cap);
+
+/* Presence v2: hub `hub_uuid` has been unreachable past the grace.  Its bots
+ * and its mesh-map entry go now instead of on the BOT_ROSTER_TTL.  Called
+ * once per outage, and again if a late relayed round brings entries of it
+ * back. */
+int hub_roster_p2_drop_hub(hub_state_t *state, const char *hub_uuid) {
+  int n = 0;
+  for (int i = 0; i < state->roster_count;) {
+    if (strcmp(state->roster[i].hub_uuid, hub_uuid) == 0) {
+      state->roster[i] = state->roster[--state->roster_count];
+      n++;
+      continue;
+    }
+    i++;
+  }
+  for (int i = 0; i < state->mesh_hub_count; i++) {
+    if (strcmp(state->mesh_hubs[i].uuid, hub_uuid) != 0) continue;
+    state->mesh_hubs[i] = state->mesh_hubs[--state->mesh_hub_count];
+    n++;
+    break;
+  }
+  if (n) state->tree_dirty = true;
+  return n;
+}
+
+/* Presence v2: a reachable hub's record says which bots it has.  An entry of
+ * that hub for a bot it no longer lists goes, unless it arrived after the
+ * record (p2_stamp); a listed bot nobody reported yet gets a bare entry (nick
+ * from the config, details "-") until the hub's own round fills it in. */
+int hub_roster_p2_reconcile(hub_state_t *state, const p2_rec_t *rec) {
+  int n = 0;
+  for (int i = 0; i < state->roster_count;) {
+    bot_roster_t *e = &state->roster[i];
+    if (strcmp(e->hub_uuid, rec->origin) == 0 && e->p2_stamp < rec->stamp) {
+      bool listed = false;
+      for (int b = 0; b < rec->nbots && !listed; b++)
+        listed = strcmp(rec->bots[b].id, e->bot_uuid) == 0;
+      if (!listed) {
+        hub_log_debug("[PRESENCE] %s left %s (record)\n", hub_who(state, 'b', e->bot_uuid),
+                      hub_who(state, 'h', e->hub_uuid));
+        state->roster[i] = state->roster[--state->roster_count];
+        state->tree_dirty = true;
+        n++;
+        continue;
+      }
+    }
+    i++;
+  }
+  const mesh_hub_t *mh = mesh_hub_find(state, rec->origin);
+  for (int b = 0; b < rec->nbots; b++) {
+    /* Skip it when it is there already, or linked to another hub more
+     * recently (it moved and this hub has not noticed yet). */
+    bool have = false;
+    for (int i = 0; i < state->roster_count && !have; i++) {
+      const bot_roster_t *x = &state->roster[i];
+      if (strcmp(x->bot_uuid, rec->bots[b].id) != 0) continue;
+      have = strcmp(x->hub_uuid, rec->origin) == 0 || x->link_since >= rec->bots[b].since;
+    }
+    if (have) continue;
+    bot_roster_t e;
+    memset(&e, 0, sizeof(e));
+    snprintf(e.hub_uuid, sizeof(e.hub_uuid), "%s", rec->origin);
+    snprintf(e.hub_name, sizeof(e.hub_name), "%s", mh && mh->name[0] ? mh->name : rec->origin);
+    snprintf(e.bot_uuid, sizeof(e.bot_uuid), "%s", rec->bots[b].id);
+    bot_nick_from_config(state, e.bot_uuid, e.nick, sizeof(e.nick));
+    time_t now = time(NULL);
+    e.link_since = rec->bots[b].since > 0 && rec->bots[b].since <= now
+                       ? (time_t)rec->bots[b].since : 0;
+    e.reported_at = now;
+    e.gen = mh ? mh->gen : 0;
+    roster_upsert(state, &e);
+    /* Added (it was absent): still "older" than any round. */
+    for (int i = 0; i < state->roster_count; i++) {
+      if (strcmp(state->roster[i].hub_uuid, rec->origin) != 0 ||
+          strcmp(state->roster[i].bot_uuid, rec->bots[b].id) != 0)
+        continue;
+      state->roster[i].p2_stamp = rec->stamp;
+      n++;
+      break;
+    }
+  }
+  return n;
 }
 
 /* This bot just told us what it is running.  Per connection and volatile. */
@@ -2222,14 +2297,16 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
   char variant[ROSTER_VARIANT_MAX + 1] = "";
   char cron[CRON_STATUS_MAX + 1] = "";
   long long started = 0;
+  unsigned long long link_ord = 0; /* phase 4: the bot's link-order counter */
 
-  /* "<version>|<server>|<started>|<variant>[|<cron>]" — a short, fixed shape.  The
+  /* "<version>|<server>|<started>|<variant>[|<cron>[|<linkord>]]" (BOT_PRESENCE_MAX) — a short, fixed shape.  The
    * variant (code base, c / rs) is the newest field; a bot that predates it
    * sends three and simply shows no code base.  Anything longer than the
    * field caps is truncated by roster_clean, never rejected, so a newer bot
    * advertising more never drops off the tree entirely. */
-  char work[ROSTER_VERSION_MAX + ROSTER_SERVER_MAX + ROSTER_VARIANT_MAX + CRON_STATUS_MAX + 64];
-  snprintf(work, sizeof(work), "%s", payload ? payload : "");
+  char work[BOT_PRESENCE_MAX + 1];
+  int plen = snprintf(work, sizeof(work), "%s", payload ? payload : "");
+  bool cut = plen < 0 || plen >= (int)sizeof(work); /* the counter rode past the cut */
   char *p1 = strchr(work, '|');
   if (p1) {
     *p1 = '\0';
@@ -2243,7 +2320,18 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
         if (p4) {
           *p4 = '\0';
           char *p5 = strchr(p4 + 1, '|');
-          if (p5) *p5 = '\0';
+          if (p5) {
+            *p5 = '\0';
+            /* Phase 4: the link-order counter rides last.  A bad or missing
+             * value reads 0, which the move decision treats as "no counter"
+             * and falls back to the hubs' clocks. */
+            char *p6 = strchr(p5 + 1, '|');
+            if (p6) *p6 = '\0';
+            char *end = NULL;
+            errno = 0;
+            unsigned long long v = strtoull(p5 + 1, &end, 10);
+            if (!cut && !errno && end && !*end && end != p5 + 1) link_ord = v;
+          }
           roster_clean(cron, sizeof(cron), p4 + 1);
         }
         roster_clean(variant, sizeof(variant), p3 + 1);
@@ -2282,7 +2370,9 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
   bool changed = strcmp(client->bot_version, version) != 0 ||
                  strcmp(client->bot_server, server) != 0 ||
                  strcmp(client->bot_variant, variant) != 0 ||
-                 client->bot_started != (time_t)started;
+                 client->bot_started != (time_t)started ||
+                 client->bot_link_ord != (uint64_t)link_ord;
+  client->bot_link_ord = (uint64_t)link_ord;
   snprintf(client->bot_version, sizeof(client->bot_version), "%s", version);
   snprintf(client->bot_server, sizeof(client->bot_server), "%s", server);
   snprintf(client->bot_variant, sizeof(client->bot_variant), "%s", variant);
@@ -2351,10 +2441,11 @@ static void bot_nick_from_config(hub_state_t *state, const char *uuid,
  * refresh on the next tick. */
 static void roster_send_to_peers(hub_state_t *state, const char *frame,
                                  int len, const hub_client_t *skip,
-                                 const mesh_hub_t *origin) {
+                                 const mesh_hub_t *origin, const hub_client_t *only) {
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
     if (c->type != CLIENT_HUB || !c->authenticated || c == skip) continue;
+    if (only && c != only) continue;
     /* Split horizon for a relayed frame: a peer that IS the origin, or that
      * the origin says it is linked to right now, already has it first hand.
      * On a full mesh this leaves nothing to relay at all. */
@@ -2441,7 +2532,8 @@ static int roster_frame_begin(hub_state_t *state, char *frame, int cap,
 /* One gossip round, chunked.  `total` < 0 only counts the frames it would send;
  * otherwise it sends them, the frame numbered total-1 marked last.  Returns the
  * frames (to be) sent, or -1. */
-static int roster_round(hub_state_t *state, long long gen, int total) {
+static int roster_round(hub_state_t *state, long long gen, int total,
+                        const hub_client_t *only) {
   char frame[ROSTER_FRAME_BUDGET];
   bool send = total >= 0;
   int chunk = 0;
@@ -2455,22 +2547,24 @@ static int roster_round(hub_state_t *state, long long gen, int total) {
 
     char nick[MAX_NICK];
     bot_nick_from_config(state, c->id, nick, sizeof(nick));
-    char row[TREE_ROW_MAX + CRON_STATUS_MAX + 16];
+    char row[TREE_ROW_MAX + CRON_STATUS_MAX + 48];
     /* 7th field: when the bot linked to this hub; 8th: the bot's address as
-     * this hub sees it; 9th: its crontab status (a hub that predates any of them
-     * stops reading before it). */
-    int rl = snprintf(row, sizeof(row), "b|%s|%s|%s|%s|%lld|%s|%lld|%s|%s\n", c->id,
+     * this hub sees it; 9th: its crontab status; 10th (phase 4): the bot's
+     * link-order counter (a hub that predates any of them stops reading before
+     * it). */
+    int rl = snprintf(row, sizeof(row), "b|%s|%s|%s|%s|%lld|%s|%lld|%s|%s|%llu\n", c->id,
                       nick[0] ? nick : "-",
                       c->bot_version[0] ? c->bot_version : "-",
                       c->bot_server[0] ? c->bot_server : "-",
                       (long long)c->bot_started,
                       c->bot_variant[0] ? c->bot_variant : "-",
                       (long long)c->connected_at, c->ip[0] ? c->ip : "-",
-                      c->bot_cron[0] ? c->bot_cron : "-");
+                      c->bot_cron[0] ? c->bot_cron : "-",
+                      (unsigned long long)c->bot_link_ord);
     if (rl <= 0 || rl >= (int)sizeof(row)) continue; /* unrepresentable row */
 
     if (offset + rl >= (int)sizeof(frame) && rows > 0) { /* full: flush */
-      if (send) roster_send_to_peers(state, frame, offset, NULL, NULL);
+      if (send) roster_send_to_peers(state, frame, offset, NULL, NULL, only);
       frames++;
       chunk++;
       offset = roster_frame_begin(state, frame, sizeof(frame), gen, chunk, chunk == total - 1);
@@ -2487,7 +2581,7 @@ static int roster_round(hub_state_t *state, long long gen, int total) {
    * this hub's liveness and uptime beacon, which is what lets a peer show an
    * empty hub in the tree with a real uptime instead of a blank. */
   if (rows > 0 || frames == 0) {
-    if (send) roster_send_to_peers(state, frame, offset, NULL, NULL);
+    if (send) roster_send_to_peers(state, frame, offset, NULL, NULL, only);
     frames++;
   }
   return frames;
@@ -2503,10 +2597,25 @@ static void hub_gossip_bot_roster(hub_state_t *state) {
   long long gen = (long long)now * 1000;
   if (gen <= state->roster_gen) gen = state->roster_gen + 1;
   state->roster_gen = gen;
-  int total = roster_round(state, gen, -1);
-  if (total > 0) roster_round(state, gen, total);
+  int total = roster_round(state, gen, -1, NULL);
+  if (total > 0) roster_round(state, gen, total, NULL);
   state->last_presence_gossip = now;
   state->presence_event_due = false;
+}
+
+/* A peer link just authenticated: one round of our own, to it alone and past
+ * the damping.  A hub that restarted knows nothing of us until our gossip
+ * reaches it — not our bots, and not that we answer a roll call (k|), so its
+ * upgrade gates would fall back to the gossip check for up to a full
+ * BOT_PRESENCE_INTERVAL.  A fresh generation, so it relays and replaces like
+ * any round; the other peers' damping clock is left alone. */
+void hub_roster_send_to_peer(hub_state_t *state, const hub_client_t *peer) {
+  if (!peer || peer->type != CLIENT_HUB || !peer->authenticated) return;
+  long long gen = (long long)time(NULL) * 1000;
+  if (gen <= state->roster_gen) gen = state->roster_gen + 1;
+  state->roster_gen = gen;
+  int total = roster_round(state, gen, -1, peer);
+  if (total > 0) roster_round(state, gen, total, peer);
 }
 
 /* Read the h| and g| lines of a roster frame without touching it.  Returns
@@ -2783,10 +2892,10 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
     /* Five fields from any hub; a sixth (the bot's code base), a seventh
      * (when it linked to that hub) and an eighth (its address) from one that
      * knows them. */
-    char *fields[9] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+    char *fields[10] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
     char *cur = line + 2;
     int n = 0;
-    while (n < 9) {
+    while (n < 10) {
       fields[n++] = cur;
       char *sep = strchr(cur, '|');
       if (!sep) break;
@@ -2817,6 +2926,12 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
       long long since = atoll(fields[6]);
       e.link_since = (since > 0 && (time_t)since <= now) ? (time_t)since : 0;
     }
+    if (n >= 10 && fields[9][0]) {
+      char *end = NULL;
+      errno = 0;
+      unsigned long long v = strtoull(fields[9], &end, 10);
+      if (!errno && end && !*end && end != fields[9]) e.link_ord = (uint64_t)v;
+    }
     /* Display only, but still a peer's word: an IPv4/IPv6 literal or nothing. */
     if (n >= 8 && fields[7][0] && strcmp(fields[7], "-") != 0 &&
         strlen(fields[7]) <= ROSTER_IP_MAX &&
@@ -2835,7 +2950,7 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
   /* Pass it on after applying it, so the split horizon uses the links this
    * very frame just reported. */
   if (relay && relay_len > 0)
-    roster_send_to_peers(state, relay, relay_len, from, mh);
+    roster_send_to_peers(state, relay, relay_len, from, mh, NULL);
   free(relay);
 }
 
@@ -2870,9 +2985,49 @@ static bool tree_hub_placed(const hub_state_t *state, const tree_hub_t *th,
  * its own hub first, its peer hubs beneath it, and every hub further out
  * beneath the hub that links to it (from the relayed gossip).  The same
  * network legitimately renders differently depending on which bot you ask. */
+/* A set of row keys (uuids), open-addressed over TREE_USET_SLOTS pointers.
+ * The strings are the caller's and must outlive the set; `len` < 0 means
+ * NUL-terminated.  tree_uset_add: true when `u` was not in the set yet. */
+typedef struct {
+  const char *k[TREE_USET_SLOTS];
+  int         l[TREE_USET_SLOTS];
+} tree_uset_t;
+
+static bool tree_uset_add(tree_uset_t *set, const char *u, int len) {
+  if (len < 0) len = (int)strlen(u);
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (int i = 0; i < len; i++) {
+    h ^= (unsigned char)u[i];
+    h *= 1099511628211ULL;
+  }
+  for (size_t i = (size_t)h & (TREE_USET_SLOTS - 1);; i = (i + 1) & (TREE_USET_SLOTS - 1)) {
+    if (!set->k[i]) {
+      set->k[i] = u;
+      set->l[i] = len;
+      return true;
+    }
+    if (set->l[i] == len && memcmp(set->k[i], u, (size_t)len) == 0) return false;
+  }
+}
+
+static bool tree_uset_has(const tree_uset_t *set, const char *u, int len) {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (int i = 0; i < len; i++) {
+    h ^= (unsigned char)u[i];
+    h *= 1099511628211ULL;
+  }
+  for (size_t i = (size_t)h & (TREE_USET_SLOTS - 1); set->k[i];
+       i = (i + 1) & (TREE_USET_SLOTS - 1))
+    if (set->l[i] == len && memcmp(set->k[i], u, (size_t)len) == 0) return true;
+  return false;
+}
+
 static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
   int offset = 0, written;
   buf[0] = '\0';
+  /* the bots listed so far: each once (see below) */
+  tree_uset_t *listed = calloc(1, sizeof(*listed));
+  if (!listed) return 0;
 
   /* <variant> is the code base (c / rs); after it comes <started>, the
    * node's absolute start time (0 = unknown), from which the bot works out
@@ -2887,14 +3042,21 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
                      HUB_VERSION, HUB_UPDATE_VARIANT,
                      (long long)state->hub_started,
                      hub_update_cron_status()[0] ? hub_update_cron_status() : "-");
-  if (written < 0 || written >= max_len) return 0;
+  if (written < 0 || written >= max_len) {
+    free(listed);
+    return 0;
+  }
   offset += written;
 
-  /* Our own bots, from the live client list — never from a peer's report. */
+  /* Our own bots, from the live client list — never from a peer's report.
+   * Each bot once (uuid-keyed row deltas need unique rows): a superseded
+   * session still open during a reconnect, or a moved bot a peer's roster
+   * still reports, would list it twice.  Our own live session comes first. */
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
-    if (c->type != CLIENT_BOT || !c->authenticated) continue;
+    if (c->type != CLIENT_BOT || !c->authenticated || c->superseded) continue;
     if (max_len - offset <= TREE_ROW_MAX) break;
+    if (!tree_uset_add(listed, c->id, -1)) continue;
     char nick[MAX_NICK];
     bot_nick_from_config(state, c->id, nick, sizeof(nick));
     written = snprintf(buf + offset, (size_t)(max_len - offset),
@@ -2916,7 +3078,10 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
    * reports it once the live mesh has been walked.  Emitted depth-first
    * below, since pre-order plus depth is what the renderer reads. */
   tree_hub_t *th = calloc(TREE_HUBS, sizeof(*th));
-  if (!th) return offset;
+  if (!th) {
+    free(listed);
+    return offset;
+  }
   int nth = 0;
   for (int p = 0; p < state->peer_count && nth < TREE_HUBS; p++) {
     hub_peer_config_t *peer = &state->peers[p];
@@ -2990,7 +3155,9 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
       for (int r = 0; r < state->roster_count; r++) {
         bot_roster_t *e = &state->roster[r];
         if (strcmp(e->hub_uuid, puuid) != 0) continue;
+        if (hub_p2_hub_gone(state, puuid)) break; /* unreachable now: hide at once */
         if (max_len - offset <= TREE_ROW_MAX) break;
+        if (!tree_uset_add(listed, e->bot_uuid, -1)) continue;
         written = snprintf(buf + offset, (size_t)(max_len - offset),
                            "B|%d|%s|%s|%s|%s|0|%s|%lld|%s\n", th[i].depth + 1,
                            e->nick[0] ? e->nick : "-", e->bot_uuid,
@@ -3006,6 +3173,7 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
       if (th[k].parent == i && sp < TREE_HUBS) stack[sp++] = k;
   }
   free(th);
+  free(listed);
 
   /* Bots the config knows but nobody currently reports.  'seen' is already
    * persisted and replicated, so this needs no new storage — it is the one
@@ -3047,10 +3215,197 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
  * (a change) skips a bot that was already sent this exact tree; the
  * BOT_TREE_REFRESH push is forced, which is what keeps a bot's tree from
  * looking stale (BOT_TREE_STALE_AFTER) on a quiet mesh. */
+/* Phase 5: FNV-1a 64 over the whole tree text — the hash carried in each row
+ * delta so a bot that applied one can tell its tree matches ours, and pull the
+ * whole tree when it does not. */
+static uint64_t tree_fnv64(const char *s, int n) {
+  uint64_t h = 0xcbf29ce484222325ULL; /* FNV-1a 64 offset basis: irchub.rs and both bots must match */
+  for (int i = 0; i < n; i++) {
+    h ^= (unsigned char)s[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+/* The uuid of a tree row, "" if malformed: field 3 of KIND|depth|name|uuid|...,
+ * but field 2 of an offline row D|nick|uuid|last_seen (its field 3 is a time
+ * that offline bots share, which made deltas hit the wrong row).  The bots'
+ * row key (ircbot bot_row_uuid, ircbot.rs tree_row_uuid) must match. */
+static void tree_row_uuid(const char *line, int linelen, char *out, size_t cap) {
+  out[0] = '\0';
+  int bars = 0;
+  int want = (linelen > 0 && line[0] == 'D') ? 2 : 3;
+  for (int i = 0; i < linelen; i++) {
+    if (line[i] == '|' && ++bars == want) {
+      size_t o = 0;
+      for (int j = i + 1; j < linelen && line[j] != '|' && o + 1 < cap; j++) out[o++] = line[j];
+      out[o] = '\0';
+      return;
+    }
+  }
+}
+
+typedef struct {
+  char uuid[64];
+  const char *line;
+  int len;
+} trow_t;
+
+static int tree_parse_rows(const char *text, int textlen, trow_t *rows, int max) {
+  int n = 0, i = 0;
+  while (i < textlen && n < max) {
+    int start = i;
+    while (i < textlen && text[i] != '\n') i++;
+    int len = i - start;
+    if (len > 0) {
+      rows[n].line = text + start;
+      rows[n].len = len;
+      tree_row_uuid(text + start, len, rows[n].uuid, sizeof(rows[n].uuid));
+      n++;
+    }
+    if (i < textlen) i++; /* skip '\n' */
+  }
+  return n;
+}
+
+/* Every row has a key and no key repeats: the rows a delta addresses by uuid
+ * are then exactly one each.  `set` gets the keys. */
+static bool tree_rows_keyed(const trow_t *rows, int n, tree_uset_t *set) {
+  for (int i = 0; i < n; i++)
+    if (!rows[i].uuid[0] || !tree_uset_add(set, rows[i].uuid, -1)) return false;
+  return true;
+}
+
+/* Build the row-delta from `oldt` to `newt` into `out`: `<fnvhex>\n`, then a
+ * `-|uuid` for each row that went and a `+|anchor|row` for each row added,
+ * moved or changed (anchor = the uuid of the row it now follows, `^` at head:
+ * no uuid is `^`, while `-` is the key of a hub whose uuid is not known yet).
+ * Returns the length, or -1 if it does not fit, is not smaller than the whole
+ * tree, or either tree has a row without a key or two rows with one key (then
+ * the caller sends the whole tree instead). */
+static int hub_build_tree_delta(const char *oldt, int oldlen, const char *newt, int newlen,
+                                uint64_t fnv, char *out, int outcap) {
+  trow_t *oldr = calloc(MAX_TREE_ROWS, sizeof(*oldr));
+  trow_t *newr = calloc(MAX_TREE_ROWS, sizeof(*newr));
+  trow_t *w = calloc(MAX_TREE_ROWS, sizeof(*w));
+  tree_uset_t *oldk = calloc(1, sizeof(*oldk));
+  tree_uset_t *newk = calloc(1, sizeof(*newk));
+  int o = -1;
+  if (!oldr || !newr || !w || !oldk || !newk) goto done;
+  int no = tree_parse_rows(oldt, oldlen, oldr, MAX_TREE_ROWS);
+  int nn = tree_parse_rows(newt, newlen, newr, MAX_TREE_ROWS);
+  if (!tree_rows_keyed(oldr, no, oldk) || !tree_rows_keyed(newr, nn, newk)) goto done;
+  o = snprintf(out, (size_t)outcap, "%016llx\n", (unsigned long long)fnv);
+  bool ok = o > 0 && o < outcap;
+  /* The deletions, and `w` = the old rows that stay (in order). */
+  int nw = 0;
+  for (int i = 0; ok && i < no; i++) {
+    if (tree_uset_has(newk, oldr[i].uuid, (int)strlen(oldr[i].uuid))) {
+      w[nw++] = oldr[i];
+      continue;
+    }
+    int wr = snprintf(out + o, (size_t)(outcap - o), "-|%s\n", oldr[i].uuid);
+    if (wr < 0 || wr >= outcap - o) ok = false;
+    else o += wr;
+  }
+  /* Replay the bot's apply on `w`: after step j, w[0..j] == new[0..j].  A row
+   * is skipped only when it already sits at position j, so a row left behind
+   * by a moved neighbour is re-sent. */
+  for (int j = 0; ok && j < nn; j++) {
+    if (j < nw && w[j].len == newr[j].len &&
+        memcmp(w[j].line, newr[j].line, (size_t)newr[j].len) == 0)
+      continue;
+    const char *anchor = j == 0 ? "^" : newr[j - 1].uuid;
+    int wr = snprintf(out + o, (size_t)(outcap - o), "+|%s|%.*s\n", anchor, newr[j].len,
+                      newr[j].line);
+    if (wr < 0 || wr >= outcap - o) {
+      ok = false;
+      break;
+    }
+    o += wr;
+    /* rows before j are final, so the old copy of this row sits at j or later */
+    for (int i = j; i < nw; i++)
+      if (strcmp(w[i].uuid, newr[j].uuid) == 0) {
+        memmove(&w[i], &w[i + 1], (size_t)(nw - i - 1) * sizeof(*w));
+        nw--;
+        break;
+      }
+    int pos = j < nw ? j : nw;
+    memmove(&w[pos + 1], &w[pos], (size_t)(nw - pos) * sizeof(*w));
+    w[pos] = newr[j];
+    nw++;
+  }
+  if (!ok || o >= newlen) o = -1;
+done:
+  free(newk);
+  free(oldk);
+  free(w);
+  free(oldr);
+  free(newr);
+  return o;
+}
+
+/* A bot that applies CMD_BOT_TREE_DELTA and checks the keepalive tree hash
+ * (TREE_DELTA_MIN_BOT and up).  Older bots, or one whose presence has not
+ * named a version yet, get whole trees on change and the BOT_TREE_REFRESH
+ * re-push they still rely on. */
+static bool bot_takes_tree_deltas(const hub_client_t *c) {
+  return c->bot_version[0] && hub_update_version_cmp(c->bot_version, TREE_DELTA_MIN_BOT) >= 0;
+}
+
+/* A tree or row delta still queued to `c` (not yet on the wire). */
+static bool tree_frame_queued(const hub_client_t *c) {
+  for (int l = 0; l < LANE_COUNT; l++)
+    for (const queued_msg_t *m = c->out_lanes[l].head; m; m = m->next)
+      if (m->cmd == CMD_BOT_TREE || m->cmd == CMD_BOT_TREE_DELTA) return true;
+  return false;
+}
+
+/* The payload of a keepalive PING to `c`: "t|<fnv64hex>", the hash of the tree
+ * the bot holds once everything we sent it has landed, so a bot whose tree
+ * diverged pulls the whole one (the hash check that replaced the periodic
+ * whole-tree push).  "" when there is nothing to vouch for: not a bot, an
+ * older bot, a tree frame still queued (pings jump the queue), or the bot not
+ * current. */
+void hub_tree_ping_payload(const hub_state_t *state, const hub_client_t *c, char *out,
+                           size_t cap) {
+  if (cap) out[0] = '\0';
+  if (!c || c->type != CLIENT_BOT || !c->authenticated || c->superseded) return;
+  if (!bot_takes_tree_deltas(c) || !state->tree_last || state->tree_last_len <= 0) return;
+  if (!c->tree_sent_valid || c->tree_sent_seq != state->tree_seq || tree_frame_queued(c)) return;
+  snprintf(out, cap, "t|%016llx", (unsigned long long)state->tree_last_fnv);
+}
+
+/* A bot that is owed a whole tree (a queued tree or delta was dropped, or it
+ * just connected): pushed on the next tick, not left for the next change. */
+static bool tree_owed(const hub_state_t *state) {
+  for (int i = 0; i < state->client_count; i++) {
+    const hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_BOT && c->authenticated && !c->superseded && !c->tree_sent_valid)
+      return true;
+  }
+  return false;
+}
+
+/* Send bot `c` the whole current tree (its own frame, coalesced). */
+static void hub_send_whole_tree(hub_state_t *state, hub_client_t *c, const char *payload,
+                                int len, uint64_t seq) {
+  queued_msg_t *m =
+      queued_msg_new(CMD_BOT_TREE, LANE_BULK, (const unsigned char *)payload, len);
+  if (!m) return;
+  c->tree_sent_valid = true;
+  c->tree_sent_seq = seq;
+  char coalesce[160];
+  snprintf(coalesce, sizeof(coalesce), "%s|bot_tree|%s", state->hub_uuid, c->id);
+  queued_msg_set_coalesce(m, state->hub_uuid, hub_next_lamport_seq(state), coalesce);
+  if (!peer_enqueue(c, m)) c->tree_sent_valid = false;
+}
+
 static void hub_push_tree_to_bots(hub_state_t *state, bool force) {
   int bots = 0;
   for (int i = 0; i < state->client_count; i++)
-    if (state->clients[i]->type == CLIENT_BOT && state->clients[i]->authenticated)
+    if (state->clients[i]->type == CLIENT_BOT && state->clients[i]->authenticated &&
+        !state->clients[i]->superseded)
       bots++;
   if (bots == 0) return;
 
@@ -3060,31 +3415,78 @@ static void hub_push_tree_to_bots(hub_state_t *state, bool force) {
     return;
   }
   int len = hub_build_tree(state, payload, MAX_TREE_PAYLOAD);
-  if (len <= 0) { free(payload); return; }
+  if (len <= 0) {
+    free(payload);
+    return;
+  }
+  if (!state->tree_last) state->tree_last = malloc(MAX_TREE_PAYLOAD);
+  uint64_t fnv = tree_fnv64(payload, len);
+  bool changed = state->tree_last_len != len || fnv != state->tree_last_fnv ||
+                 !state->tree_last || memcmp(payload, state->tree_last, (size_t)len) != 0;
+  uint64_t old_seq = state->tree_seq;
+  uint64_t new_seq = changed ? old_seq + 1 : old_seq;
 
-  unsigned char hash[32];
-  unsigned int hlen = 0;
-  bool hashed = EVP_Digest(payload, (size_t)len, hash, &hlen, EVP_sha256(),
-                           NULL) == 1 && hlen == sizeof(hash);
+  /* One delta, shared by every delta-capable bot holding the previous tree.
+   * `force` (the BOT_TREE_REFRESH tick) re-pushes the whole tree only to the
+   * older bots that need it; delta bots are checked by the keepalive hash. */
+  char *delta = NULL;
+  int dlen = -1;
+  if (changed && state->tree_last && state->tree_last_len > 0) {
+    delta = malloc((size_t)MAX_TREE_PAYLOAD * 2);
+    if (delta)
+      dlen = hub_build_tree_delta(state->tree_last, state->tree_last_len, payload, len, fnv,
+                                  delta, MAX_TREE_PAYLOAD * 2);
+  }
+
   for (int i = 0; i < state->client_count; i++) {
     hub_client_t *c = state->clients[i];
-    if (c->type != CLIENT_BOT || !c->authenticated) continue;
-    if (!force && hashed && c->tree_sent_valid &&
-        memcmp(hash, c->tree_sent_hash, sizeof(hash)) == 0)
-      continue;
-    queued_msg_t *m = queued_msg_new(CMD_BOT_TREE, LANE_BULK,
-                                     (const unsigned char *)payload, len);
-    if (!m) continue;
-    c->tree_sent_valid = hashed;
-    if (hashed) memcpy(c->tree_sent_hash, hash, sizeof(hash));
-    char coalesce[160];
-    snprintf(coalesce, sizeof(coalesce), "%s|bot_tree|%s", state->hub_uuid,
-             c->id);
-    queued_msg_set_coalesce(m, state->hub_uuid, hub_next_lamport_seq(state),
-                            coalesce);
-    if (!peer_enqueue(c, m)) c->tree_sent_valid = false;
+    /* A superseded session is closing: no tree frames to it. */
+    if (c->type != CLIENT_BOT || !c->authenticated || c->superseded) continue;
+    bool deltas = bot_takes_tree_deltas(c);
+    bool forced = force && !deltas;
+    bool current = c->tree_sent_valid && c->tree_sent_seq == old_seq;
+    if (!forced && !changed && current) continue; /* already up to date */
+    if (!forced && changed && current && deltas && delta && dlen > 0) {
+      queued_msg_t *m =
+          queued_msg_new(CMD_BOT_TREE_DELTA, LANE_BULK, (const unsigned char *)delta, dlen);
+      if (!m) continue;
+      c->tree_sent_valid = true;
+      c->tree_sent_seq = new_seq;
+      if (!peer_enqueue(c, m)) c->tree_sent_valid = false;
+    } else {
+      hub_send_whole_tree(state, c, payload, len, new_seq);
+    }
   }
+
+  if (changed && state->tree_last) {
+    memcpy(state->tree_last, payload, (size_t)len);
+    state->tree_last_len = len;
+    state->tree_last_fnv = fnv;
+    state->tree_seq = new_seq;
+  }
+  free(delta);
   free(payload);
+}
+
+/* A bot applied a delta whose hash did not match its tree: send it the whole
+ * current tree (CMD_BOT_TREE_PULL), at most once per TREE_PULL_MIN_GAP; one
+ * inside the gap is held and served by hub_presence_tick when the gap ends. */
+static void hub_tree_pull(hub_state_t *state, hub_client_t *c) {
+  if (!c || c->type != CLIENT_BOT || !c->authenticated) return;
+  time_t now = time(NULL);
+  if (c->tree_pull_at && now - c->tree_pull_at < TREE_PULL_MIN_GAP) {
+    c->tree_pull_due = true;
+    return;
+  }
+  c->tree_pull_due = false;
+  c->tree_pull_at = now;
+  if (state->tree_last && state->tree_last_len > 0) {
+    hub_send_whole_tree(state, c, state->tree_last, state->tree_last_len, state->tree_seq);
+    return;
+  }
+  /* No tree built yet: let the next tick push build and send one. */
+  c->tree_sent_valid = false;
+  state->tree_dirty = true;
 }
 
 /* How long event gossip holds after `burst` event gossips in a row: 1, 2, 4, 8, 16,
@@ -3104,6 +3506,7 @@ void hub_presence_tick(hub_state_t *state, time_t now) {
   if (state->hub_started == 0) state->hub_started = now;
 
   hub_roster_expire(state, now);
+  hub_p2_tick(state); /* presence v2 records, reachability (phase 1) */
 
   /* A peer link that came up or went down is news for everyone's tree and for
    * every forwarder's split horizon (hub_broadcast_sync_to_peers): gossip it
@@ -3131,7 +3534,11 @@ void hub_presence_tick(hub_state_t *state, time_t now) {
     hub_request_sync_from_peers(state);
   }
 
-  if (now - state->last_presence_gossip >= BOT_PRESENCE_INTERVAL) {
+  /* Presence v2 runs alongside today's rounds for one release (plan §8.4):
+   * v2 gossips who is where, these rounds keep carrying it too and the roster
+   * details (nick, version, capabilities) on their own cadence. */
+  int round = BOT_PRESENCE_INTERVAL;
+  if (now - state->last_presence_gossip >= round) {
     hub_gossip_bot_roster(state);
   } else if (state->presence_event_due && now >= state->presence_hold_until) {
     hub_gossip_bot_roster(state);
@@ -3144,6 +3551,12 @@ void hub_presence_tick(hub_state_t *state, time_t now) {
     state->presence_hold_until = now + hub_presence_hold(state->presence_burst);
   }
 
+  /* Pulls held by the TREE_PULL_MIN_GAP throttle, once the gap is over. */
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->tree_pull_due && now - c->tree_pull_at >= TREE_PULL_MIN_GAP) hub_tree_pull(state, c);
+  }
+
   /* Push on change (only to bots whose tree it changes), with an
    * unconditional refresh so a bot that missed a frame — or connected between
    * changes — still converges.  Only the refresh restarts the refresh clock:
@@ -3153,6 +3566,12 @@ void hub_presence_tick(hub_state_t *state, time_t now) {
   bool refresh = now - state->last_tree_push >= BOT_TREE_REFRESH;
   int gap = state->tree_dirty_local ? BOT_TREE_COALESCE_LOCAL : BOT_TREE_COALESCE;
   bool due = state->tree_dirty && now - state->last_tree_change_push >= gap;
+  /* A bot owed a whole tree gets it now (a dropped frame used to wait for
+   * the next change or the refresh). */
+  if (!due && !refresh && tree_owed(state)) {
+    hub_push_tree_to_bots(state, false);
+    return;
+  }
   if (due || refresh) {
     state->tree_dirty = false;
     state->tree_dirty_local = false;
@@ -4171,25 +4590,6 @@ static void process_peer_sync(hub_state_t *state, char *payload,
       continue;
     }
 
-    /* Peer-forwarded invite request: invite|nick|#channel */
-    if (strncmp(line, "invite|", 7) == 0) {
-      char inv_nick[64], inv_chan[64];
-      if (sscanf(line + 7, "%63[^|]|%63s", inv_nick, inv_chan) == 2) {
-        hub_log_info("[MESH] Forwarded INVITE_REQUEST: invite %s into %s\n",
-                inv_nick, inv_chan);
-        /* Broadcast CMD_INVITE_REQUEST to our connected bots */
-        char inv_payload[160];
-        snprintf(inv_payload, sizeof(inv_payload), "%s|%s", inv_nick, inv_chan);
-        for (int i = 0; i < state->client_count; i++) {
-          hub_client_t *bc = state->clients[i];
-          if (bc->type == CLIENT_BOT && bc->authenticated)
-            send_cmd_to_bot(state, bc, CMD_INVITE_REQUEST, inv_payload);
-        }
-      }
-      line = strtok_r(NULL, "\n", &saveptr);
-      continue;
-    }
-
     /* uf| / uc|: admin flags and oper channel bindings (hub_access.c), for
      * users this hub holds (their a| / o| lines come first in every sync). */
     if (line[0] == 'u' && (line[1] == 'f' || line[1] == 'c') && line[2] == '|') {
@@ -4689,7 +5089,9 @@ static bool send_response(hub_state_t *state, hub_client_t *client,
 }
 
 static bool send_pong(hub_state_t *state, hub_client_t *c) {
-  if (!hub_client_send(state, c, CMD_PING, NULL)) {
+  char tp[32];
+  hub_tree_ping_payload(state, c, tp, sizeof(tp));
+  if (!hub_client_send(state, c, CMD_PING, tp[0] ? tp : NULL)) {
     hub_disconnect_client(state, c);
     return false;
   }
@@ -6688,7 +7090,7 @@ static bool admin_ban(hub_state_t *state, hub_client_t *client, const char *payl
     e->ban_expires = expires;
     e->ban_sticky = strcmp(sticky, "1") == 0;
     e->ban_existed = existed;
-    snprintf(e->ban_reason, sizeof(e->ban_reason), "%s", reason);
+    snprintf(e->ban_reason, sizeof(e->ban_reason), "%.*s", BAN_REASON_MAX, reason);
     return true;
   }
   reply_init(&r);
@@ -8223,6 +8625,24 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     reply_kvu(&r, "noop", st->sync_noop);
     reply_kvu(&r, "records", st->sync_records);
     reply_kvu(&r, "applied", st->sync_applied);
+    /* Presence v2 (hub_presence2.c). */
+    if (state->p2) {
+      const p2_state_t *p = state->p2;
+      reply_rec(&r, "p2");
+      reply_kvi(&r, "ready", p->ready ? 1 : 0);
+      reply_kvu(&r, "rx", p->c_rx);
+      reply_kvu(&r, "bad", p->c_rx_bad);
+      reply_kvu(&r, "tx", p->c_tx);
+      reply_kvu(&r, "deltas", p->c_deltas);
+      reply_kvu(&r, "snaps", p->c_snaps);
+      reply_kvu(&r, "held", p->c_held);
+      reply_kvu(&r, "pulls", p->c_pulls);
+      reply_kvu(&r, "relays", p->c_relays);
+      reply_kvu(&r, "miss", p->c_digest_miss);
+      reply_kvu(&r, "heals", p->c_heals);
+      reply_kvu(&r, "jumps", p->c_jumps);
+      reply_kvu(&r, "drops", p->c_purges);
+    }
     /* Client load and the maintenance countdowns (hub_maintenance). */
     time_t now = time(NULL);
     int bots = 0, peers = 0, consoles = 0, authing = 0;
@@ -8733,8 +9153,12 @@ static bool op_forward_seen_check_and_add(hub_state_t *state,
   }
   /* Not found — insert at ring head position and advance. */
   int slot = state->seen_forward_head;
-  snprintf(state->seen_forwards[slot].request_id,
-           sizeof(state->seen_forwards[slot].request_id), "%s", request_id);
+  /* A copy, not snprintf: the id often lives in *state too (a roll call's),
+   * which snprintf's restrict contract does not allow. */
+  char *dst = state->seen_forwards[slot].request_id;
+  size_t n = strnlen(request_id, SEEN_FORWARD_ID_MAX - 1);
+  memmove(dst, request_id, n);
+  dst[n] = '\0';
   state->seen_forwards[slot].seen_at = time(NULL);
   state->seen_forward_head = (slot + 1) % MAX_SEEN_FORWARD_IDS;
   return false; /* first time seeing this */
@@ -12831,7 +13255,8 @@ static void rc_want(hub_rollcall_t *rc, const char *uuid, const char *name, bool
  * the roll call is out (its end comes through rollcall_end), 0 when the gossip
  * check has to decide instead: a configured peer that has never linked (no
  * uuid, nobody can ask it), a known hub that has not said it answers a roll
- * call (an older build), a full table, or no hub to ask at all. */
+ * call (an older build), a linked peer not yet in the mesh view, a full table,
+ * or no hub to ask at all.  A hub presence dropped as unreachable is asked. */
 static int rollcall_begin(hub_state_t *state, rollcall_purpose_t purpose, char *id_out) {
   time_t now = time(NULL);
   id_out[0] = '\0';
@@ -12855,7 +13280,18 @@ static int rollcall_begin(hub_state_t *state, rollcall_purpose_t purpose, char *
   if (full || rc->want_n == 0) return 0;
   for (int i = 0; i < rc->want_n; i++) {
     const mesh_hub_t *mh = mesh_hub_find(state, rc->want[i]);
-    if (!mh || !mh->rollcall) return 0;
+    if (mh) {
+      if (!mh->rollcall) return 0;
+      continue;
+    }
+    /* Not in the mesh view.  A peer linked right now that has not gossiped yet
+     * may be an older build: the gossip decides.  Otherwise presence dropped it
+     * as unreachable (a stopped hub, 2 s before an upgrade start on a 10-hub
+     * mesh): it cannot answer whatever it runs, so ask anyway and let it count
+     * as "did not answer". */
+    for (int p = 0; p < state->peer_count; p++)
+      if (state->peers[p].connected && strcmp(state->peers[p].uuid, rc->want[i]) == 0)
+        return 0;
   }
   unsigned char rb[16];
   if (RAND_bytes(rb, sizeof(rb)) != 1) return 0;
@@ -13158,7 +13594,7 @@ static void plan_note_run_end(hub_state_t *state, upgrade_phase_t phase) {
     const char *to = upgrade_node_target(u, n);
     if (n->state == UPG_NODE_UNABLE && !n->cur_version[0]) {
       hub_log_warning("[UPGRADE] %s never answered step %d/%d; if the next step leaves it below "
-                      "its floor it must be upgraded by hand\n", hub_who(state, n->kind != 'b', n->uuid),
+                      "its floor it must be upgraded by hand\n", hub_who(state, n->kind == 'b' ? 'b' : 'h', n->uuid),
                       pl->step + 1, steps);
       continue;
     }
@@ -13524,7 +13960,7 @@ static bool hub_upgrade_stage_watch(hub_state_t *state, time_t now) {
     else
       snprintf(n->reason, sizeof(n->reason), "stage: still %s at its %d s limit",
                n->stage_phase[0] ? n->stage_phase : "going", limit);
-    hub_log_warning("[UPGRADE] %s left run %s: %s\n", hub_who(state, n->kind != 'b', n->uuid), u->id,
+    hub_log_warning("[UPGRADE] %s left run %s: %s\n", hub_who(state, n->kind == 'b' ? 'b' : 'h', n->uuid), u->id,
                     n->reason);
   }
   if (left >= 2 && left * 100 > touched * UPGRADE_STOP_PERCENT) {
@@ -13558,7 +13994,7 @@ static bool hub_upgrade_weigh_failures(hub_state_t *state) {
     upgrade_node_t *n = &u->nodes[i];
     if (n->state != UPG_NODE_FAILED || n->counted) continue;
     n->counted = true;
-    hub_log_warning("[UPGRADE] %s failed: %s\n", hub_who(state, n->kind != 'b', n->uuid), n->reason);
+    hub_log_warning("[UPGRADE] %s failed: %s\n", hub_who(state, n->kind == 'b' ? 'b' : 'h', n->uuid), n->reason);
     if (n->kind == 'h') {
       u->hubs_stopped = true;
       for (int k = 0; k < u->node_count; k++) {
@@ -13649,7 +14085,7 @@ static void hub_upgrade_note_progress(hub_state_t *state, const char *payload) {
     n->staged_at = time(NULL);
   } else if (strcmp(phase, "failed") == 0) {
     snprintf(n->stage_code, sizeof(n->stage_code), "%s", code);
-    char why[192];
+    char why[sizeof(code) + 2 + sizeof(note)]; /* "<code>: <note>" whole */
     snprintf(why, sizeof(why), "%s: %s", code[0] ? code : "stage", note);
     /* A signature or hash that does not hold is the release's fault, not this host's. */
     if (strcmp(code, "sig") == 0 || strcmp(code, "hash") == 0) {
@@ -13663,7 +14099,7 @@ static void hub_upgrade_note_progress(hub_state_t *state, const char *payload) {
     n->state = UPG_NODE_UNABLE;
     n->left = true;
     upgrade_clean(n->reason, sizeof(n->reason), why);
-    hub_log_warning("[UPGRADE] %s left run %s: %s\n", hub_who(state, n->kind != 'b', uuid), id,
+    hub_log_warning("[UPGRADE] %s left run %s: %s\n", hub_who(state, n->kind == 'b' ? 'b' : 'h', uuid), id,
                     n->reason);
   }
 }
@@ -15086,6 +15522,11 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     process_bot_presence(state, client, payload);
     break;
 
+  case CMD_BOT_TREE_PULL:
+    /* Phase 5: the bot's tree diverged from a delta — send it the whole one. */
+    hub_tree_pull(state, client);
+    break;
+
   case CMD_ACTIVITY:
     process_activity(state, client, payload);
     break;
@@ -15348,33 +15789,6 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
   case CMD_CHAN_EVENT:
     hub_chan_event_receive(state, client, payload);
     break;
-
-  case CMD_INVITE_REQUEST: {
-    /* Payload: nick|#channel — broadcast to all other bots, forward to peers */
-    char inv_nick[64], inv_chan[64];
-    if (sscanf(payload, "%63[^|]|%63s", inv_nick, inv_chan) != 2) {
-      hub_log_warning("[HUB] Invalid INVITE_REQUEST payload from %s\n",
-                      hub_who_client(state, client));
-      break;
-    }
-    hub_log_info("[HUB] INVITE_REQUEST from %s: invite %s into %s\n",
-            hub_who_client(state, client), inv_nick, inv_chan);
-
-    /* Broadcast to all other connected bots */
-    for (int i = 0; i < state->client_count; i++) {
-      hub_client_t *bc = state->clients[i];
-      if (bc->type == CLIENT_BOT && bc->authenticated &&
-          bc->fd != client->fd &&
-          !send_cmd_to_bot(state, bc, CMD_INVITE_REQUEST, payload))
-        hub_log_warning("[HUB] Failed to forward INVITE_REQUEST to %s\n",
-                hub_who_client(state, bc));
-    }
-
-    /* Forward to peer hubs via mesh sync */
-    char peer_inv[192];
-    snprintf(peer_inv, sizeof(peer_inv), "invite|%s|%s", inv_nick, inv_chan);
-    hub_broadcast_sync_to_peers(state, peer_inv, client->fd);
-  } break;
 
   case CMD_BOT_RELAY: {
     /* Payload: target_uuid|<sealed frame> — forward to target bot. The hub
@@ -15807,7 +16221,10 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
             hub_uhist_send_digest(state, client);
             hub_plan_send_digest(state, client);
 
+            client->peer_heard = true; /* its signed hello was the first frame */
             hub_link_offer(state, client, peer_uuid);
+            hub_p2_link_up(state, client);
+            hub_roster_send_to_peer(state, client);
 
             /* Initial full state sync to the newly authenticated peer. */
             {
@@ -15881,6 +16298,13 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
           client->link_rx_ctr++;
         }
 
+        if (pl > 0 && client->type == CLIENT_HUB && !client->peer_heard) {
+          /* A dialled link: the far end answered, so it is alive and holds
+           * our session key.  Only now does the link count as up. */
+          client->peer_heard = true;
+          hub_p2_link_up(state, client);
+        }
+
         if (pl > 0) {
           unsigned char cmd = plain[0];
           g_hub_stats.rx_frames[cmd]++;
@@ -15949,6 +16373,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                   client->sync_held = true;
               } else if (cmd == CMD_MESH_STATE) {
                 process_mesh_state(state, client, payload_ptr);
+              } else if (cmd == CMD_PRESENCE2) {
+                hub_p2_rx(state, client, payload_ptr);
               } else if (cmd == CMD_BOT_ROSTER) {
                 process_bot_roster(state, client, payload_ptr);
                 if (client->refused) { /* a peer below MESH_MIN_VERSION */

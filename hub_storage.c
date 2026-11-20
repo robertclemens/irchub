@@ -3,8 +3,6 @@
 
 #include <strings.h>
 
-void hub_storage_init(void) {}
-
 static bot_config_t *get_or_create_bot(hub_state_t *state, const char *uuid) {
   for (int i = 0; i < state->bot_count; i++) {
     if (strcmp(state->bots[i].uuid, uuid) == 0) {

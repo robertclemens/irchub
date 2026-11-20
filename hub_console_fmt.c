@@ -1937,7 +1937,7 @@ static void render_tomb_purged(const fmt_ctx_t *ctx, const creply_t *rep, flines
 static const char *const OPNAME[256] = {
  [0x01] = "CMD_PING", [0x02] = "CMD_CONFIG_PUSH", [0x03] = "CMD_CONFIG_PULL",
  [0x04] = "CMD_CONFIG_DATA", [0x05] = "CMD_UPDATE_PUBKEY", [0x06] = "CMD_PEER_SYNC",
- [0x07] = "CMD_MESH_STATE", [0x08] = "CMD_SYNC_REQUEST", [0x09] = "CMD_INVITE_REQUEST",
+ [0x07] = "CMD_MESH_STATE", [0x08] = "CMD_SYNC_REQUEST",
  [0x10] = "CMD_ADMIN_AUTH", [0x11] = "CMD_ADMIN_LIST_FULL", [0x12] = "CMD_ADMIN_ADD",
  [0x13] = "CMD_ADMIN_DEL", [0x14] = "CMD_ADMIN_REGEN_KEYS", [0x15] = "CMD_ADMIN_LIST_SUMMARY",
  [0x16] = "CMD_ADMIN_GET_PENDING", [0x17] = "CMD_ADMIN_APPROVE", [0x18] = "CMD_ADMIN_ADD_PEER",
@@ -1982,7 +1982,8 @@ static const char *const OPNAME[256] = {
  [0x79] = "CMD_ADMIN_NET_SET", [0x7A] = "CMD_ADMIN_SET_SSH", [0x7B] = "CMD_CHAN_EVENT", [0x7C] = "CMD_ADMIN_USER_ACCESS", [0x7D] = "CMD_USER_CHAN_REQUEST", [0x7E] = "CMD_USER_CHAN_RESULT", [0x7F] = "CMD_BOT_RETIRE", [0x80] = "CMD_BOT_RETIRE_ACK", [0x81] = "CMD_ADMIN_LIST_REVOKED", [0x82] = "CMD_ADMIN_PEER_REFS",
  [0x83] = "CMD_LINK_SEQ", [0x84] = "CMD_ADMIN_KICK_USER", [0x87] = "CMD_UPGRADE_HISTORY",
  [0x88] = "CMD_UPGRADE_STAGE", [0x89] = "CMD_UPGRADE_PROGRESS", [0x8A] = "CMD_UPGRADE_PLAN",
- [0x8B] = "CMD_CRON_SET", [0x8C] = "CMD_HUB_ROLLCALL", [0x8D] = "CMD_HUB_ROLLCALL_ACK",
+ [0x8B] = "CMD_CRON_SET", [0x8C] = "CMD_HUB_ROLLCALL", [0x8D] = "CMD_HUB_ROLLCALL_ACK", [0x8E] = "CMD_PRESENCE2",
+ [0x8F] = "CMD_BOT_TREE_DELTA", [0x90] = "CMD_BOT_TREE_PULL",
 };
 
 static unsigned long long rvu(const crec_t *r, const char *k) {
@@ -2038,10 +2039,11 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
   snprintf(right, sizeof(right), "%s %s up %s", ctx->hubname && *ctx->hubname ? ctx->hubname : "hub",
            GL(G_DOT), up);
   fmt_title(ctx, out, "Hub statistics", right);
-  const crec_t *cfg = NULL, *sy = NULL, *ld = NULL;
+  const crec_t *cfg = NULL, *sy = NULL, *ld = NULL, *p2 = NULL;
   for (int i = 0; i < rep->n; i++) {
     if (!strcmp(rep->r[i].type, "cfg")) cfg = &rep->r[i];
     if (!strcmp(rep->r[i].type, "sync")) sy = &rep->r[i];
+    if (!strcmp(rep->r[i].type, "p2")) p2 = &rep->r[i];
     if (!strcmp(rep->r[i].type, "load")) ld = &rep->r[i];
   }
   sb_t b = {0};
@@ -2058,6 +2060,22 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
     count_kv(&b, "no-op", rvu(sy, "noop"), 24);
     count_kv(&b, "records", rvu(sy, "records"), 40);
     count_kv(&b, "applied", rvu(sy, "applied"), 60);
+    sb_emit(&b, out, RL_NORMAL);
+  }
+  if (p2) {
+    line(out, RL_HEAD, rvi(p2, "ready", 0) ? " Presence v2 (every hub on it)"
+                                           : " Presence v2 (older hub in the mesh)");
+    count_kv(&b, "  deltas", rvu(p2, "deltas"), 0);
+    count_kv(&b, "snapshots", rvu(p2, "snaps"), 24);
+    count_kv(&b, "held", rvu(p2, "held"), 40);
+    count_kv(&b, "pulls", rvu(p2, "pulls"), 60);
+    count_kv(&b, "relays", rvu(p2, "relays"), 80);
+    sb_emit(&b, out, RL_NORMAL);
+    count_kv(&b, "  digest misses", rvu(p2, "miss"), 0);
+    count_kv(&b, "heals", rvu(p2, "heals"), 24);
+    count_kv(&b, "jumps", rvu(p2, "jumps"), 40);
+    count_kv(&b, "bad", rvu(p2, "bad"), 60);
+    count_kv(&b, "drops", rvu(p2, "drops"), 80);
     sb_emit(&b, out, RL_NORMAL);
   }
   if (ld) {

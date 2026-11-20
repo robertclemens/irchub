@@ -58,7 +58,6 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define SALT_SIZE 16 // FIXED: Increased from 8 to 16 bytes (128 bits)
 #define GCM_IV_LEN 12
 #define GCM_TAG_LEN 16
-#define HEADER_SIZE 4
 #define MAX_PENDING_OP_REQUESTS 500
 /* PBKDF2-HMAC-SHA256 rounds for the .irchub.cnf and .irchub.pass keys
  * (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; every
@@ -154,6 +153,10 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 // OP_FORWARD_REQUEST deduplication — prevents packet storms
 #define OP_FORWARD_TTL_SECONDS 60        // Drop forwarded OP requests older than 60s
 #define MAX_SEEN_FORWARD_IDS   256       // LRU ring of recently-seen OP forward request IDs
+/* The longest key the ring is given: the plan keys ("pb:<driver>:<step>",
+ * "pc:<started>:<at>") are built in 96-byte buffers.  A key cut to fit would
+ * make two different steps look like one. */
+#define SEEN_FORWARD_ID_MAX    96
 
 /* Keepalive traffic (CMD_PING and the PONG it draws) is pure noise in the hub
  * log: with every bot and peer exchanging one a minute it buries the lines
@@ -249,10 +252,16 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define UPGRADE_STOP_PERCENT 25    /* more than this share failing stops everything */
 #define UPGRADE_SWAP_BACK    90    /* a staged node must be back by now */
 #define UPGRADE_STAGE_KEEP   900   /* a stage no COMMIT came for is removed */
-#define CRON_STATUS_MAX     31   /* yes, silent, manual, no, failed:<why> */
+#define CRON_STATUS_MAX     31   /* yes, silent, manual, no, busy, failed:<why> */
 #define CRON_HELPER_TIMEOUT 60   /* a crontab edit that takes longer is killed */
 #define CRON_CHECK_SECS     3600 /* how often a node looks at its line */
 #define CRON_SILENT_SECS    900  /* no stamp for this long: no cron daemon */
+/* Every node of one account edits its one crontab under one lock: a helper that
+ * cannot get it exits CRON_RC_BUSY and is run again this soon, spread by pid so
+ * a queue of nodes does not meet again at the same second. */
+#define CRON_RC_BUSY        5
+#define CRON_BUSY_RETRY_MIN 10
+#define CRON_BUSY_RETRY_SPAN 21  /* 10..30 s */
 /* What preflight asks of the disk, in bytes.  A build's own needs come from the
  * manifest's size column; these cover what it cannot say. */
 #define UPGRADE_SPACE_MARGIN      (16ULL * 1024 * 1024)
@@ -287,7 +296,9 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define CMD_PEER_SYNC 0x06
 #define CMD_MESH_STATE 0x07
 #define CMD_SYNC_REQUEST 0x08  // Hub -> Hub: request peer to immediately send its full sync
-#define CMD_INVITE_REQUEST 0x09 // Bot -> Hub: Request invite for nick into channel
+/* 0x09 was CMD_INVITE_REQUEST (a bot asking every bot to invite a nick, flooded
+ * as invite| sync lines); removed in 2.5.3, the channel-request election does
+ * invites.  Never reuse the value. */
 
 #define CMD_ADMIN_AUTH 0x10
 #define CMD_ADMIN_LIST_FULL 0x11
@@ -541,6 +552,18 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * would leave the mesh unable to upgrade it. */
 #define CMD_HUB_ROLLCALL       0x8C
 #define CMD_HUB_ROLLCALL_ACK   0x8D
+/* Presence v2 (docs/plans/2026-11-14_presence_v2_plan.md, phase 1): one
+ * versioned record per hub.  Hub <-> Hub only, text payload, one frame each:
+ *   S|origin|epoch|seq|ttl|caps|links|bots   record (ttl 0 = this peer only)
+ *   G|origin:epoch:seq,...  W|...            digest (W asks for a G back)
+ *   R|origin                                 pull: answer S ttl 0
+ * Unknown tags are ignored (later phases add D/H).  hub_presence2.c. */
+#define CMD_PRESENCE2          0x8E
+/* Phase 5 (presence v2 K): the bots tree is pushed to bots as row deltas, not
+ * the whole tree, with the new tree's hash in each; a bot whose hash mismatches
+ * pulls the whole tree.  The 300 s whole-tree refresh stays. */
+#define CMD_BOT_TREE_DELTA     0x8F  /* Hub -> Bot: <seq>|<fnv64> + +/- row ops */
+#define CMD_BOT_TREE_PULL      0x90  /* Bot -> Hub: send me the whole tree      */
 #define ROLLCALL_WAIT          3   /* seconds the asking hub waits for the answers */
 #define ROLLCALL_TTL           30  /* a relayed roll call older than this is dropped */
 #define ROLLCALL_KEEP          10  /* seconds a relay routes the answers back */
@@ -718,7 +741,6 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define CONSOLE_LOG_RING      1024
 #define CONSOLE_LOG_LINE_MAX  512
 /* Coalescing of pushed events. */
-#define CONSOLE_TREE_MIN_GAP  1     /* seconds between two tree events      */
 #define CONSOLE_NAME_MAX      64
 
 #define MAX_PENDING_CHAN_REQUESTS 200
@@ -727,7 +749,11 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 /* ---- Network upgrade run (CMD_UPGRADE_*, CMD_ADMIN_UPGRADE_NET) ----------
  * One run at a time per hub: the whole point is that exactly one plan drives
  * the mesh while the config is frozen. */
-#define MAX_UPGRADE_NODES (MAX_CLIENTS + 1) /* every client, plus this hub */
+/* A run spans the whole mesh, not one hub's clients: every registered bot
+ * (the config holds at most MAX_BOTS mesh-wide), every hub the mesh can know
+ * (MAX_MESH_HUBS remote plus MAX_PEERS direct), plus this hub.  Sized to
+ * MAX_CLIENTS + 1 it left 10 bots out of an 11-hub, 100-bot network. */
+#define MAX_UPGRADE_NODES (MAX_BOTS + MAX_MESH_HUBS + MAX_PEERS + 1)
 /* Downstream routes a follower remembers for a run it is only relaying: one
  * per node it forwarded an answer for.  See upgrade_route_t. */
 #define MAX_UPGRADE_ROUTES MAX_UPGRADE_NODES
@@ -1082,7 +1108,10 @@ typedef struct { int rep; int live; } global_ban_slot_t;
  * the config store — see the CMD_BOT_PRESENCE block near the opcodes.
  * ========================================================================== */
 #define BOT_PRESENCE_INTERVAL 60   /* how often a hub gossips its own bots   */
-#define BOT_TREE_REFRESH      300  /* unconditional re-push to bots          */
+#define BOT_TREE_REFRESH      300  /* whole-tree re-push to pre-delta bots    */
+/* Bots from this version apply CMD_BOT_TREE_DELTA and check the tree hash a
+ * keepalive PING carries ("t|<fnv64hex>"); older ones get whole trees. */
+#define TREE_DELTA_MIN_BOT    "2.5.3"
 /* Change pushes are coalesced: news from the mesh (peer gossip, links, TTL
  * expiry) reaches bots at most once per BOT_TREE_COALESCE — it is already up
  * to a gossip interval old — while a change to this hub's own bots goes out
@@ -1090,9 +1119,18 @@ typedef struct { int rep; int live; } global_ban_slot_t;
  * the flag is held until the push, so the latest tree always lands. */
 #define BOT_TREE_COALESCE       30
 #define BOT_TREE_COALESCE_LOCAL 2
+/* A bot's CMD_BOT_TREE_PULLs are served at most once per this many seconds;
+ * one inside the gap is held and served when it ends (hub_tree_pull). */
+#define TREE_PULL_MIN_GAP       2
 #define BOT_ROSTER_TTL        240  /* entry nobody refreshed since -> dropped */
 #define ROSTER_VERSION_MAX    15   /* "2.3.0", with room to grow             */
 #define ROSTER_VARIANT_MAX    7    /* code base: "c" / "rs"                  */
+/* The longest CMD_BOT_PRESENCE payload read: version|server|started|variant|
+ * cron|link_ord at their caps (a 64-bit number is at most 20 digits), plus
+ * room for fields a newer bot adds.  Anything longer is cut, and then the
+ * link-order counter (last) is not trusted: it reads 0. */
+#define BOT_PRESENCE_MAX \
+  (ROSTER_VERSION_MAX + ROSTER_SERVER_MAX + 20 + ROSTER_VARIANT_MAX + CRON_STATUS_MAX + 20 + 5 + 64)
 #define ROSTER_SERVER_MAX     63   /* host:port of the bot's IRC link        */
 #define ROSTER_IP_MAX         45   /* INET6_ADDRSTRLEN - 1                   */
 #define ROSTER_FRAME_BUDGET   8192 /* chunk gossip well under MAX_BUFFER     */
@@ -1124,6 +1162,12 @@ typedef struct { int rep; int live; } global_ban_slot_t;
 /* Tree rows: every hub node, every bot beneath one, plus the disconnected
  * tail (bounded by the bots the config knows about). */
 #define MAX_TREE_ROWS         (MAX_MESH_HUBS + MAX_PEERS + 1 + MAX_BOT_ROSTER + MAX_BOTS)
+/* Open-addressed uuid set for one tree (hub_build_tree's "each bot once", the
+ * delta builder's row keys): a power of two at least twice MAX_TREE_ROWS. */
+#define TREE_USET_SLOTS       4096
+_Static_assert(TREE_USET_SLOTS >= 2 * MAX_TREE_ROWS &&
+                   (TREE_USET_SLOTS & (TREE_USET_SLOTS - 1)) == 0,
+               "tree uuid set: a power of two, at most half full");
 #define MAX_TREE_PAYLOAD      ((MAX_TREE_ROWS) * TREE_ROW_MAX + PAYLOAD_SLACK)
 
 /* ==========================================================================
@@ -1144,11 +1188,8 @@ _Static_assert(UHIST_LINE_MAX + 16 <= MAX_SYNC_PAYLOAD,
                "one upgrade history record must fit a peer frame");
 _Static_assert(MAX_QUEUED_BYTES_PER_PEER >= MAX_BULK_PAYLOAD,
                "per-peer queue budget must hold at least one bulk payload");
-#define MAX_DELTA_SEEN            8192
 #define BULK_SOFT_BUDGET_BPS      (32 * 1024)
 #define DELTA_HARD_BUDGET_BPS     (64 * 1024)
-#define BOT_DELTA_RATE_LIMIT      10           /* deltas/s/bot before suspect */
-#define BOT_DELTA_RATE_WINDOW     30           /* seconds */
 
 /* Lane indices (lower = higher priority). LANE_URGENT must be 0 so the drain
  * loop can rely on numeric ordering. */
@@ -1571,6 +1612,9 @@ typedef struct {
   time_t drop_logged;           /* last queue-drop warning for this client */
   int drop_unlogged;            /* drops since, not yet in a warning       */
   bool superseded;              /* a newer session of this bot replaced it */
+  bool p2_seen;                 /* peer: it sent a CMD_PRESENCE2 record     */
+  bool peer_heard;              /* peer: a frame from it opened (a dialled  */
+                                /* link is not up until the far end speaks) */
   bool result_relayed;          /* this link's one relayed UPGRADE_RESULT  */
   /* Review 6 (CMD_LINK_SEQ): its offer seen, our go queued / sealed, its go
    * seen; the counters of the frames sealed / opened since. */
@@ -1667,6 +1711,7 @@ typedef struct {
   bool   late_prepared;                       /* joined a run in flight already */
   bool   plan_capable;                        /* a peer that speaks CMD_UPGRADE_PLAN */
   time_t bot_started;              /* bot's own start time, 0 = unreported  */
+  uint64_t bot_link_ord;           /* phase 4: bot's link-order counter, 0 = unreported */
 
   /* SHA-256 of the last full config queued to this bot (CMD_CONFIG_DATA), so
    * a broadcast push that would repeat it is skipped.  Only valid while that
@@ -1682,8 +1727,10 @@ typedef struct {
   /* SHA-256 of the last bot tree queued to this bot (CMD_BOT_TREE): a change
    * push that would repeat it is skipped (the BOT_TREE_REFRESH one never is).
    * Cleared when a queued tree is dropped on overflow. */
-  unsigned char tree_sent_hash[32];
   bool          tree_sent_valid;
+  uint64_t      tree_sent_seq;     /* phase 5: the tree version this bot holds  */
+  time_t        tree_pull_at;      /* last CMD_BOT_TREE_PULL served             */
+  bool          tree_pull_due;     /* one came inside TREE_PULL_MIN_GAP: held   */
 } hub_client_t;
 
 // Track recently processed PURGE messages to prevent feedback loops
@@ -1695,7 +1742,7 @@ typedef struct {
 
 // Track recently seen OP_FORWARD_REQUEST IDs to prevent packet storms
 typedef struct {
-  char   request_id[64]; // Unique request ID
+  char   request_id[SEEN_FORWARD_ID_MAX]; // Unique request ID
   time_t seen_at;        // When we first processed this request
 } seen_forward_t;
 
@@ -1789,9 +1836,11 @@ typedef struct {
   char   server[ROSTER_SERVER_MAX + 1];   /* the bot's IRC link           */
   time_t connected_at;                    /* bot's own start, for uptime  */
   time_t link_since;                      /* bot -> its hub link, 0 = unknown */
+  uint64_t link_ord;                      /* phase 4: bot's link-order counter, 0 = unknown */
   char   ip[ROSTER_IP_MAX + 1];           /* bot's address as its hub sees it */
   time_t reported_at;                     /* local clock: drives the TTL  */
   long long gen;                          /* the gossip round it came in (0 = none) */
+  uint64_t p2_stamp;                      /* arrival order vs presence v2 records */
 } bot_roster_t;
 
 /* One peer link a hub reports in its roster gossip (an l| line): a peer it is
@@ -1824,13 +1873,90 @@ typedef struct {
   bool        rollcall;     /* its gossip carries k|rollcall: it answers one */
 } mesh_hub_t;
 
-/* Loop-prevention seen-set: highest lamport_seq observed per (origin, bot). */
+/* ---- Presence v2, phases 1-2 (hub_presence2.c) ----
+ * Each hub publishes one record {origin, epoch, seq, caps, links, bots}.
+ * epoch is a boot counter persisted in P2_EPOCH_FILE (never the clock), seq
+ * counts published changes.  Records are flooded (ttl, split horizon) when
+ * they change, pulled on link-up through a digest, and walked breadth-first
+ * for reachability: a link counts only when both ends list it.  Phase 1 runs
+ * alongside the CMD_BOT_ROSTER rounds and only ever shortens how long a gone
+ * hub or bot lingers in their view. */
+#define P2_EPOCH_FILE     ".irchub.epoch"
+#define P2_TTL_HOPS       16
+#define P2_MAX_LINKS      16
+#define P2_MAX_BOTS       128
+#define P2_ID_MAX         63
+#define P2_CAPS_MAX       15
+#define P2_MAX_FRAME      16384
+#define P2_EPOCH_MAX      (1ULL << 40)
+#define P2_SEQ_MAX        (1ULL << 48)
+#define P2_EPOCH_JUMP     1024ULL      /* relayed epoch jump refused above this */
+#define P2_SEQ_JUMP       (1ULL << 20) /* ... and seq jump in one epoch         */
+#define P2_PULL_RETRY_MS  2000
+#define P2_GRACE_MS       5000         /* unreachable this long = gone for decisions */
+#define P2_FULL_EVERY_MS  300000       /* own record re-flooded at a new seq      */
+#define P2_RECONCILE_MS   1000
+#define P2_TICK_MS        100          /* hub_p2_tick runs at most this often    */
+/* phase 2: deltas, damping, storm cap, compact digest */
+#define P2_SEEN_WINDOW    64           /* per-origin seen window for D frames    */
+#define P2_FLAP_WINDOW_MS 30000
+#define P2_FLAP_FREE      4            /* flips per window before damping        */
+#define P2_HOLD_MAX_MS    30000
+#define P2_BUCKET_RATE    20           /* deltas per second ...                  */
+#define P2_BUCKET_BURST   100          /* ... with this burst; past it: snapshots */
+#define P2_STORM_GAP_MS   1000         /* at most one storm snapshot per gap     */
+#define P2_DIGEST_MS      15000        /* H|count|fnv64 on every link            */
+#define P2_MAX_ENTS       (2 * (P2_MAX_BOTS + P2_MAX_LINKS)) /* live + damped gone */
+/* phase 3: the 15 s digest is the keepalive on a v2 peer link, so idle links
+ * carry no pings and a link silent for 3 missed digests is dropped. */
+#define P2_LINK_TIMEOUT   45           /* s: drop a v2 peer link unheard this long */
+
 typedef struct {
-  char     origin_hub_uuid[64];
-  char     bot_uuid[64];
-  uint64_t max_seq_seen;
-  time_t   last_seen_at;
-} delta_seen_t;
+  char      id[P2_ID_MAX + 1];
+  long long since;                     /* its link to the origin (unix s)  */
+} p2_bot_t;
+
+typedef struct {
+  char      origin[P2_ID_MAX + 1];
+  uint64_t  epoch, seq;                /* epoch 0 = known name, no record yet */
+  char      caps[P2_CAPS_MAX + 1];
+  char      links[P2_MAX_LINKS][P2_ID_MAX + 1];
+  int       nlinks;
+  p2_bot_t *bots;                      /* heap, nbots entries                */
+  int       nbots;
+  uint64_t  stamp;                     /* bot_roster_t.p2_stamp order at accept */
+  int64_t   pull_next_ms;
+  int64_t   gone_ms;                   /* monotonic: when it became unreachable */
+  bool      reach, purged;
+  bool      rdirty;                    /* roster or record changed: reconcile */
+  uint64_t  win_epoch, win_top, win_mask; /* D seen window (P2_SEEN_WINDOW)  */
+} p2_rec_t;
+
+/* One of our bots or peer links, damped on its own (P2_FLAP_*). */
+typedef struct {
+  char      id[P2_ID_MAX + 1];
+  char      kind;                      /* 'b' bot, 'l' peer link             */
+  bool      live;
+  long long since;                     /* bot: its link time while live      */
+  int       flips;
+  int64_t   window_ms, hold_ms;        /* flap window start, hold until      */
+} p2_ent_t;
+
+typedef struct {
+  p2_rec_t  self;
+  p2_rec_t  recs[MAX_MESH_HUBS];
+  int       nrecs;
+  bool      dirty;                     /* storm pending: snapshot instead of D */
+  int64_t   last_flood_ms, next_full_ms, next_reconcile_ms, next_digest_ms;
+  int64_t   last_tick_ms;              /* P2_TICK_MS gate                    */
+  uint64_t  stamp_ctr;
+  p2_ent_t  ents[P2_MAX_ENTS];
+  int       nents;
+  int64_t   tokens_milli, bucket_ms;   /* storm cap token bucket             */
+  bool      ready;                     /* last tick's p2_ready()             */
+  uint64_t  c_rx, c_rx_bad, c_tx, c_relays, c_pulls, c_heals, c_jumps, c_purges;
+  uint64_t  c_deltas, c_snaps, c_held, c_digest_miss;
+} p2_state_t;
 
 /* Traffic counters since start, answered by CMD_ADMIN_STATS.  Monotonic:
  * whoever reads them diffs two snapshots. */
@@ -2086,17 +2212,20 @@ typedef struct {
    * the system clock or stored value lags. */
   uint64_t next_lamport_seq;
 
-  /* Loop prevention: deltas already observed per (origin_hub_uuid, bot_uuid).
-   * LRU-evicted past MAX_DELTA_SEEN. */
-  delta_seen_t delta_seen[MAX_DELTA_SEEN];
-  int          delta_seen_count;
-
   /* ---- Bot presence (volatile; never serialized) ---- */
   bot_roster_t roster[MAX_BOT_ROSTER];
   int          roster_count;
   time_t       hub_started;        /* this hub's own uptime base           */
   time_t       last_presence_gossip;
   time_t       last_tree_push;
+  /* Phase 5: the last whole tree pushed, for row deltas.  A change sends every
+   * current bot (`tree_sent_seq` == `tree_seq`) the diff from this to the new
+   * tree; others get the whole tree.  FNV-1a 64 is the tree hash carried in
+   * each delta so a bot can tell it diverged and pull the whole tree. */
+  char        *tree_last;
+  int          tree_last_len;
+  uint64_t     tree_last_fnv;
+  uint64_t     tree_seq;
   bool         tree_dirty;         /* roster changed: push to bots next tick */
   bool         tree_dirty_local;   /* ...by one of our own bots (short gap)  */
   time_t       last_tree_change_push; /* coalescing clock (BOT_TREE_COALESCE) */
@@ -2108,6 +2237,7 @@ typedef struct {
   time_t       presence_hold_until;/* no event gossip before then (damping)     */
   time_t       presence_last_event;/* the last event gossip                     */
   int          presence_burst;     /* event gossips in a row inside the window  */
+  p2_state_t  *p2;                 /* presence v2 (heap; NULL until hub_p2_init) */
   time_t       gossip_again_at;    /* a link came up: gossip once more then     */
   time_t       resync_due_at;      /* ask peers for a sync then (0 = none)  */
 
@@ -2368,7 +2498,6 @@ int  hub_ssh_evict_pick(const char *const *ips, const long long *start_ms, int n
  * the entries written with the `console` word. */
 bool hub_ip_acl_permits_console(const hub_state_t *state, const char *ip);
 
-void hub_storage_init(void);
 bool hub_storage_update_entry(hub_state_t *state, const char *uuid,
                               const char *key, const char *value,
                               const char *extra, const char *op, time_t ts);
@@ -2709,7 +2838,6 @@ void hub_update_failback_confirm(void);
 const char *hub_update_cron_status(void);
 void hub_update_cron_set(bool on);
 bool hub_update_cron_tick(const char *exe);
-int hub_update_cron_drop(const char *exe);
 bool hub_update_install_in_progress(void);
 bool hub_update_has_build(const char *root, const char *variant, const char *ver, const char *arch,
                           const char *libc);
@@ -2734,6 +2862,9 @@ bool hub_update_take_pending(char *id_out, size_t id_size, char *ver_out,
                              size_t variant_size);
 /* Compare two version strings, tolerating a leading 'v' on either side. */
 int hub_update_version_cmp(const char *a, const char *b);
+/* Keepalive PING payload for `c`: "t|<tree fnv64>" or "" (hub_logic.c). */
+void hub_tree_ping_payload(const hub_state_t *state, const hub_client_t *c, char *out,
+                           size_t cap);
 /* Host capability probe answered in CMD_UPGRADE_READY. */
 void hub_update_host_arch(char *out, size_t out_size);
 void hub_update_host_libc(char *out, size_t out_size);
@@ -2742,6 +2873,22 @@ const char *hub_update_host_variant(void);
 int hub_update_check_cli(const char *variant);
 void hub_roster_expire(hub_state_t *state, time_t now);
 void hub_roster_mark_dirty(hub_state_t *state, bool local);
+void hub_roster_send_to_peer(hub_state_t *state, const hub_client_t *peer);
+/* Presence v2 hooks into the roster (hub_logic.c): drop every entry of
+ * `hub_uuid` and its mesh-map hub; make the roster match a record's bot list
+ * (drop entries older than `stamp` that the record no longer lists, add a
+ * bare entry for a listed bot nobody reported yet).  Both return changes. */
+int  hub_roster_p2_drop_hub(hub_state_t *state, const char *hub_uuid);
+int  hub_roster_p2_reconcile(hub_state_t *state, const p2_rec_t *rec);
+/* hub_presence2.c */
+void hub_p2_init(hub_state_t *state);
+void hub_p2_link_up(hub_state_t *state, hub_client_t *peer);
+void hub_p2_rx(hub_state_t *state, hub_client_t *peer, const char *payload);
+void hub_p2_tick(hub_state_t *state);
+bool hub_p2_hub_gone(const hub_state_t *state, const char *uuid);
+bool hub_p2_digest_keepalive(const hub_state_t *state, const hub_client_t *c);
+void hub_p2_roster_touched(hub_state_t *state, const char *hub_uuid);
+/* Phase 2: whether the v2 view stands in for today's 60 s rounds. */
 void hub_chan_elect_tick(hub_state_t *state, time_t now);
 
 /* ---- Mesh transport: per-peer outbound queue (see docs/mesh.md) ---- */
@@ -2785,13 +2932,6 @@ void peer_queue_destroy(hub_client_t *peer);
 
 /* Allocate the next outgoing Lamport sequence number for this hub. */
 uint64_t hub_next_lamport_seq(hub_state_t *state);
-
-/* Loop-prevention seen-set helpers.  Returns true if (origin, bot, seq) is
- * new (and updates the set); false if seq <= last seen. */
-bool hub_delta_seen_check_and_update(hub_state_t *state,
-                                     const char *origin_hub_uuid,
-                                     const char *bot_uuid,
-                                     uint64_t seq);
 
 /* ---- SSH admin console, core side (hub_console_core.c) -------------------
  * Everything here runs on the main thread.  hub_console_start spawns the

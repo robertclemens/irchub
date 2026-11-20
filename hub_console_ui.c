@@ -3776,6 +3776,7 @@ static void set_view(console_ui_t *ui, int v, long long now_ms) {
 }
 
 static void net_rows_count(const console_ui_t *ui, int *n);
+static int net_list_rows(int H, int n, int *detail);
 
 static void handle_key(console_ui_t *ui, ckey_t k, long long now_ms) {
   if (ui->line_mode) {
@@ -3851,6 +3852,8 @@ static void handle_key(console_ui_t *ui, ckey_t k, long long now_ms) {
         ui->anchor[ui->view] = sb_floor(ui, ui->view, ui->cols, ui->rows - 3);
       else if (ui->view == V_UPG || ui->view == V_STATS)
         ui->anchor[ui->view] = -1;
+      else if (ui->view == V_NET)
+        ui->net_sel = 0;
       ui->dirty = true;
     }
     ui->in_cur = 0;
@@ -3859,6 +3862,11 @@ static void handle_key(console_ui_t *ui, ckey_t k, long long now_ms) {
     if (empty || ui->in_cur == ui->in_len) {
       ui->anchor[ui->view] = -1;
       if (ui->view == V_LOG) ui->paused = false;
+      if (ui->view == V_NET && empty) {
+        int n = 0;
+        net_rows_count(ui, &n);
+        ui->net_sel = n ? n - 1 : 0;
+      }
     }
     ui->in_cur = ui->in_len;
     break;
@@ -3894,8 +3902,21 @@ static void handle_key(console_ui_t *ui, ckey_t k, long long now_ms) {
       in_set(ui, ui->hist_pos == ui->hist_n ? ui->hist_stash : ui->hist[ui->hist_pos]);
     }
     break;
-  case K_PGUP: scroll_view(ui, -1); break;
-  case K_PGDN: scroll_view(ui, 1); break;
+  case K_PGUP:
+  case K_PGDN:
+    if (ui->view == V_NET) {
+      /* View 3 pages its pick: the list follows it, as with Up/Down. */
+      int n = 0;
+      net_rows_count(ui, &n);
+      int shown = net_list_rows(ui->rows - 3, n, NULL) - 1;
+      int page = shown > 2 ? shown - 1 : 1;
+      ui->net_sel += k.type == K_PGUP ? -page : page;
+      if (ui->net_sel >= n) ui->net_sel = n - 1;
+      if (ui->net_sel < 0) ui->net_sel = 0;
+      break;
+    }
+    scroll_view(ui, k.type == K_PGUP ? -1 : 1);
+    break;
   case K_TAB: complete(ui); break;
   case K_F:
     if (k.cp == 2) {
@@ -4059,6 +4080,8 @@ static const char *G(const console_ui_t *ui, const char *utf8) {
   if (!strcmp(utf8, "─")) return "-";
   if (!strcmp(utf8, "┬")) return "+";
   if (!strcmp(utf8, "▾")) return "v";
+  if (!strcmp(utf8, "▸")) return ">";
+  if (!strcmp(utf8, "…")) return "...";
   if (!strcmp(utf8, "├")) return "|";
   if (!strcmp(utf8, "└")) return "`";
   if (!strcmp(utf8, "●")) return "*";
@@ -4157,7 +4180,7 @@ static int parse_tree(const char *tree, trow_t *out, int max) {
     if (ll < sizeof(row)) {
       memcpy(row, p, ll);
       row[ll] = '\0';
-      char *f[10];
+      char *f[10] = {0};
       int nf = 0;
       /* keep empty fields: split by hand */
       char *q = row;
@@ -4221,16 +4244,26 @@ static void fmt_age(long long since, char *out, size_t cap) {
 
 /* One pane line for tree row i. */
 static void tree_line(const console_ui_t *ui, rowb_t *r, const trow_t *t, int i,
-                      const trow_t *all, int n, int width) {
+                      const trow_t *all, int n, int width, int folded) {
+  /* folded >= 0: a hub row standing for its bots (the pane folded to fit):
+   * ▸, and the bot count where the version goes */
   int start = r->w;
   bool wide_ver = width >= 30, wide_var = width >= 26, wide_up = width >= 34;
   int right = (wide_ver ? 9 : 0) + 2 + (wide_var ? 3 : 0) + (wide_up ? 5 : 0);
+  /* no version column to hold a folded hub's count: it follows the name */
+  char nm[96];
+  if (folded >= 0 && !wide_ver) usnprintf(nm, sizeof(nm), "%s (%d)", t->name, folded);
+  else usnprintf(nm, sizeof(nm), "%s", t->name);
   int indent = t->type == 'D' ? 0 : t->depth * 2;
   if (indent > width / 3) indent = width / 3;
+  /* A deep row gives up indent before its name is cut: tnhub10 at depth 9 of
+   * a chain read "tnhub1" in a 38-column pane. */
+  int room = width - right - 2 - str_width(nm);
+  if (indent > room) indent = room > 0 ? room : 0;
   rb_pad(r, start + indent);
   if (t->type == 'H') {
     rb_sgr(r, "0;1");
-    rb_text(r, G(ui, "▾"), 1);
+    rb_text(r, G(ui, folded >= 0 ? "▸" : "▾"), 1);
     rb_text(r, " ", 1);
   } else if (t->type == 'B') {
     bool last = true;
@@ -4247,11 +4280,13 @@ static void tree_line(const console_ui_t *ui, rowb_t *r, const trow_t *t, int i,
   }
   int name_w = width - (r->w - start) - right;
   if (name_w < 1) name_w = 1;
-  rb_text(r, t->name, name_w);
+  char bots[24] = "";
+  if (folded >= 0) usnprintf(bots, sizeof(bots), "%d %s", folded, folded == 1 ? "bot" : "bots");
+  rb_text(r, nm, name_w);
   rb_pad(r, start + width - right);
   if (wide_ver) {
     rb_sgr(r, "0;90");
-    rb_right(r, t->type == 'D' ? "" : (strcmp(t->ver, "-") ? t->ver : ""), 8);
+    rb_right(r, folded >= 0 ? bots : t->type == 'D' ? "" : (strcmp(t->ver, "-") ? t->ver : ""), 8);
     rb_text(r, " ", 1);
   }
   rb_sgr(r, t->online ? "0;32" : "0;31");
@@ -4272,6 +4307,96 @@ static void tree_line(const console_ui_t *ui, rowb_t *r, const trow_t *t, int i,
   }
   rb_sgr(r, SGR_RESET);
   rb_pad(r, start + width);
+}
+
+/* A pane line that is no tree row: "… N more", "N not connected", the
+ * truncation note. */
+static void tree_note_line(const console_ui_t *ui, rowb_t *r, int indent, const char *glyph,
+                           const char *glyph_sgr, const char *text, int width) {
+  int start = r->w;
+  if (indent > width / 3) indent = width / 3;
+  rb_pad(r, start + indent);
+  if (glyph) {
+    rb_sgr(r, glyph_sgr);
+    rb_text(r, G(ui, glyph), 1);
+    rb_text(r, " ", 1);
+  }
+  rb_sgr(r, "0;90");
+  int w = width - (r->w - start);
+  rb_text(r, text, w < 1 ? 1 : w);
+  rb_sgr(r, SGR_RESET);
+  rb_pad(r, start + width);
+}
+
+/* Tree pane, folded to fit (no keys: view 3 lists everything).  A tree that
+ * fits is drawn whole.  Otherwise every other hub folds to one line with its
+ * bot count; our own hub (row 0) keeps as many of its bots as the rows left
+ * allow, then "… N more"; the not-connected rows fold to one line when they
+ * do not fit beside the hubs; our hub folds too when not even two rows are
+ * left for its bots; past that the last row says how much is cut. */
+enum { PL_ROW, PL_FOLD, PL_MORE, PL_DSUM, PL_TRUNC };
+typedef struct {
+  int kind, idx, count;
+} pline_t;
+
+/* The bots listed under hub row i: they follow it (pre-order). */
+static int tree_hub_bots(const trow_t *tr, int n, int i) {
+  int c = 0;
+  for (int k = i + 1; k < n && tr[k].type == 'B'; k++) c++;
+  return c;
+}
+
+static int pane_plan(const trow_t *tr, int n, int H, pline_t *out, int cap) {
+  int m = 0;
+  if (H < 1 || cap < 1) return 0;
+  if (n <= H) {
+    for (int i = 0; i < n && m < cap; i++) out[m++] = (pline_t){PL_ROW, i, 0};
+    return m;
+  }
+  bool local = n > 0 && tr[0].type == 'H';
+  int hubs = 0, nd = 0;
+  for (int i = local ? 1 : 0; i < n; i++) {
+    if (tr[i].type == 'H') hubs++;
+    else if (tr[i].type == 'D') nd++;
+  }
+  int local_bots = local ? tree_hub_bots(tr, n, 0) : 0;
+  bool fold_d = (local ? 1 : 0) + hubs + nd > H;
+  int fixed = (local ? 1 : 0) + hubs + (nd ? (fold_d ? 1 : nd) : 0);
+  int budget = H - fixed, show = local_bots, more = 0;
+  bool fold_local = false;
+  if (local_bots > budget) {
+    if (budget >= 2) {
+      show = budget - 1;
+      more = local_bots - show;
+    } else {
+      show = 0;
+      fold_local = true;
+    }
+  }
+  bool d_done = false;
+  for (int i = 0; i < n && m < cap; i++) {
+    const trow_t *t = &tr[i];
+    if (t->type == 'H') {
+      int b = tree_hub_bots(tr, n, i);
+      bool fold = !(local && i == 0) || fold_local;
+      out[m++] = fold ? (pline_t){PL_FOLD, i, b} : (pline_t){PL_ROW, i, 0};
+      if (!fold) {
+        for (int k = 0; k < show && m < cap; k++) out[m++] = (pline_t){PL_ROW, i + 1 + k, 0};
+        if (more && m < cap) out[m++] = (pline_t){PL_MORE, i, more};
+      }
+      i += b;
+    } else if (t->type == 'D' && fold_d) {
+      if (!d_done) out[m++] = (pline_t){PL_DSUM, i, nd};
+      d_done = true;
+    } else {
+      out[m++] = (pline_t){PL_ROW, i, 0};
+    }
+  }
+  if (m > H) {
+    out[H - 1] = (pline_t){PL_TRUNC, 0, m - (H - 1)};
+    m = H;
+  }
+  return m;
 }
 
 /* ---- scrollback views ---- */
@@ -4435,19 +4560,31 @@ static void net_rows_count(const console_ui_t *ui, int *n) {
   *n = parse_tree(ui->tree, tr, MAX_TROWS);
 }
 
+/* View 3's list height in nodes for a pane H rows tall and n nodes: the
+ * details take 5 rows when they fit, the header one. */
+static int net_list_rows(int H, int n, int *detail) {
+  int d = n ? 5 : 0;
+  int list_h = H - d;
+  if (list_h < 1) {
+    list_h = H;
+    d = 0;
+  }
+  if (detail) *detail = d;
+  return list_h;
+}
+
 /* View 3: every tree column, and the selected node's details. */
 static void net_view(console_ui_t *ui, int W, int H, rowb_t *rows, int col0) {
   static trow_t tr[MAX_TROWS];
   int n = parse_tree(ui->tree, tr, MAX_TROWS);
   if (ui->net_sel >= n) ui->net_sel = n ? n - 1 : 0;
-  int detail = n ? 5 : 0;
-  int list_h = H - detail;
-  if (list_h < 1) {
-    list_h = H;
-    detail = 0;
-  }
+  int detail;
+  int list_h = net_list_rows(H, n, &detail);
+  /* Row 0 is the header, so the list shows list_h - 1 nodes: keep the pick
+   * among them (counting list_h hid it one row below the last line). */
+  int shown = list_h - 1 > 0 ? list_h - 1 : 1;
   int top = 0;
-  if (ui->net_sel >= list_h) top = ui->net_sel - list_h + 1;
+  if (ui->net_sel >= shown) top = ui->net_sel - shown + 1;
   rb_sgr(&rows[0], "0;1");
   rb_text(&rows[0], n ? "node                            version   base  up     cron    server / uuid"
                       : "(no tree yet)", W);
@@ -4689,14 +4826,36 @@ static void compose(console_ui_t *ui, rowb_t *rows, int *cur_row, int *cur_col,
   /* tree pane */
   if (pane_w > 0) {
     static trow_t tr[MAX_TROWS];
+    static pline_t plan[MAX_TROWS + 2];
     int n = parse_tree(ui->tree, tr, MAX_TROWS);
+    int m = pane_plan(tr, n, H, plan, MAX_TROWS + 2);
     for (int y = 0; y < H; y++) {
       rowb_t *r = &body[y];
       rb_sgr(r, SGR_LINE);
       rb_text(r, G(ui, "│"), 1);
       rb_sgr(r, SGR_RESET);
-      if (y < n) tree_line(ui, r, &tr[y], y, tr, n, pane_w);
-      else rb_pad(r, r->w + pane_w);
+      if (y >= m) {
+        rb_pad(r, r->w + pane_w);
+        continue;
+      }
+      const pline_t *p = &plan[y];
+      char note[64];
+      switch (p->kind) {
+      case PL_ROW: tree_line(ui, r, &tr[p->idx], p->idx, tr, n, pane_w, -1); break;
+      case PL_FOLD: tree_line(ui, r, &tr[p->idx], p->idx, tr, n, pane_w, p->count); break;
+      case PL_MORE:
+        usnprintf(note, sizeof(note), "%s %d more", G(ui, "…"), p->count);
+        tree_note_line(ui, r, (tr[p->idx].depth + 1) * 2, "└", SGR_RESET, note, pane_w);
+        break;
+      case PL_DSUM:
+        usnprintf(note, sizeof(note), "%d not connected", p->count);
+        tree_note_line(ui, r, 0, "○", "0;31", note, pane_w);
+        break;
+      default:
+        usnprintf(note, sizeof(note), "%s +%d more, Alt+3", G(ui, "…"), p->count);
+        tree_note_line(ui, r, 0, NULL, NULL, note, pane_w);
+        break;
+      }
     }
   }
 
