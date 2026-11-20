@@ -10257,11 +10257,60 @@ static void ce_try_hub(hub_state_t *state, chan_elect_t *e) {
   ce_finish(state, e, "nobody", NULL, NULL, NULL, NULL);
 }
 
+/* Hubs this one knows, itself included: what its ELECT_ACK reports. */
+static int ce_mesh_total(const hub_state_t *state) {
+  int n = 1;
+  for (int j = 0; j < state->mesh_hub_count; j++)
+    if (strcmp(state->mesh_hubs[j].uuid, state->hub_uuid) != 0) n++;
+  return n;
+}
+
+/* True while this hub's picture of the mesh is still being built: it started
+ * moments ago and configured peers are not all linked yet, or a peer linked
+ * moments ago has not yet named its version (no sync exchanged).  An origin
+ * that asked the mesh then would take a few neighbours for all of it. */
+static bool ce_mesh_settling(const hub_state_t *state, time_t now) {
+  if (state->hub_started > 0 && now - state->hub_started < CHAN_ELECT_SETTLE &&
+      linked_peer_count(state) < state->peer_count)
+    return true;
+  for (int i = 0; i < state->client_count; i++) {
+    const hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_HUB && c->authenticated && c->sync_held &&
+        now - c->connected_at < CHAN_ELECT_SETTLE)
+      return true;
+  }
+  return false;
+}
+
+/* A bot authenticated here that the election has not asked yet. */
+static bool ce_new_local_bot(const hub_state_t *state, const chan_elect_t *e) {
+  for (int i = 0; i < state->client_count; i++) {
+    const hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_BOT || !c->authenticated || strcmp(c->id, e->requester) == 0)
+      continue;
+    bool asked = false;
+    for (int j = 0; j < e->bot_n && !asked; j++) asked = strcmp(e->bots[j].uuid, c->id) == 0;
+    if (!asked) return true;
+  }
+  return false;
+}
+
 /* Nothing (more) to do locally: the origin asks the mesh, a relay says so. */
 static void ce_local_exhausted(hub_state_t *state, chan_elect_t *e) {
   if (!e->origin) {
     ce_done_up(state, e, "", "", "fail", "no ready bot");
     e->phase = CE_ACKED;
+    return;
+  }
+  time_t now = time(NULL);
+  /* Held once, not re-sent: the one election waits for the mesh view and
+   * then runs; the requester is answered either way, nothing is repeated. */
+  if (!e->held && e->phase != CE_MESH_DO && e->hub_n == 0 && ce_mesh_settling(state, now)) {
+    e->held = true;
+    e->phase = CE_HOLD;
+    e->phase_at = now;
+    hub_log_debug("[CHANREQ] Election %s: mesh view still settling, held up to %d s\n", e->id,
+                  CHAN_ELECT_HOLD_MAX);
     return;
   }
   if (e->phase == CE_MESH_DO || e->hub_n > 0) { /* the mesh was asked already */
@@ -10517,18 +10566,24 @@ static void process_chan_elect_fwd(hub_state_t *state, hub_client_t *client,
                 e->id, client->fd, kind, nick[0] ? nick : requester, channel, e->bot_n);
 }
 
-/* ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|0.  The origin records
- * it; a relay remembers which peer leads to that hub and passes it on. */
+/* ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|silent|mesh.  mesh (2.5.3+,
+ * absent from older hubs) is how many hubs the answering hub knows, itself
+ * included.  The origin records it; a relay remembers which peer leads to
+ * that hub and passes it on unchanged. */
 static void process_chan_elect_ack(hub_state_t *state, hub_client_t *client,
                                    const char *payload) {
-  char id[64] = "", hub[64] = "", name[64] = "", a[12] = "", r[12] = "";
+  char id[64] = "", hub[64] = "", name[64] = "", a[12] = "", r[12] = "", m[12] = "";
   wire_field(payload, 0, id, sizeof(id));
   wire_field(payload, 1, hub, sizeof(hub));
   wire_field(payload, 2, name, sizeof(name));
   wire_field(payload, 3, a, sizeof(a));
   wire_field(payload, 4, r, sizeof(r));
+  wire_field(payload, 6, m, sizeof(m));
   chan_elect_t *e = id[0] && hub[0] ? ce_find(state, id) : NULL;
   if (!e || e->hub_n >= MAX_MESH_HUBS) return;
+  int known = atoi(m); /* bounded: a wild count can only cost MESH_WAIT */
+  if (known > MAX_MESH_HUBS) known = MAX_MESH_HUBS;
+  if (known > e->mesh_known) e->mesh_known = known;
   for (int i = 0; i < e->hub_n; i++)
     if (strcmp(e->hubs[i].uuid, hub) == 0) return; /* second copy */
   chan_elect_hub_t *h = &e->hubs[e->hub_n++];
@@ -10638,8 +10693,9 @@ void hub_chan_elect_tick(hub_state_t *state, time_t now) {
         }
       if (!e->origin) {
         char ack[256];
-        snprintf(ack, sizeof(ack), "%s|%s|%s|%d|%d|%d", e->id, state->hub_uuid,
-                 hub_display_name(state), e->bot_n, ce_count(e, 'y'), ce_count(e, 'a'));
+        snprintf(ack, sizeof(ack), "%s|%s|%s|%d|%d|%d|%d", e->id, state->hub_uuid,
+                 hub_display_name(state), e->bot_n, ce_count(e, 'y'), ce_count(e, 'a'),
+                 ce_mesh_total(state));
         ce_up(state, e, CMD_CHAN_ELECT_ACK, ack);
         e->phase = CE_ACKED;
         e->phase_at = now;
@@ -10656,13 +10712,18 @@ void hub_chan_elect_tick(hub_state_t *state, time_t now) {
       if (!ce_try_local(state, e)) ce_local_exhausted(state, e);
       break;
     case CE_MESH_WAIT: {
-      int expect = 0;
-      for (int j = 0; j < state->mesh_hub_count; j++)
-        if (strcmp(state->mesh_hubs[j].uuid, state->hub_uuid) != 0) expect++;
+      /* every other hub we know of, or that any answer says exists */
+      int expect = ce_mesh_total(state) - 1;
+      if (e->mesh_known - 1 > expect) expect = e->mesh_known - 1;
       if (e->hub_n < expect && now - e->phase_at < CHAN_ELECT_MESH_WAIT) break;
       ce_try_hub(state, e);
       break;
     }
+    case CE_HOLD:
+      if (ce_mesh_settling(state, now) && now - e->phase_at < CHAN_ELECT_HOLD_MAX) break;
+      if (ce_new_local_bot(state, e)) ce_probe_local(state, e); /* attached meanwhile */
+      else ce_local_exhausted(state, e);
+      break;
     case CE_MESH_DO:
       if (now - e->phase_at < CHAN_ELECT_HUB_WAIT) break;
       ce_try_hub(state, e);

@@ -595,6 +595,13 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define CHAN_ELECT_DO_WAIT    5   /* s: one bot's DONE                      */
 #define CHAN_ELECT_HUB_WAIT   12  /* s: one hub's ELECT_DONE (it may retry)  */
 #define CHAN_ELECT_TTL        40  /* s: hard end of any election            */
+/* An origin whose mesh view is still settling holds its mesh ask (CE_HOLD):
+ * up to CHAN_ELECT_SETTLE s after start while configured peers are still
+ * dialing, or while a peer linked less than that ago has not yet named its
+ * version (sync_held).  At most CHAN_ELECT_HOLD_MAX s, once per election;
+ * HOLD_MAX + PROBE + MESH + DO + HUB_WAIT stays within CHAN_ELECT_TTL. */
+#define CHAN_ELECT_SETTLE     10
+#define CHAN_ELECT_HOLD_MAX   10
 #define MAX_CHAN_ELECTIONS    16
 #define CHAN_ELECT_REASON_MAX 48
 
@@ -1753,7 +1760,9 @@ typedef enum {
   CE_LOCAL_DO,   /* one of our bots was handed the action               */
   CE_MESH_WAIT,  /* origin: flooded, collecting the other hubs' answers  */
   CE_MESH_DO,    /* origin: one hub was handed the action               */
-  CE_ACKED       /* relay: answered the origin, routing DO/DONE now     */
+  CE_ACKED,      /* relay: answered the origin, routing DO/DONE now     */
+  CE_HOLD        /* origin: its mesh view is still settling (restart or
+                    relink); asks the mesh once it has, CHAN_ELECT_HOLD_MAX */
 } chan_elect_phase_t;
 
 typedef struct {
@@ -1791,6 +1800,11 @@ typedef struct {
   int    bot_n;
   chan_elect_hub_t hubs[MAX_MESH_HUBS];
   int    hub_n;
+  /* the most hubs any answer said it knows, itself included: a hub that has
+   * just restarted or relinked may know only its neighbours yet, and must
+   * not take their answers for the whole mesh's */
+  int    mesh_known;
+  bool   held;                           /* CE_HOLD was used (only once)   */
   char   doing[64];                      /* bot (CE_LOCAL_DO) or hub uuid  */
   /* a person's request from a bot (CMD_USER_CHAN_REQUEST): the answer goes
    * back to that connection as CMD_USER_CHAN_RESULT; reply_fd -1 = none */
