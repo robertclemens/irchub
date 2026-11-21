@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
+#include "elf_needs.h"
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
@@ -66,15 +67,48 @@ void hub_update_host_arch(char *out, size_t out_size) {
   }
 }
 
+/* The host's C library, at run time (2.5.4, docs/plans/2026-11-20_artifact_choice_plan.md
+ * §3): on Linux "gnu" when a glibc program loader is present — whatever libc
+ * this build itself uses, so a static (musl) build on Ubuntu can still take a
+ * gnu artifact — else "musl"; elsewhere the OS name in lower case (freebsd,
+ * netbsd, openbsd, darwin), which no Linux row ever matches. */
 void hub_update_host_libc(char *out, size_t out_size) {
   if (!out || out_size == 0) return;
-#if defined(__GLIBC__)
-  snprintf(out, out_size, "gnu");
-#elif defined(__linux__)
+#if defined(__linux__)
+  static const char *const loaders[] = {"/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-x86-64.so.2",
+                                        "/lib/ld-linux-aarch64.so.1", "/lib/ld-linux-armhf.so.3",
+                                        "/lib/ld-linux.so.2"};
+  for (size_t i = 0; i < sizeof(loaders) / sizeof(loaders[0]); i++)
+    if (access(loaders[i], F_OK) == 0) {
+      snprintf(out, out_size, "gnu");
+      return;
+    }
   snprintf(out, out_size, "musl");
 #else
-  snprintf(out, out_size, "unknown");
+  struct utsname u;
+  size_t w = 0;
+  if (uname(&u) == 0)
+    for (const char *c = u.sysname; *c && w + 1 < out_size; c++)
+      if (isalnum((unsigned char)*c)) out[w++] = (char)tolower((unsigned char)*c);
+  out[w] = '\0';
+  if (!w) snprintf(out, out_size, "unknown");
 #endif
+}
+
+static int run_bounded(const char *const argv[], int timeout_s, char *out, size_t out_size);
+
+/* The host's glibc version (the highest GLIBC_x.y its libc.so.6 defines,
+ * read from that file's version table — elf_needs.c), or NULL when there is
+ * none; asked once.  The same in a static and a glibc build, and in the Rust
+ * trees.  A pre-filter only: the new build's -selftest decides. */
+static const char *host_glibc(void) {
+  static bool asked;
+  static char ver[32];
+  if (!asked) {
+    asked = true;
+    if (!en_glibc(ver, sizeof(ver))) ver[0] = '\0';
+  }
+  return ver[0] ? ver : NULL;
 }
 
 const char *hub_update_host_variant(void) { return HUB_UPDATE_VARIANT; }
@@ -204,6 +238,7 @@ static const char *const FAILBACK_BODY[] = {
   "PATH=\"${PATH:-}:/usr/bin:/bin\"; export PATH\n",
   "cd \"$D\" 2>/dev/null || exit 1\n",
   "STATE=.upgrade.state; CONF=.upgrade.confirmed; SELF=${SELF:-.upgrade.failback}\n",
+  "FAILF=.upgrade.failback\n",
   "LOCK=.upgrade.lock; TRIES=.upgrade.tries; PREV=\"$EXE.prev\"\n",
   "FAILTAG=\"# $PRODUCT:failback:$D:\"; PRODTAG=\"# $PRODUCT:production:$D:\"\n",
   "# A hardened daemon is not dumpable, so its /proc/<pid>/exe cannot be read: the\n",
@@ -272,10 +307,16 @@ static const char *const FAILBACK_BODY[] = {
   "    while read -r dd; do [ -d \"$dd\" ] || printf ':%s:\\n' \"$dd\"; done >\"$2.dead\"\n",
   "  if [ -s \"$2.dead\" ]; then grep -vF -f \"$2.dead\" \"$1\" >\"$2\"; else cp \"$1\" \"$2\"; fi\n",
   "}\n",
-  "cron_edit() { # add|remove tag line\n",
+  "cron_edit() { # add|remove|orphan tag line\n",
   "  command -v crontab >/dev/null 2>&1 || return 3\n",
   "  take_lock \"$HLOCK\" 15 || return 5  # busy: the binary runs it again soon\n",
   "  T=\".upgrade.cron.$$\"; rc=1; n=0\n",
+  "  # orphan: remove, but only while no upgrade script is here.  Looked at under\n",
+  "  # the lock, so an upgrade that is starting keeps its line.\n",
+  "  if [ \"$1\" = orphan ]; then\n",
+  "    [ -e \"$FAILF\" ] && n=3 && rc=0\n",
+  "    set -- remove \"$2\"\n",
+  "  fi\n",
   "  while [ \"$n\" -lt 3 ]; do\n",
   "    n=$((n + 1))\n",
   "    cron_read \"$T.cur\" || break\n",
@@ -298,6 +339,21 @@ static const char *const FAILBACK_BODY[] = {
   "  rm -f \"$T\".*\n",
   "  rm -f \"$HLOCK\"; HELD=$(printf '%s' \"$HELD\" | sed \"s| $HLOCK||\")\n",
   "  return \"$rc\"\n",
+  "}\n",
+  "# An upgrade's line whose script is gone: a \"done\" that found the crontab lock\n",
+  "# busy left it behind.  A helper that finds the lock busy here exits 5 (busy),\n",
+  "# and the binary runs it again in 10-30 s.\n",
+  "orphan_or_busy() {\n",
+  "  [ -e \"$FAILF\" ] && return 0\n",
+  "  command -v crontab >/dev/null 2>&1 || return 0\n",
+  "  T=\".upgrade.cron.$$\"\n",
+  "  cron_read \"$T.fo\" || { rm -f \"$T\".*; return 0; }\n",
+  "  grep -qF \"$FAILTAG\" \"$T.fo\"; f=$?\n",
+  "  rm -f \"$T\".*\n",
+  "  [ \"$f\" = 0 ] || return 0\n",
+  "  cron_edit orphan \"$FAILTAG\"\n",
+  "  [ $? = 5 ] && { rm -f \"$SELF\"; exit 5; }\n",
+  "  return 0\n",
   "}\n",
   "fail_line() {\n",
   "  printf \"* * * * * [ -x '%s/%s' ] && '%s/%s' tick >/dev/null 2>&1 %s\\n\" \\\n",
@@ -404,8 +460,9 @@ static const char *const FAILBACK_BODY[] = {
   "  # A loop names its upgrade: a loop that outlived it stops here, touching nothing.\n",
   "  tick) [ -n \"${2:-}\" ] && [ \"$2\" != \"$ID\" ] && exit 1\n",
   "    take_lock \"$LOCK\" 2 || exit 0; tick ;;\n",
-  "  cron-status) cron_status; rc=$?; rm -f \"$SELF\"; exit \"$rc\" ;;\n",
+  "  cron-status) orphan_or_busy; cron_status; rc=$?; rm -f \"$SELF\"; exit \"$rc\" ;;\n",
   "  cron-on)\n",
+  "    orphan_or_busy\n",
   "    cron_status; rc=$?\n",
   "    if [ \"$rc\" = 11 ]; then\n",
   "      if safe_path; then\n",
@@ -417,6 +474,7 @@ static const char *const FAILBACK_BODY[] = {
   "    fi\n",
   "    rm -f \"$SELF\"; exit \"$rc\" ;;\n",
   "  cron-off)\n",
+  "    orphan_or_busy\n",
   "    rc=0\n",
   "    cron_edit remove \"$PRODTAG\" || rc=$?\n",
   "    if [ \"$rc\" = 0 ]; then rm -f .cron.seen; cron_status; rc=$?; fi\n",
@@ -752,18 +810,25 @@ typedef struct {
 
 /* curl 7.85 replaced the bitmask protocol options with string ones and marked
  * the old pair deprecated; Rocky 8's 7.61 has only the bitmask.  Pick at
- * compile time so both build warning-free. */
+ * compile time so both build warning-free.  HTTP/1.1 only: a static build
+ * links Alpine's libcurl with HTTP/2 and HTTP/3 compiled in, and pinning the
+ * version keeps that code (nghttp2/nghttp3) unreachable — the Rust updater's
+ * ureq speaks HTTP/1.1 alone.  No Accept-Encoding is ever set, so brotli /
+ * zstd / gzip decoding never runs either; IDN only runs for a non-ASCII host,
+ * which validate_url never lets through. */
 #if LIBCURL_VERSION_NUM >= 0x075500
 #define UPDATER_SET_PROTOCOLS(h)                                               \
   do {                                                                         \
     curl_easy_setopt((h), CURLOPT_PROTOCOLS_STR, "https,file");                \
     curl_easy_setopt((h), CURLOPT_REDIR_PROTOCOLS_STR, "https");               \
+    curl_easy_setopt((h), CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);  \
   } while (0)
 #else
 #define UPDATER_SET_PROTOCOLS(h)                                               \
   do {                                                                         \
     curl_easy_setopt((h), CURLOPT_PROTOCOLS, CURLPROTO_HTTPS | CURLPROTO_FILE);\
     curl_easy_setopt((h), CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);           \
+    curl_easy_setopt((h), CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);  \
   } while (0)
 #endif
 
@@ -1130,7 +1195,13 @@ typedef struct {
   char min_from[64]; /* oldest version this may upgrade FROM; '*' = any */
   char cpu[256];     /* CPU features it needs, "-" = none (column 10)   */
   unsigned long long size; /* archive + unpacked bytes (column 11), 0 = unknown */
+  char libc_min[16]; /* a gnu row's minimum glibc (column 12), "-" = none */
+  char needs[512];   /* a gnu row's libraries + versions (column 13), "-" = none */
 } hub_manifest_row_t;
+
+/* Candidates manifest_candidates() keeps per version: gnu, static, src, with
+ * room for a manifest that lists more than one of a kind. */
+#define MANIFEST_CANDIDATES_MAX 8
 
 /* The variant whose tree manifest_select() is reading, for its reasons. */
 static const char *g_select_variant = NULL;
@@ -1198,36 +1269,73 @@ static const char *row_cpu_missing(const hub_manifest_row_t *r) {
   return NULL;
 }
 
-static bool row_fits_host(const hub_manifest_row_t *r) {
+/* `why` (may be NULL) says what does not fit.  A binary row with libc "any"
+ * is a static Linux build: only Linux hosts (gnu / musl) take it.  A gnu row
+ * whose libc_min is newer than this host's known glibc is skipped without a
+ * download; an unknown glibc (a static build asking) leaves it to -selftest. */
+static bool row_fits_host(const hub_manifest_row_t *r, char *why, size_t why_size) {
   char arch[32], libc[16];
   hub_update_host_arch(arch, sizeof(arch));
   hub_update_host_libc(libc, sizeof(libc));
-  if (strcmp(r->arch, "any") != 0 && strcasecmp(r->arch, arch) != 0)
+  if (why && why_size) why[0] = '\0';
+  if (strcmp(r->arch, "any") != 0 && strcasecmp(r->arch, arch) != 0) {
+    if (why) snprintf(why, why_size, "no artifact for this host arch/libc");
     return false;
-  if (strcmp(r->libc, "any") != 0 && strcasecmp(r->libc, libc) != 0)
+  }
+  bool linux_host = strcmp(libc, "gnu") == 0 || strcmp(libc, "musl") == 0;
+  bool bin = strcasecmp(r->kind, "bin") == 0;
+  if (strcmp(r->libc, "any") == 0 ? (bin && !linux_host) : strcasecmp(r->libc, libc) != 0) {
+    if (why) snprintf(why, why_size, "no artifact for this host arch/libc");
     return false;
+  }
+  const char *g = host_glibc();
+  if (bin && strcasecmp(r->libc, "gnu") == 0 && g && r->libc_min[0] && strcmp(r->libc_min, "-") != 0 &&
+      hub_update_version_cmp(g, r->libc_min) < 0) {
+    if (why) snprintf(why, why_size, "this host's glibc %s is older than the gnu build's %s", g, r->libc_min);
+    return false;
+  }
+  /* Column 13: every library the gnu build needs, with the versions it
+   * requires, present here — read from the host's own files, nothing
+   * downloaded (plan §4a). */
+  char miss[320];
+  if (bin && strcmp(r->libc, "any") != 0 && !en_check(r->needs, miss, sizeof(miss))) {
+    if (why) snprintf(why, why_size, "the gnu build needs %s", miss);
+    return false;
+  }
   return true;
 }
 
-/* Choose the artifact for `version`: a usable prebuilt binary for this host
- * wins, otherwise a source tarball.  `manifest` is consumed (strtok_r), and
- * `reason` explains an empty result.
+/* A candidate's rank: the host's own libc's build first (gnu: distro-patched
+ * shared libraries), then the static Linux build, then source. */
+static int row_rank(const hub_manifest_row_t *r) {
+  if (strcasecmp(r->kind, "bin") != 0) return 2;
+  return strcmp(r->libc, "any") == 0 ? 1 : 0;
+}
+
+/* What a candidate is called in logs: gnu, static or src. */
+static const char *row_label(const hub_manifest_row_t *r) {
+  int k = row_rank(r);
+  return k == 0 ? "gnu" : k == 1 ? "static" : "src";
+}
+
+/* Every artifact for `version` this host can take, best first (row_rank: the
+ * host's own libc's build, the static build, source; manifest order within a
+ * rank) into rows[0..max).  `manifest` is consumed (strtok_r), and `reason`
+ * explains an empty result.  The caller tries them in turn: the first whose
+ * download, hash and -selftest pass is installed (plan §2).
  *
  * Build dependencies are NOT checked here as the bot's updater does: the hub
  * has no dependency prober, and a source build that cannot compile fails in
- * the upgrade script, which restores the retained binary — see
+ * the stage or the upgrade script, which restores the retained binary — see
  * write_upgrade_script. */
-static bool manifest_select(char *manifest, const char *version,
-                            hub_manifest_row_t *out, char *reason,
-                            size_t reason_size) {
-  bool have_pick = false;
+static int manifest_candidates(char *manifest, const char *version, hub_manifest_row_t *rows,
+                               int max, char *reason, size_t reason_size) {
+  int n = 0;
   snprintf(reason, reason_size, "requested version is not in the manifest");
-
   char *saveptr = NULL;
   for (char *line = strtok_r(manifest, "\n", &saveptr); line;
        line = strtok_r(NULL, "\n", &saveptr)) {
     if (line[0] == '#' || line[0] == '\0') continue;
-
     hub_manifest_row_t row;
     memset(&row, 0, sizeof(row));
     char date[64];
@@ -1236,18 +1344,20 @@ static bool manifest_select(char *manifest, const char *version,
     snprintf(row.libc, sizeof(row.libc), "any");
     snprintf(row.min_from, sizeof(row.min_from), "*");
     snprintf(row.cpu, sizeof(row.cpu), "-");
-    int n = sscanf(line, "%63s %63s %511s %127s %255s %7s %31s %15s %63s %255s %llu",
+    snprintf(row.libc_min, sizeof(row.libc_min), "-");
+    snprintf(row.needs, sizeof(row.needs), "-");
+    int f = sscanf(line, "%63s %63s %511s %127s %255s %7s %31s %15s %63s %255s %llu %15s %511s",
                    row.version, date, row.url, row.hash, row.deps, row.kind,
-                   row.arch, row.libc, row.min_from, row.cpu, &row.size);
-    if (n < 5) continue;
+                   row.arch, row.libc, row.min_from, row.cpu, &row.size, row.libc_min, row.needs);
+    if (f < 5) continue;
     if (!version_eq(row.version, version)) continue;
-
     if (!validate_url(row.url)) {
       snprintf(reason, reason_size, "untrusted artifact URL in manifest");
       continue;
     }
-    if (!row_fits_host(&row)) {
-      snprintf(reason, reason_size, "no artifact for this host arch/libc");
+    char nofit[400];
+    if (!row_fits_host(&row, nofit, sizeof(nofit))) {
+      snprintf(reason, reason_size, "%s", nofit);
       continue;
     }
     const char *lacks = row_cpu_missing(&row);
@@ -1263,12 +1373,28 @@ static bool manifest_select(char *manifest, const char *version,
                row.min_from);
       continue;
     }
-    *out = row;
-    have_pick = true;
-    if (strcasecmp(row.kind, "bin") == 0) break;
+    if (n >= max) continue;
+    /* Insert after every row of the same or a better rank (stable). */
+    int at = n;
+    while (at > 0 && row_rank(&rows[at - 1]) > row_rank(&row)) {
+      rows[at] = rows[at - 1];
+      at--;
+    }
+    rows[at] = row;
+    n++;
   }
-  if (have_pick) reason[0] = '\0';
-  return have_pick;
+  if (n) reason[0] = '\0';
+  return n;
+}
+
+/* The best candidate alone (the checks that only need to know one fits). */
+static bool manifest_select(char *manifest, const char *version,
+                            hub_manifest_row_t *out, char *reason,
+                            size_t reason_size) {
+  hub_manifest_row_t rows[MANIFEST_CANDIDATES_MAX];
+  int n = manifest_candidates(manifest, version, rows, MANIFEST_CANDIDATES_MAX, reason, reason_size);
+  if (n > 0) *out = rows[0];
+  return n > 0;
 }
 
 /* The checks that need no network: version order, variant, min_from and the
@@ -1651,7 +1777,6 @@ static bool copy_file(const char *src, const char *dst, mode_t mode) {
  * down when the stage is stopped. */
 static volatile sig_atomic_t g_build_pgid = 0;
 
-static int run_bounded(const char *const argv[], int timeout_s, char *out, size_t out_size);
 
 static pid_t g_stage_pid = 0;
 static char g_stage_id[64] = "", g_stage_ver[64] = "";
@@ -1782,41 +1907,35 @@ static void stage_fail(const char *code, const char *note) {
 }
 
 /* The whole job, in the child. */
-static void stage_child(const char *ver, const char *variant, const char *exe) {
-  (void)exe;
-  char why[320] = "";
-  /* A run names no variant unless the admin chose one: this host's own, as at PREPARE. */
-  if (!variant || !variant[0]) variant = hub_update_host_variant();
-  stage_say("fetching", "", "");
-  char tree[600];
-  if (!release_tree(variant, tree, sizeof(tree))) stage_fail("net", "rejected malformed manifest base or variant");
-  const char *verr = NULL;
-  char *manifest = fetch_verified_manifest(tree, &verr);
-  if (!manifest) {
-    const char *t = verr ? verr : "manifest fetch failed";
-    stage_fail(strstr(t, "signature") ? "sig" : "net", t);
-  }
-  hub_manifest_row_t row;
-  memset(&row, 0, sizeof(row));
-  g_select_variant = variant;
-  bool picked = manifest_select(manifest, ver, &row, why, sizeof(why));
-  free(manifest);
-  if (!picked) stage_fail("build", why[0] ? why : "no usable artifact");
-  bool is_bin = strcasecmp(row.kind, "bin") == 0;
+/* One candidate, in the stage child: fetch, verify, unpack, build (source),
+ * -selftest, and keep it as STAGE_DIR/new.  False with *code / why on any
+ * failure, after removing what it laid down, so the next candidate starts
+ * clean. */
+static bool stage_one(const hub_manifest_row_t *row, const char **code, char *why, size_t why_size) {
+  bool is_bin = strcasecmp(row->kind, "bin") == 0;
   const char *archive = STAGE_DIR "/archive.tar.gz";
-  g_stage_fetching = true;
-  bool fetched = download_file(row.url, archive);
-  g_stage_fetching = false;
-  if (!fetched) stage_fail("net", "artifact download failed");
-  stage_say("verifying", is_bin ? "bin" : "src", "");
-  if (!verify_sha256(archive, row.hash)) stage_fail("hash", "artifact SHA-256 mismatch");
   const char *bdir = STAGE_DIR "/build";
-  if (mkdir(bdir, 0700) != 0) stage_fail("dir", "could not make the build directory");
+  const char *rmb[] = {"/bin/rm", "-rf", bdir, archive, NULL};
+  run_bounded(rmb, 60, NULL, 0);
+#define STAGE_NO(c, ...)                         \
+  do {                                           \
+    *code = (c);                                 \
+    snprintf(why, why_size, __VA_ARGS__);        \
+    run_bounded(rmb, 60, NULL, 0);               \
+    return false;                                \
+  } while (0)
+  g_stage_fetching = true;
+  bool fetched = download_file(row->url, archive);
+  g_stage_fetching = false;
+  if (!fetched) STAGE_NO("net", "artifact download failed");
+  stage_say("verifying", is_bin ? "bin" : "src", "");
+  if (!verify_sha256(archive, row->hash)) STAGE_NO("hash", "artifact SHA-256 mismatch");
+  if (mkdir(bdir, 0700) != 0) STAGE_NO("dir", "could not make the build directory");
   char out[256] = "";
   const char *tar[] = {"/bin/tar", "-xzf", archive, "--strip-components=1", "-C", bdir, NULL};
   if (access("/bin/tar", X_OK) != 0) tar[0] = "/usr/bin/tar";
   if (run_bounded(tar, 120, out, sizeof(out)) != 0)
-    stage_fail("archive", "could not unpack the artifact");
+    STAGE_NO("archive", "could not unpack the artifact");
   char bin[256];
   snprintf(bin, sizeof(bin), "%s/irchub", bdir);
   if (!is_bin) {
@@ -1836,27 +1955,68 @@ static void stage_child(const char *ver, const char *variant, const char *exe) {
       if (access(bin, F_OK) != 0) snprintf(bin, sizeof(bin), "%s/irchub", bdir);
     }
     g_stage_build = NULL;
-    if (rc < 0) stage_fail("build", "the build ran past its limit");
-    if (rc != 0 || access(bin, F_OK) != 0) {
-      snprintf(why, sizeof(why), "the build failed: %.200s", out);
-      stage_fail("build", why);
-    }
+    if (rc < 0) STAGE_NO("build", "the build ran past its limit");
+    if (rc != 0 || access(bin, F_OK) != 0) STAGE_NO("build", "the build failed: %.200s", out);
   }
-  if (access(bin, F_OK) != 0) stage_fail("archive", "the artifact holds no irchub binary");
+  if (access(bin, F_OK) != 0) STAGE_NO("archive", "the artifact holds no irchub binary");
   (void)chmod(bin, 0700);
   stage_say("testing", is_bin ? "bin" : "src", "");
   const char *st[] = {bin, "-selftest", NULL};
   int rc = run_bounded(st, UPGRADE_SELFTEST_SECS, out, sizeof(out));
-  if (rc != 0) {
-    snprintf(why, sizeof(why), "new build failed its selftest: %.200s",
+  if (rc != 0)
+    STAGE_NO("selftest", "new build failed its selftest: %.200s",
              out[0] ? out : (rc < 0 ? "timed out" : "it exited with an error"));
-    stage_fail("selftest", why);
-  }
-  if (rename(bin, STAGE_DIR "/new") != 0) stage_fail("dir", "could not keep the staged build");
-  const char *rmb[] = {"/bin/rm", "-rf", bdir, archive, NULL};
+  if (rename(bin, STAGE_DIR "/new") != 0) STAGE_NO("dir", "could not keep the staged build");
+#undef STAGE_NO
   run_bounded(rmb, 60, NULL, 0);
-  stage_say("staged", is_bin ? "bin" : "src", "");
-  _exit(0);
+  return true;
+}
+
+/* The whole job, in the child: every candidate in turn (gnu, static, src —
+ * plan docs/plans/2026-11-20_artifact_choice_plan.md §2) until one builds
+ * and passes its -selftest here. */
+static void stage_child(const char *ver, const char *variant, const char *exe) {
+  (void)exe;
+  char why[320] = "";
+  /* A run names no variant unless the admin chose one: this host's own, as at PREPARE. */
+  if (!variant || !variant[0]) variant = hub_update_host_variant();
+  stage_say("fetching", "", "");
+  char tree[600];
+  if (!release_tree(variant, tree, sizeof(tree))) stage_fail("net", "rejected malformed manifest base or variant");
+  const char *verr = NULL;
+  char *manifest = fetch_verified_manifest(tree, &verr);
+  if (!manifest) {
+    const char *t = verr ? verr : "manifest fetch failed";
+    stage_fail(strstr(t, "signature") ? "sig" : "net", t);
+  }
+  hub_manifest_row_t rows[MANIFEST_CANDIDATES_MAX];
+  g_select_variant = variant;
+  int n = manifest_candidates(manifest, ver, rows, MANIFEST_CANDIDATES_MAX, why, sizeof(why));
+  free(manifest);
+  if (n <= 0) stage_fail("build", why[0] ? why : "no usable artifact");
+  const char *code = "build";
+  /* What failed before the build that is staged: the "staged" note carries
+   * it ("static; the gnu build: <why>"), since the "trying" notes in between
+   * can be overwritten before the daemon reads them.  As ircbot. */
+  char fell[192] = "";
+  for (int i = 0; i < n; i++) {
+    if (stage_one(&rows[i], &code, why, sizeof(why))) {
+      char note[sizeof(fell) + 8];
+      snprintf(note, sizeof(note), "%s%s", row_label(&rows[i]), fell);
+      stage_say("staged", strcasecmp(rows[i].kind, "bin") == 0 ? "bin" : "src", note);
+      _exit(0);
+    }
+    if (i + 1 < n) {
+      char note[400];
+      snprintf(note, sizeof(note), "the %s build: %.300s; trying the %s build", row_label(&rows[i]),
+               why, row_label(&rows[i + 1]));
+      stage_say("fetching", "", note);
+      size_t used = strlen(fell);
+      if (used + 1 < sizeof(fell))
+        snprintf(fell + used, sizeof(fell) - used, "; the %s build: %.120s", row_label(&rows[i]), why);
+    }
+  }
+  stage_fail(code, why);
 }
 
 /* The stage child's SIGTERM (a stop, or the daemon's death): the build's group
@@ -2375,60 +2535,70 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
   }
 
   static char pick_why[320];
+  hub_manifest_row_t cands[MANIFEST_CANDIDATES_MAX];
   g_select_variant = want_variant;
-  bool picked = manifest_select(manifest, target_ver, &row, pick_why,
-                                sizeof(pick_why));
+  int nc = manifest_candidates(manifest, target_ver, cands, MANIFEST_CANDIDATES_MAX, pick_why,
+                               sizeof(pick_why));
   g_select_variant = NULL;
   free(manifest);
-  if (!picked) {
+  if (nc <= 0) {
     *err = pick_why[0] ? pick_why : "no usable artifact";
     return false;
   }
-
-  const char *slash = strrchr(row.url, '/');
-  if (!sanitize_filename(slash ? slash + 1 : "irchub.tar.gz", archive,
-                         sizeof(archive))) {
-    *err = "artifact filename in manifest is not acceptable";
-    return false;
-  }
-
-  /* Every release artifact is named "<product>-…tar.gz" (see the releases
-   * repo README).  A base override that names the OTHER product's tree would
-   * otherwise hand this daemon the wrong binary and install it over itself —
-   * fail closed here instead, where nothing has been downloaded yet. */
-  if (strncmp(archive, "irchub-", 7) != 0) {
-    *err = "manifest artifact is not a irchub release";
-    return false;
-  }
-
-  hub_log_info("[UPGRADE] Fetching %s artifact %s\n", row.kind, archive);
-  if (!download_file(row.url, archive)) {
-    *err = "artifact download failed";
-    return false;
-  }
-  if (!verify_sha256(archive, row.hash)) {
-    remove(archive);
-    *err = "artifact SHA-256 mismatch";
-    return false;
-  }
-
-  /* Run the NEW binary's -selftest before anything is swapped: CPU, libraries
-   * and this very config, checked by the build that would have to run on
-   * them; a source build is checked by the script.  A target older than
-   * MESH_MIN_VERSION would be refused by every peer and bot. */
+  /* A target older than MESH_MIN_VERSION would be refused by every peer and bot. */
   if (hub_update_version_cmp(target_ver, MESH_MIN_VERSION) < 0) {
-    remove(archive);
     *err = "target predates " MESH_MIN_VERSION ", the oldest the mesh links with";
     return false;
   }
-  if (strcasecmp(row.kind, "bin") == 0) {
-    static char st_err[320];
-    if (!staged_selftest(archive, st_err, sizeof(st_err))) {
-      remove(archive);
-      *err = st_err;
+
+  /* Every candidate in turn, best first (gnu, static, src: plan
+   * docs/plans/2026-11-20_artifact_choice_plan.md §2): the first whose
+   * download, hash and -selftest pass is the one.  A source build is checked
+   * by the script. */
+  static char last_err[400];
+  bool have = false;
+  for (int ci = 0; ci < nc && !have; ci++) {
+    row = cands[ci];
+    const char *slash = strrchr(row.url, '/');
+    if (!sanitize_filename(slash ? slash + 1 : "irchub.tar.gz", archive,
+                           sizeof(archive))) {
+      *err = "artifact filename in manifest is not acceptable";
       return false;
     }
-    hub_log_info("[UPGRADE] Staged %s passed its selftest\n", target_ver);
+    /* Every release artifact is named "<product>-…tar.gz" (see the releases
+     * repo README).  A base override that names the OTHER product's tree would
+     * otherwise hand this daemon the wrong binary and install it over itself —
+     * fail closed here instead, where nothing has been downloaded yet. */
+    if (strncmp(archive, "irchub-", 7) != 0) {
+      *err = "manifest artifact is not a irchub release";
+      return false;
+    }
+    hub_log_info("[UPGRADE] Fetching the %s artifact %s\n", row_label(&row), archive);
+    const char *no = NULL;
+    static char st_err[320];
+    if (!download_file(row.url, archive)) {
+      no = "artifact download failed";
+    } else if (!verify_sha256(archive, row.hash)) {
+      no = "artifact SHA-256 mismatch";
+    } else if (strcasecmp(row.kind, "bin") == 0) {
+      /* Run the NEW binary's -selftest before anything is swapped: CPU,
+       * libraries and this very config, checked by the build that would have
+       * to run on them. */
+      if (!staged_selftest(archive, st_err, sizeof(st_err))) no = st_err;
+      else hub_log_info("[UPGRADE] Staged %s (%s) passed its selftest\n", target_ver, row_label(&row));
+    }
+    if (!no) {
+      have = true;
+      break;
+    }
+    remove(archive);
+    snprintf(last_err, sizeof(last_err), "the %s build: %s", row_label(&row), no);
+    if (ci + 1 < nc)
+      hub_log_warning("[UPGRADE] %s; trying the %s build\n", last_err, row_label(&cands[ci + 1]));
+  }
+  if (!have) {
+    *err = last_err;
+    return false;
   }
   }
 

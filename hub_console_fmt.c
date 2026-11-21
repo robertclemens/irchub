@@ -1983,7 +1983,8 @@ static const char *const OPNAME[256] = {
  [0x83] = "CMD_LINK_SEQ", [0x84] = "CMD_ADMIN_KICK_USER", [0x87] = "CMD_UPGRADE_HISTORY",
  [0x88] = "CMD_UPGRADE_STAGE", [0x89] = "CMD_UPGRADE_PROGRESS", [0x8A] = "CMD_UPGRADE_PLAN",
  [0x8B] = "CMD_CRON_SET", [0x8C] = "CMD_HUB_ROLLCALL", [0x8D] = "CMD_HUB_ROLLCALL_ACK", [0x8E] = "CMD_PRESENCE2",
- [0x8F] = "CMD_BOT_TREE_DELTA", [0x90] = "CMD_BOT_TREE_PULL",
+ [0x8F] = "CMD_BOT_TREE_DELTA", [0x90] = "CMD_BOT_TREE_PULL", [0x91] = "CMD_CONFIG_DELTA",
+ [0x92] = "CMD_CFG_RESYNC", [0x93] = "CMD_ADMIN_BOT_RESYNC", [0x94] = "CMD_SYNC_DIGEST",
 };
 
 static unsigned long long rvu(const crec_t *r, const char *k) {
@@ -1996,6 +1997,20 @@ static void count_kv(sb_t *b, const char *label, unsigned long long n, int col) 
   fmt_count(n, c, sizeof(c));
   sb_pad(b, col);
   sb_addf(b, "%s  %s", label, c);
+}
+
+/* "delta share  N%" and "saved  <bytes>" for a cfg / tree stats record:
+ * the share of pushes sent as deltas, and the full bytes they stood in for
+ * less what they took. */
+static void delta_kv(sb_t *b, const crec_t *r) {
+  unsigned long long full = rvu(r, "full"), delta = rvu(r, "delta");
+  unsigned long long of = rvu(r, "delta_of"), db = rvu(r, "delta_bytes");
+  char s[32];
+  sb_pad(b, 24);
+  sb_addf(b, "delta share  %llu%%", full + delta ? delta * 100 / (full + delta) : 0);
+  fmt_bytes(of > db ? of - db : 0, s, sizeof(s));
+  sb_pad(b, 48);
+  sb_addf(b, "saved  %s", s);
 }
 
 /* The maintenance countdowns of a stats reply ("timer" records). */
@@ -2039,19 +2054,37 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
   snprintf(right, sizeof(right), "%s %s up %s", ctx->hubname && *ctx->hubname ? ctx->hubname : "hub",
            GL(G_DOT), up);
   fmt_title(ctx, out, "Hub statistics", right);
-  const crec_t *cfg = NULL, *sy = NULL, *ld = NULL, *p2 = NULL;
+  const crec_t *cfg = NULL, *sy = NULL, *ld = NULL, *p2 = NULL, *tr = NULL;
   for (int i = 0; i < rep->n; i++) {
     if (!strcmp(rep->r[i].type, "cfg")) cfg = &rep->r[i];
+    if (!strcmp(rep->r[i].type, "tree")) tr = &rep->r[i];
     if (!strcmp(rep->r[i].type, "sync")) sy = &rep->r[i];
     if (!strcmp(rep->r[i].type, "p2")) p2 = &rep->r[i];
     if (!strcmp(rep->r[i].type, "load")) ld = &rep->r[i];
   }
   sb_t b = {0};
   if (cfg) {
+    /* A 2.5.3 hub answers sent= (all full) and no delta or pull. */
     line(out, RL_HEAD, " Config pushes to bots");
-    count_kv(&b, "  sent", rvu(cfg, "sent"), 0);
-    count_kv(&b, "skipped (unchanged)", rvu(cfg, "same"), 24);
-    count_kv(&b, "lost", rvu(cfg, "lost"), 56);
+    count_kv(&b, "  full", rv(cfg, "full") ? rvu(cfg, "full") : rvu(cfg, "sent"), 0);
+    count_kv(&b, "delta", rvu(cfg, "delta"), 24);
+    count_kv(&b, "skipped (unchanged)", rvu(cfg, "same"), 40);
+    count_kv(&b, "lost", rvu(cfg, "lost"), 72);
+    sb_emit(&b, out, RL_NORMAL);
+    if (rv(cfg, "delta")) {
+      count_kv(&b, "  pulls", rvu(cfg, "pull"), 0);
+      delta_kv(&b, cfg);
+      sb_emit(&b, out, RL_NORMAL);
+    }
+  }
+  if (tr) {
+    line(out, RL_HEAD, " Bot tree pushes");
+    count_kv(&b, "  full", rvu(tr, "full"), 0);
+    count_kv(&b, "delta", rvu(tr, "delta"), 24);
+    count_kv(&b, "pulls", rvu(tr, "pull"), 40);
+    sb_emit(&b, out, RL_NORMAL);
+    sb_addf(&b, " ");
+    delta_kv(&b, tr);
     sb_emit(&b, out, RL_NORMAL);
   }
   if (sy) {
@@ -2061,10 +2094,21 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
     count_kv(&b, "records", rvu(sy, "records"), 40);
     count_kv(&b, "applied", rvu(sy, "applied"), 60);
     sb_emit(&b, out, RL_NORMAL);
+    if (rv(sy, "digests")) {
+      /* 2.5.4 hash-first rounds: sent, received, nothing to repair, kinds
+       * exchanged, whole-state fallbacks. */
+      count_kv(&b, "  digests", rvu(sy, "digests"), 0);
+      count_kv(&b, "received", rvu(sy, "digests_in"), 24);
+      count_kv(&b, "matched", rvu(sy, "matched"), 40);
+      count_kv(&b, "repaired", rvu(sy, "repaired"), 60);
+      count_kv(&b, "fallbacks", rvu(sy, "fallbacks"), 80);
+      sb_emit(&b, out, RL_NORMAL);
+    }
   }
   if (p2) {
-    line(out, RL_HEAD, rvi(p2, "ready", 0) ? " Presence v2 (every hub on it)"
-                                           : " Presence v2 (older hub in the mesh)");
+    /* Not ready: a linked hub's first record is not in yet (every hub runs v2). */
+    line(out, RL_HEAD, rvi(p2, "ready", 0) ? " Presence v2"
+                                           : " Presence v2 (waiting for a hub's record)");
     count_kv(&b, "  deltas", rvu(p2, "deltas"), 0);
     count_kv(&b, "snapshots", rvu(p2, "snaps"), 24);
     count_kv(&b, "held", rvu(p2, "held"), 40);
@@ -3948,6 +3992,25 @@ static void render_bot_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
              uuid, s, rv(r, "ip") ? rv(r, "ip") : "?");
     fmt_ok(ctx, "Bot disconnected", subj, out);
     effect(ctx, out, "it reconnects by itself; use bot del to remove it for good");
+  } else if (!strcmp(code, "bot.resync")) {
+    long long here = rvi(r, "here", 0), hubs = rvi(r, "hubs", 0);
+    char e[192];
+    if (!strcmp(uuid, "all")) {
+      fmt_ok(ctx, "Full config queued", "every bot", out);
+      snprintf(e, sizeof(e), "%lld bot%s on this hub now; %lld other hub%s asked to do the same", here,
+               here == 1 ? "" : "s", hubs, hubs == 1 ? "" : "s");
+    } else {
+      snprintf(subj, sizeof(subj), "%s  %s", rv(r, "nick") ? rv(r, "nick") : "?", uuid);
+      fmt_ok(ctx, "Full config queued", subj, out);
+      if (here)
+        snprintf(e, sizeof(e), "it is connected to this hub: sent now");
+      else if (hubs)
+        snprintf(e, sizeof(e), "it is not on this hub: %lld other hub%s asked to send it", hubs,
+                 hubs == 1 ? "" : "s");
+      else
+        snprintf(e, sizeof(e), "it is not on this hub, and no other hub is linked to ask");
+    }
+    effect(ctx, out, e);
   } else if (!strcmp(code, "bot.rekey_howto")) {
     const char *nick = rvs(r, "nick") ? rv(r, "nick") : uuid;
     bool on = rvb(r, "online");

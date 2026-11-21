@@ -325,6 +325,7 @@ void hub_disconnect_client(hub_state_t *state, hub_client_t *c) {
     secure_wipe(c->bot_eph_x25519_priv, sizeof(c->bot_eph_x25519_priv));
     c->bot_eph_priv_set = false;
     if (c->recv_buf) secure_wipe(c->recv_buf, (size_t)c->recv_len);
+    hub_cfg_delta_release(c); /* the bot's config texts (S and the queued one) */
     /* Free per-peer outbound queues + in-flight ciphertext.  Done after the
      * fd is closed so no drain attempts can race. */
     peer_queue_destroy(c);
@@ -511,8 +512,8 @@ static void hub_peer_handshake(hub_state_t *state, hub_client_t *c,
 /* Queued like every frame after the handshake: a ping sent straight to the
  * socket landed inside a part-sent sync frame and broke the link. */
 static bool send_ping(hub_state_t *state, hub_client_t *c) {
-    char tp[32]; /* a bot's ping carries its tree hash (hub_tree_ping_payload) */
-    hub_tree_ping_payload(state, c, tp, sizeof(tp));
+    char tp[128]; /* a bot's ping carries its tree and config hashes (hub_bot_ping_payload) */
+    hub_bot_ping_payload(state, c, tp, sizeof(tp));
     return hub_client_send(state, c, CMD_PING, tp[0] ? tp : NULL);
 }
 
@@ -565,7 +566,7 @@ static void hub_maintenance(hub_state_t *state) {
             char *full_sync = malloc(MAX_SYNC_PAYLOAD);
             if (full_sync) {
                 hub_generate_sync_packet(state, full_sync, MAX_SYNC_PAYLOAD);
-                hub_broadcast_sync_to_peers(state, full_sync, -1);
+                hub_anti_entropy_round(state, full_sync);
                 free(full_sync);
             } else {
                 hub_log_error("[MESH] OOM building anti-entropy sync\n");

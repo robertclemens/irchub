@@ -993,13 +993,13 @@ bool hub_p2_hub_gone(const hub_state_t *state, const char *uuid) {
 }
 
 /* phase 3: a link whose keepalive is the 15 s digest rather than pings — a
- * connected configured peer that has sent us a v2 record, so both ends run v2
- * and exchange `H` every P2_DIGEST_MS.  Its liveness is the digest; it is
- * pinged no more and dropped after P2_LINK_TIMEOUT unheard.  A bot, an
- * older peer that has not spoken v2, and an unconfigured inbound hub are not
- * such links and keep today's ping and CLIENT_TIMEOUT. */
+ * connected configured peer: every hub the mesh admits (MESH_MIN_VERSION
+ * 2.5.3) runs v2 and sends `H` every P2_DIGEST_MS from link-up.  Its liveness
+ * is the digest; it is pinged no more and dropped after P2_LINK_TIMEOUT
+ * unheard.  A bot and an unconfigured inbound hub are not such links and keep
+ * the ping and CLIENT_TIMEOUT. */
 bool hub_p2_digest_keepalive(const hub_state_t *state, const hub_client_t *c) {
-  if (!c || c->type != CLIENT_HUB || !c->authenticated || !c->p2_seen) return false;
+  if (!c || c->type != CLIENT_HUB || !c->authenticated) return false;
   for (int p = 0; p < state->peer_count; p++)
     if (state->peers[p].connected && state->peers[p].fd == c->fd) return true;
   return false;

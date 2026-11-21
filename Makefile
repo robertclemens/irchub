@@ -27,7 +27,7 @@ OBJ_DIR = $(BUILD_DIR)/obj
 
 # Source files
 # One line: tools (the testnet) read this variable with a single-line match.
-HUB_SOURCES = hub_main.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_access.c hub_revoke.c hub_uhist.c hub_presence2.c hub_modes.c hub_connlimits.c glob_overlap.c hub_update.c hub_reply.c hub_console.c hub_console_ui.c hub_console_fmt.c hub_console_core.c
+HUB_SOURCES = hub_main.c cfg_delta.c sync_digest.c elf_needs.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_access.c hub_revoke.c hub_uhist.c hub_presence2.c hub_modes.c hub_connlimits.c glob_overlap.c hub_update.c hub_reply.c hub_console.c hub_console_ui.c hub_console_fmt.c hub_console_core.c
 
 # Object files
 HUB_OBJECTS = $(HUB_SOURCES:%.c=$(OBJ_DIR)/%.o)
@@ -109,7 +109,14 @@ LIBSSH_CMAKE   = -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
                  -DWITH_SERVER=ON -DWITH_SFTP=OFF -DWITH_GSSAPI=OFF -DWITH_ZLIB=OFF \
                  -DWITH_PCAP=OFF -DWITH_EXAMPLES=OFF -DWITH_NACL=OFF -DWITH_GEX=OFF \
                  -DWITH_EXEC=OFF -DWITH_DEBUG_CALLTRACE=OFF -DWITH_SYMBOL_VERSIONING=OFF \
-                 -DWITH_PKCS11_URI=OFF -DWITH_FIDO2=OFF -DUNIT_TESTING=OFF
+                 -DWITH_PKCS11_URI=OFF -DWITH_FIDO2=OFF -DUNIT_TESTING=OFF \
+                 -DWITH_PKCS11_PROVIDER=OFF -DWITH_BLOWFISH_CIPHER=OFF -DWITH_INSECURE_NONE=OFF \
+                 -DWITH_DEBUG_CRYPTO=OFF -DWITH_DEBUG_PACKET=OFF -DWITH_GCRYPT=OFF -DWITH_MBEDTLS=OFF \
+                 -DWITH_INTERNAL_DOC=OFF -DCLIENT_TESTING=OFF -DSERVER_TESTING=OFF -DGSSAPI_TESTING=OFF \
+                 -DWITH_BENCHMARKS=OFF -DFUZZ_TESTING=OFF -DWITH_ABI_BREAK=OFF -DWITH_HERMETIC_USR=OFF \
+                 -DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections"
+# Every libssh option is set here, the ones off by default too: a later
+# libssh that turned one of them on by default would otherwise build it in.
 # -isystem: the pinned libssh headers are third-party code, outside the
 # warning set this tree is held to.
 INCLUDES += -isystem $(LIBSSH_PREFIX)/include
@@ -117,6 +124,19 @@ HUB_LIBS = $(LIBSSH_LIB) $(LIBS)
 
 # Linker flags
 LDFLAGS =
+
+# Only code that is used ends up in the binary: every function and object in
+# a section of its own, and the linker drops each section nothing references
+# — ours, and the objects it pulls from static libraries.  Its own variable,
+# on the link line itself, so a release build that sets LDFLAGS / LIBS on the
+# command line (tools/relcommon.py) keeps it.  macOS's linker calls it
+# -dead_strip.
+CFLAGS += -ffunction-sections -fdata-sections
+ifeq ($(UNAME_S),Darwin)
+GC_LDFLAGS = -Wl,-dead_strip
+else
+GC_LDFLAGS = -Wl,--gc-sections
+endif
 
 # Ports install third-party libs under /usr/local on the BSDs.
 ifneq ($(UNAME_S),Linux)
@@ -202,7 +222,7 @@ check-openssl:
 
 $(HUB_TARGET): $(HUB_OBJECTS) $(LIBSSH_LIB)
 	@echo "Linking $@..."
-	@$(CC) $(LDFLAGS) -o $@ $(HUB_OBJECTS) $(HUB_LIBS)
+	@$(CC) $(LDFLAGS) $(GC_LDFLAGS) -o $@ $(HUB_OBJECTS) $(HUB_LIBS)
 	@echo "Built: $@ (mode: $(BUILD_MODE))"
 	@echo ""
 
@@ -250,7 +270,7 @@ $(OBJ_DIR)/bcrypt_pbkdf.o: bcrypt_pbkdf.c bcrypt_pbkdf.h
 # Object Files
 # ============================================================================
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c hub.h
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c hub.h cfg_delta.h sync_digest.h elf_needs.h
 	@echo "Compiling $<..."
 	@$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 

@@ -71,9 +71,11 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define BOT_PROTO_USER_FLAGS 3
 /* The oldest bot or hub this hub links with (2.5.1 plan D1 / D4): a bot's
  * CMD_BOT_PRESENCE or a direct peer's roster header below it drops the link
- * with a "upgrade it by hand" line.  2.5.2 raised it to 2.5.1: every node
- * reads only PBKDF2 600k files, reports K|, and has dropped .pass.prev. */
-#define MESH_MIN_VERSION "2.5.1"
+ * with a "upgrade it by hand" line.  2.5.2 raised it to 2.5.1 (every node
+ * reads only PBKDF2 600k files, reports K|, and has dropped .pass.prev);
+ * 2.5.4 to 2.5.3: every node speaks the sequenced link framing, presence v2
+ * and the hub roll call, and every bot takes tree deltas. */
+#define MESH_MIN_VERSION "2.5.3"
 #define KEY_FP_LEN 19              /* "ab12:cd34:ef56:7890" */
 #define HUB_PID_FILE ".irchub.pid"
 #define HUB_PASS_FILE ".irchub.pass"
@@ -170,7 +172,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * the Makefile; -D-overridable so a release build can stamp its own version
  * without editing the tree (mirrors BOT_VERSION in ircbot/bot.h). */
 #ifndef HUB_VERSION
-#define HUB_VERSION "2.5.3"
+#define HUB_VERSION "2.5.4"
 #endif
 
 /* Signed-release channel for the hub (irchub-releases).  Same Ed25519 key as
@@ -518,9 +520,8 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * endian, from 0, not sent).  The counter makes a replayed or reordered
  * frame fail its tag, the direction byte a reflected one (H hub->bot, B
  * bot->hub; between hubs L from the lower uuid, G from the greater).  A
- * 2.5.1 node ignores the offer and the link keeps the old framing; one that
- * says it is HUB_LINK_SEQ_VERSION or newer without having offered is dropped
- * (a stripped offer).  2.5.3 drops the old framing. */
+ * node that names its version without having offered is dropped (a stripped
+ * offer): every node the mesh admits (MESH_MIN_VERSION) offers. */
 #define CMD_LINK_SEQ           0x83
 /* channel kick (2.5.3): console -> hub "nick|#chan|reason"; one elected bot
  * kicks (CMD_CHAN_PROBE kind "kick", the reason riding the hostmask slot). */
@@ -545,11 +546,9 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * missing.  An unanswered ACK can only make the gate refuse, never pass it.
  *   ROLLCALL      hub->hub  rid|origin_uuid|origin_ts
  *   ROLLCALL_ACK  hub->hub  rid|hub_uuid
- * Hub <-> hub only.  A hub that can answer says so with a k|rollcall line in
- * its roster gossip (older hubs skip a line they do not know).  While any hub
- * known here has not said so, the gate keeps to the gossip it used before: an
- * older hub neither answers nor passes the probe on, and refusing every start
- * would leave the mesh unable to upgrade it. */
+ * Hub <-> hub only.  Every hub the mesh admits answers (MESH_MIN_VERSION
+ * 2.5.3); each still says so with a k|rollcall line in its roster gossip, which
+ * a 2.5.3 hub waits for before it asks. */
 #define CMD_HUB_ROLLCALL       0x8C
 #define CMD_HUB_ROLLCALL_ACK   0x8D
 /* Presence v2 (docs/plans/2026-11-14_presence_v2_plan.md, phase 1): one
@@ -564,13 +563,46 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * pulls the whole tree.  The 300 s whole-tree refresh stays. */
 #define CMD_BOT_TREE_DELTA     0x8F  /* Hub -> Bot: <seq>|<fnv64> + +/- row ops */
 #define CMD_BOT_TREE_PULL      0x90  /* Bot -> Hub: send me the whole tree      */
+/* 2.5.4: a bot's config as a line edit of the text it holds (cfg_delta.h):
+ * "<base sha256>|<new sha256>\n" + =n / -n / +line ops.  The bot rebuilds the
+ * full text, checks both hashes and runs its full-config apply on it; any
+ * doubt is a CMD_CONFIG_PULL, answered with a full CMD_CONFIG_DATA. */
+#define CMD_CONFIG_DELTA       0x91  /* Hub -> Bot: config text delta           */
+/* `bot resync <nick|uuid|all>`: every hub queues a full config push to the
+ * named bot (or all of its bots), whatever they hold.  Hub <-> hub flood
+ * "<id>|<ts>|<bot uuid or *>", deduplicated by id (op_forward_seen) and
+ * dropped past CFG_RESYNC_TTL; the admin request carries the bot alone. */
+#define CMD_CFG_RESYNC         0x92  /* Hub <-> Hub: resync one bot or all      */
+#define CMD_ADMIN_BOT_RESYNC   0x93  /* Admin -> Hub: "<nick|uuid|all>"         */
+#define CFG_RESYNC_TTL         60
+/* 2.5.4 hash-first anti-entropy (docs/plans/2026-11-20_sync_digest_plan.md).
+ * Hub <-> hub, point-to-point, two shapes:
+ *   "v|1\n" + one "s|<kind>|<records>|<sha256hex>\n" per record kind
+ *            (kind = a sync line's first field, kinds sorted; a kind's lines
+ *            normalised — a|/o| field 5 and m| field 4, the max-merged
+ *            activity times, blanked — sorted bytewise and hashed each with
+ *            its \n): the periodic round, in place of the full state;
+ *   "r|<kind>[,<kind>...]\n" or "r|*\n": send me your records of these.
+ * The receiver of a digest pushes its own records of every kind that differs
+ * (CMD_PEER_SYNC) and pulls the sender's; both LWW-merge as for any sync.
+ * Only to a peer at SYNC_DIGEST_MIN_HUB or later; older ones keep the full
+ * round.  Every SYNC_DIGEST_FULL_EVERY-th round on a link is full anyway
+ * (2.5.4 only), and a kind still differing after SYNC_DIGEST_STUCK repaired
+ * rounds sends the whole state both ways. */
+#define CMD_SYNC_DIGEST        0x94
+#define SYNC_DIGEST_MIN_HUB    "2.5.4"
+#define SYNC_DIGEST_FULL_EVERY 6
+#define SYNC_DIGEST_STUCK      3
+#define SYNC_DIGEST_KIND_MAX   15  /* a kind's bytes (the field before the first |) */
+#define SYNC_DIGEST_KINDS_MAX  48  /* kinds per digest / pull                        */
+#define SYNC_DIGEST_MAX        (SYNC_DIGEST_KINDS_MAX * (SYNC_DIGEST_KIND_MAX + 90) + 16)
+#define SYNC_DIGEST_WARN_EVERY 3600
 #define ROLLCALL_WAIT          3   /* seconds the asking hub waits for the answers */
 #define ROLLCALL_TTL           30  /* a relayed roll call older than this is dropped */
 #define ROLLCALL_KEEP          10  /* seconds a relay routes the answers back */
 #define MAX_ROLLCALLS          16  /* in flight here, asked or relayed */
 #define ROLLCALL_ID_LEN        33  /* 16 random bytes in hex + NUL */
 #define HUB_LINK_AAD_LEN 13
-#define HUB_LINK_SEQ_VERSION "2.5.2"
 /* Review 7: ephemeral keys of the HUBv3 hellos accepted in the last
  * HELLO_SEEN_SECS (the hello's freshness window); a repeat is a replay. */
 #define HELLO_SEEN_MAX  128
@@ -673,7 +705,13 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 /* Admin -> Hub: this hub's traffic counters since it started (read-only,
  * empty payload).  Reply lines, zero rows left out:
  *   stats|up=<s>
- *   cfg|sent=<n>|same=<n>|lost=<n>        full config pushes to bots
+ *   cfg|full=<n>|full_bytes=<n>|delta=<n>|delta_bytes=<n>|delta_of=<n>|same=<n>|lost=<n>|pull=<n>
+ *                                          config pushes to bots (a 2.5.3 hub
+ *                                          sends sent= for full and no delta)
+ *   tree|full=<n>|full_bytes=<n>|delta=<n>|delta_bytes=<n>|delta_of=<n>|pull=<n>
+ *                                          (delta_of: the full bytes the deltas
+ *                                          replaced; saved = delta_of - delta_bytes)
+ *                                          bot tree pushes (2.5.4)
  *   sync|frames=<n>|noop=<n>|records=<n>|applied=<n>   PEER_SYNC/BCAST in
  *   op|0x<cc>|rx=<frames>/<bytes>|tx=<frames>/<bytes>
  * "same" = a push skipped because that bot was already sent the identical
@@ -1115,10 +1153,12 @@ typedef struct { int rep; int live; } global_ban_slot_t;
  * the config store — see the CMD_BOT_PRESENCE block near the opcodes.
  * ========================================================================== */
 #define BOT_PRESENCE_INTERVAL 60   /* how often a hub gossips its own bots   */
-#define BOT_TREE_REFRESH      300  /* whole-tree re-push to pre-delta bots    */
-/* Bots from this version apply CMD_BOT_TREE_DELTA and check the tree hash a
- * keepalive PING carries ("t|<fnv64hex>"); older ones get whole trees. */
-#define TREE_DELTA_MIN_BOT    "2.5.3"
+/* Every bot (MESH_MIN_VERSION 2.5.3) applies CMD_BOT_TREE_DELTA and checks
+ * the tree hash a keepalive PING carries ("t|<fnv64hex>"). */
+/* Bots from this version take CMD_CONFIG_DELTA and check the config hash a
+ * keepalive carries ("c|<sha256hex>", a second line after any t|); older
+ * ones get full pushes and t| alone. */
+#define CFG_DELTA_MIN_BOT     "2.5.4"
 /* Change pushes are coalesced: news from the mesh (peer gossip, links, TTL
  * expiry) reaches bots at most once per BOT_TREE_COALESCE — it is already up
  * to a gossip interval old — while a change to this hub's own bots goes out
@@ -1585,6 +1625,10 @@ typedef struct queued_msg {
   char               origin_hub_uuid[64];
   int                payload_len;
   unsigned char     *payload;            /* malloc'd plaintext */
+  /* A config push to a bot (CMD_CONFIG_DATA / CMD_CONFIG_DELTA from
+   * send_config_to_bot): written, it moves the bot's cfg_base; a PURGE line,
+   * also CMD_CONFIG_DATA, does not. */
+  bool               cfg_frame;
   struct queued_msg *next;
 } queued_msg_t;
 
@@ -1726,13 +1770,37 @@ typedef struct {
    * on overflow and whenever the bot sends a config push of its own. */
   unsigned char cfg_sent_hash[32];
   bool          cfg_sent_valid;
+  /* Config deltas (2.5.4, plan §4.3a).  cfg_base is S, the exact text this
+   * bot holds once every config frame already written to its socket is
+   * applied (NULL = unknown: the next push is full); cfg_base_hash its
+   * SHA-256, what the keepalive's c| vouches for.  cfg_next is the text the
+   * one queued config frame (cfg_queued) leaves the bot holding: at most one
+   * is queued (per-bot coalesce key), it always has base S, and a newer push
+   * replaces it with delta(S -> newer), never a delta on top of it.  When the
+   * frame is written, S := cfg_next.  A frame lost on overflow leaves S as it
+   * was and sets cfg_owed, which the next flush honours.  Both texts are
+   * wiped on replace and teardown (hub_cfg_delta_release). */
+  char         *cfg_base;
+  size_t        cfg_base_len;
+  unsigned char cfg_base_hash[32];
+  char         *cfg_next;
+  size_t        cfg_next_len;
+  bool          cfg_queued;
+  bool          cfg_owed;
+  /* Hash-first anti-entropy (CMD_SYNC_DIGEST), for a peer link: rounds sent
+   * (every SYNC_DIGEST_FULL_EVERY-th is full), the kinds that differed in
+   * consecutive rounds and how many times, and the last stuck warning. */
+  int           sd_rounds;
+  int           sd_stuck_n;
+  struct { char kind[SYNC_DIGEST_KIND_MAX + 1]; int n; } sd_stuck[SYNC_DIGEST_KINDS_MAX];
+  time_t        sd_warned;
   /* This connection has pushed its config once: the first push is answered
    * with a full config even when it changed nothing (a reconnecting bot may
    * hold a stale copy, e.g. its own old key after a rekey). */
   bool          pushed;
 
   /* SHA-256 of the last bot tree queued to this bot (CMD_BOT_TREE): a change
-   * push that would repeat it is skipped (the BOT_TREE_REFRESH one never is).
+   * push that would repeat it is skipped.
    * Cleared when a queued tree is dropped on overflow. */
   bool          tree_sent_valid;
   uint64_t      tree_sent_seq;     /* phase 5: the tree version this bot holds  */
@@ -1884,7 +1952,6 @@ typedef struct {
   long long   gen;          /* newest gossip generation seen from it      */
   uint64_t    chunks_seen;  /* chunks of `gen` already applied (bit n)    */
   time_t      reported_at;  /* local clock: drives the TTL                */
-  bool        rollcall;     /* its gossip carries k|rollcall: it answers one */
 } mesh_hub_t;
 
 /* ---- Presence v2, phases 1-2 (hub_presence2.c) ----
@@ -1977,13 +2044,29 @@ typedef struct {
 typedef struct {
   uint64_t rx_frames[256], rx_bytes[256];  /* by opcode, decrypted frames   */
   uint64_t tx_frames[256], tx_bytes[256];  /* by opcode, queued frames sent */
-  uint64_t cfg_sent;      /* full configs queued to a bot                  */
+  uint64_t cfg_full;      /* full configs queued to a bot (CMD_CONFIG_DATA) */
+  uint64_t cfg_full_bytes;
+  uint64_t cfg_delta;     /* config deltas queued (CMD_CONFIG_DELTA)        */
+  uint64_t cfg_delta_bytes;
+  uint64_t cfg_delta_of;  /* full-text bytes those deltas stood in for      */
   uint64_t cfg_same;      /* skipped: that bot already has this exact one  */
   uint64_t cfg_lost;      /* queued config dropped on lane overflow        */
+  uint64_t cfg_pull;      /* CMD_CONFIG_PULLs served (a bot's hash check)   */
+  uint64_t tree_full;     /* whole bot trees queued (CMD_BOT_TREE)          */
+  uint64_t tree_full_bytes;
+  uint64_t tree_delta;    /* tree row deltas queued (CMD_BOT_TREE_DELTA)    */
+  uint64_t tree_delta_bytes;
+  uint64_t tree_delta_of; /* whole-tree bytes those deltas stood in for     */
+  uint64_t tree_pull;     /* CMD_BOT_TREE_PULLs served                      */
   uint64_t sync_frames;   /* PEER_SYNC / PEER_BCAST frames processed       */
   uint64_t sync_noop;     /* ... of which changed nothing                  */
   uint64_t sync_records;  /* record lines in them                          */
   uint64_t sync_applied;  /* ... of which were new and applied             */
+  uint64_t sd_tx;         /* CMD_SYNC_DIGEST rounds sent (2.5.4)            */
+  uint64_t sd_rx;         /* ... received and compared                      */
+  uint64_t sd_match;      /* ... of which matched: nothing to repair        */
+  uint64_t sd_kinds;      /* kinds that differed and were exchanged         */
+  uint64_t sd_full;       /* whole-state fallbacks (stuck or malformed)     */
 } hub_stats_t;
 /* One per process (the daemon is single-threaded); defined in hub_logic.c. */
 extern hub_stats_t g_hub_stats;
@@ -2231,7 +2314,6 @@ typedef struct {
   int          roster_count;
   time_t       hub_started;        /* this hub's own uptime base           */
   time_t       last_presence_gossip;
-  time_t       last_tree_push;
   /* Phase 5: the last whole tree pushed, for row deltas.  A change sends every
    * current bot (`tree_sent_seq` == `tree_seq`) the diff from this to the new
    * tree; others get the whole tree.  FNV-1a 64 is the tree hash carried in
@@ -2736,6 +2818,10 @@ void hub_peer_enqueue_sync(hub_state_t *state, hub_client_t *c, uint8_t op, lane
                            const char *payload, const char *coalesce, uint64_t seq);
 
 void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len);
+/* One periodic anti-entropy round (2.5.4): a CMD_SYNC_DIGEST of `full` to
+ * each peer that takes one, the full state to the others and on every
+ * SYNC_DIGEST_FULL_EVERY-th round. */
+void hub_anti_entropy_round(hub_state_t *state, const char *full);
 void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
                               char *buffer, int max_len);
 void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
@@ -2788,8 +2874,8 @@ void hub_broadcast_mesh_state(hub_state_t *state);
 /* ---- Bot presence / the 'bots' tree (hub_logic.c) ----
  * hub_presence_tick drives both halves on the maintenance clock: it gossips
  * this hub's own connected bots to the peers every BOT_PRESENCE_INTERVAL and
- * pushes a refreshed tree down to the bots when the roster changed (or every
- * BOT_TREE_REFRESH regardless).  hub_roster_expire drops entries past the
+ * pushes a refreshed tree down to the bots when the roster changed (the
+ * keepalive tree hash covers a quiet mesh).  hub_roster_expire drops entries past the
  * TTL; hub_roster_mark_dirty asks for a push (`local`: one of our own bots
  * changed, pushed within BOT_TREE_COALESCE_LOCAL). */
 void hub_presence_tick(hub_state_t *state, time_t now);
@@ -2876,9 +2962,13 @@ bool hub_update_take_pending(char *id_out, size_t id_size, char *ver_out,
                              size_t variant_size);
 /* Compare two version strings, tolerating a leading 'v' on either side. */
 int hub_update_version_cmp(const char *a, const char *b);
-/* Keepalive PING payload for `c`: "t|<tree fnv64>" or "" (hub_logic.c). */
-void hub_tree_ping_payload(const hub_state_t *state, const hub_client_t *c, char *out,
-                           size_t cap);
+/* Keepalive PING payload for `c`: "t|<tree fnv64>", then for a 2.5.4+ bot
+ * "\nc|<config sha256>", either left out when not current; "" for neither
+ * (hub_logic.c).  128 bytes hold both. */
+void hub_bot_ping_payload(const hub_state_t *state, const hub_client_t *c, char *out,
+                          size_t cap);
+/* Wipe and free a client's config-delta texts (cfg_base / cfg_next). */
+void hub_cfg_delta_release(hub_client_t *c);
 /* Host capability probe answered in CMD_UPGRADE_READY. */
 void hub_update_host_arch(char *out, size_t out_size);
 void hub_update_host_libc(char *out, size_t out_size);

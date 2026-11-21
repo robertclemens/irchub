@@ -591,6 +591,7 @@ static const cmd_def_t CMDS[] = {
   {"bot", "del", CMD_ADMIN_DEL, B_ARG, 1, 0, CF_YN, PRE_BOT_DEL, NULL, "bot del <uuid|nick>", "delete a bot everywhere for good (asks y/N; wipes its config and stops it)", NULL},
   {"bot", "kick", CMD_ADMIN_DISCONNECT_BOT, B_ARG, 1, 0, CF_YN, PRE_BOT_KICK, NULL, "bot kick <uuid|nick>", "drop its connection to this hub (asks y/N; it reconnects)", NULL},
   {"bot", "rekey", CMD_ADMIN_REKEY_BOT, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot rekey <uuid>", "how to rekey a bot (only the bot can)", NULL},
+  {"bot", "resync", CMD_ADMIN_BOT_RESYNC, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot resync <uuid|nick|all>", "send a bot (or every bot) its whole config again, from whichever hub it is on", NULL},
   {"bot", "tree", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|tree", "bot tree", "every hub and bot as a tree", NULL},
   {"bot", "set", CMD_ADMIN_NET_SET, B_NET_SET, 0, 3, CF_NONE, 0, NULL, "bot set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default> | cron <global|nick|uuid> <on|off>]", "show the bot settings, or change one (every bot gets it; cron: every bot, or one until the next global)", NULL},
   {"hub", "show", CMD_ADMIN_GET_PUBKEY, B_HUB_SHOW, 0, 1, CF_NONE, 0, NULL, "hub show [#|uuid|name]", "this hub (identity, key, listener, counts), or one linked hub in detail", NULL},
@@ -672,6 +673,7 @@ static const struct {
 } CMD_FLAGS[] = {
   {"bot", "add", "b"},
   {"bot", "del", "b"},     {"bot", "kick", "b"},      {"bot", "rekey", "b"},
+  {"bot", "resync", "b"},
   {"bot", "set", "b"},
   {"hub", "add", "h"},     {"hub", "del", "h"},       {"hub", "set", "h"},
   {"hub", "sync", "h"},    {"hub", "rekey", "h"},     {"hub", "purge", "h"},
@@ -770,6 +772,11 @@ static const struct {
    "bot kick alpha\nbot kick " EX_UUID},
   {"bot", "rekey", "uuid\tthe bot's uuid; prints how to rekey it on its host",
    "bot rekey " EX_UUID},
+  {"bot", "resync", "uuid|nick|all\tthe bot's uuid or its nick (Tab completes both), or all.  "
+   "Bots are normally sent only what changed and check what they hold against the hub at each "
+   "keepalive, pulling the whole config on any mismatch; this sends it whole now, from the hub "
+   "each bot is connected to",
+   "bot resync alpha\nbot resync all"},
   {"bot", "tree", NULL, "bot tree"},
   {"bot", "set",
    "(none)\tshows every bot setting: its value, where it comes from, its default\n"
@@ -3447,6 +3454,7 @@ static const arg_comp_t ARG_COMP[] = {
   {"bot", "del", 0, CK_BOT_NICK, NULL},
   {"bot", "kick", 0, CK_BOT_ON, NULL},
   {"bot", "rekey", 0, CK_BOT, NULL},
+  {"bot", "resync", 0, CK_BOT_NICK, NULL},
   {"bot", "set", 0, CK_WORDS, "flood ignoretime sendq"},
   {"bot", "set", -1, CK_NETSET, NULL},
   {"hub", "show", 0, CK_HUB_NAME, NULL},

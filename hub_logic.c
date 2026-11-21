@@ -1,6 +1,8 @@
 #include "hub_uhist.h"
 #include "hub_console.h"
 #include "hub_reply.h"
+#include "cfg_delta.h"
+#include "sync_digest.h"
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -32,14 +34,75 @@ static void roster_evict_moved(hub_state_t *state, const char *bot_uuid,
  * malformed frame, not something to truncate silently: false, `dst` empty. */
 hub_stats_t g_hub_stats;
 
+static bool bot_takes_cfg_deltas(const hub_client_t *c);
+static int cfg_resync_local(hub_state_t *state, const char *target);
+static int cfg_resync_flood(hub_state_t *state, hub_client_t *skip, const char *payload);
+static void process_peer_cfg_resync(hub_state_t *state, hub_client_t *peer, const char *payload);
+static void process_sync_digest(hub_state_t *state, hub_client_t *peer, const char *payload);
+static void cfg_hex(const unsigned char h[32], char out[CFGD_HASH_HEX + 1]);
+
+/* Some bot's config frame was lost since the last flush (cfg_owed). */
+static bool g_cfg_owed;
+
 /* A config push that never reaches its bot must not stand as "sent", or the
- * next identical broadcast would be skipped and the bot left behind. */
+ * next identical broadcast would be skipped and the bot left behind.  Nor may
+ * it wait for the next change: the bot still holds S, which the keepalive's
+ * c| vouches for, so nothing else would notice (proto/cfgdelta model, seed
+ * 82) — it is owed, and the next flush sends it. */
 static void cfg_push_lost(hub_client_t *c, const queued_msg_t *m) {
   if (m->cmd == CMD_BOT_TREE || m->cmd == CMD_BOT_TREE_DELTA)
     c->tree_sent_valid = false; /* a tree or delta that never landed: resend whole */
-  if (m->cmd != CMD_CONFIG_DATA) return;
+  if (m->cmd != CMD_CONFIG_DATA && m->cmd != CMD_CONFIG_DELTA) return;
   c->cfg_sent_valid = false;
   g_hub_stats.cfg_lost++;
+  if (!m->cfg_frame) return;
+  if (c->cfg_next) {
+    secure_wipe(c->cfg_next, c->cfg_next_len);
+    free(c->cfg_next);
+    c->cfg_next = NULL;
+    c->cfg_next_len = 0;
+  }
+  c->cfg_queued = false;
+  c->cfg_owed = true;
+  g_cfg_owed = true;
+}
+
+/* The queued config frame went to the socket: the bot will hold its text. */
+static void cfg_frame_written(hub_client_t *c) {
+  if (!c->cfg_queued || !c->cfg_next) return;
+  if (c->cfg_base) {
+    secure_wipe(c->cfg_base, c->cfg_base_len);
+    free(c->cfg_base);
+  }
+  c->cfg_base = c->cfg_next;
+  c->cfg_base_len = c->cfg_next_len;
+  unsigned int olen = 0;
+  if (EVP_Digest(c->cfg_base, c->cfg_base_len, c->cfg_base_hash, &olen, EVP_sha256(), NULL) != 1 ||
+      olen != 32) {
+    /* No hash, no vouching for it: forget S, the next push goes out full. */
+    secure_wipe(c->cfg_base, c->cfg_base_len);
+    free(c->cfg_base);
+    c->cfg_base = NULL;
+    c->cfg_base_len = 0;
+  }
+  c->cfg_next = NULL;
+  c->cfg_next_len = 0;
+  c->cfg_queued = false;
+}
+
+void hub_cfg_delta_release(hub_client_t *c) {
+  if (!c) return;
+  if (c->cfg_base) {
+    secure_wipe(c->cfg_base, c->cfg_base_len);
+    free(c->cfg_base);
+  }
+  if (c->cfg_next) {
+    secure_wipe(c->cfg_next, c->cfg_next_len);
+    free(c->cfg_next);
+  }
+  c->cfg_base = c->cfg_next = NULL;
+  c->cfg_base_len = c->cfg_next_len = 0;
+  c->cfg_queued = c->cfg_owed = false;
 }
 
 /* Max-merge one activity time (last_seen / last_used) outside LWW.  A rise
@@ -143,6 +206,10 @@ static void queued_msg_replace_payload(queued_msg_t *dst, queued_msg_t *src) {
   dst->payload     = src->payload;
   dst->payload_len = src->payload_len;
   dst->lamport_seq = src->lamport_seq;
+  /* The newer frame wins whole: a queued full config may be replaced by a
+   * delta or the other way round (same per-bot key). */
+  dst->cmd         = src->cmd;
+  dst->cfg_frame   = src->cfg_frame;
   /* Origin hub may differ if a peer's update overwrote a local-origin one;
    * the new origin "wins" because newer seq belongs to it. */
   snprintf(dst->origin_hub_uuid, sizeof(dst->origin_hub_uuid),
@@ -428,6 +495,7 @@ void peer_drain_writable(hub_state_t *state, hub_client_t *peer) {
       }
       g_hub_stats.tx_frames[m->cmd]++;
       g_hub_stats.tx_bytes[m->cmd] += (uint64_t)wire_len;
+      if (m->cfg_frame) cfg_frame_written(peer);
       queued_msg_free(m);
       peer->writing_len    = wire_len;
       peer->writing_offset = 0;
@@ -2356,10 +2424,9 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
     client->refused = true;
     return;
   }
-  /* Review 6: a bot this new sends CMD_LINK_SEQ "offer" as its first frame,
+  /* Review 6: every bot sends CMD_LINK_SEQ "offer" as its first frame,
    * before any presence; none means it was stripped on the way. */
-  if (version[0] && !client->link_offered &&
-      hub_update_version_cmp(version, HUB_LINK_SEQ_VERSION) >= 0) {
+  if (version[0] && !client->link_offered) {
     hub_log_warning("[HUB] %s runs %s but never offered the sequenced link framing "
                     "(a frame stripped on the way?): dropped\n",
                     hub_who_client(state, client), version);
@@ -2484,7 +2551,8 @@ static int roster_frame_begin(hub_state_t *state, char *frame, int cap,
     if (cw <= 0 || cw >= cap - off) return -1;
     off += cw;
   }
-  /* This hub answers CMD_HUB_ROLLCALL: the upgrade gates may ask it. */
+  /* This hub answers CMD_HUB_ROLLCALL.  Every hub the mesh admits does
+   * (MESH_MIN_VERSION 2.5.3); a 2.5.3 hub still asks only hubs that say so. */
   {
     int kw = snprintf(frame + off, (size_t)(cap - off), "k|rollcall\n");
     if (kw <= 0 || kw >= cap - off) return -1;
@@ -2704,7 +2772,6 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
     if (o_started > 0 && mh->started > 0 && (time_t)o_started != mh->started) {
       mh->gen = -1;
       mh->chunks_seen = 0;
-      mh->rollcall = false; /* a build that lost it says so by leaving out k| */
     }
     if (gen < mh->gen) return; /* a late copy of an older round */
     uint64_t bit = (chunk >= 0 && chunk < 64) ? (1ULL << chunk) : 0;
@@ -2787,9 +2854,8 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
         free(relay);
         return;
       }
-      /* Review 6: a direct peer this new offered CMD_LINK_SEQ on connect. */
+      /* Review 6: every direct peer offers CMD_LINK_SEQ on connect. */
       if (hub_ver[0] && !from->link_offered &&
-          hub_update_version_cmp(hub_ver, HUB_LINK_SEQ_VERSION) >= 0 &&
           strcmp(hub_uuid, upgrade_peer_uuid(state, from)) == 0) {
         hub_log_warning("[MESH] Peer %s (%s) runs %s but never offered the sequenced link "
                         "framing (a frame stripped on the way?): link dropped\n",
@@ -2847,12 +2913,7 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
       }
       continue;
     }
-    if (strncmp(line, "k|", 2) == 0) {
-      /* What the hub whose h| header opened it can do (see CMD_HUB_ROLLCALL). */
-      if (mh && strcmp(mh->uuid, hub_uuid) == 0 && strcmp(line + 2, "rollcall") == 0)
-        mh->rollcall = true;
-      continue;
-    }
+    if (strncmp(line, "k|", 2) == 0) continue; /* capabilities: every hub answers a roll call */
     if (strncmp(line, "l|", 2) == 0) {
       /* The origin's peer links, first chunk of a round only: the list
        * replaces what we had, so a link it dropped disappears. */
@@ -3211,10 +3272,10 @@ static int hub_build_tree(hub_state_t *state, char *buf, int max_len) {
 }
 
 /* Push the assembled tree to every connected bot.  Coalesced per bot so a
- * burst of roster changes collapses to one send per drain cycle.  force=false
- * (a change) skips a bot that was already sent this exact tree; the
- * BOT_TREE_REFRESH push is forced, which is what keeps a bot's tree from
- * looking stale (BOT_TREE_STALE_AFTER) on a quiet mesh. */
+ * burst of roster changes collapses to one send per drain cycle; a bot that
+ * already holds this exact tree is skipped.  On a quiet mesh the keepalive
+ * tree hash (hub_bot_ping_payload) is what keeps a bot's tree from looking
+ * stale (BOT_TREE_STALE_AFTER). */
 /* Phase 5: FNV-1a 64 over the whole tree text — the hash carried in each row
  * delta so a bot that applied one can tell its tree matches ours, and pull the
  * whole tree when it does not. */
@@ -3345,14 +3406,6 @@ done:
   return o;
 }
 
-/* A bot that applies CMD_BOT_TREE_DELTA and checks the keepalive tree hash
- * (TREE_DELTA_MIN_BOT and up).  Older bots, or one whose presence has not
- * named a version yet, get whole trees on change and the BOT_TREE_REFRESH
- * re-push they still rely on. */
-static bool bot_takes_tree_deltas(const hub_client_t *c) {
-  return c->bot_version[0] && hub_update_version_cmp(c->bot_version, TREE_DELTA_MIN_BOT) >= 0;
-}
-
 /* A tree or row delta still queued to `c` (not yet on the wire). */
 static bool tree_frame_queued(const hub_client_t *c) {
   for (int l = 0; l < LANE_COUNT; l++)
@@ -3364,16 +3417,33 @@ static bool tree_frame_queued(const hub_client_t *c) {
 /* The payload of a keepalive PING to `c`: "t|<fnv64hex>", the hash of the tree
  * the bot holds once everything we sent it has landed, so a bot whose tree
  * diverged pulls the whole one (the hash check that replaced the periodic
- * whole-tree push).  "" when there is nothing to vouch for: not a bot, an
- * older bot, a tree frame still queued (pings jump the queue), or the bot not
- * current. */
-void hub_tree_ping_payload(const hub_state_t *state, const hub_client_t *c, char *out,
-                           size_t cap) {
+ * whole-tree push); and, to a 2.5.4+ bot, a second line "c|<sha256hex>", the
+ * hash of S, the config text it holds once every config frame already written
+ * has applied (plan §4.3a I5): a bot holding anything else pulls a full
+ * config.  Each part is left out when there is nothing to vouch for: not a
+ * bot, a frame of that kind still queued (pings jump the queue), or the bot
+ * not current.  "" when both are out.  2.5.3 bots read t| alone and ignore a
+ * payload that is anything more, so they never get c|. */
+void hub_bot_ping_payload(const hub_state_t *state, const hub_client_t *c, char *out,
+                          size_t cap) {
   if (cap) out[0] = '\0';
   if (!c || c->type != CLIENT_BOT || !c->authenticated || c->superseded) return;
-  if (!bot_takes_tree_deltas(c) || !state->tree_last || state->tree_last_len <= 0) return;
-  if (!c->tree_sent_valid || c->tree_sent_seq != state->tree_seq || tree_frame_queued(c)) return;
-  snprintf(out, cap, "t|%016llx", (unsigned long long)state->tree_last_fnv);
+  size_t at = 0;
+  if (state->tree_last && state->tree_last_len > 0 &&
+      c->tree_sent_valid && c->tree_sent_seq == state->tree_seq && !tree_frame_queued(c)) {
+    int n = snprintf(out, cap, "t|%016llx", (unsigned long long)state->tree_last_fnv);
+    if (n < 0 || (size_t)n >= cap) {
+      out[0] = '\0';
+      return;
+    }
+    at = (size_t)n;
+  }
+  if (bot_takes_cfg_deltas(c) && c->cfg_base && !c->cfg_queued && !c->cfg_owed) {
+    char hex[CFGD_HASH_HEX + 1];
+    cfg_hex(c->cfg_base_hash, hex);
+    int n = snprintf(out + at, cap - at, "%sc|%s", at ? "\n" : "", hex);
+    if (n < 0 || (size_t)n >= cap - at) out[at] = '\0';
+  }
 }
 
 /* A bot that is owed a whole tree (a queued tree or delta was dropped, or it
@@ -3398,10 +3468,15 @@ static void hub_send_whole_tree(hub_state_t *state, hub_client_t *c, const char 
   char coalesce[160];
   snprintf(coalesce, sizeof(coalesce), "%s|bot_tree|%s", state->hub_uuid, c->id);
   queued_msg_set_coalesce(m, state->hub_uuid, hub_next_lamport_seq(state), coalesce);
-  if (!peer_enqueue(c, m)) c->tree_sent_valid = false;
+  if (!peer_enqueue(c, m)) {
+    c->tree_sent_valid = false;
+    return;
+  }
+  g_hub_stats.tree_full++;
+  g_hub_stats.tree_full_bytes += (uint64_t)len;
 }
 
-static void hub_push_tree_to_bots(hub_state_t *state, bool force) {
+static void hub_push_tree_to_bots(hub_state_t *state) {
   int bots = 0;
   for (int i = 0; i < state->client_count; i++)
     if (state->clients[i]->type == CLIENT_BOT && state->clients[i]->authenticated &&
@@ -3426,9 +3501,8 @@ static void hub_push_tree_to_bots(hub_state_t *state, bool force) {
   uint64_t old_seq = state->tree_seq;
   uint64_t new_seq = changed ? old_seq + 1 : old_seq;
 
-  /* One delta, shared by every delta-capable bot holding the previous tree.
-   * `force` (the BOT_TREE_REFRESH tick) re-pushes the whole tree only to the
-   * older bots that need it; delta bots are checked by the keepalive hash. */
+  /* One delta, shared by every bot holding the previous tree; the keepalive
+   * hash checks that it landed. */
   char *delta = NULL;
   int dlen = -1;
   if (changed && state->tree_last && state->tree_last_len > 0) {
@@ -3442,17 +3516,21 @@ static void hub_push_tree_to_bots(hub_state_t *state, bool force) {
     hub_client_t *c = state->clients[i];
     /* A superseded session is closing: no tree frames to it. */
     if (c->type != CLIENT_BOT || !c->authenticated || c->superseded) continue;
-    bool deltas = bot_takes_tree_deltas(c);
-    bool forced = force && !deltas;
     bool current = c->tree_sent_valid && c->tree_sent_seq == old_seq;
-    if (!forced && !changed && current) continue; /* already up to date */
-    if (!forced && changed && current && deltas && delta && dlen > 0) {
+    if (!changed && current) continue; /* already up to date */
+    if (changed && current && delta && dlen > 0) {
       queued_msg_t *m =
           queued_msg_new(CMD_BOT_TREE_DELTA, LANE_BULK, (const unsigned char *)delta, dlen);
       if (!m) continue;
       c->tree_sent_valid = true;
       c->tree_sent_seq = new_seq;
-      if (!peer_enqueue(c, m)) c->tree_sent_valid = false;
+      if (!peer_enqueue(c, m)) {
+        c->tree_sent_valid = false;
+      } else {
+        g_hub_stats.tree_delta++;
+        g_hub_stats.tree_delta_bytes += (uint64_t)dlen;
+        g_hub_stats.tree_delta_of += (uint64_t)len;
+      }
     } else {
       hub_send_whole_tree(state, c, payload, len, new_seq);
     }
@@ -3480,6 +3558,7 @@ static void hub_tree_pull(hub_state_t *state, hub_client_t *c) {
   }
   c->tree_pull_due = false;
   c->tree_pull_at = now;
+  g_hub_stats.tree_pull++;
   if (state->tree_last && state->tree_last_len > 0) {
     hub_send_whole_tree(state, c, state->tree_last, state->tree_last_len, state->tree_seq);
     return;
@@ -3557,27 +3636,24 @@ void hub_presence_tick(hub_state_t *state, time_t now) {
     if (c->tree_pull_due && now - c->tree_pull_at >= TREE_PULL_MIN_GAP) hub_tree_pull(state, c);
   }
 
-  /* Push on change (only to bots whose tree it changes), with an
-   * unconditional refresh so a bot that missed a frame — or connected between
-   * changes — still converges.  Only the refresh restarts the refresh clock:
-   * a change push may reach no bot at all.  Changes are coalesced (see
+  /* Push on change (only to bots whose tree it changes).  A bot that missed
+   * a frame converges through the keepalive tree hash (it pulls), one that
+   * connected between changes through tree_owed.  Changes are coalesced (see
    * BOT_TREE_COALESCE): under churn every peer's gossip round re-rendered the
    * tree for every bot, O(hubs x bots) 10 KB frames a minute. */
-  bool refresh = now - state->last_tree_push >= BOT_TREE_REFRESH;
   int gap = state->tree_dirty_local ? BOT_TREE_COALESCE_LOCAL : BOT_TREE_COALESCE;
   bool due = state->tree_dirty && now - state->last_tree_change_push >= gap;
   /* A bot owed a whole tree gets it now (a dropped frame used to wait for
-   * the next change or the refresh). */
-  if (!due && !refresh && tree_owed(state)) {
-    hub_push_tree_to_bots(state, false);
+   * the next change). */
+  if (!due && tree_owed(state)) {
+    hub_push_tree_to_bots(state);
     return;
   }
-  if (due || refresh) {
+  if (due) {
     state->tree_dirty = false;
     state->tree_dirty_local = false;
     state->last_tree_change_push = now;
-    if (refresh) state->last_tree_push = now;
-    hub_push_tree_to_bots(state, refresh);
+    hub_push_tree_to_bots(state);
   }
 }
 
@@ -3783,6 +3859,169 @@ void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
   sync_send_to_peers(state, payload, exclude_fd, false, lane, NULL, 0);
 }
 
+/* ---- Hash-first anti-entropy (CMD_SYNC_DIGEST, 2.5.4) ----------------------
+ * docs/plans/2026-11-20_sync_digest_plan.md; spec proto/syncdigest/model.py.
+ * G1: a digest applies nothing — only the ordinary CMD_PEER_SYNC records it
+ * makes us send do, through process_peer_sync.  G2: anything malformed sends
+ * more, never less. */
+
+/* The peer's version, as peer_version_level reads it ("" unknown). */
+static const char *peer_version_str(hub_state_t *state, const hub_client_t *c) {
+  const char *cu = upgrade_peer_uuid(state, c);
+  for (int i = 0; cu[0] && i < state->peer_count; i++)
+    if (strcmp(state->peers[i].uuid, cu) == 0 && state->peers[i].remote_version[0])
+      return state->peers[i].remote_version;
+  const mesh_hub_t *mh = cu[0] ? mesh_hub_find(state, cu) : NULL;
+  return mh ? mh->version : "";
+}
+
+static bool peer_takes_sync_digest(hub_state_t *state, const hub_client_t *c) {
+  const char *v = peer_version_str(state, c);
+  return v[0] && hub_update_version_cmp(v, SYNC_DIGEST_MIN_HUB) >= 0;
+}
+
+static void sd_send(hub_client_t *c, const char *text) {
+  queued_msg_t *m =
+      queued_msg_new(CMD_SYNC_DIGEST, LANE_BULK, (const unsigned char *)text, (int)strlen(text));
+  if (m && peer_enqueue(c, m)) return;
+  hub_log_warning("[MESH] Could not queue a sync digest to %s\n", c->ip);
+}
+
+/* Our records of `kinds` (all for `all`) to peer c as one CMD_PEER_SYNC.
+ * `packet` is our current hub_generate_sync_packet text. */
+static void sd_push(hub_state_t *state, hub_client_t *c, const char *packet,
+                    char kinds[][SDG_KIND_MAX + 1], int nk, bool all) {
+  char *sel = malloc(MAX_SYNC_PAYLOAD);
+  if (!sel) return;
+  long n = sdg_select(packet, strlen(packet), kinds, nk, all, sel, MAX_SYNC_PAYLOAD);
+  if (n > 0)
+    hub_peer_enqueue_sync(state, c, CMD_PEER_SYNC, n > 1024 ? LANE_BULK : LANE_DELTA, sel, NULL, 0);
+  free(sel);
+}
+
+/* One periodic anti-entropy round: to each peer the digest of `full` (our
+ * hub_generate_sync_packet text), or the full state to a peer older than
+ * SYNC_DIGEST_MIN_HUB and on every SYNC_DIGEST_FULL_EVERY-th round (S2). */
+void hub_anti_entropy_round(hub_state_t *state, const char *full) {
+  char *dg = malloc(SYNC_DIGEST_MAX);
+  long dl = dg ? sdg_digest(full, strlen(full), dg, SYNC_DIGEST_MAX) : -1;
+  lane_t lane = strlen(full) > 1024 ? LANE_BULK : LANE_DELTA;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_HUB || !c->authenticated) continue;
+    bool digest = dl > 0 && peer_takes_sync_digest(state, c) &&
+                  ++c->sd_rounds % SYNC_DIGEST_FULL_EVERY != 0;
+    if (digest) {
+      sd_send(c, dg);
+      g_hub_stats.sd_tx++;
+    } else {
+      hub_peer_enqueue_sync(state, c, sync_bcast_opcode(state, c), lane, full, NULL, 0);
+    }
+  }
+  free(dg);
+}
+
+/* G3: the kinds that differed this round on peer c's link, counted across
+ * consecutive rounds (a kind that matched drops out).  True when one has
+ * differed SYNC_DIGEST_STUCK times running: send the whole state. */
+static bool sd_note_stuck(hub_state_t *state, hub_client_t *c, char bad[][SDG_KIND_MAX + 1],
+                          int nb) {
+  int keep = 0;
+  bool stuck = false;
+  const char *which = NULL;
+  for (int b = 0; b < nb; b++) {
+    int n = 1;
+    for (int i = 0; i < c->sd_stuck_n; i++)
+      if (strcmp(c->sd_stuck[i].kind, bad[b]) == 0) n = c->sd_stuck[i].n + 1;
+    if (keep >= SYNC_DIGEST_KINDS_MAX) break;
+    snprintf(c->sd_stuck[keep].kind, sizeof(c->sd_stuck[keep].kind), "%s", bad[b]);
+    c->sd_stuck[keep].n = n;
+    keep++;
+    if (n >= SYNC_DIGEST_STUCK && !stuck) {
+      stuck = true;
+      which = bad[b];
+    }
+  }
+  /* bad[] is ascending and so is what we keep: the next round compares. */
+  c->sd_stuck_n = keep;
+  if (stuck) {
+    time_t now = time(NULL);
+    if (now - c->sd_warned >= SYNC_DIGEST_WARN_EVERY) {
+      c->sd_warned = now;
+      hub_log_warning("[MESH] Sync with %s: records of kind %s still differ after %d repaired "
+                      "rounds; sending the whole state both ways\n",
+                      hub_who_client(state, c), which, SYNC_DIGEST_STUCK);
+    }
+    c->sd_stuck_n = 0;
+  }
+  return stuck;
+}
+
+/* CMD_SYNC_DIGEST from a peer: a digest to compare, or a pull to answer. */
+static void process_sync_digest(hub_state_t *state, hub_client_t *peer, const char *payload) {
+  size_t len = strlen(payload);
+  char *full = malloc(MAX_SYNC_PAYLOAD);
+  if (!full) return;
+  hub_generate_sync_packet(state, full, MAX_SYNC_PAYLOAD);
+  char (*kinds)[SDG_KIND_MAX + 1] = calloc(SDG_KINDS_MAX, sizeof(*kinds));
+  if (!kinds) {
+    free(full);
+    return;
+  }
+  if (len >= 2 && payload[0] == 'r' && payload[1] == '|') {
+    bool all = false;
+    int nk = sdg_parse_pull(payload, len, kinds, SDG_KINDS_MAX, &all);
+    if (nk < 0)
+      hub_log_warning("[MESH] Malformed sync pull from %s\n", hub_who_client(state, peer));
+    else
+      sd_push(state, peer, full, kinds, nk, all);
+    goto out;
+  }
+  g_hub_stats.sd_rx++;
+  sdg_entry_t *theirs = calloc(SDG_KINDS_MAX, sizeof(*theirs));
+  sdg_entry_t *mine = calloc(SDG_KINDS_MAX, sizeof(*mine));
+  char *dg = malloc(SYNC_DIGEST_MAX);
+  int nt = -1, nm = -1, nb = -1;
+  if (theirs && mine && dg) {
+    nt = sdg_parse(payload, len, theirs, SDG_KINDS_MAX);
+    long dl = sdg_digest(full, strlen(full), dg, SYNC_DIGEST_MAX);
+    if (dl > 0) nm = sdg_parse(dg, (size_t)dl, mine, SDG_KINDS_MAX);
+    if (nt >= 0 && nm >= 0) nb = sdg_mismatch(mine, nm, theirs, nt, kinds, SDG_KINDS_MAX);
+  }
+  if (nb == 0) {
+    g_hub_stats.sd_match++;
+    peer->sd_stuck_n = 0;
+  } else if (nb > 0 && !sd_note_stuck(state, peer, kinds, nb)) {
+    /* Push ours of every kind that differs, pull theirs: either may be behind. */
+    g_hub_stats.sd_kinds += (uint64_t)nb;
+    sd_push(state, peer, full, kinds, nb, false);
+    char *pull = malloc(SYNC_DIGEST_MAX);
+    if (pull) {
+      size_t at = (size_t)snprintf(pull, SYNC_DIGEST_MAX, "r|");
+      for (int i = 0; i < nb; i++)
+        at += (size_t)snprintf(pull + at, SYNC_DIGEST_MAX - at, "%s%s", i ? "," : "", kinds[i]);
+      snprintf(pull + at, SYNC_DIGEST_MAX - at, "\n");
+      sd_send(peer, pull);
+      free(pull);
+    }
+  } else {
+    /* Malformed, unreadable, or stuck: the whole state both ways (G2/G3). */
+    if (nb < 0)
+      hub_log_warning("[MESH] Unreadable sync digest from %s; sending the whole state\n",
+                      hub_who_client(state, peer));
+    g_hub_stats.sd_full++;
+    sd_push(state, peer, full, kinds, 0, true);
+    sd_send(peer, "r|*\n");
+  }
+  free(theirs);
+  free(mine);
+  free(dg);
+out:
+  free(kinds);
+  secure_wipe(full, strlen(full));
+  free(full);
+}
+
 /* A forward of what we accepted from a peer's frame.  `bcast`: that frame
  * was a CMD_PEER_BCAST, so the split horizon applies. */
 static void sync_forward_to_peers(hub_state_t *state, const char *payload,
@@ -3819,15 +4058,25 @@ static void broadcast_full_config_to_all_bots(hub_state_t *state) {
 static void send_owed_bot_config(hub_state_t *state, time_t now);
 
 void hub_flush_bot_config(hub_state_t *state, time_t now) {
-  if (!state->bot_config_pending ||
-      now - state->last_bot_config_push < BOT_CONFIG_PUSH_COALESCE)
+  if (now - state->last_bot_config_push < BOT_CONFIG_PUSH_COALESCE) return;
+  if (state->bot_config_pending) {
+    send_owed_bot_config(state, now); /* every bot, owed ones included */
     return;
-  send_owed_bot_config(state, now);
+  }
+  if (!g_cfg_owed) return;
+  /* Only bots whose last config frame was lost (cfg_push_lost). */
+  g_cfg_owed = false;
+  state->last_bot_config_push = now;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_BOT && c->authenticated && c->cfg_owed) send_config_to_bot(state, c, false);
+  }
 }
 
 
 static void send_owed_bot_config(hub_state_t *state, time_t now) {
   state->bot_config_pending = false;
+  g_cfg_owed = false;
   state->last_bot_config_push = now;
   int sent_count = 0;
   for (int i = 0; i < state->client_count; i++) {
@@ -5089,8 +5338,8 @@ static bool send_response(hub_state_t *state, hub_client_t *client,
 }
 
 static bool send_pong(hub_state_t *state, hub_client_t *c) {
-  char tp[32];
-  hub_tree_ping_payload(state, c, tp, sizeof(tp));
+  char tp[128];
+  hub_bot_ping_payload(state, c, tp, sizeof(tp));
   if (!hub_client_send(state, c, CMD_PING, tp[0] ? tp : NULL)) {
     hub_disconnect_client(state, c);
     return false;
@@ -7157,6 +7406,7 @@ static char admin_flag_needed(hub_state_t *state, const hub_user_record_t *me, i
   switch (cmd) {
   case CMD_ADMIN_CREATE_BOT:      case CMD_ADMIN_DEL:
   case CMD_ADMIN_DISCONNECT_BOT:  case CMD_ADMIN_REKEY_BOT:
+  case CMD_ADMIN_BOT_RESYNC:
     return 'b';
   case CMD_ADMIN_NET_SET:
     if (payload && strncmp(payload, "hubcron|", 8) == 0) return 'h';
@@ -7401,8 +7651,8 @@ static bool admin_upgrade_start(hub_state_t *state, hub_client_t *client, const 
                payload);
       return true;
     }
-    /* No roll call possible (an older hub, a peer that never linked): the
-     * gossip decides, as before. */
+    /* No roll call possible (a peer that never linked, a full table): the
+     * gossip decides. */
     char gone[320];
     int missing = upgrade_hubs_missing(state, gone, sizeof(gone));
     if (missing > 0) {
@@ -7733,6 +7983,53 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     if (nick[0]) reply_kv(&r, "nick", nick);
     reply_kvi(&r, "since", (long long)since);
     reply_kv(&r, "ip", ip);
+    return send_reply(state, client, &r);
+  }
+
+  case CMD_ADMIN_BOT_RESYNC: {
+    /* bot resync <nick|uuid|all>: a full config push, here and on every hub. */
+    if (!payload || !payload[0])
+      return admin_err(state, client, "bot.usage", "say which bot", "bot resync <nick|uuid|all>");
+    const char *target = "*";
+    char nick[MAX_NICK] = "";
+    bool all = strcasecmp(payload, "all") == 0;
+    if (!all) {
+      bot_config_t *hit = bot_by_uuid(state, payload);
+      if (hit && !hit->is_active) hit = NULL;
+      int matches = hit ? 1 : 0;
+      if (!hit)
+        for (int i = 0; i < state->bot_count; i++) {
+          const config_entry_t *n = bot_entry_rec(&state->bots[i], "n");
+          if (state->bots[i].is_active && n && strcasecmp(n->value, payload) == 0) {
+            if (!hit) hit = &state->bots[i];
+            matches++;
+          }
+        }
+      if (!hit)
+        return admin_err(state, client, "bot.not_found", "no registered bot has that nick or uuid",
+                         "bot list");
+      if (matches > 1)
+        return admin_err(state, client, "bot.ambiguous", "more than one bot has that nick",
+                         "bot resync <uuid>");
+      target = hit->uuid;
+      bot_nick_from_config(state, hit->uuid, nick, sizeof(nick));
+    }
+    int here = cfg_resync_local(state, target);
+    char id[64], fwd[160];
+    generate_request_id(id, sizeof(id));
+    op_forward_seen_check_and_add(state, id);
+    snprintf(fwd, sizeof(fwd), "%s|%lld|%s", id, (long long)time(NULL), target);
+    /* A bot connected here needs no other hub; all, or one elsewhere, floods. */
+    int told = (all || here == 0) ? cfg_resync_flood(state, NULL, fwd) : 0;
+    hub_log_info("[ADMIN] Resync %s: full config queued to %d bot(s) here, %d hub(s) asked\n",
+                 all ? "all bots" : target, here, told);
+    reply_t r;
+    reply_init(&r);
+    reply_ok(&r, "bot.resync");
+    reply_kv(&r, "uuid", all ? "all" : target);
+    if (nick[0]) reply_kv(&r, "nick", nick);
+    reply_kvi(&r, "here", here);
+    reply_kvi(&r, "hubs", told);
     return send_reply(state, client, &r);
   }
 
@@ -8617,14 +8914,31 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     reply_ok(&r, "stats");
     reply_kvi(&r, "up", (long long)(state->hub_started > 0 ? time(NULL) - state->hub_started : 0));
     reply_rec(&r, "cfg");
-    reply_kvu(&r, "sent", st->cfg_sent);
+    reply_kvu(&r, "full", st->cfg_full);
+    reply_kvu(&r, "full_bytes", st->cfg_full_bytes);
+    reply_kvu(&r, "delta", st->cfg_delta);
+    reply_kvu(&r, "delta_bytes", st->cfg_delta_bytes);
+    reply_kvu(&r, "delta_of", st->cfg_delta_of);
     reply_kvu(&r, "same", st->cfg_same);
     reply_kvu(&r, "lost", st->cfg_lost);
+    reply_kvu(&r, "pull", st->cfg_pull);
+    reply_rec(&r, "tree");
+    reply_kvu(&r, "full", st->tree_full);
+    reply_kvu(&r, "full_bytes", st->tree_full_bytes);
+    reply_kvu(&r, "delta", st->tree_delta);
+    reply_kvu(&r, "delta_bytes", st->tree_delta_bytes);
+    reply_kvu(&r, "delta_of", st->tree_delta_of);
+    reply_kvu(&r, "pull", st->tree_pull);
     reply_rec(&r, "sync");
     reply_kvu(&r, "frames", st->sync_frames);
     reply_kvu(&r, "noop", st->sync_noop);
     reply_kvu(&r, "records", st->sync_records);
     reply_kvu(&r, "applied", st->sync_applied);
+    reply_kvu(&r, "digests", st->sd_tx);
+    reply_kvu(&r, "digests_in", st->sd_rx);
+    reply_kvu(&r, "matched", st->sd_match);
+    reply_kvu(&r, "repaired", st->sd_kinds);
+    reply_kvu(&r, "fallbacks", st->sd_full);
     /* Presence v2 (hub_presence2.c). */
     if (state->p2) {
       const p2_state_t *p = state->p2;
@@ -10566,8 +10880,8 @@ static void process_chan_elect_fwd(hub_state_t *state, hub_client_t *client,
                 e->id, client->fd, kind, nick[0] ? nick : requester, channel, e->bot_n);
 }
 
-/* ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|silent|mesh.  mesh (2.5.3+,
- * absent from older hubs) is how many hubs the answering hub knows, itself
+/* ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|silent|mesh.  mesh (2.5.3+:
+ * every hub the mesh admits sends it) is how many hubs the answering hub knows, itself
  * included.  The origin records it; a relay remembers which peer leads to
  * that hub and passes it on unchanged. */
 static void process_chan_elect_ack(hub_state_t *state, hub_client_t *client,
@@ -10825,6 +11139,7 @@ static bool console_admin_op(int cmd) {
   case CMD_ADMIN_BAN:             case CMD_ADMIN_NET_SET:
   case CMD_ADMIN_SET_SSH:
   case CMD_ADMIN_UPGRADE_NET:     case CMD_ADMIN_UPGRADE_STATUS:
+  case CMD_ADMIN_BOT_RESYNC:
     return true;
   default:
     return false;
@@ -12057,6 +12372,50 @@ static bool hub_rollup_forget(hub_state_t *state, const char *why) {
   state->rollup_try_count = 0;
   if (had) hub_config_write(state);
   return had;
+}
+
+/* `bot resync`: a forced full config push to this hub's bot `target` (a uuid),
+ * or to every one of its bots for "*".  The count queued. */
+static int cfg_resync_local(hub_state_t *state, const char *target) {
+  int n = 0;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_BOT || !c->authenticated || c->superseded || c->retiring) continue;
+    if (strcmp(target, "*") != 0 && strcmp(c->id, target) != 0) continue;
+    send_config_to_bot(state, c, true);
+    n++;
+  }
+  return n;
+}
+
+/* CMD_CFG_RESYNC "<id>|<ts>|<uuid or *>" to every linked hub but `skip`. */
+static int cfg_resync_flood(hub_state_t *state, hub_client_t *skip, const char *payload) {
+  int told = 0;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_HUB && c->authenticated && c != skip &&
+        peer_send_urgent(state, c, CMD_CFG_RESYNC, payload))
+      told++;
+  }
+  return told;
+}
+
+/* CMD_CFG_RESYNC from a peer: resync our matching bots, pass it on. */
+static void process_peer_cfg_resync(hub_state_t *state, hub_client_t *peer, const char *payload) {
+  char id[64] = "", ts[24] = "", target[64] = "";
+  if (!wire_field(payload, 0, id, sizeof(id)) || !wire_field(payload, 1, ts, sizeof(ts)) ||
+      !wire_field(payload, 2, target, sizeof(target)) || !id[0] ||
+      !hub_upgrade_plan_field_ok(id) || (strcmp(target, "*") != 0 && !uuid_valid(target))) {
+    hub_log_warning("[HUB] Malformed CFG_RESYNC from peer %s\n", peer->ip);
+    return;
+  }
+  long long t = atoll(ts);
+  long long age = t > 0 ? (long long)time(NULL) - t : 0;
+  if (t <= 0 || age > CFG_RESYNC_TTL || age < -CFG_RESYNC_TTL) return;
+  if (op_forward_seen_check_and_add(state, id)) return;
+  int n = cfg_resync_local(state, target);
+  if (n) hub_log_info("[HUB] Resync from another hub: full config queued to %d bot(s)\n", n);
+  cfg_resync_flood(state, peer, payload);
 }
 
 /* CMD_UPGRADE_FORGET from a peer: drop our plan and pass it on. */
@@ -13315,9 +13674,9 @@ static void rc_want(hub_rollcall_t *rc, const char *uuid, const char *name, bool
  * report a link to (the same set upgrade_hubs_missing counts).  Returns 1 when
  * the roll call is out (its end comes through rollcall_end), 0 when the gossip
  * check has to decide instead: a configured peer that has never linked (no
- * uuid, nobody can ask it), a known hub that has not said it answers a roll
- * call (an older build), a linked peer not yet in the mesh view, a full table,
- * or no hub to ask at all.  A hub presence dropped as unreachable is asked. */
+ * uuid, nobody can ask it), a full table, or no hub to ask at all.  Every hub
+ * the mesh admits answers (MESH_MIN_VERSION), so one presence dropped as
+ * unreachable, or a linked peer that has not gossiped yet, is asked too. */
 static int rollcall_begin(hub_state_t *state, rollcall_purpose_t purpose, char *id_out) {
   time_t now = time(NULL);
   id_out[0] = '\0';
@@ -13339,21 +13698,6 @@ static int rollcall_begin(hub_state_t *state, rollcall_purpose_t purpose, char *
     }
   }
   if (full || rc->want_n == 0) return 0;
-  for (int i = 0; i < rc->want_n; i++) {
-    const mesh_hub_t *mh = mesh_hub_find(state, rc->want[i]);
-    if (mh) {
-      if (!mh->rollcall) return 0;
-      continue;
-    }
-    /* Not in the mesh view.  A peer linked right now that has not gossiped yet
-     * may be an older build: the gossip decides.  Otherwise presence dropped it
-     * as unreachable (a stopped hub, 2 s before an upgrade start on a 10-hub
-     * mesh): it cannot answer whatever it runs, so ask anyway and let it count
-     * as "did not answer". */
-    for (int p = 0; p < state->peer_count; p++)
-      if (state->peers[p].connected && strcmp(state->peers[p].uuid, rc->want[i]) == 0)
-        return 0;
-  }
   unsigned char rb[16];
   if (RAND_bytes(rb, sizeof(rb)) != 1) return 0;
   for (size_t i = 0; i < sizeof(rb); i++) snprintf(rc->id + 2 * i, 3, "%02x", rb[i]);
@@ -14187,6 +14531,10 @@ static void process_peer_upgrade_stage(hub_state_t *state, hub_client_t *peer, c
 static void hub_upgrade_stage_tick(hub_state_t *state) {
   char id[64], status[256], payload[400];
   if (!hub_update_stage_tick(id, sizeof(id), status, sizeof(status))) return;
+  /* A build staged after another failed says so: the operator should know this
+   * host could not take its first choice.  As ircbot. */
+  if (strncmp(status, "staged|", 7) == 0 && strstr(status, "; the ") != NULL)
+    hub_log_info("[UPGRADE] Stage of %s: %s\n", id, status);
   snprintf(payload, sizeof(payload), "%s|%s|%s", id, state->hub_uuid, status);
   bool following = strcmp(state->follow_id, id) == 0;
   hub_client_t *origin = following ? upgrade_find_peer(state, state->follow_origin) : NULL;
@@ -15613,7 +15961,10 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
   } break;
 
   case CMD_CONFIG_PULL:
+    /* A delta did not apply, or the keepalive's c| did not match what the bot
+     * holds: a full push.  A burst collapses into the one queued frame. */
     hub_log_debug("[HUB] Config PULL request from %s\n", hub_who_client(state, client));
+    g_hub_stats.cfg_pull++;
     send_config_to_bot(state, client, true);
     break;
 
@@ -15948,9 +16299,26 @@ static bool bot_config_hash(const char *payload, size_t len,
   return ok;
 }
 
-/* Queue this bot its full config.  force=false (a broadcast) skips the push
- * when the bot was already sent this exact config and that push was not
- * lost; force=true always sends (the bot's first config, a PULL, a re-shape). */
+static bool bot_takes_cfg_deltas(const hub_client_t *c) {
+  return c->bot_version[0] && hub_update_version_cmp(c->bot_version, CFG_DELTA_MIN_BOT) >= 0;
+}
+
+static void cfg_hex(const unsigned char h[32], char out[CFGD_HASH_HEX + 1]) {
+  static const char hx[] = "0123456789abcdef";
+  for (int i = 0; i < 32; i++) {
+    out[2 * i] = hx[h[i] >> 4];
+    out[2 * i + 1] = hx[h[i] & 15];
+  }
+  out[CFGD_HASH_HEX] = '\0';
+}
+
+/* Queue this bot its config: a delta of the text it holds (S, cfg_base) when
+ * it takes them, else the full text.  force=false (a broadcast) skips the
+ * push when the bot was already sent this exact config and that push was not
+ * lost; force=true always sends, and sends it full (the bot's first config, a
+ * PULL, `bot resync`).  Plan §4.3a: the one queued frame always has base S; a
+ * newer push replaces it (same coalesce key) with delta(S -> newer), and S
+ * moves only when a frame is written (cfg_frame_written). */
 static void send_config_to_bot(hub_state_t *state, hub_client_t *client,
                                bool force) {
   /* Change 5: heap the generation buffer — a full config can exceed MAX_BUFFER
@@ -15984,31 +16352,91 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client,
     return;
   }
 
-  hub_log_debug("[HUB-SYNC] Queueing config to %s (%d bytes)\n", hub_who_client(state, client),
-                len);
+  /* The text the bot holds once this frame is written (cfg_next). */
+  char *next = malloc((size_t)len);
+  if (next) memcpy(next, payload, (size_t)len);
 
-  /* Bot config push goes through the bot-client's BULK lane.  The encrypt
-   * path knows to apply htonl() to the inner length only for CMD_CONFIG_DATA
-   * so the bot's parser still decodes correctly.  Coalesce on a per-bot key
-   * so a burst of broadcast_full_config_to_all_bots calls collapses to one
-   * per bot per drain cycle. */
+  /* A delta against S when the bot takes them and S is known. */
+  char *delta = NULL;
+  long dlen = -1;
+  if (!force && next && client->cfg_base && bot_takes_cfg_deltas(client)) {
+    unsigned char nh[32];
+    unsigned int olen = 0;
+    if (EVP_Digest(payload, (size_t)len, nh, &olen, EVP_sha256(), NULL) == 1 && olen == 32) {
+      char bhex[CFGD_HASH_HEX + 1], nhex[CFGD_HASH_HEX + 1];
+      cfg_hex(client->cfg_base_hash, bhex);
+      cfg_hex(nh, nhex);
+      size_t cap = (size_t)len * CFG_DELTA_MAX_PCT / 100 + CFGD_HEADER_LEN;
+      delta = malloc(cap);
+      if (delta)
+        dlen = cfgd_diff(client->cfg_base, client->cfg_base_len, payload, (size_t)len, bhex,
+                         nhex, delta, cap);
+    }
+  }
+
+  hub_log_debug("[HUB-SYNC] Queueing config to %s (%d bytes%s)\n", hub_who_client(state, client),
+                len, dlen > 0 ? ", as a delta" : "");
+
+  /* Bot config push goes through the bot-client's BULK lane.  Coalesce on a
+   * per-bot key so a burst of broadcast_full_config_to_all_bots calls
+   * collapses to one frame per bot per drain cycle — full or delta, the
+   * newer replaces the queued one whole (queued_msg_replace_payload). */
   char coalesce[160];
   snprintf(coalesce, sizeof(coalesce), "%s|cfg_data|%s",
            state->hub_uuid, client->id);
 
-  queued_msg_t *m = queued_msg_new(CMD_CONFIG_DATA, LANE_BULK,
-                                   (const unsigned char *)payload, len);
+  queued_msg_t *m =
+      dlen > 0 ? queued_msg_new(CMD_CONFIG_DELTA, LANE_BULK, (const unsigned char *)delta, (int)dlen)
+               : queued_msg_new(CMD_CONFIG_DATA, LANE_BULK, (const unsigned char *)payload, len);
   secure_wipe(payload, (size_t)len);
   free(payload);
+  if (delta) {
+    secure_wipe(delta, dlen > 0 ? (size_t)dlen : 0);
+    free(delta);
+  }
   client->cfg_sent_valid = false;
-  if (!m) return;
+  if (!m || !next) {
+    /* Nothing queued, or no text to move S to: owe it rather than leave it. */
+    if (m) queued_msg_free(m);
+    if (next) {
+      secure_wipe(next, (size_t)len);
+      free(next);
+    }
+    client->cfg_owed = true;
+    g_cfg_owed = true;
+    return;
+  }
+  m->cfg_frame = true;
   queued_msg_set_coalesce(m, state->hub_uuid,
                           hub_next_lamport_seq(state), coalesce);
+  /* The queued frame's result: replaces any earlier queued one's. */
+  if (client->cfg_next) {
+    secure_wipe(client->cfg_next, client->cfg_next_len);
+    free(client->cfg_next);
+  }
+  client->cfg_next = next;
+  client->cfg_next_len = (size_t)len;
+  client->cfg_queued = true;
+  client->cfg_owed = false;
+  bool is_delta = dlen > 0;
   if (!peer_enqueue(client, m)) {
+    /* peer_enqueue freed m; the frame never queued. */
+    secure_wipe(client->cfg_next, client->cfg_next_len);
+    free(client->cfg_next);
+    client->cfg_next = NULL;
+    client->cfg_next_len = 0;
+    client->cfg_queued = false;
     g_hub_stats.cfg_lost++;
     return;
   }
-  g_hub_stats.cfg_sent++;
+  if (is_delta) {
+    g_hub_stats.cfg_delta++;
+    g_hub_stats.cfg_delta_bytes += (uint64_t)dlen;
+    g_hub_stats.cfg_delta_of += (uint64_t)len;
+  } else {
+    g_hub_stats.cfg_full++;
+    g_hub_stats.cfg_full_bytes += (uint64_t)len;
+  }
   if (hashed) {
     memcpy(client->cfg_sent_hash, hash, sizeof(hash));
     client->cfg_sent_valid = true;
@@ -16457,6 +16885,10 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 hub_plan_process(state, client, payload_ptr);
               } else if (cmd == CMD_UPGRADE_FORGET) {
                 process_peer_upgrade_forget(state, client, payload_ptr);
+              } else if (cmd == CMD_CFG_RESYNC) {
+                process_peer_cfg_resync(state, client, payload_ptr);
+              } else if (cmd == CMD_SYNC_DIGEST) {
+                process_sync_digest(state, client, payload_ptr);
               } else if (cmd == CMD_HUB_ROLLCALL) {
                 process_hub_rollcall(state, client, payload_ptr);
               } else if (cmd == CMD_HUB_ROLLCALL_ACK) {
