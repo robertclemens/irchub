@@ -1985,6 +1985,7 @@ static const char *const OPNAME[256] = {
  [0x8B] = "CMD_CRON_SET", [0x8C] = "CMD_HUB_ROLLCALL", [0x8D] = "CMD_HUB_ROLLCALL_ACK", [0x8E] = "CMD_PRESENCE2",
  [0x8F] = "CMD_BOT_TREE_DELTA", [0x90] = "CMD_BOT_TREE_PULL", [0x91] = "CMD_CONFIG_DELTA",
  [0x92] = "CMD_CFG_RESYNC", [0x93] = "CMD_ADMIN_BOT_RESYNC", [0x94] = "CMD_SYNC_DIGEST",
+ [0x95] = "CMD_CHAN_WHO",
 };
 
 static unsigned long long rvu(const crec_t *r, const char *k) {
@@ -2729,6 +2730,7 @@ static void render_channel_list(const fmt_ctx_t *ctx, const creply_t *rep, fline
 static const char *modes_source_phrase(const char *src);
 static void overrides_phrase(const char *ov, char *out, size_t cap);
 static bool settings_card(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out, int L);
+static int setting_on(const creply_t *rep, const char *name);
 
 static void render_channel_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   const crec_t *c = NULL;
@@ -2744,11 +2746,24 @@ static void render_channel_show(const fmt_ctx_t *ctx, const creply_t *rep, fline
      * modes a bot last reported, the channel's own settings, its bans */
     const crec_t *res = &rep->res;
     fmt_card_line(ctx, out, L, "key", rvs(c, "key") ? rv(c, "key") : GL(G_DASH), RL_NORMAL);
-    snprintf(v, sizeof(v), "%s   (%s)", rv(res, "want"), modes_source_phrase(rv(res, "want_src")));
-    fmt_card_line(ctx, out, L, "modes", v, RL_NORMAL);
-    if (rvs(c, "modes")) snprintf(v, sizeof(v), "+%s   (i and k as last reported by a bot)", rv(c, "modes"));
-    else snprintf(v, sizeof(v), "not reported");
-    fmt_card_line(ctx, out, L, "live modes", v, RL_NORMAL);
+    int enf = setting_on(rep, "enforcemodes");
+    if (enf < 0) {
+      /* a hub without the settings records: the stored modes as before */
+      snprintf(v, sizeof(v), "%s   (%s)", rv(res, "want"), modes_source_phrase(rv(res, "want_src")));
+      fmt_card_line(ctx, out, L, "modes", v, RL_NORMAL);
+      if (rvs(c, "modes")) snprintf(v, sizeof(v), "+%s   (i and k as last reported by a bot)", rv(c, "modes"));
+      else snprintf(v, sizeof(v), "not reported");
+      fmt_card_line(ctx, out, L, "live modes", v, RL_NORMAL);
+    } else if (enf) {
+      /* 2.5.4: the stored modes are shown only when the bots hold the
+       * channel to them; otherwise the live ones are channel who's */
+      snprintf(v, sizeof(v), "%s   enforced (%s)", rv(res, "want"), modes_source_phrase(rv(res, "want_src")));
+      fmt_card_line(ctx, out, L, "modes", v, RL_NORMAL);
+    } else {
+      snprintf(v, sizeof(v), "not enforced %s live: channel who %s", GL(G_DOT),
+               rv(c, "name") ? rv(c, "name") : "<#chan>");
+      fmt_card_line(ctx, out, L, "modes", v, RL_NORMAL);
+    }
     if (!settings_card(ctx, rep, out, L)) {
       char ov[512];
       overrides_phrase(rv(res, "overrides"), ov, sizeof(ov));
@@ -2769,6 +2784,75 @@ static void render_channel_show(const fmt_ctx_t *ctx, const creply_t *rep, fline
   line(out, RL_DIM, "  bot presence per channel: not reported yet");
   if (rvs(&rep->res, "want"))
     hint(out, "channel mode <#chan> · channel set <#chan> · ban list <#chan>");
+}
+
+/* channel who: the topic, the modes, then the members as irssi's /names lays
+ * them out -- "[@nick ]" cells, as many to a row as the width takes. */
+static void render_channel_who(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  const crec_t *r = &rep->res;
+  const char *chan = rv(r, "chan") ? rv(r, "chan") : "?";
+  char title[96], right[160], v[1024], w[96];
+  snprintf(title, sizeof(title), "Channel %s", chan);
+  snprintf(right, sizeof(right), "via %s on %s", rv(r, "by") ? rv(r, "by") : "?",
+           rv(r, "hub_name") ? rv(r, "hub_name") : "?");
+  fmt_title(ctx, out, title, right);
+  const int L = 6;
+  if (!rvb(r, "topic_known")) {
+    fmt_card_line(ctx, out, L, "topic", "not known yet", RL_DIM);
+  } else if (!rvs(r, "topic")) {
+    fmt_card_line(ctx, out, L, "topic", "(none)", RL_NORMAL);
+  } else {
+    fmt_card_line(ctx, out, L, "topic", rv(r, "topic"), RL_NORMAL);
+    if (rvs(r, "topic_by") || rvi(r, "topic_at", 0) > 0) {
+      when_ago(ctx, rvi(r, "topic_at", 0), w, sizeof(w));
+      snprintf(v, sizeof(v), "%s %s %s", rvs(r, "topic_by") ? rv(r, "topic_by") : "?", GL(G_DOT), w);
+      fmt_card_line(ctx, out, L, "set by", v, RL_NORMAL);
+    }
+  }
+  if (!rvb(r, "modes_known")) {
+    fmt_card_line(ctx, out, L, "modes", "not known yet", RL_DIM);
+  } else {
+    int o = snprintf(v, sizeof(v), "%s", rvs(r, "modes") ? rv(r, "modes") : "(none)");
+    if (o > 0 && rvs(r, "key") && (size_t)o < sizeof(v))
+      o += snprintf(v + o, sizeof(v) - (size_t)o, "   key %s", rv(r, "key"));
+    if (o > 0 && rvi(r, "limit", 0) > 0 && (size_t)o < sizeof(v))
+      snprintf(v + o, sizeof(v) - (size_t)o, "   limit %lld", rvi(r, "limit", 0));
+    fmt_card_line(ctx, out, L, "modes", v, RL_NORMAL);
+  }
+  line(out, RL_HEAD, "  [Users %s]", chan);
+  int nw = 1;
+  for (int i = 0; i < rep->n; i++)
+    if (!strcmp(rep->r[i].type, "nick") && rv(&rep->r[i], "n")) {
+      int cw = console_str_width(rv(&rep->r[i], "n"));
+      if (cw > nw) nw = cw;
+    }
+  int cell = nw + 3; /* "[" prefix nick "]" */
+  int cols = (ctx->width - 2 + 1) / (cell + 1);
+  if (cols < 1) cols = 1;
+  sb_t b = {0};
+  int k = 0;
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *m = &rep->r[i];
+    if (strcmp(m->type, "nick") != 0 || !rv(m, "n")) continue;
+    if (k % cols == 0) sb_add(&b, "  ");
+    else sb_add(&b, " ");
+    const char *pf = rvs(m, "p") ? rv(m, "p") : " ";
+    sb_add(&b, "[");
+    sb_add(&b, pf);
+    sb_add(&b, rv(m, "n"));
+    sb_rep(&b, " ", nw - console_str_width(rv(m, "n")));
+    sb_add(&b, "]");
+    if (++k % cols == 0) sb_emit(&b, out, RL_NORMAL);
+  }
+  if (k % cols) sb_emit(&b, out, RL_NORMAL);
+  sb_free(&b);
+  if (k == 0) line(out, RL_DIM, "  (nobody)");
+  long long total = rvi(r, "total", 0);
+  line(out, RL_NORMAL, "  Total of %lld nick%s [%lld ops, %lld halfops, %lld voices, %lld normal]", total,
+       total == 1 ? "" : "s", rvi(r, "ops", 0), rvi(r, "halfops", 0), rvi(r, "voices", 0),
+       rvi(r, "normal", 0));
+  if (rvb(r, "capped")) warn(ctx, out, "the bot's member list is full; some members are not shown");
+  hint(out, "channel show <#chan> · channel mode <#chan>");
 }
 
 static void render_channel_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
@@ -3209,6 +3293,19 @@ static void render_ban_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_
  * (options on, options off, values, message floods, op floods), the
  * channel's own marked '*',
  * then whether it is all default.  False: no setting records (an older hub). */
+/* An on/off setting's effective value from the reply's setting records:
+ * 1 on, 0 off, -1 not in the reply (an older hub). */
+static int setting_on(const creply_t *rep, const char *name) {
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *c = &rep->r[i];
+    if (strcmp(c->type, "setting") || !rv(c, "name") || strcmp(rv(c, "name"), name)) continue;
+    char val[48];
+    setting_value(name, rv(c, "kind"), rv(c, "value"), val, sizeof(val));
+    return !strcmp(val, "on");
+  }
+  return -1;
+}
+
 static bool settings_card(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out, int L) {
   sb_t ln[5] = {{0}};
   int own = 0, rows = 0;
@@ -4039,7 +4136,7 @@ static void render_peer_change(const fmt_ctx_t *ctx, const creply_t *rep, flines
     fmt_ok(ctx, "Hub added", subj, out);
     res_kv(out, "uuid", rvs(r, "uuid") ? rv(r, "uuid") : GL(G_DASH));
     res_kv(out, "key", rvs(r, "fp") ? rv(r, "fp") : "?");
-    snprintf(subj, sizeof(subj), "this hub dials it now; hub list shows the link once %s has added this hub too",
+    snprintf(subj, sizeof(subj), "the link comes up on the next dial (within 2 min) once %s has added this hub too",
              peer_name(r));
     effect(ctx, out, subj);
   } else if (!strcmp(rep->code, "peer.removed")) {
@@ -4230,6 +4327,7 @@ void fmt_reply(const fmt_ctx_t *ctx, const creply_t *rep, const char *words, fli
   else if (!strncmp(c, "user.", 5)) render_user_change(ctx, rep, out);
   else if (!strcmp(c, "channel.list")) render_channel_list(ctx, rep, out);
   else if (!strcmp(c, "channel.show")) render_channel_show(ctx, rep, out);
+  else if (!strcmp(c, "channel.who")) render_channel_who(ctx, rep, out);
   else if (!strcmp(c, "channel.settings")) render_settings_table(ctx, rep, out, false);
   else if (!strcmp(c, "channel.mode")) render_channel_mode(ctx, rep, out);
   else if (!strcmp(c, "channel.set")) render_settings_change(ctx, rep, out);

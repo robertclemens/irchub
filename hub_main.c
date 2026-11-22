@@ -1396,9 +1396,9 @@ int main(int argc, char *argv[]) {
                 printf("[+] Public key: %s\n\n", pub_b64);
                 printf("    ┌─────────────────────────────────────────────────┐\n");
                 printf("    │ Save this public key + this hub's UUID.         │\n");
-                printf("    │   - Bots adding this hub will need both         │\n");
-                printf("    │     (ircbot -setup prompts for UUID + pubkey).  │\n");
-                printf("    │   - Other hubs adding this hub will need the    │\n");
+                printf("    │   - Bots adding this hub need its ip:port and   │\n");
+                printf("    │     public key (ircbot -setup asks for both).   │\n");
+                printf("    │   - Other hubs adding this hub need the         │\n");
                 printf("    │     UUID + ip:port + pubkey (console: hub add). │\n");
                 printf("    │ The hub's PRIVATE key never leaves this machine │\n");
                 printf("    │ (stored encrypted inside .irchub.cnf).          │\n");
@@ -1434,7 +1434,7 @@ int main(int argc, char *argv[]) {
 
             /* Name */
             while (bot_admin_name[0] == '\0') {
-                printf("Admin friendly name (no spaces, e.g. robert): ");
+                printf("Admin friendly name (no spaces, e.g. admin): ");
                 fflush(stdout);
                 if (!fgets(bot_admin_name, sizeof(bot_admin_name), stdin)) break;
                 bot_admin_name[strcspn(bot_admin_name, "\n")] = '\0';

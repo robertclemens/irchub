@@ -997,8 +997,9 @@ int main(int argc, char *argv[]) {
   printf("  public key:  %s\n", pub_b64);
   print_fp(pub);
   printf("\nNext:\n");
-  printf("  - Give the PUBLIC key to an admin: hub console 'admin add' / 'oper add'\n");
-  printf("    / 'userkey', or IRC '+admin|+oper <name> <pubkey> <mask>'.\n");
+  printf("  - Give the PUBLIC key to an admin, who adds you on the hub console:\n");
+  printf("    'user add admin|oper <name> <pubkey> <mask> <flags|channels>'\n");
+  printf("    (or on IRC: '+admin|+oper <name> <pubkey> <mask> <flags|channels>').\n");
   printf("  - Point your IRC client script (ircbot/utils) at %s\n", priv_path);
   if (!n) printf("  - Add a passphrase later with: keygen --passwd %s\n", priv_path);
   printf("\n");

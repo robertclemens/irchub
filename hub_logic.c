@@ -6614,7 +6614,7 @@ static int mf_field_count(const char *s) {
   return n;
 }
 
-/* The name a console session logs in as ("ADMIN:robert" -> "robert"). */
+/* The name a console session logs in as ("ADMIN:admin" -> "admin"). */
 static const char *mf_admin_name(const hub_client_t *c) {
   return strncmp(c->id, "ADMIN:", 6) == 0 ? c->id + 6 : c->id;
 }
@@ -8678,6 +8678,24 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
   case CMD_ADMIN_SET_SSH:
     return admin_set_ssh(state, client, payload);
 
+  case CMD_CHAN_WHO: {
+    /* #chan: one bot in the channel reports its topic, modes and members
+     * (election kind "who"; no ops needed).  Read-only: no flag. */
+    char channel[MAX_CHAN] = "";
+    if (!payload || !wire_field(payload, 0, channel, sizeof(channel)) || !chan_name_valid(channel))
+      return admin_err(state, client, "channel.usage", "say which channel", "channel who <#chan>");
+    config_entry_t *ce = chan_entry(state, channel);
+    char op[16] = "";
+    if (ce) parse_global_channel_value(ce->value, NULL, 0, NULL, 0, NULL, op, sizeof(op));
+    if (!ce || strcmp(op, "del") == 0) {
+      snprintf(msg, sizeof(msg), "%.64s is not a managed channel", channel);
+      return admin_err(state, client, "channel.not_found", msg, "channel list");
+    }
+    if (ce_start(state, "who", channel, "ADMIN", "", "", client)) return true;
+    return admin_err(state, client, "channel.busy", "too many channel requests in flight",
+                     "try again in a few seconds");
+  }
+
   case CMD_ADMIN_KICK_USER: {
     /* nick|#chan|reason: one opped bot kicks (election kind "kick", the
      * reason in the hostmask slot).  The bot refuses a bot or an authorised
@@ -10215,10 +10233,17 @@ static chan_elect_t *ce_find(hub_state_t *state, const char *id) {
   return NULL;
 }
 
+/* End an election: the slot is free and a `who` answer's buffer goes. */
+static void ce_release(chan_elect_t *e) {
+  chanwho_reset(&e->who);
+  e->active = false;
+}
+
 static chan_elect_t *ce_alloc(hub_state_t *state) {
   for (int i = 0; i < MAX_CHAN_ELECTIONS; i++)
     if (!state->chan_elections[i].active) {
       chan_elect_t *e = &state->chan_elections[i];
+      ce_release(e);
       memset(e, 0, sizeof(*e));
       e->from_fd = e->admin_fd = e->reply_fd = -1;
       e->created = e->phase_at = time(NULL);
@@ -10342,7 +10367,115 @@ static const char *ce_kind_word(const char *kind) {
          : strcmp(kind, "mode") == 0   ? "mode"
          : strcmp(kind, "kick") == 0   ? "kick"
          : strcmp(kind, "ban") == 0    ? "ban"
+         : strcmp(kind, "who") == 0    ? "who"
                                        : "key";
+}
+
+/* ---- `channel who` (kind "who", CMD_CHAN_WHO) ----------------------------- */
+
+static void ce_up(hub_state_t *state, chan_elect_t *e, uint8_t cmd, const char *payload);
+
+static void ce_who_answer(hub_state_t *state, hub_client_t *admin, chan_elect_t *e, bool ok,
+                          const char *by_uuid, const char *by_nick, const char *hub_name,
+                          const char *detail, int asked, int hubs) {
+  char msg[256];
+  if (!ok) {
+    char why[160];
+    ce_reasons(e, why, sizeof(why));
+    if (!why[0] && detail && detail[0]) snprintf(why, sizeof(why), "%s", detail);
+    if (!why[0] && asked > 0) snprintf(why, sizeof(why), "none is in the channel");
+    int mw = snprintf(msg, sizeof(msg), "no bot could list %s: %d bot%s asked on %d hub%s%s%s",
+                      e->channel, asked, asked == 1 ? "" : "s", hubs, hubs == 1 ? "" : "s",
+                      why[0] ? "; " : "", why);
+    if (mw < 0) msg[0] = '\0';
+    admin_err(state, admin, "channel.nobody", msg,
+              "a bot must be in the channel (it needs no ops)");
+    return;
+  }
+  if (!chanwho_complete(&e->who)) {
+    snprintf(msg, sizeof(msg), "%.31s answered for %.64s but its list did not arrive whole",
+             by_nick && by_nick[0] ? by_nick : "a bot", e->channel);
+    admin_err(state, admin, "channel.who_incomplete", msg, "channel who again");
+    return;
+  }
+  chanwho_view_t v;
+  if (chanwho_parse(e->who.buf, &v) < 0) {
+    chanwho_view_free(&v);
+    admin_err(state, admin, "internal.oom", "out of memory", NULL);
+    return;
+  }
+  reply_t r;
+  reply_init(&r);
+  reply_ok(&r, "channel.who");
+  reply_kv(&r, "chan", e->channel);
+  reply_kv(&r, "by", by_nick && by_nick[0] ? by_nick : by_uuid);
+  reply_kv(&r, "by_uuid", by_uuid);
+  reply_kv(&r, "hub_name", hub_name);
+  reply_kvi(&r, "asked", asked);
+  reply_kvi(&r, "hubs", hubs);
+  reply_kvb(&r, "topic_known", v.topic_known);
+  reply_kv(&r, "topic", v.topic);
+  reply_kv(&r, "topic_by", v.topic_by);
+  reply_kvi(&r, "topic_at", v.topic_at);
+  reply_kvb(&r, "modes_known", v.modes_known);
+  reply_kv(&r, "modes", v.modes);
+  reply_kvi(&r, "limit", v.limit);
+  reply_kv(&r, "key", v.key);
+  reply_kvi(&r, "total", v.n);
+  reply_kvb(&r, "capped", v.capped);
+  reply_kvi(&r, "ops", v.cnt[0]);
+  reply_kvi(&r, "halfops", v.cnt[1]);
+  reply_kvi(&r, "voices", v.cnt[2]);
+  reply_kvi(&r, "normal", v.cnt[3]);
+  static const char *const PFX[] = {"@", "%", "+", ""};
+  for (int i = 0; i < v.n; i++) {
+    reply_rec(&r, "nick");
+    reply_kv(&r, "p", PFX[v.nicks[i].rank]);
+    reply_kv(&r, "n", v.nicks[i].nick);
+  }
+  chanwho_view_free(&v);
+  send_reply(state, admin, &r);
+}
+
+/* CHAN_WHO eid|seq|more|<chunk>: from the bot we picked, or from the peer on
+ * the election's path.  A relay passes it up unchanged; the origin joins the
+ * chunks (seq 0 starts afresh: a retry with the next bot). */
+static void process_chan_who(hub_state_t *state, hub_client_t *client, const char *payload) {
+  char id[64] = "", seqs[12] = "", more[4] = "";
+  if (!payload || !wire_field(payload, 0, id, sizeof(id)) ||
+      !wire_field(payload, 1, seqs, sizeof(seqs)) || !wire_field(payload, 2, more, sizeof(more)))
+    return;
+  const char *body = payload;
+  for (int k = 0; k < 3; k++) {
+    body = strchr(body, '|');
+    if (!body) return;
+    body++;
+  }
+  chan_elect_t *e = id[0] ? ce_find(state, id) : NULL;
+  if (!e || strcmp(e->kind, "who") != 0) return;
+  if (client->type == CLIENT_BOT) {
+    if (e->phase != CE_LOCAL_DO || strcmp(e->doing, client->id) != 0) return;
+  } else if (client->type == CLIENT_HUB) {
+    if (!e->origin) {
+      if (client->fd == e->from_fd && client->conn_serial == e->from_serial) return;
+    } else {
+      bool from_ok = false;
+      for (int i = 0; e->phase == CE_MESH_DO && i < e->hub_n; i++)
+        if (strcmp(e->hubs[i].uuid, e->doing) == 0 && e->hubs[i].fd == client->fd &&
+            e->hubs[i].serial == client->conn_serial)
+          from_ok = true;
+      if (!from_ok) return;
+    }
+  } else {
+    return;
+  }
+  if (!e->origin) {
+    ce_up(state, e, CMD_CHAN_WHO, payload);
+    return;
+  }
+  if (chanwho_add(&e->who, seqs, more, body, strlen(body)) == -2)
+    hub_log_warning("[CHANREQ] channel who %s (id:%s): the answer is over %d bytes, dropped\n",
+                    e->channel, e->id, CHAN_WHO_MAX);
 }
 
 /* The origin's end of an election: answer the console that asked, log, and
@@ -10362,7 +10495,10 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
    * answer is about the nick, so no other bot was tried */
   bool absent = strcmp(status, "absent") == 0, prot = strcmp(status, "protected") == 0;
   bool ban = strcmp(e->kind, "ban") == 0;
-  const char *tgt = e->nick[0] ? e->nick : ban && e->hostmask[0] ? e->hostmask : e->requester;
+  const char *tgt = strcmp(e->kind, "who") == 0 ? "members"
+                    : e->nick[0]                ? e->nick
+                    : ban && e->hostmask[0]     ? e->hostmask
+                                                : e->requester;
   if (bitch)
     hub_log_info("[CHANREQ] %s %s on %s (id:%s): refused, not authorised and +bitch is on\n",
                  ce_kind_word(e->kind), tgt, e->channel,
@@ -10408,7 +10544,9 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
     hub_client_t *c = state->clients[i];
     if (c->internal && c->fd == e->admin_fd && c->conn_serial == e->admin_serial) admin = c;
   }
-  if (admin && ban) {
+  if (admin && strcmp(e->kind, "who") == 0) {
+    ce_who_answer(state, admin, e, ok, by_uuid, by_nick, hub_name, detail, asked, hubs);
+  } else if (admin && ban) {
     /* ban add / channel ban: the ban is stored whatever happened; the answer
      * says whether one bot set it now (placed) or why not (the bots' sweep
      * keeps trying) */
@@ -10525,7 +10663,7 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
       }
     }
   }
-  e->active = false;
+  ce_release(e);
 }
 
 /* A relay hub's report back toward the origin. */
@@ -10840,7 +10978,7 @@ static void process_chan_elect_fwd(hub_state_t *state, hub_client_t *client,
       !wire_field(payload, 3, channel, sizeof(channel)) ||
       !wire_field(payload, 4, requester, sizeof(requester)) || !id[0] ||
       (!chan_kind_valid(kind) && strcmp(kind, "op") != 0 && strcmp(kind, "mode") != 0 &&
-       strcmp(kind, "kick") != 0 && strcmp(kind, "ban") != 0) ||
+       strcmp(kind, "kick") != 0 && strcmp(kind, "ban") != 0 && strcmp(kind, "who") != 0) ||
       (channel[0] != '#' && channel[0] != '&')) {
     hub_log_warning("[CHANREQ] Malformed CHAN_ELECT_FWD from peer fd=%d\n", client->fd);
     return;
@@ -10993,7 +11131,7 @@ void hub_chan_elect_tick(hub_state_t *state, time_t now) {
     if (!e->active) continue;
     if (now - e->created > CHAN_ELECT_TTL) {
       if (e->origin) ce_finish(state, e, "timeout", NULL, NULL, NULL, "timed out");
-      e->active = false;
+      ce_release(e);
       continue;
     }
     switch (e->phase) {
@@ -11140,6 +11278,7 @@ static bool console_admin_op(int cmd) {
   case CMD_ADMIN_SET_SSH:
   case CMD_ADMIN_UPGRADE_NET:     case CMD_ADMIN_UPGRADE_STATUS:
   case CMD_ADMIN_BOT_RESYNC:
+  case CMD_CHAN_WHO:
     return true;
   default:
     return false;
@@ -16198,6 +16337,10 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     process_chan_done(state, client, payload);
     break;
 
+  case CMD_CHAN_WHO:
+    process_chan_who(state, client, payload);
+    break;
+
   case CMD_CHAN_EVENT:
     hub_chan_event_receive(state, client, payload);
     break;
@@ -16909,6 +17052,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 process_chan_elect_do(state, client, payload_ptr);
               } else if (cmd == CMD_CHAN_ELECT_DONE) {
                 process_chan_elect_done(state, client, payload_ptr);
+              } else if (cmd == CMD_CHAN_WHO) {
+                process_chan_who(state, client, payload_ptr);
               } else if (cmd == CMD_UPGRADE_PREPARE) {
                 process_peer_upgrade_prepare(state, client, payload_ptr);
               } else if (cmd == CMD_UPGRADE_COMMIT) {

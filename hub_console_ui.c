@@ -622,6 +622,7 @@ static const cmd_def_t CMDS[] = {
   {"user", "mask", 0, B_USER_MASK, 3, 0, CF_NONE, 0, NULL, "user mask add|del <name> <mask>", "add or remove a usermask (del asks y/N)", NULL},
   {"channel", "list", CMD_ADMIN_LIST_CHANNELS, B_NONE, 0, 0, CF_NONE, 0, NULL, "channel list", "every managed channel with its settings", NULL},
   {"channel", "show", CMD_ADMIN_LIST_CHANNELS, B_ARG, 1, 0, CF_NONE, 0, NULL, "channel show <#chan>", "one channel in detail", NULL},
+  {"channel", "who", CMD_CHAN_WHO, B_ARG, 1, 0, CF_NONE, 0, NULL, "channel who <#chan>", "topic, modes and members, as one bot in the channel sees them now", NULL},
   {"channel", "add", CMD_ADMIN_ADD_CHANNEL, B_CHAN_ADD, 1, 1, CF_NONE, 0, NULL, "channel add <#chan> [key]", "add (or re-add) a channel", NULL},
   {"channel", "del", CMD_ADMIN_DEL_CHANNEL, B_ARG, 1, 0, CF_YN, 0, NULL, "channel del <#chan>", "remove it from every bot (asks y/N)", NULL},
   {"channel", "mode", CMD_ADMIN_CHAN_MODE, B_CHAN_MODES, 1, 3, CF_NONE, 0, NULL, "channel mode <#chan> [<+modes> [key] [limit] | -]", "show the channel's modes, or store them and apply them once", "modes: i m n p s t k l · - = the network default"},
@@ -861,7 +862,7 @@ static const struct {
    "option set h\noption set -"},
   {"user", "list", "admin|oper\tonly that role (default both)",
    "user list\nuser list oper"},
-  {"user", "show", "name|*\ta user's name, or * for every user", "user show robert\nuser show *"},
+  {"user", "show", "name|*\ta user's name, or * for every user", "user show admin\nuser show *"},
   {"user", "add",
    "admin|oper\tthe role\n"
    "name\tthe user's name\n"
@@ -872,7 +873,7 @@ static const struct {
    "admin may log in and view everything\n"
    "channels\tan oper: * for every channel, or the channels, comma-separated (#ircbot,#dev); "
    "on each they may op, invite, unban, key",
-   "user add admin robert " EX_KEY " robert!*@* +a\n"
+   "user add admin admin2 " EX_KEY " admin2!*@* +a\n"
    "user add admin dana " EX_KEY " dana!*@* +chu\n"
    "user add oper alice " EX_KEY " alice!*@*.example.net *\n"
    "user add oper alice " EX_KEY " alice!*@*.example.net #ircbot"},
@@ -898,6 +899,8 @@ static const struct {
    "user mask add alice alice!*@203.0.113.*\nuser mask del alice alice!*@*.example.net"},
   {"channel", "list", NULL, "channel list"},
   {"channel", "show", "#chan\tthe channel's name", "channel show #ops"},
+  {"channel", "who", "#chan\tthe channel; one bot in it (no ops needed) is picked to answer",
+   "channel who #ops"},
   {"channel", "add", "#chan\tthe channel's name\nkey\tits channel key, if it has one",
    "channel add #ops\nchannel add #ops s3cret"},
   {"channel", "del", "#chan\tthe channel; every bot parts it (asks y/N)", "channel del #ops"},

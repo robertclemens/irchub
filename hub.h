@@ -458,6 +458,19 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define CMD_CHAN_ELECT_ACK   0x72
 #define CMD_CHAN_ELECT_DO    0x73
 #define CMD_CHAN_ELECT_DONE  0x74
+/* 2.5.4 `channel who` (docs/plans/2026-11-21_channel_who_plan.md): election
+ * kind "who" -- any bot in the channel whose WHO list is complete answers,
+ * ops not needed.  The picked bot sends its view as CHAN_WHO chunks ahead of
+ * DONE; relay hubs pass them up the election path like ELECT_DONE; the origin
+ * joins them (CHAN_WHO_MAX, heap, freed with the election) and answers the
+ * console channel.who.  Admin -> hub uses the same opcode, payload "#chan".
+ *   CHAN_WHO  bot->hub, hub->hub  eid|seq|more|<body chunk>
+ * Body (split anywhere; ircbot/bot.h has the lines): t| B| T| M| K| C| N|.
+ * A 2.5.3 bot answers the probe "unknown request" and a 2.5.3 hub drops the
+ * ELECT_FWD, so old nodes take no part.  Mirrors ircbot/bot.h, consts.rs. */
+#define CMD_CHAN_WHO         0x95
+#define CHAN_WHO_MAX         32768  /* joined body: 500 nicks + topic + key  */
+#define CHAN_WHO_TOPIC_MAX   512    /* the bots keep a topic to this          */
 #define CMD_ADMIN_INVITE_USER 0x75 // Admin: invite a user (nick|#chan)
 
 /* ---- Modes, settings, bans, flood protection (docs/modes.md, 2.4.5) ------
@@ -1821,6 +1834,34 @@ typedef struct {
   time_t seen_at;        // When we first processed this request
 } seen_forward_t;
 
+/* `channel who` (hub_chanwho.c): the origin's join of one bot's CHAN_WHO
+ * chunks, and the parsed view of the joined body. */
+typedef struct {
+  char  *buf;                            /* heap, CHAN_WHO_MAX + 1          */
+  size_t len;
+  int    seq;                            /* the next chunk expected         */
+  bool   done, bad;                      /* more=0 seen / out of order, cap */
+} chanwho_acc_t;
+typedef struct {
+  int  rank;                             /* 0 @, 1 %, 2 +, 3 none           */
+  char nick[MAX_NICK];
+} chanwho_nick_t;
+typedef struct {
+  bool topic_known, modes_known, capped;
+  char topic[CHAN_WHO_TOPIC_MAX], topic_by[MAX_MASK_LEN], modes[64], key[64];
+  long long topic_at, limit;
+  chanwho_nick_t *nicks;                 /* heap, sorted irssi-style        */
+  int  n, cnt[4];                        /* per rank                        */
+} chanwho_view_t;
+void chanwho_reset(chanwho_acc_t *a);   /* wipe + free, all fields zero   */
+/* 0 joined; -1 dropped (bad seq/order, no memory), -2 over CHAN_WHO_MAX.
+ * seq "0" starts afresh (the next bot's answer). */
+int  chanwho_add(chanwho_acc_t *a, const char *seqs, const char *more, const char *body,
+                 size_t bl);
+bool chanwho_complete(const chanwho_acc_t *a);
+int  chanwho_parse(const char *body, chanwho_view_t *v); /* 0 ok, -1 no memory */
+void chanwho_view_free(chanwho_view_t *v);
+
 /* One election (see CMD_CHAN_PROBE).  `from_fd` is the peer the question came
  * from (-1: this hub started it); `admin_fd` the console owed the answer. */
 typedef enum {
@@ -1884,6 +1925,9 @@ typedef struct {
   time_t ban_expires;
   bool   ban_sticky, ban_existed;
   char   ban_reason[BAN_REASON_MAX + 1];
+  /* kind "who", origin only: the CHAN_WHO chunks joined (hub_chanwho.c;
+   * freed by ce_release) */
+  chanwho_acc_t who;
 } chan_elect_t;
 
 /* One roll call (see CMD_HUB_ROLLCALL).  As the asking hub: the hubs it waits
@@ -2546,7 +2590,7 @@ bool hub_name_valid(const char *name);
 /* "8-4-4-4-12" hex: the shape of every node and user uuid. */
 bool hub_uuid_shape(const char *u);
 /* Log labels (any log line naming a node or user by uuid names it too):
- * "bot bunny_ (<uuid>)", "hub hubtbl (<uuid>)", "admin robert (<uuid>)",
+ * "bot bunny_ (<uuid>)", "hub hubtbl (<uuid>)", "admin admin (<uuid>)",
  * "oper x (<uuid>)"; a name nobody knows reads "?", so "bot ? (<uuid>)".
  * kind: 'b' bot, 'h' hub, 'u' admin/oper, 0 = whichever knows the uuid.
  * hub_who_client labels a connection: a bot by its uuid, a peer by its name
