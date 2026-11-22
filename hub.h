@@ -2810,6 +2810,7 @@ bool hub_ban_bot_write(hub_state_t *state, const char *bot_uuid, const char *val
                        time_t ts);
 /* 60 s sweep: `del` for every expired ban, announced to peers and bots. */
 void hub_bans_sweep(hub_state_t *state, time_t now);
+time_t hub_bans_sweep_last(void); /* hub stats: the last sweep (0 = none yet) */
 /* CMD_CHAN_EVENT from an authenticated bot (validate, rate-limit, log). */
 void hub_chan_event_receive(hub_state_t *state, hub_client_t *client, const char *payload);
 /* Start the apply-once election (kind "mode") for `channel` on behalf of
@@ -2980,6 +2981,7 @@ bool hub_update_commit(hub_state_t *state, const char *upgrade_id,
 bool hub_update_rollback(hub_state_t *state, const char *reason);
 void hub_update_failback_confirm(void);
 const char *hub_update_cron_status(void);
+time_t hub_update_cron_next(void); /* hub stats: when it looks at its line next */
 void hub_update_cron_set(bool on);
 bool hub_update_cron_tick(const char *exe);
 bool hub_update_install_in_progress(void);

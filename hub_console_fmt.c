@@ -1743,6 +1743,8 @@ static void render_hub_settings(const fmt_ctx_t *ctx, const crec_t *h, flines_t 
   for (int i = 0; i < 5; i++) tbl_row(ctx, &t, RL_NORMAL, NULL, rows[i]);
   tbl_render(ctx, out, &t);
   tbl_free(&t);
+  line(out, RL_DIM, "  cron: each hub's keepalive crontab line (hub list CRON column); help hub set");
+  hint(out, "hub set ssh | hub set conn · hub set <#|uuid|name> key <key> · hub set cron <global|#|uuid|name> <on|off>");
 }
 
 /* hub set ssh / hub set conn: this hub's connection limits.  ok|hub.show with
@@ -1766,6 +1768,14 @@ static const struct {
   {"conn", "startups", "logins in progress, S:R[:F]: from S, unknown addresses refused R%, "
    "rising to all at F"},
 };
+
+bool fmt_limit_info(int i, const char **group, const char **name, const char **meaning) {
+  if (i < 0 || (size_t)i >= sizeof(LIMIT_ROWS) / sizeof(LIMIT_ROWS[0])) return false;
+  *group = LIMIT_ROWS[i].group;
+  *name = LIMIT_ROWS[i].name;
+  *meaning = LIMIT_ROWS[i].meaning;
+  return true;
+}
 
 static void render_limits(const fmt_ctx_t *ctx, const crec_t *h, flines_t *out) {
   const char *group = rv(h, "group") ? rv(h, "group") : "ssh";
@@ -2020,7 +2030,10 @@ static void render_timers(const fmt_ctx_t *ctx, const creply_t *rep, const crec_
   static const struct { const char *k, *label; } NAMES[] = {
       {"gossip", "mesh gossip"},      {"entropy", "anti-entropy sync"},
       {"scan", "client scan"},        {"ipclean", "ip limit cleanup"},
-      {"peers", "hub reconnect"},     {"purge", "tombstone purge"}};
+      {"peers", "hub reconnect"},     {"purge", "tombstone purge"},
+      {"roster", "bot roster gossip"}, {"p2digest", "presence v2 digest"},
+      {"p2record", "presence v2 record"}, {"bansweep", "ban expiry sweep"},
+      {"cron", "crontab line check"}};
   static const col_t cols[] = {{"JOB", 'L', 1}, {"EVERY", 'R', 1}, {"NEXT RUN", 'R', 1}};
   tbl_t t;
   tbl_init(&t, cols, 3, -1, 1, 1);
@@ -2966,6 +2979,7 @@ static const struct {
   {"flood ctcp", "3:60", "CTCPs to a bot per host: the host is ignored", true},
   {"ignoretime", "10 min", "how long a flooding host or user stays ignored", true},
   {"sendq", "10:100", "a bot's IRC output: B lines at once, then one every I ms", true},
+  {"cron", "off", "keepalive crontab line on each bot's host: global, or one bot", true},
 };
 #define NSETINFO ((int)(sizeof(SET_INFO) / sizeof(SET_INFO[0])))
 
@@ -2997,6 +3011,8 @@ static bool is_flag_setting(const char *name) {
     if (!strcmp(FLAG_SETTINGS[i], name)) return true;
   return false;
 }
+
+bool fmt_setting_is_flag(const char *name) { return is_flag_setting(name); }
 
 /* A setting's value as a person reads it: on / off, minutes, seconds,
  * permanent; floods stay N:S or off. */
@@ -3124,7 +3140,8 @@ static void render_settings_table(const fmt_ctx_t *ctx, const creply_t *rep, fli
   if (network) {
     line(out, RL_DIM, "  cmd counts per user, msg and ctcp per host; a flooding host is ignored for ignoretime");
     line(out, RL_DIM, "  sendq paces what a bot says: B lines at once, then one every I ms (I 0 = no delay)");
-    hint(out, "bot set flood <cmd|msg|ctcp> <N:S|off|default> · bot set ignoretime <min|default> · bot set sendq <B:I|default>");
+    line(out, RL_DIM, "  cron: each bot's keepalive crontab line (bot list CRON column); help bot set");
+    hint(out, "bot set flood <cmd|msg|ctcp> <N:S|off|default> · bot set ignoretime <min|default> · bot set sendq <B:I|default> · bot set cron <global|nick|uuid> <on|off>");
   } else {
     const char *eff = rv(r, "effective");
     snprintf(v, sizeof(v), "  modes %s (%s)", eff ? eff : "?", modes_source_phrase(rv(r, "source")));

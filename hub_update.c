@@ -670,6 +670,9 @@ static void cron_helper_kill(pid_t pid) {
 /* What hub_update_cron_tick last found: yes, silent, manual, no, busy or failed:<why>. */
 const char *hub_update_cron_status(void) { return g_cron_status; }
 
+/* When the next look at the line is due (0 = at once). */
+time_t hub_update_cron_next(void) { return g_cron_next; }
+
 /* A hub's order. */
 void hub_update_cron_set(bool on) {
   int want = on ? 1 : 0;

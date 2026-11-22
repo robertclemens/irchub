@@ -581,7 +581,7 @@ typedef struct {
 } cmd_def_t;
 
 static const cmd_def_t CMDS[] = {
-  {"help", NULL, 0, B_LOCAL, 0, 2, CF_NONE, 0, NULL, "help [group [command]]", "the command groups, one group's commands, or one command in full (? does the same)", NULL},
+  {"help", NULL, 0, B_LOCAL, 0, 4, CF_NONE, 0, NULL, "help [group [command [topic ...]]]", "the command groups, one group's commands, one command in full, or one of its topics (? does the same)", NULL},
   {"quit", NULL, 0, B_LOCAL, 0, 0, CF_NONE, 0, NULL, "quit", "close this console", NULL},
   {"bot", "list", CMD_ADMIN_LIST_FULL, B_NONE, 0, 0, CF_NONE, 0, NULL, "bot list", "every registered bot: state, hub, version, last seen", NULL},
   {"bot", "show", CMD_ADMIN_LIST_FULL, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot show <uuid|nick>", "one bot in detail", NULL},
@@ -747,9 +747,11 @@ static const struct {
 } CMD_HELP[] = {
   {"help", NULL,
    "group\tone of: bot hub log acl option user channel ban upgrade display\n"
-   "command\tone of that group's commands: its arguments and an example\n"
-   "?\ttyped in place of help it does the same",
-   "help\nhelp bot\nhelp bot add\n? upgrade start"},
+   "command\tone of that group's commands: its arguments, its topics and examples\n"
+   "topic\ta setting or keyword the command takes (help <group> <command> lists them), "
+   "then any topic under that one (help hub set ssh preauth)\n"
+   "?\ttyped in place of help it does the same; Tab completes every level",
+   "help\nhelp bot\nhelp bot set\nhelp bot set cron\nhelp hub set ssh preauth\n? upgrade start"},
   {"quit", NULL, NULL, "quit"},
   {"bot", "list", NULL, "bot list"},
   {"bot", "show", "uuid|nick\tthe bot's uuid or its current nick (Tab completes both)",
@@ -786,8 +788,13 @@ static const struct {
    "ignoretime\tminutes (1-1440), or default\n"
    "sendq\tB:I = B lines (1-100) at once, then one every I ms (0-10000, 0 = no delay), or "
    "default\n"
-   "(scope)\tevery bot on every hub gets the same values; there is no per-bot setting",
-   "bot set\nbot set flood cmd 10:30\nbot set flood msg off\nbot set ignoretime 20\nbot set sendq 5:250\nbot set sendq default"},
+   "cron\tglobal, or a bot's nick or uuid, then on or off: the keepalive crontab line on "
+   "each bot's host (global = every bot; one bot keeps its own until the next global).  "
+   "help bot set cron has the whole of it\n"
+   "(scope)\tflood, ignoretime and sendq: every bot on every hub gets the same values; only "
+   "cron can be set per bot",
+   "bot set\nbot set flood cmd 10:30\nbot set flood msg off\nbot set ignoretime 20\nbot set sendq 5:250\nbot set sendq default\n"
+   "bot set cron global on\nbot set cron alpha off"},
   {"hub", "show", "#|uuid|name\talone: this hub; else a linked hub by the number hub list "
    "shows, its uuid, or its name",
    "hub show\nhub show 1\nhub show east"},
@@ -818,10 +825,14 @@ static const struct {
    "pubkey: the key its private key derives (a new key is hub rekey) · "
    "autopurge: days to keep tombstones, 0 = off\n"
    "#|uuid|name key\ta linked hub (its number in hub list, its uuid, or its name), then "
-   "key and its new 88-character public key: hub show or ./irchub -id on that hub",
+   "key and its new 88-character public key: hub show or ./irchub -id on that hub\n"
+   "cron\tglobal, or a hub's list number, uuid or name (this hub's too), then on or off: the "
+   "keepalive crontab line on each hub's host (global = every hub; one hub keeps its own until "
+   "the next global).  help hub set cron has the whole of it",
    "hub set\nhub set name west\nhub set port 6697\nhub set autopurge 30\nhub set ssh\n"
    "hub set ssh preauth 16\nhub set ssh authfail 3:3600\nhub set conn perip 8\n"
-   "hub set conn churn 30:10:30\nhub set east key " EX_KEY},
+   "hub set conn churn 30:10:30\nhub set east key " EX_KEY "\n"
+   "hub set cron global on\nhub set cron east off"},
   {"hub", "sync", NULL, "hub sync"},
   {"hub", "stats", NULL, "hub stats"},
   {"hub", "rekey", "(confirm)\tyou type this hub's name to go ahead; every other hub and bot "
@@ -988,6 +999,338 @@ static const struct {
   {"display", "clear", NULL, "display clear"},
 };
 #define NCMDHELP ((int)(sizeof(CMD_HELP) / sizeof(CMD_HELP[0])))
+
+/* ==========================================================================
+ * Help topics: help <group> <command> <topic> [<topic>]
+ * Every keyword a command takes where it picks what changes (a setting, a
+ * form, an option word) has a page of its own, listed by the page above it;
+ * Tab offers the same words.  The setting families (channel options, the
+ * floods, the connection limits) come from the tables behind the settings
+ * views, so a new setting there gets its page here too.
+ * ========================================================================== */
+typedef struct {
+  const char *path;  /* the command's words, then the topic's: "bot set cron" */
+  const char *brief, *usage, *text, *examples;
+} topic_t;
+
+#define CRON_TOPIC_TEXT(who, list, tag, pass)                                                  \
+  "The keepalive crontab line on each " who "'s host: every 5 minutes it starts the " who      \
+  " if it is not running (the line ends # " tag ":production:<dir>:).\n"                       \
+  "on adds the line, off removes only that tagged line; no other crontab line is ever "        \
+  "changed.  A hand-written line that runs the same binary path is left alone and shows as "   \
+  "manual.  The " who " needs " pass " in its directory to start unattended.\n"                \
+  "A " who " looks at its line once an hour, and at once when its setting changes.  The CRON " \
+  "column of " list " shows what it found: yes, silent (cron has not run the line for 15 "     \
+  "min), manual, no, busy (another node held the crontab lock; it tries again in 10-30 s) or " \
+  "failed (" who " show has why)."
+
+static const topic_t TOPICS[] = {
+  /* bot set */
+  {"bot set flood", "how many commands, messages or CTCPs a bot takes before it acts",
+   "bot set flood <cmd|msg|ctcp> <N:S|off|default>",
+   "N:S = more than N in S seconds trips it (N 1-1000, S 1-3600); off = no limit; default = "
+   "back to the built-in.\n"
+   "cmd counts per user: extras are dropped, 3x the rate ignores the user.  msg and ctcp count "
+   "per host: the host is ignored for ignoretime.  Every bot on every hub gets the same values.",
+   "bot set flood cmd 10:30\nbot set flood msg off\nbot set flood ctcp default"},
+  {"bot set ignoretime", "how long a flooding host or user stays ignored",
+   "bot set ignoretime <min|default>",
+   "Minutes, 1-1440; default = back to the built-in 10 min.  Every bot gets the same value.",
+   "bot set ignoretime 20\nbot set ignoretime default"},
+  {"bot set sendq", "how fast a bot talks to its IRC server", "bot set sendq <B:I|default>",
+   "B lines (1-100) at once, then one every I ms (0-10000, 0 = no delay); default = back to the "
+   "built-in 10:100.  Every bot gets the same value.",
+   "bot set sendq 5:250\nbot set sendq default"},
+  {"bot set cron", "the keepalive crontab line on each bot's host (default off)",
+   "bot set cron <global|nick|uuid> <on|off>",
+   CRON_TOPIC_TEXT("bot", "bot list", "ircbot", ".ircbot.pass") "\n"
+   "global = every bot; a nick or uuid = that bot only, until the next global (Tab completes "
+   "both).",
+   "bot set cron global on\nbot set cron alpha off\nbot set cron global off"},
+  {"bot resync all", "every bot, from whichever hub each is on", "bot resync all",
+   "Sends every bot its whole config again instead of only what changed.", "bot resync all"},
+  /* hub set */
+  {"hub set name", "this hub's name", "hub set name <name>",
+   "A-Z a-z 0-9 . _ -, 1-63 characters.",
+   "hub set name west"},
+  {"hub set bindip", "the address this hub listens on", "hub set bindip <ip>",
+   "Takes effect at the next restart; hub set shows the pending value until then.",
+   "hub set bindip 0.0.0.0"},
+  {"hub set port", "the port this hub listens on", "hub set port <1-65535>",
+   "Takes effect at the next restart; bots and hubs that dial this hub need the new port.",
+   "hub set port 6697"},
+  {"hub set pubkey", "store this hub's public key again", "hub set pubkey <key>",
+   "The 88-character key its private key derives; refused if it does not match.  A new key "
+   "is hub rekey.",
+   "hub set pubkey " EX_KEY},
+  {"hub set autopurge", "purge tombstones older than <days>, daily", "hub set autopurge <days>",
+   "0 = off.  Checked daily on every hub; hub purge clears them by hand.",
+   "hub set autopurge 30\nhub set autopurge 0"},
+  {"hub set ssh", "this hub's SSH console limits", "hub set ssh [<name> <value|default>]",
+   "Alone it shows every limit, its value and its built-in.  A change applies to the next "
+   "connection.  N:S is N per S seconds.",
+   "hub set ssh\nhub set ssh preauth 16\nhub set ssh authfail 3:3600"},
+  {"hub set conn", "this hub's connection limits (bots, hubs and SSH)",
+   "hub set conn [<name> <value|default>]",
+   "Alone it shows every limit, its value and its built-in.  A change applies to the next "
+   "connection.  N:S is N per S seconds; B is seconds blocked.",
+   "hub set conn\nhub set conn perip 8\nhub set conn churn 30:10:30"},
+  {"hub set key", "replace a linked hub's public key", "hub set <#|uuid|name> key <key>",
+   "The hub by its number in hub list, its uuid or its name (Tab completes names and uuids), "
+   "then its new 88-character public key: hub show or ./irchub -id on that hub.",
+   "hub set east key " EX_KEY},
+  {"hub set cron", "the keepalive crontab line on each hub's host (default off)",
+   "hub set cron <global|#|uuid|name> <on|off>",
+   CRON_TOPIC_TEXT("hub", "hub list", "irchub", ".irchub.pass") "\n"
+   "global = every hub; a hub list number, uuid or name (this hub's too) = that hub only, "
+   "until the next global (Tab completes names and uuids).",
+   "hub set cron global on\nhub set cron east off\nhub set cron global off"},
+  {"hub purge now", "every tombstone, whatever its age", "hub purge now",
+   "Asks y/N.  Deleted bots stay on bot revoked.", "hub purge now"},
+  /* log */
+  {"log set file", "the log file's level", "log set file <level>",
+   "none error warning info debug, or 0-4: that level and worse are written.", "log set file info"},
+  {"log set console", "the console log ring's level", "log set console <level>",
+   "none error warning info debug, or 0-4: what the log view and log on can show.",
+   "log set console debug"},
+  {"log set size", "the log file's size limit", "log set size <MB|<n>k|<n>b>",
+   "<MB>, <n>k or <n>b, at most 1024 MB.", "log set size 50\nlog set size 512k"},
+  {"log filter clear", "drop the log view filter", "log filter clear",
+   "The log view shows every line again.", "log filter clear"},
+  /* acl */
+  {"acl add allow", "the allow list", "acl add allow <ip[/n]> [console]",
+   "Once the allow list has an entry, only the addresses on it may connect (console entries: only SSH logins).",
+   "acl add allow 203.0.113.0/24"},
+  {"acl add deny", "the deny list", "acl add deny <ip[/n]> [console]",
+   "A listed address is refused, and an open inbound connection from it is closed.",
+   "acl add deny 198.51.100.9"},
+  {"acl add console", "the entry applies to SSH logins only", "acl add allow|deny <ip[/n]> console",
+   "Bots and other hubs are not affected; without it the entry applies to everything.",
+   "acl add allow 203.0.113.7 console"},
+  {"acl del allow", "remove an allow list entry", "acl del allow <ip[/n]> [console]",
+   "The entry exactly as acl list shows it (asks y/N).", "acl del allow 203.0.113.0/24"},
+  {"acl del deny", "remove a deny list entry", "acl del deny <ip[/n]> [console]",
+   "The entry exactly as acl list shows it (asks y/N).", "acl del deny 198.51.100.9"},
+  {"acl del console", "an entry that was added with console", "acl del allow|deny <ip[/n]> console",
+   "Give it for an entry that was added with it.", "acl del allow 203.0.113.7 console"},
+  /* user */
+  {"user list admin", "admins only", "user list admin", "Every admin with key, last seen and masks.",
+   "user list admin"},
+  {"user list oper", "opers only", "user list oper", "Every oper with key, last seen and masks.",
+   "user list oper"},
+  {"user add admin", "an admin, with flags", "user add admin <name> <key> <mask> <flags>",
+   "flags: +a for a full admin (every command), or the letters of what they may change: b bots, "
+   "c channels, h hub, o opers, u upgrades (+chu).  Every admin may log in and view everything.",
+   "user add admin dana " EX_KEY " dana!*@* +chu"},
+  {"user add oper", "an oper, with channels", "user add oper <name> <key> <mask> <channels>",
+   "channels: * for every channel, or the channels, comma-separated (#ircbot,#dev); on each "
+   "they may op, invite, unban, key.",
+   "user add oper alice " EX_KEY " alice!*@*.example.net #ircbot"},
+  {"user set key", "replace a user's key", "user set <name> key <key>",
+   "Anyone's (your own needs no flag); their new 88-character public key.  Asks y/N.",
+   "user set alice key " EX_KEY},
+  {"user set flags", "an admin's flags", "user set <name> flags <+x-y|letters|+a>",
+   "+c-u adds and removes, chu or +a replaces them all.  Needs +a.",
+   "user set dana flags +b-u\nuser set dana flags +a"},
+  {"user chan add", "give an oper a channel", "user chan add <name> <#chan|*>",
+   "* = every channel; * and channels exclude each other (add * drops the channels, add #c "
+   "drops *).",
+   "user chan add alice #ops\nuser chan add alice *"},
+  {"user chan del", "take a channel away from an oper", "user chan del <name> <#chan|*>",
+   "del * takes everything away.", "user chan del alice #dev\nuser chan del alice *"},
+  {"user mask add", "add a usermask", "user mask add <name> <mask>",
+   "nick!user@host (* and ? match).", "user mask add alice alice!*@203.0.113.*"},
+  {"user mask del", "remove a usermask", "user mask del <name> <mask>",
+   "The mask exactly as user show lists it (asks y/N).",
+   "user mask del alice alice!*@*.example.net"},
+  /* channel */
+  {"channel set default", "the network default every channel inherits",
+   "channel set default [+opt|-opt|<name> <value|default>|flood <type> <N:S|off|default>]",
+   "A channel without its own value for a setting follows this one; default on a setting here "
+   "goes back to the built-in.",
+   "channel set default\nchannel set default -dynamicbans\nchannel set default bantime 60"},
+  {"channel set flood", "the channel floods: chan ctcp join nick deop kick ban",
+   "channel set <#chan|default> flood <type> <N:S|off|default>",
+   "N:S = more than N in S seconds from one host trips it; off = no limit here; default = "
+   "inherit.  Only unauthorised members are acted on, and only by an opped bot.",
+   "channel set #ops flood join 10:60\nchannel set #ops flood chan off"},
+  {"channel ban perm", "the ban never expires (the default)",
+   "channel ban <#chan|*> <mask> perm [sticky] [reason]", "Without a duration a ban is perm.",
+   "channel ban #ops *!*@203.0.113.7 perm"},
+  {"channel ban sticky", "put the ban back at once if an op removes it",
+   "channel ban <#chan|*> <mask> [<min>|perm] sticky [reason]",
+   "The bots set it again as soon as they see it lifted.",
+   "channel ban #ops *!*@203.0.113.7 60 sticky"},
+  /* ban */
+  {"ban add perm", "the ban never expires (the default)", "ban add <#chan|*> <mask> perm [sticky] [reason]",
+   "Without a duration a ban is perm.", "ban add #ops *!*@203.0.113.7 perm"},
+  {"ban add sticky", "put the ban back at once if an op removes it",
+   "ban add <#chan|*> <mask> [<min>|perm] sticky [reason]",
+   "The bots set it again as soon as they see it lifted.",
+   "ban add * *!*@*.badhost.example 1440 sticky open proxy"},
+  /* upgrade */
+  {"upgrade start bot=", "the bot version to move to (required)", "upgrade start bot=<ver>",
+   "As upgrade releases lists it.", "upgrade start bot=2.4.5"},
+  {"upgrade start hub=", "also move the hubs to this version", "upgrade start bot=<ver> hub=<ver>",
+   "- or left out = leave the hubs where they are.", "upgrade start bot=2.4.5 hub=2.4.4"},
+  {"upgrade start nodes=", "only these nodes", "upgrade start bot=<ver> nodes=<a,b=c>",
+   "Names or uuids, comma-separated; name=c or name=rs also switches that node's build "
+   "(default: the whole network).",
+   "upgrade start bot=2.4.5 nodes=alpha,beta=rs"},
+};
+#define NTOPICS ((int)(sizeof(TOPICS) / sizeof(TOPICS[0])))
+
+#define TOPIC_SET_MAX 40
+typedef struct {
+  topic_t t[TOPIC_SET_MAX];
+  int     n;
+  size_t  used;
+  char    pool[16384];
+} topic_set_t;
+
+static const char *tset_str(topic_set_t *s, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static const char *tset_str(topic_set_t *s, const char *fmt, ...) {
+  size_t room = sizeof(s->pool) - s->used;
+  if (room < 2) return "";
+  char *r = s->pool + s->used;
+  va_list ap;
+  va_start(ap, fmt);
+  int w = vsnprintf(r, room, fmt, ap);
+  va_end(ap);
+  if (w < 0) {
+    r[0] = '\0';
+    w = 0;
+  }
+  s->used += (size_t)w + 1 < room ? (size_t)w + 1 : room;
+  return r;
+}
+
+static void tset_add(topic_set_t *s, const char *path, const char *brief, const char *usage,
+                     const char *text, const char *ex) {
+  if (s->n >= TOPIC_SET_MAX) return;
+  s->t[s->n++] = (topic_t){path, brief, usage, text, ex};
+}
+
+static const char *topic_name(const char *path) {
+  const char *sp = strrchr(path, ' ');
+  return sp ? sp + 1 : path;
+}
+
+/* The first word of a built-in value, for an example: "120 min" -> 120. */
+static const char *tset_word(topic_set_t *s, const char *v) {
+  return tset_str(s, "%.*s", (int)strcspn(v, " "), v);
+}
+
+/* The topics right under `parent` ("bot set", "hub set ssh"), in help order. */
+static void topic_children(const char *parent, topic_set_t *s) {
+  s->n = 0;
+  s->used = 0;
+  size_t pl = strlen(parent);
+  for (int i = 0; i < NTOPICS; i++) {
+    const char *p = TOPICS[i].path;
+    if (strncasecmp(p, parent, pl) || p[pl] != ' ' || strchr(p + pl + 1, ' ')) continue;
+    if (s->n < TOPIC_SET_MAX) s->t[s->n++] = TOPICS[i];
+  }
+  const char *n, *def, *what;
+  bool bot_flood = !strcasecmp(parent, "bot set flood");
+  if (bot_flood || !strcasecmp(parent, "channel set flood")) {
+    for (int i = 0; fmt_setting_info(i, bot_flood, &n, &def, &what); i++) {
+      if (strncmp(n, "flood ", 6)) continue;
+      const char *ty = n + 6;
+      if (bot_flood)
+        tset_add(s, tset_str(s, "bot set flood %s", ty), what,
+                 tset_str(s, "bot set flood %s <N:S|off|default>", ty),
+                 tset_str(s, "Built-in: %s.\nN:S = more than N in S seconds trips it (N "
+                          "1-1000, S 1-3600); off = no limit; default = back to the built-in.  "
+                          "Every bot gets the same value.", def),
+                 tset_str(s, "bot set flood %s %s\nbot set flood %s default", ty, def, ty));
+      else
+        tset_add(s, tset_str(s, "channel set flood %s", ty), what,
+                 tset_str(s, "channel set <#chan|default> flood %s <N:S|off|default>", ty),
+                 tset_str(s, "Built-in: %s.\nN:S = more than N in S seconds from one host "
+                          "trips it; off = no limit here; default = inherit (a channel from "
+                          "default, default from the built-in).  Only unauthorised members are "
+                          "acted on, and only by an opped bot.", def),
+                 tset_str(s, "channel set #ops flood %s %s\nchannel set #ops flood %s default",
+                          ty, def, ty));
+    }
+  } else if (!strcasecmp(parent, "channel set")) {
+    for (int i = 0; fmt_setting_info(i, false, &n, &def, &what); i++) {
+      if (!strncmp(n, "flood ", 6)) continue;
+      if (fmt_setting_is_flag(n))
+        tset_add(s, tset_str(s, "channel set %s", n), what,
+                 tset_str(s, "channel set <#chan|default> +%s | -%s", n, n),
+                 tset_str(s, "Built-in: %s.\n+%s turns it on, -%s off; several options "
+                          "can go in one line.  On default it is what every channel without "
+                          "its own value follows.", def, n, n),
+                 tset_str(s, "channel set #ops +%s\nchannel set default -%s", n, n));
+      else
+        tset_add(s, tset_str(s, "channel set %s", n), what,
+                 tset_str(s, "channel set <#chan|default> %s <value|default>", n),
+                 tset_str(s, "Built-in: %s.\ndefault drops the channel's own value, so it "
+                          "inherits again.", def),
+                 tset_str(s, "channel set #ops %s %s\nchannel set #ops %s default", n,
+                          tset_word(s, def), n));
+    }
+  } else if (!strcasecmp(parent, "hub set ssh") || !strcasecmp(parent, "hub set conn")) {
+    const char *grp = parent + 8;
+    for (int i = 0; fmt_limit_info(i, &def, &n, &what); i++) {
+      if (strcasecmp(def, grp)) continue;
+      tset_add(s, tset_str(s, "hub set %s %s", def, n), what,
+               tset_str(s, "hub set %s %s <value|default>", def, n),
+               tset_str(s, "hub set %s shows its value here and its built-in; default goes "
+                        "back to the built-in.  This hub only; a change applies to the next "
+                        "connection.", def),
+               tset_str(s, "hub set %s %s default", def, n));
+    }
+  }
+}
+
+/* The topic `word` under `parent` (a leading + or - is the channel option's
+ * sign, not its name), or NULL. */
+static const topic_t *topic_find(const char *parent, const char *word, topic_set_t *s) {
+  if (word[0] == '+' || word[0] == '-') word++;
+  topic_children(parent, s);
+  for (int i = 0; i < s->n; i++)
+    if (!strcasecmp(topic_name(s->t[i].path), word)) return &s->t[i];
+  return NULL;
+}
+
+/* The topics under `parent`: a table of name and brief, or (compact, where a
+ * settings table above already explains them) one line of names. */
+static void help_topic_list(const fmt_ctx_t *c, flines_t *f, const char *parent, bool compact) {
+  topic_set_t *s = malloc(sizeof(*s));
+  if (!s) return;
+  topic_children(parent, s);
+  if (s->n) {
+    char line[1024];
+    flines_add(f, RL_NORMAL, "");
+    usnprintf(line, sizeof(line), " Topics  help %s <topic> for one", parent);
+    flines_add(f, RL_HEAD, line);
+    if (compact) {
+      size_t o = (size_t)usnprintf(line, sizeof(line), "  ");
+      for (int i = 0; i < s->n && o + 2 < sizeof(line); i++)
+        o += (size_t)usnprintf(line + o, sizeof(line) - o, " %s", topic_name(s->t[i].path));
+      flines_add(f, RL_NORMAL, line);
+    } else {
+      int nw = 0;
+      for (int i = 0; i < s->n; i++) {
+        int w = console_str_width(topic_name(s->t[i].path));
+        if (w > nw) nw = w;
+      }
+      if (nw > 16) nw = 16;
+      for (int i = 0; i < s->n; i++) {
+        const char *nm = topic_name(s->t[i].path);
+        int w = console_str_width(nm);
+        usnprintf(line, sizeof(line), "   %s%*s  %s", nm, w < nw ? nw - w : 0, "", s->t[i].brief);
+        flines_add(f, RL_NORMAL, line);
+      }
+    }
+    (void)c;
+  }
+  free(s);
+}
 
 static const char *const LEVEL_WORD[] = {"none", "error", "warning", "info", "debug"};
 
@@ -1949,6 +2292,13 @@ static void help_command(const fmt_ctx_t *c, flines_t *f, const cmd_def_t *d) {
       flines_add(f, RL_NORMAL, line);
     }
   }
+  /* the topics under it: help <group> <command> <topic> */
+  if (d->sub) {
+    char parent[48];
+    usnprintf(parent, sizeof(parent), "%s %s", d->cmd, d->sub);
+    help_topic_list(c, f, parent,
+                    net_set || (!strcmp(d->cmd, "channel") && !strcmp(d->sub, "set")));
+  }
   /* user add / user set: what each admin flag allows (from CMD_FLAGS) */
   if (!strcmp(d->cmd, "user") && d->sub && (!strcmp(d->sub, "add") || !strcmp(d->sub, "set"))) {
     flines_add(f, RL_NORMAL, "");
@@ -1979,6 +2329,54 @@ static void help_command(const fmt_ctx_t *c, flines_t *f, const cmd_def_t *d) {
       p = *nl ? nl + 1 : nl;
     }
   }
+}
+
+/* help <group> <command> <topic> [<topic>]: one topic in full, then the
+ * topics under it.  `d` is the command it belongs to (the flag it needs). */
+static void help_topic(console_ui_t *ui, const cmd_def_t *d, const topic_t *t,
+                       const char *parent) {
+  fmt_ctx_t c;
+  char slog[128], right[96], line[1024];
+  ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
+  flines_t f = {0};
+  usnprintf(right, sizeof(right), "help %s for the %s", parent,
+            strchr(strchr(parent, ' ') + 1, ' ') ? "topic" : "command");
+  fmt_title(&c, &f, t->path, right);
+  usnprintf(line, sizeof(line), "   %s", t->usage);
+  flines_add(&f, RL_NORMAL, line);
+  usnprintf(line, sizeof(line), "   %s", t->brief);
+  flines_add(&f, RL_DIM, line);
+  const char *fl = cmd_flag(d);
+  if (fl && !strcmp(fl, "a/o"))
+    flines_add(&f, RL_DIM, "   needs +a for an admin, +o for an oper");
+  else if (fl) {
+    usnprintf(line, sizeof(line), "   changing needs +%s (%s)", fl, flag_word(fl[0]));
+    flines_add(&f, RL_DIM, line);
+  }
+  if (t->text && t->text[0]) {
+    flines_add(&f, RL_NORMAL, "");
+    for (const char *p = t->text; *p;) {
+      const char *nl = strchr(p, '\n');
+      if (!nl) nl = p + strlen(p);
+      usnprintf(line, sizeof(line), "   %.*s", (int)(nl - p), p);
+      flines_add(&f, RL_NORMAL, line);
+      p = *nl ? nl + 1 : nl;
+    }
+  }
+  help_topic_list(&c, &f, t->path, false);
+  if (t->examples && t->examples[0]) {
+    flines_add(&f, RL_NORMAL, "");
+    flines_add(&f, RL_HEAD, strchr(t->examples, '\n') ? " Examples" : " Example");
+    for (const char *p = t->examples; *p;) {
+      const char *nl = strchr(p, '\n');
+      if (!nl) nl = p + strlen(p);
+      usnprintf(line, sizeof(line), "   %.*s", (int)(nl - p), p);
+      flines_add(&f, RL_CMD, line);
+      p = *nl ? nl + 1 : nl;
+    }
+  }
+  emit_flines(ui, &f);
+  flines_free(&f);
 }
 
 /* help: the groups; help <group>: its commands; help <group> <command>: one
@@ -2018,7 +2416,7 @@ static void show_help(console_ui_t *ui, const char *topic, const cmd_def_t *one)
         flines_add(&f, RL_DIM, line);
       }
     }
-    usnprintf(line, sizeof(line), "   help [group [command]] %s ? [group [command]] %s quit", dot, dot);
+    usnprintf(line, sizeof(line), "   help [group [command [topic]]] %s ? does the same %s quit", dot, dot);
     flines_add(&f, RL_NORMAL, line);
     if (!ui->line_mode) {
       flines_add(&f, RL_NORMAL, "");
@@ -2170,7 +2568,42 @@ static void local_command(console_ui_t *ui, const cmd_def_t *c, const words_t *w
         return;
       }
     }
-    show_help(ui, a1, one);
+    /* help <group> <command> <topic> [<topic>] */
+    if (one && one->sub && ws->n > argi + 2) {
+      topic_set_t *s = malloc(sizeof(*s));
+      if (!s) {
+        refuse(ui, seq, "cmd.failed", "out of memory", NULL);
+        return;
+      }
+      char parent[160], path[160];
+      usnprintf(parent, sizeof(parent), "%s %s", one->cmd, one->sub);
+      topic_t t = {0};
+      bool found = true;
+      for (int k = argi + 2; k < ws->n; k++) {
+        const topic_t *hit = topic_find(parent, ws->w[k], s);
+        if (!hit) {
+          char m[224], h[176];
+          usnprintf(m, sizeof(m), "%s has no topic %.*s", parent, uprec(ws->w[k], 40), ws->w[k]);
+          usnprintf(h, sizeof(h), "help %s", parent);
+          refuse(ui, seq, "cmd.unknown", m, h);
+          found = false;
+          break;
+        }
+        t = *hit;
+        /* the next word looks under this one; its strings stay in `s` until then */
+        usnprintf(path, sizeof(path), "%s", hit->path);
+        if (k + 1 < ws->n) usnprintf(parent, sizeof(parent), "%s", path);
+      }
+      if (found) {
+        /* the parent of the page shown: the path without its last word */
+        usnprintf(parent, sizeof(parent), "%.*s", (int)(topic_name(path) - path - 1), path);
+        help_topic(ui, one, &t, parent);
+      }
+      free(s);
+      if (!found) return; /* refused: no ok marker */
+    } else {
+      show_help(ui, a1, one);
+    }
   } else if (!strcmp(c->cmd, "quit")) {
     if (!ui->raw) {
       char m[160], d[32];
@@ -3441,7 +3874,7 @@ static void in_backspace(console_ui_t *ui) {
 
 /* What Tab offers for one argument of a command (docs/console.md §2). */
 enum ck { CK_NONE, CK_GROUP, CK_WORDS, CK_BOT, CK_BOT_ON, CK_BOT_NICK, CK_HUB_NAME,
-          CK_CHSET, CK_NETSET, CK_HUBSET };
+          CK_HUB_SELF /* CK_HUB_NAME with this hub too */, CK_CHSET, CK_NETSET, CK_HUBSET };
 
 typedef struct {
   const char *cmd, *sub;
@@ -3457,10 +3890,11 @@ static const arg_comp_t ARG_COMP[] = {
   {"bot", "del", 0, CK_BOT_NICK, NULL},
   {"bot", "kick", 0, CK_BOT_ON, NULL},
   {"bot", "rekey", 0, CK_BOT, NULL},
-  {"bot", "resync", 0, CK_BOT_NICK, NULL},
-  {"bot", "set", 0, CK_WORDS, "flood ignoretime sendq"},
+  {"bot", "resync", 0, CK_BOT_NICK, "all"},
+  {"bot", "set", 0, CK_WORDS, "flood ignoretime sendq cron"},
   {"bot", "set", -1, CK_NETSET, NULL},
   {"hub", "show", 0, CK_HUB_NAME, NULL},
+  {"hub", "del", 0, CK_HUB_NAME, NULL},
   {"hub", "set", -1, CK_HUBSET, NULL},
   {"hub", "purge", 0, CK_WORDS, "now"},
   {"log", "set", 0, CK_WORDS, "file console size"},
@@ -3516,12 +3950,16 @@ static const char *netset_words(const char *p1, const char *p2) {
   if (!strcasecmp(p1, "flood")) return "cmd msg ctcp";
   if (!strcasecmp(p2, "flood")) return "off default";
   if (!strcasecmp(p1, "ignoretime") || !strcasecmp(p1, "sendq")) return "default";
+  if (!strcasecmp(p1, "cron")) return "global"; /* and the bots' nicks and uuids */
+  if (!strcasecmp(p2, "cron")) return "on off";
   return "";
 }
 
 /* hub set <setting> | ssh <name> <value> | conn <name> <value> | <hub> key <key> */
 static const char *hubset_words(int pos, const char *p1, const char *p2) {
-  if (pos == 0) return "name bindip port pubkey autopurge ssh conn";
+  if (pos == 0) return "name bindip port pubkey autopurge ssh conn cron";
+  if (pos == 1 && !strcasecmp(p1, "cron")) return "global"; /* and the hubs' names and uuids */
+  if (pos == 2 && !strcasecmp(p2, "cron")) return "on off";
   if (pos == 1 && !strcasecmp(p1, "ssh"))
     return "preauth preauthip sessions grace authtries idle authfail connect block cmdrate";
   if (pos == 1 && !strcasecmp(p1, "conn")) return "perip churn authfail startups";
@@ -3565,6 +4003,30 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
       if (CMDS[i].sub && !strcasecmp(CMDS[i].cmd, w[1])) ADD_CAND(CMDS[i].sub);
     return n;
   }
+  /* help <group> <command> <topic> [<topic>] */
+  if (!strcasecmp(w[0], "help") && (word_idx == 3 || word_idx == 4)) {
+    char parent[200];
+    const char *up = p1[0] == '+' || p1[0] == '-' ? p1 + 1 : p1;
+    if (word_idx == 3) usnprintf(parent, sizeof(parent), "%s %s", w[1], w[2]);
+    else usnprintf(parent, sizeof(parent), "%s %s %s", w[1], w[2], up);
+    topic_set_t *s = malloc(sizeof(*s));
+    if (!s) return n;
+    topic_children(parent, s);
+    /* +bit / -bit: a channel option keeps the sign it was typed with */
+    bool sign = (prefix[0] == '+' || prefix[0] == '-') && !strcasecmp(parent, "channel set");
+    for (int i = 0; i < s->n && *pooln < 128; i++) {
+      const char *nm = topic_name(s->t[i].path);
+      if (sign && !fmt_setting_is_flag(nm)) continue;
+      if (sign) usnprintf(pool[*pooln], 72, "%c%s", prefix[0], nm);
+      else usnprintf(pool[*pooln], 72, "%s", nm);
+      size_t before = (size_t)n;
+      ADD_CAND(pool[*pooln]);
+      if ((size_t)n > before) (*pooln)++;
+    }
+    free(s);
+    return n;
+  }
+  if (!strcasecmp(w[0], "help") && word_idx > 4) return 0;
   bool subs = cmd_has_subs(w[0]);
   if (word_idx == 1 && subs) {
     for (int i = 0; i < NCMDS; i++)
@@ -3595,6 +4057,7 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
     for (int i = 0; i < NGROUPS; i++) ADD_CAND(GROUPS[i].name);
     return n;
   }
+  int kind = ac->kind;
   if (ac->kind == CK_WORDS || ac->kind == CK_CHSET || ac->kind == CK_NETSET ||
       ac->kind == CK_HUBSET) {
     const char *words = ac->kind == CK_WORDS ? ac->words
@@ -3610,7 +4073,23 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
       p += l;
       while (*p == ' ') p++;
     }
-    return n;
+    /* bot set cron <nick|uuid>, hub set cron <name|uuid>, hub set <hub> key:
+     * the nodes too */
+    if (ac->kind == CK_NETSET && pos == 1 && !strcasecmp(p1, "cron")) kind = CK_BOT_NICK;
+    else if (ac->kind == CK_HUBSET && pos == 1 && !strcasecmp(p1, "cron")) kind = CK_HUB_SELF;
+    else if (ac->kind == CK_HUBSET && pos == 0) kind = CK_HUB_NAME;
+    else return n;
+  } else if (ac->words) {
+    /* a node, or one of these words (bot resync all) */
+    for (const char *p = ac->words; *p && *pooln < 128;) {
+      size_t l = strcspn(p, " ");
+      usnprintf(pool[*pooln], 72, "%.*s", (int)l, p);
+      size_t before = (size_t)n;
+      ADD_CAND(pool[*pooln]);
+      if ((size_t)n > before) (*pooln)++;
+      p += l;
+      while (*p == ' ') p++;
+    }
   }
   /* uuids (and for show / kick / del / hub show, names) from the tree rows:
    * H|depth|name|uuid|..., B|depth|nick|uuid|..., D|nick|uuid|... (offline) */
@@ -3628,16 +4107,17 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
         f[nf++] = t;
       const char *cand[2] = {NULL, NULL};
       char ty = nf ? f[0][0] : 0;
-      if (ac->kind == CK_HUB_NAME && ty == 'H' && nf >= 4 && strcmp(f[1], "0")) {
+      if ((kind == CK_HUB_NAME || kind == CK_HUB_SELF) && ty == 'H' && nf >= 4 &&
+          (kind == CK_HUB_SELF || strcmp(f[1], "0"))) {
         cand[0] = f[2];
         cand[1] = f[3];
-      } else if ((ac->kind == CK_BOT || ac->kind == CK_BOT_ON || ac->kind == CK_BOT_NICK) &&
-                 ty == 'B' && nf >= 4) {
+      } else if ((kind == CK_BOT || kind == CK_BOT_ON || kind == CK_BOT_NICK) && ty == 'B' &&
+                 nf >= 4) {
         cand[0] = f[3];
-        if (ac->kind != CK_BOT) cand[1] = f[2];
-      } else if ((ac->kind == CK_BOT || ac->kind == CK_BOT_NICK) && ty == 'D' && nf >= 3) {
+        if (kind != CK_BOT) cand[1] = f[2];
+      } else if ((kind == CK_BOT || kind == CK_BOT_NICK) && ty == 'D' && nf >= 3) {
         cand[0] = f[2];
-        if (ac->kind == CK_BOT_NICK) cand[1] = f[1];
+        if (kind == CK_BOT_NICK) cand[1] = f[1];
       }
       for (int k = 0; k < 2 && *pooln < 128; k++) {
         if (!cand[k] || !strcmp(cand[k], "-")) continue;

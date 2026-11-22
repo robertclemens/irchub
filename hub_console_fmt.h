@@ -116,6 +116,11 @@ typedef struct {
  * the last. */
 bool   fmt_setting_info(int i, bool net, const char **name, const char **def,
                         const char **what);
+/* A channel setting that is on/off (+name / -name), not valued. */
+bool   fmt_setting_is_flag(const char *name);
+/* The i-th hub connection limit: its group (ssh or conn), name and meaning.
+ * False past the last. */
+bool   fmt_limit_info(int i, const char **group, const char **name, const char **meaning);
 
 /* Text helpers shared with hub_console_ui.c. */
 int    console_str_width(const char *s);

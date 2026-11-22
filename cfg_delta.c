@@ -34,9 +34,14 @@ static cfgd_line_t *cfgd_split(const char *t, size_t len, long *n) {
     *n = -1;
     return NULL;
   }
+  /* At least one: the text ends in '\n' (gcc 8 cannot see it: -Walloc-zero). */
   long count = 0;
   for (size_t i = 0; i < len; i++)
     if (t[i] == '\n') count++;
+  if (count < 1) {
+    *n = -1;
+    return NULL;
+  }
   cfgd_line_t *ls = malloc((size_t)count * sizeof(*ls));
   if (!ls) {
     *n = -1;

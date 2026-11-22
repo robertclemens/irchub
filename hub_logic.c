@@ -7604,6 +7604,15 @@ static void stats_timer(reply_t *r, const char *name, long long every, time_t la
   reply_kvi(r, "in", in < 0 ? 0 : in);
 }
 
+/* The same for a job that keeps the time of its next run (`due`, 0 = now). */
+static void stats_timer_due(reply_t *r, const char *name, long long every, time_t due, time_t now) {
+  reply_rec(r, "timer");
+  reply_kv(r, "name", name);
+  reply_kvi(r, "every", every);
+  long long in = due > now ? (long long)(due - now) : 0;
+  reply_kvi(r, "in", in > every ? every : in);
+}
+
 /* upgrade start.  `roll_called`: the hubs have just answered a roll call, so
  * the gate is passed. */
 static bool admin_upgrade_start(hub_state_t *state, hub_client_t *client, const char *payload,
@@ -9000,6 +9009,19 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     stats_timer(&r, "purge", 86400,
                 state->purge_days_setting > 0 && state->last_purge > 0 ? state->last_purge : -1,
                 now);
+    stats_timer(&r, "roster", BOT_PRESENCE_INTERVAL, state->last_presence_gossip, now);
+    if (state->p2) {
+      /* Presence v2 keeps CLOCK_MONOTONIC milliseconds. */
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      int64_t mono = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+      stats_timer_due(&r, "p2digest", P2_DIGEST_MS / 1000,
+                      now + (time_t)((state->p2->next_digest_ms - mono + 999) / 1000), now);
+      stats_timer_due(&r, "p2record", P2_FULL_EVERY_MS / 1000,
+                      now + (time_t)((state->p2->next_full_ms - mono + 999) / 1000), now);
+    }
+    stats_timer(&r, "bansweep", BAN_SWEEP_INTERVAL, hub_bans_sweep_last(), now);
+    stats_timer_due(&r, "cron", CRON_CHECK_SECS, hub_update_cron_next(), now);
     for (int op = 0; op < 256; op++) {
       if (!st->rx_frames[op] && !st->tx_frames[op]) continue;
       char code[8];

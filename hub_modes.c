@@ -751,10 +751,12 @@ bool hub_ban_bot_write(hub_state_t *state, const char *bot_uuid, const char *val
   return hub_storage_put_record(state, "B", value, ts);
 }
 
+static time_t g_bans_swept = 0;
+time_t hub_bans_sweep_last(void) { return g_bans_swept; }
+
 void hub_bans_sweep(hub_state_t *state, time_t now) {
-  static time_t last = 0;
-  if (last != 0 && now - last < BAN_SWEEP_INTERVAL) return;
-  last = now;
+  if (g_bans_swept != 0 && now - g_bans_swept < BAN_SWEEP_INTERVAL) return;
+  g_bans_swept = now;
   if (frozen(state)) return;
   char out[8192];
   size_t off = 0;
