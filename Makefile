@@ -451,6 +451,13 @@ help:
 # Auto-generate dependencies (not for clean: generating them needs libssh's
 # headers, i.e. a libssh build)
 ifeq ($(filter clean distclean help libssh,$(MAKECMDGOALS)),)
+# The .d files need libssh built first, and a failure under -include is
+# silent (make then stops on "No rule to make target libssh.a"): say why now.
+ifeq ($(wildcard $(LIBSSH_LIB)),)
+ifeq ($(shell command -v cmake 2>/dev/null),)
+$(error cmake is required to build the bundled libssh (Debian/Ubuntu: sudo apt install cmake))
+endif
+endif
 -include $(HUB_OBJECTS:.o=.d)
 endif
 
