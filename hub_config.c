@@ -1135,7 +1135,8 @@ static bool config_load(hub_state_t *state, const char *password) {
             }
           }
         }
-      } else if (strcmp(k, "C") == 0 || strcmp(k, "D") == 0 || strcmp(k, "B") == 0) {
+      } else if (strcmp(k, "C") == 0 || strcmp(k, "D") == 0 || strcmp(k, "B") == 0 ||
+                 strcmp(k, "N") == 0 || strcmp(k, "S") == 0) {
         /* 2.4.5 records: key|value|ts.  The same ingest point as the wire, so a
          * hand-edited or damaged line is dropped, not trusted.  Case variants
          * of one channel / mask (from an older c|-style store) merge there,

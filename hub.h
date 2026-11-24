@@ -20,6 +20,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pool_rec.h"   /* N| / S| server pool records (shared with ircbot) */
+
 /* A non-blocking call with nothing to do.  POSIX lets EAGAIN and EWOULDBLOCK
  * differ; where they are one value (Linux) testing both trips -Wlogical-op. */
 #if EAGAIN == EWOULDBLOCK
@@ -394,7 +396,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * volatile runtime facts: parking them in the LWW config would persist them to
  * disk, replicate them with tombstones, drag them through the purge policy and
  * leave a dead hub's bots reading "online, uptime 40d" forever.  They also do
- * not belong in the per-bot ingest whitelist {t,n,h,pub,seen,d,hl} -- that bound
+ * not belong in the per-bot ingest whitelist {t,n,h,pub,seen,d,hl,pm} -- that bound
  * is what makes the payload ceilings above provable, and it stays untouched.
  *
  * So presence rides its own gossip: every hub reports the bots currently
@@ -469,6 +471,29 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * A 2.5.3 bot answers the probe "unknown request" and a 2.5.3 hub drops the
  * ELECT_FWD, so old nodes take no part.  Mirrors ircbot/bot.h, consts.rs. */
 #define CMD_CHAN_WHO         0x95
+/* Server pool (2.5.4, docs/plans/2026-10-29_server_pool_plan.md §4).  Bot ->
+ * hub, sent only to a hub that gave the link an N| (so never to 2.5.3):
+ *   <entry_uuid>|<kind>|<network>|<server>   kind ok / wrongnet / unverified
+ * hub_pool.c: ok names an unlearned network; wrongnet/unverified from
+ * POOL_STRIKES_NEEDED distinct bots (or the only bot) flags the entry.  Hub ->
+ * hub (2.5.4 peers only) a new strike is forwarded and passed on:
+ *   <bot_uuid>|<entry_uuid>|<kind>|<network>|<server> */
+#define CMD_SERVER_REPORT    0x86
+/* Bot -> hub, volatile, gated like CMD_SERVER_REPORT:
+ *   <net_id>|<entry_uuid>|<link>|<vs>   link connecting/up/down/idle; vs is
+ *   the servers the bot sees friends on (split detection, 2.5.5: empty now).
+ * Gossiped hub <-> hub as a roster i| line after the bot's b| row (2.5.3 hubs
+ * skip unknown roster tags). */
+#define CMD_BOT_IRC_LINK     0x96
+/* Hub -> bot (pool bots only), volatile: the load on each pool entry, one
+ *   E|<entry_uuid>|<up>|<connecting>\n
+ * per live entry.  up counts the bots on the entry's real servers (two names
+ * for one server share it).  Built from this hub's bots and the roster, sent
+ * on change at most every POOL_VIEW_GAP s, whole each time. */
+#define CMD_POOL_VIEW        0x85
+#define POOL_VIEW_GAP        2
+#define POOL_VIEW_LINE_MAX   (POOL_UUID_LEN + 32)
+#define POOL_LINK_WORD_MAX   11
 #define CHAN_WHO_MAX         32768  /* joined body: 500 nicks + topic + key  */
 #define CHAN_WHO_TOPIC_MAX   512    /* the bots keep a topic to this          */
 #define CMD_ADMIN_INVITE_USER 0x75 // Admin: invite a user (nick|#chan)
@@ -587,6 +612,10 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * dropped past CFG_RESYNC_TTL; the admin request carries the bot alone. */
 #define CMD_CFG_RESYNC         0x92  /* Hub <-> Hub: resync one bot or all      */
 #define CMD_ADMIN_BOT_RESYNC   0x93  /* Admin -> Hub: "<nick|uuid|all>"         */
+/* Console -> hub (2.5.4): the server pool.  list | add|<hp>|<k=v,...> |
+ * set|<what>|<k=v,...> | del|<what>|<0|1 force> | clear|<what> | net |
+ * netset|<k=v,...>.  The changing forms need +s. */
+#define CMD_ADMIN_POOL         0x97
 #define CFG_RESYNC_TTL         60
 /* 2.5.4 hash-first anti-entropy (docs/plans/2026-11-20_sync_digest_plan.md).
  * Hub <-> hub, point-to-point, two shapes:
@@ -894,6 +923,8 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 /* An `upgrade abort` is re-sent to every peer link that comes up for this
  * long, so a planner restarting onto a step when it was typed still gets it. */
 #define UPGRADE_CANCEL_HOLD  600
+/* s after a restart that its RESULT goes to every new peer link */
+#define UPGRADE_RESULT_RESEND 60
 
 typedef struct {
   bool   active;
@@ -1006,8 +1037,8 @@ typedef struct {
 /* Admin flags and oper channel bindings (user_flags plan §3.1).  The letters
  * in their canonical order: a full, b bots, c channels, h hub, o opers,
  * u upgrades.  Mirrored in ircbot/bot.h. */
-#define USER_FLAG_LETTERS    "abchou"
-#define USER_FLAGS_MAX       6
+#define USER_FLAG_LETTERS    "abchosu"  /* s: server pool (2.5.4) */
+#define USER_FLAGS_MAX       7
 #define MAX_HUB_USER_FLAGS   MAX_HUB_USER_RECORDS  /* one uf| per user record */
 #define MAX_HUB_CHAN_BINDS   400  /* uc| records, live and tombstones */
 /* The stamp hub_access_migrate writes: older than any real record. */
@@ -1020,12 +1051,12 @@ typedef struct {
  * the bytes actually sent (payloads carry only real records at real sizes).
  *
  * These are true hard bounds because ingest is bounded: per-bot state is
- * restricted to the whitelist {t,n,h,pub,seen,d,hl} with per-key value caps in
+ * restricted to the whitelist {t,n,h,pub,seen,d,hl,pm} with per-key value caps in
  * hub_storage_update_entry, so a bot has at most BOT_SYNC_FIELDS entries whose
  * lines never approach value[1024].  Keep this shared contract identical with
  * ircbot/bot.h (MAX_CONFIG_PAYLOAD).
  * ========================================================================== */
-#define BOT_SYNC_FIELDS   8      /* {t,n,h,pub,seen,d,hl} = 7, +slack; hl has its own HK_LINE_MAX */
+#define BOT_SYNC_FIELDS   9      /* {t,n,h,pub,seen,d,hl,pm} = 8, +slack; hl has its own HK_LINE_MAX */
 #define GLOBAK_LINE_MAX   1088   /* config_entry_t: key[32]+value[1024]+ts+seps */
 #define BOT_FIELD_LINE    320    /* per-bot line: capped value (<=MAX_MASK_LEN) */
 #define USER_LINE_MAX     384    /* a|/o|: uuid+name+COMBINED_KEY_B64+stamps */
@@ -1043,7 +1074,7 @@ typedef struct {
  * Ed25519 key)[0..8].  Mirrors ircbot's bot.h. */
 #define HL_ADDR_MAX       80
 #define HL_FP_LEN         16
-#define HL_ENTRIES_MAX    10     /* ircbot MAX_SERVERS */
+#define HL_ENTRIES_MAX    10     /* ircbot MAX_HUBS */
 #define HL_VALUE_MAX      (HL_ENTRIES_MAX * (HL_ADDR_MAX + 1 + HL_FP_LEN + 1))
 #define HK_LINE_MAX       (HL_VALUE_MAX + 64)  /* b|<uuid>|hl|<value>|<ts> */
 /* What rv| and hs| add to a bulk payload at their caps. */
@@ -1085,9 +1116,33 @@ typedef struct {
 #define K_MODES_MASK        (64 | 128)   /* M_K | M_I */
 /* bu|<#chan|*>|<mask>|<last_used>: a ban's last use, cnf only (activity). */
 #define BU_LINE_MAX         (MAX_CHAN + BAN_MASK_MAX + 32)
-/* global_entries[]: the old c/m/o rows (MAX_BOT_ENTRIES), then C, D, B. */
+/* Server pool (docs/plans/2026-10-29_server_pool_plan.md, 2.5.4): N| one
+ * per network, S| one per server entry, both in global_entries[] under the
+ * same LWW store (hub_storage_put_record, validated by pool_rec.c).  Live S|
+ * entries are capped at MAX_POOL_SERVERS and their tombstones, which are never
+ * autopurged (they stop a re-migration reviving a deleted server), at
+ * MAX_POOL_TOMBS; past that the oldest tombstone goes.  Mirrored in
+ * ircbot/bot.h. */
+#define MAX_NETWORKS        4     /* v1 uses POOL_DEFAULT_NET only          */
+#define MAX_POOL_SERVERS    64
+#define MAX_POOL_TOMBS      64
+#define POOL_RECORDS_MAX \
+  ( MAX_NETWORKS * POOL_N_LINE_MAX + \
+    (MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_S_LINE_MAX )
+/* The oldest hub a peer must run to be sent N|/S| sync lines, and the oldest
+ * bot sent them in its config.  A 2.5.3 hub reads an unknown sync key as a
+ * per-bot line and creates a phantom bot "S"/"N". */
+#define POOL_MIN_HUB        "2.5.4"
+#define POOL_MIN_BOT        "2.5.4"
+/* s after a bot's first migration offer (its 2.5.3 s| lines, stamp 0) that
+ * more of it is taken under opt 'h': one offer spans a few CMD_CONFIG_PUSH
+ * frames.  After it, never again (per-bot pm|, mesh-wide).  2.5.5 drops the
+ * opt 'h' exception. */
+#define POOL_MIGRATE_WINDOW 300
+/* global_entries[]: the old c/m/o rows (MAX_BOT_ENTRIES), then C, D, B, N, S. */
 #define MAX_GLOBAL_ENTRIES \
-  ( MAX_BOT_ENTRIES + MAX_CHANNELS + 1 + MAX_BANS_TOTAL )
+  ( MAX_BOT_ENTRIES + MAX_CHANNELS + 1 + MAX_BANS_TOTAL + MAX_NETWORKS + \
+    MAX_POOL_SERVERS + MAX_POOL_TOMBS )
 #define GLOBAL_IDX_SLOTS    ( 2 * MAX_GLOBAL_ENTRIES )  /* open addressing, load <= 0.5 */
 /* Live bans of one channel: rep = index + 1 of a B entry that names it. */
 typedef struct { int rep; int live; } global_ban_slot_t;
@@ -1111,6 +1166,7 @@ typedef struct { int rep; int live; } global_ban_slot_t;
     BOT_SYNC_FIELDS      * BOT_FIELD_LINE  + \
     MAX_BOTS             * BLINE_MAX       + \
     MODES_RECORDS_MAX                          + \
+    POOL_RECORDS_MAX                           + \
     PAYLOAD_SLACK )
 
 /* Hub<->hub full-state sync (hub_generate_sync_packet): globals + users +
@@ -1124,6 +1180,7 @@ typedef struct { int rep; int live; } global_ban_slot_t;
     MAX_BOTS             * HK_LINE_MAX     + \
     MAX_PEERS            * PEER_LINE_MAX   + \
     MODES_RECORDS_MAX                          + \
+    POOL_RECORDS_MAX                           + \
     REVOKE_RECORDS_MAX                         + \
     PAYLOAD_SLACK )
 
@@ -1148,6 +1205,7 @@ typedef struct { int rep; int live; } global_ban_slot_t;
     (size_t)MAX_HUB_USER_MASKS   * MASK_LINE_MAX   + \
     (size_t)USER_ACCESS_RECORDS_MAX                + \
     (size_t)MODES_RECORDS_MAX                      + \
+    (size_t)POOL_RECORDS_MAX                       + \
     (size_t)REVOKE_RECORDS_MAX                     + \
     (size_t)MAX_BANS_TOTAL       * BU_LINE_MAX     + \
     (size_t)2 * MAX_IP_ACL_ENTRIES * IP_ACK_LINE_MAX + \
@@ -1769,6 +1827,11 @@ typedef struct {
    * never reports simply shows blank fields in the tree.  Never persisted. */
   char   bot_version[ROSTER_VERSION_MAX + 1];
   char   bot_server[ROSTER_SERVER_MAX + 1];
+  /* Server pool (CMD_BOT_IRC_LINK, volatile): the pool entry the bot's IRC
+   * link uses and its state ("connecting"/"up"/"down"/"idle", "" = unknown). */
+  char   bot_irc_entry[POOL_UUID_LEN + 1];
+  char   bot_irc_link[12];
+  bool   pool_view_sent;   /* had the current CMD_POOL_VIEW */
   char   bot_variant[ROSTER_VARIANT_MAX + 1]; /* "c" / "rs", "" = unreported */
   char   bot_cron[CRON_STATUS_MAX + 1];       /* "" = unreported */
   int    cron_sent;                           /* last CMD_CRON_SET + 1, 0 = none */
@@ -1920,6 +1983,9 @@ typedef struct {
   int    reply_fd;
   uint64_t reply_serial;
   char   reply_rid[USER_CHAN_RID_MAX + 1];
+  /* the requesting bot's OWN op / invite / key / unban (CMD_CHAN_REQUEST with
+   * a rid, 2.5.4): answered ok / none / denied, never fail (2026-11-23 plan) */
+  bool   reply_own;
   /* kind "ban" (ban add / channel ban): the record just stored, for the
    * ban.added answer the console gets when the election ends */
   time_t ban_expires;
@@ -1967,6 +2033,8 @@ typedef struct {
   time_t reported_at;                     /* local clock: drives the TTL  */
   long long gen;                          /* the gossip round it came in (0 = none) */
   uint64_t p2_stamp;                      /* arrival order vs presence v2 records */
+  char   irc_entry[POOL_UUID_LEN + 1];    /* pool: the entry its IRC link uses (i|) */
+  char   irc_link[12];                    /* pool: connecting / up / down / idle    */
 } bot_roster_t;
 
 /* One peer link a hub reports in its roster gossip (an l| line): a peer it is
@@ -2096,6 +2164,9 @@ typedef struct {
   uint64_t cfg_same;      /* skipped: that bot already has this exact one  */
   uint64_t cfg_lost;      /* queued config dropped on lane overflow        */
   uint64_t cfg_pull;      /* CMD_CONFIG_PULLs served (a bot's hash check)   */
+  uint64_t pool_reports;  /* CMD_SERVER_REPORTs taken in (server pool)       */
+  uint64_t pool_flagged;  /* entries this hub flagged wrong network          */
+  uint64_t pool_views;    /* CMD_POOL_VIEW frames queued to bots             */
   uint64_t tree_full;     /* whole bot trees queued (CMD_BOT_TREE)          */
   uint64_t tree_full_bytes;
   uint64_t tree_delta;    /* tree row deltas queued (CMD_BOT_TREE_DELTA)    */
@@ -2173,6 +2244,7 @@ typedef struct {
   int global_idx[GLOBAL_IDX_SLOTS];
   global_ban_slot_t global_ban_chan[GLOBAL_IDX_SLOTS];
   int global_n_old, global_n_C, global_n_D, global_n_B;
+  int global_n_N, global_n_S, global_n_S_live; /* pool: networks, entries, live entries */
   /* K|: what the bots saw on IRC, one per live channel (never a tombstone). */
   hub_chan_learned_t chan_learned[MAX_CHANNELS];
   int chan_learned_count;
@@ -2232,6 +2304,9 @@ typedef struct {
    * command wins by timestamp, a single node's or the global one. */
   int bot_cron_setting, hub_cron_setting;  /* hs|botcron, hs|hubcron: 0 off, 1 on */
   time_t bot_cron_ts, hub_cron_ts;
+  /* hs|sgrant: 1 once every +b admin was given +s (server pool plan D11). */
+  int sgrant_setting;
+  time_t sgrant_ts;
   struct {
     char uuid[64];
     char kind;  /* 'b' or 'h' */
@@ -2268,6 +2343,12 @@ typedef struct {
   bool   follow_self_ready;  /* this hub itself can take the followed run */
   time_t follow_prepared;
   char upgrade_installed_id[64]; /* the run whose restart made this process */
+  /* That run's RESULT, sent on every peer link that comes up for
+   * UPGRADE_RESULT_RESEND s after the restart (the first link alone may be
+   * gone or still settling); the driver drops the copies. */
+  char upgrade_report_status[32];
+  char upgrade_report_detail[192];
+  time_t upgrade_report_until;
   /* Nodes below this hub in the followed run's fan-out tree (its own peers'
    * subtrees).  Rebuilt for every run; see upgrade_route_t. */
   upgrade_route_t follow_routes[MAX_UPGRADE_ROUTES];
@@ -2867,8 +2948,52 @@ void hub_generate_sync_packet(hub_state_t *state, char *buffer, int max_len);
  * each peer that takes one, the full state to the others and on every
  * SYNC_DIGEST_FULL_EVERY-th round. */
 void hub_anti_entropy_round(hub_state_t *state, const char *full);
-void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
+/* pool: the bot takes N|/S| (POOL_MIN_BOT); it then always gets an N| line
+ * for POOL_DEFAULT_NET, the stored one or the default, which is how it knows
+ * this hub keeps the pool. */
+void hub_generate_bot_payload(hub_state_t *state, const char *uuid, bool pool,
                               char *buffer, int max_len);
+/* Whether a connected bot running `version` takes N|/S| in its config. */
+bool hub_bot_version_takes_pool(const char *version);
+/* Usable S| entries of network `net_id`: live, state ok. */
+int hub_pool_eligible_count(const hub_state_t *state, const char *net_id);
+/* hub_access.c: the uf|/uc| lines of a bot's config ('s' left out for a bot
+ * older than POOL_MIN_BOT). */
+bool hub_access_append_bot(hub_state_t *state, char *buf, int cap, int *off, bool pool);
+/* Once per mesh (hs|sgrant): every admin with b gets s (plan D11). */
+void hub_access_sgrant_once(hub_state_t *state);
+/* hub_pool.c: store + announce (peers, owed bot pushes) one N| / S| record,
+ * stamped past the stored one; read an S| by uuid; a CMD_SERVER_REPORT. */
+bool hub_pool_net_put(hub_state_t *state, const pool_net_t *n);
+bool hub_pool_srv_put(hub_state_t *state, const pool_srv_t *s);
+bool hub_pool_srv_get(const hub_state_t *state, const char *uuid, pool_srv_t *out);
+void hub_pool_strikes_clear(const char *uuid);
+void hub_pool_server_report(hub_state_t *state, hub_client_t *client, const char *payload);
+/* A strike forwarded by a peer: <bot_uuid>|<entry>|<kind>|<network>|<server>. */
+void hub_pool_peer_report(hub_state_t *state, hub_client_t *peer, const char *payload);
+/* Whether peer c runs POOL_MIN_HUB or later (hub_logic.c). */
+bool hub_peer_takes_pool(hub_state_t *state, const hub_client_t *c);
+/* CMD_BOT_IRC_LINK: store the bot's link state; true when it changed. */
+bool hub_pool_irc_link(hub_state_t *state, hub_client_t *client, const char *payload);
+bool hub_pool_link_word_ok(const char *w);
+/* Once a second: send CMD_POOL_VIEW to the pool bots when it changed. */
+void hub_pool_view_tick(hub_state_t *state, time_t now);
+/* The console: the view text (E| lines), bots idle for want of a server, an
+ * entry by uuid or host[:port], a network's N| (default when none stored). */
+int hub_pool_view_text(hub_state_t *state, char *out, size_t cap);
+int hub_pool_idle_bots(const hub_state_t *state);
+bool hub_pool_find(const hub_state_t *state, const char *what, pool_srv_t *out);
+void hub_pool_net_get(const hub_state_t *state, const char *net_id, pool_net_t *out, time_t *ts);
+/* A bot-pushed S|<value>|<ts> line's data (plan §4, §5.2, §5.6): opt h
+ * refused; ts 0 (migration) only when no record exists, stamped now; an
+ * existing entry keeps its admin fields (a bot sets add/del only); the last
+ * usable entry is never deleted by a bot.  On success *out holds the stored
+ * value and *out_ts its stamp. */
+/* nick!user@host, three non-empty parts, printable ASCII, no '*' or '?'. */
+bool hub_hostmask_literal(const char *h);
+bool hub_pool_bot_write(hub_state_t *state, const char *who, const char *data,
+                        bool hub_only, bool migrate_ok, char *out, size_t cap,
+                        time_t *out_ts);
 void hub_broadcast_sync_to_peers(hub_state_t *state, const char *payload,
                                  int exclude_fd);
 

@@ -27,7 +27,7 @@ OBJ_DIR = $(BUILD_DIR)/obj
 
 # Source files
 # One line: tools (the testnet) read this variable with a single-line match.
-HUB_SOURCES = hub_main.c cfg_delta.c sync_digest.c elf_needs.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_access.c hub_revoke.c hub_uhist.c hub_presence2.c hub_chanwho.c hub_modes.c hub_connlimits.c glob_overlap.c hub_update.c hub_reply.c hub_console.c hub_console_ui.c hub_console_fmt.c hub_console_core.c
+HUB_SOURCES = hub_main.c cfg_delta.c sync_digest.c pool_rec.c hub_pool.c elf_needs.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_access.c hub_revoke.c hub_uhist.c hub_presence2.c hub_chanwho.c hub_modes.c hub_connlimits.c glob_overlap.c hub_update.c hub_reply.c hub_console.c hub_console_ui.c hub_console_fmt.c hub_console_core.c
 
 # Object files
 HUB_OBJECTS = $(HUB_SOURCES:%.c=$(OBJ_DIR)/%.o)
@@ -270,7 +270,7 @@ $(OBJ_DIR)/bcrypt_pbkdf.o: bcrypt_pbkdf.c bcrypt_pbkdf.h
 # Object Files
 # ============================================================================
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c hub.h cfg_delta.h sync_digest.h elf_needs.h
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c hub.h cfg_delta.h sync_digest.h elf_needs.h pool_rec.h
 	@echo "Compiling $<..."
 	@$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 

@@ -34,6 +34,7 @@ static const gsetting_t GSET[] = {
      offsetof(hub_state_t, uhist_keep_ts)},
     {"botcron", 1, offsetof(hub_state_t, bot_cron_setting), offsetof(hub_state_t, bot_cron_ts)},
     {"hubcron", 1, offsetof(hub_state_t, hub_cron_setting), offsetof(hub_state_t, hub_cron_ts)},
+    {"sgrant", 1, offsetof(hub_state_t, sgrant_setting), offsetof(hub_state_t, sgrant_ts)},
 };
 #define GSET_COUNT ((int)(sizeof(GSET) / sizeof(GSET[0])))
 _Static_assert(sizeof(GSET) / sizeof(GSET[0]) <= HUB_GSETTINGS_MAX,

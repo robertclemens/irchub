@@ -528,6 +528,7 @@ static void hub_maintenance(hub_state_t *state) {
      * refreshed, and push the tree to bots when it changed.  All volatile —
      * see the CMD_BOT_PRESENCE block in hub.h. */
     hub_presence_tick(state, now);
+    hub_pool_view_tick(state, now); /* server pool load to the bots */
 
     /* Rolling network upgrade: one step per tick (no-op unless running). */
     hub_upgrade_tick(state, now);
@@ -1634,6 +1635,7 @@ int main(int argc, char *argv[]) {
     }
     hub_uhist_boot(&state);
     hub_plan_boot(&state);
+    hub_access_sgrant_once(&state); /* 2.5.4: +b admins get +s, once per mesh */
     hub_p2_init(&state); /* bumps the boot counter: after the config gave us our uuid */
     secure_wipe(_hub_plain_pass, sizeof(_hub_plain_pass));
 

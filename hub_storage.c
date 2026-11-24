@@ -63,6 +63,16 @@ static bool key_is_modes(const char *key) {
   return key[0] && !key[1] && (key[0] == 'C' || key[0] == 'D' || key[0] == 'B');
 }
 
+/* The server pool's records (N| network, S| server entry), 2.5.4. */
+static bool key_is_pool(const char *key) {
+  return key[0] && !key[1] && (key[0] == 'N' || key[0] == 'S');
+}
+
+/* Every record kind written through hub_storage_put_record. */
+static bool key_is_record(const char *key) {
+  return key_is_modes(key) || key_is_pool(key);
+}
+
 /* Length of a value's identity prefix: the channel (c|, C|), channel|mask
  * (B|), else the first field. */
 static size_t ident_len(const char *key, const char *v) {
@@ -170,7 +180,14 @@ void hub_global_note_new(hub_state_t *state, int i) {
   const config_entry_t *e = &state->global_entries[i];
   uint32_t p = gidx_pos(state, e->key, e->value);
   if (!state->global_idx[p]) state->global_idx[p] = i + 1;  /* a duplicate keeps the first */
-  if (key_is_modes(e->key)) {
+  if (key_is_pool(e->key)) {
+    if (e->key[0] == 'N') {
+      state->global_n_N++;
+    } else {
+      state->global_n_S++;
+      if (hub_global_value_active(e->value)) state->global_n_S_live++;
+    }
+  } else if (key_is_modes(e->key)) {
     if (e->key[0] == 'C') state->global_n_C++;
     else if (e->key[0] == 'D') state->global_n_D++;
     else state->global_n_B++;
@@ -185,6 +202,7 @@ void hub_global_reindex(hub_state_t *state) {
   memset(state->global_idx, 0, sizeof(state->global_idx));
   memset(state->global_ban_chan, 0, sizeof(state->global_ban_chan));
   state->global_n_old = state->global_n_C = state->global_n_D = state->global_n_B = 0;
+  state->global_n_N = state->global_n_S = state->global_n_S_live = 0;
   for (int i = 0; i < state->global_entry_count; i++) hub_global_note_new(state, i);
 }
 
@@ -194,10 +212,15 @@ static int global_entry_find(const hub_state_t *state, const char *key,
 }
 
 /* Room for one more entry of `key`'s class: the old c/m/o rows share
- * MAX_BOT_ENTRIES, C| has MAX_CHANNELS, D| one, B| MAX_BANS_TOTAL. */
+ * MAX_BOT_ENTRIES, C| has MAX_CHANNELS, D| one, B| MAX_BANS_TOTAL, N|
+ * MAX_NETWORKS, S| MAX_POOL_SERVERS + MAX_POOL_TOMBS (live ones are capped
+ * separately by pool_live_room). */
 static bool global_room(const hub_state_t *state, const char *key) {
   int n, cap;
-  if (key_is_modes(key)) {
+  if (key_is_pool(key)) {
+    n = key[0] == 'N' ? state->global_n_N : state->global_n_S;
+    cap = key[0] == 'N' ? MAX_NETWORKS : MAX_POOL_SERVERS + MAX_POOL_TOMBS;
+  } else if (key_is_modes(key)) {
     n = key[0] == 'C' ? state->global_n_C
         : key[0] == 'D' ? state->global_n_D : state->global_n_B;
     cap = key[0] == 'C' ? MAX_CHANNELS : key[0] == 'D' ? 1 : MAX_BANS_TOTAL;
@@ -224,9 +247,9 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
                                      const char *op, time_t ts) {
   char combined_value[1024];
 
-  /* C|, D| and B| carry their own op and field set: they go through
+  /* C|, D|, B|, N| and S| carry their own op and field set: they go through
    * hub_storage_put_record, never through this c/m/o composer. */
-  if (key_is_modes(key)) {
+  if (key_is_record(key)) {
     hub_log_warning("[STORAGE] Global %s: not a c/m/o record (use put_record)\n", key);
     return false;
   }
@@ -336,7 +359,7 @@ bool hub_storage_update_global_entry(hub_state_t *state, const char *key,
 }
 
 /* nick!user@host, three non-empty parts, printable ASCII, no '*' or '?'. */
-static bool hostmask_literal(const char *h) {
+bool hub_hostmask_literal(const char *h) {
   const char *bang = strchr(h, '!'), *at = bang ? strchr(bang + 1, '@') : NULL;
   if (!bang || !at || bang == h || at == bang + 1 || !at[1]) return false;
   if (strchr(at + 1, '!') || strchr(at + 1, '@')) return false;
@@ -428,9 +451,9 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
     return false;
   }
 
-  /* C|, D|, B| are global records with their own writers and checks; a
-   * per-bot delta or sync line under those keys is never one of them. */
-  if (key_is_modes(key)) {
+  /* C|, D|, B|, N|, S| are global records with their own writers and checks;
+   * a per-bot delta or sync line under those keys is never one of them. */
+  if (key_is_record(key)) {
     hub_log_warning("[STORAGE] REJECTED key '%s' on the per-bot path\n", key);
     return false;
   }
@@ -450,21 +473,18 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
     return false;
   }
 
-  bot_config_t *b = get_or_create_bot(state, uuid);
-  if (!b)
-    return false;
-
   /* Change 3b — zero-trust per-bot ingest bound (single enforcement point for
    * the delta path, config-push, peer-sync, and config load).  Global keys
    * (c/m/o/a/p) were already intercepted above.  A bot's per-bot state is
    * exactly {t, n, h, pub, seen, d}; reject any other key so a hostile bot or
    * peer cannot create arbitrarily-named entries and unbound the sync payload.
+   * pm (2.5.4) is the first migration offer's time, for the opt 'h' window.
    * This is what makes BOT_SYNC_FIELDS a hard bound (see hub.h). Value length
    * is capped per key so a per-bot line can never approach value[1024]. */
   if (strcmp(key, "t") != 0 && strcmp(key, "n") != 0 &&
       strcmp(key, "h") != 0 && strcmp(key, "pub") != 0 &&
       strcmp(key, "seen") != 0 && strcmp(key, "d") != 0 &&
-      strcmp(key, "hl") != 0) {
+      strcmp(key, "hl") != 0 && strcmp(key, "pm") != 0) {
     hub_log_warning("[STORAGE] REJECTED per-bot key '%s' for %s (not in whitelist)\n",
             key, hub_who(state, 'b', uuid));
     return false;
@@ -476,7 +496,7 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
     else if (strcmp(key, "n") == 0)   cap = MAX_NICK - 1;
     else if (strcmp(key, "pub") == 0) cap = COMBINED_KEY_B64;
     else if (strcmp(key, "hl") == 0)  cap = HL_VALUE_MAX;
-    else                              cap = 31; /* seen/d/t: short numerics */
+    else                              cap = 31; /* seen/d/t/pm: short numerics */
     if (vlen > cap) {
       hub_log_warning("[STORAGE] REJECTED per-bot '%s' for %s: value too long "
               "(%zu > %zu)\n", key, hub_who(state, 'b', uuid), vlen, cap);
@@ -491,11 +511,18 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
 
   /* A reported hostmask is a literal nick!user@host, never a pattern: the ban
    * protection matches bans against it, so a '*' here would shield everyone. */
-  if (strcmp(key, "h") == 0 && value && value[0] && !hostmask_literal(value)) {
+  if (strcmp(key, "h") == 0 && value && value[0] && !hub_hostmask_literal(value)) {
     hub_log_warning("[STORAGE] REJECTED per-bot 'h' for %s: not a literal "
             "nick!user@host\n", hub_who(state, 'b', uuid));
     return false;
   }
+
+  /* Only now, with the key and value known good, may the bot record exist:
+   * creating it first let any unknown key (a newer hub's N|/S| sync line read
+   * as "uuid|key|...") leave a phantom bot named after the tag. */
+  bot_config_t *b = get_or_create_bot(state, uuid);
+  if (!b)
+    return false;
 
   // Special Metadata: Sync Timestamp
   if (strcmp(key, "t") == 0) {
@@ -564,7 +591,8 @@ static bool storage_update_entry(hub_state_t *state, const char *uuid,
   bool is_singleton = (strcmp(key, "n") == 0 || strcmp(key, "a") == 0 ||
                        strcmp(key, "p") == 0 || strcmp(key, "h") == 0 ||
                        strcmp(key, "d") == 0 || strcmp(key, "pub") == 0 ||
-                       strcmp(key, "seen") == 0 || strcmp(key, "hl") == 0);
+                       strcmp(key, "seen") == 0 || strcmp(key, "hl") == 0 ||
+                       strcmp(key, "pm") == 0);
 
   /* is_active follows the 'd' entry alone.  An 'n' or 's' entry used to set
    * it back to true ("auto-undelete on check-in"): a peer still holding a
@@ -703,7 +731,7 @@ bool hub_storage_delete(hub_state_t *state, const char *uuid, time_t *ts_out) {
 // Generate payload for a specific bot (Global + Bot-specific)
 // Does NOT include "b|uuid|" prefix for global items, preserving protocol
 // compatibility
-void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
+void hub_generate_bot_payload(hub_state_t *state, const char *uuid, bool pool,
                               char *buffer, int max_len) {
   int offset = 0;
   int written;
@@ -711,6 +739,7 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
 
   // 1. Add Global Entries (channels; skip h/n/a/m/o — now in typed arrays —
   //    and the retired bot password p)
+  bool have_default_net = false;
   for (int i = 0; i < state->global_entry_count; i++) {
     config_entry_t *e = &state->global_entries[i];
     if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0 ||
@@ -718,11 +747,24 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
         strcmp(e->key, "o") == 0 || strcmp(e->key, "p") == 0) {
       continue;
     }
+    if (key_is_pool(e->key)) {
+      if (!pool) continue; /* an older bot would keep them as unknown lines */
+      if (e->key[0] == 'N' && strncmp(e->value, POOL_DEFAULT_NET "|",
+                                      sizeof(POOL_DEFAULT_NET)) == 0)
+        have_default_net = true;
+    }
     written = snprintf(buffer + offset, (size_t)(max_len - offset), "%s|%s|%ld\n", e->key,
                        e->value, (long)e->timestamp);
     if (written < 0 || written >= (max_len - offset))
       break;
     offset += written;
+  }
+  /* No N| stored yet: the default (name not learned, split_wait 0), stamp 0 so
+   * any real record beats it. */
+  if (pool && !have_default_net) {
+    written = snprintf(buffer + offset, (size_t)(max_len - offset),
+                       "N|" POOL_DEFAULT_NET "|" POOL_DEFAULT_NET "|||0|add|0\n");
+    if (written > 0 && written < (max_len - offset)) offset += written;
   }
   // K|: what the bots saw on IRC, after the c| lines it hangs off.
   hub_learned_append(state, buffer, max_len, &offset);
@@ -748,7 +790,7 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   }
 
   // 1b. Admin flags and oper channel bindings, after the users they name.
-  hub_access_append(state, buffer, max_len, &offset, NULL, NULL);
+  hub_access_append_bot(state, buffer, max_len, &offset, pool);
 
   // 1b. Add purge_days setting (allows bots to validate purge policies)
   // Format: pd|<days>|<timestamp>
@@ -773,7 +815,7 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
   }
 
   // 2. Add Bot-Specific Entries
-  // Skip: h, n (hub-only metadata), c, m, o, a, p (now global entries)
+  // Skip: h, n, pm (hub-only metadata), c, m, o, a, p (now global entries)
   for (int i = 0; i < state->bot_count; i++) {
     if (strcmp(state->bots[i].uuid, uuid) == 0) {
       bot_config_t *b = &state->bots[i];
@@ -783,8 +825,8 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid,
         if (strcmp(e->key, "h") == 0 || strcmp(e->key, "n") == 0 ||
             strcmp(e->key, "c") == 0 || strcmp(e->key, "m") == 0 ||
             strcmp(e->key, "o") == 0 || strcmp(e->key, "a") == 0 ||
-            strcmp(e->key, "p") == 0) {
-          continue;
+            strcmp(e->key, "p") == 0 || strcmp(e->key, "pm") == 0) {
+          continue;  /* pm: the hub's migration mark, never the bot's */
         }
         written = snprintf(buffer + offset, (size_t)(max_len - offset), "%s|%s|%ld\n",
                            e->key, e->value, (long)e->timestamp);
@@ -947,6 +989,10 @@ static bool rec_op_ok(const char *s) {
 
 bool hub_record_valid(const char *key, const char *value) {
   if (!key || !value) return false;
+  /* Server pool records: shape, caps, charsets and (S|) the derived uuid
+   * live in pool_rec.c, shared with the bot. */
+  if (strcmp(key, "N") == 0) return pool_net_parse(value, NULL);
+  if (strcmp(key, "S") == 0) return pool_srv_parse(value, NULL);
   char buf[1100];
   char *f[REC_MAX_FIELDS];
   if (strcmp(key, "C") == 0) {
@@ -1039,6 +1085,9 @@ static bool evict_oldest_tombstone(hub_state_t *state, const char *key) {
   long keep = state->purge_days_setting > 0 ? (long)state->purge_days_setting * 86400L
                                             : TOMB_MIN_AGE_OFF;
   time_t newest_ok = time(NULL) - keep;
+  /* S| tombstones have their own MAX_POOL_TOMBS share and are never purged
+   * by age, so the oldest goes whatever its age. */
+  if (key[0] == 'S' && !key[1]) newest_ok = (time_t)LLONG_MAX;
   int best = -1;
   for (int i = 0; i < state->global_entry_count; i++) {
     const config_entry_t *e = &state->global_entries[i];
@@ -1053,7 +1102,7 @@ static bool evict_oldest_tombstone(hub_state_t *state, const char *key) {
 
 bool hub_storage_put_record(hub_state_t *state, const char *key, const char *value,
                             time_t ts) {
-  if (!state || !key || !value || !key_is_modes(key) || ts <= 0 || hub_ts_ahead(ts))
+  if (!state || !key || !value || !key_is_record(key) || ts <= 0 || hub_ts_ahead(ts))
     return false;
   if (!hub_record_valid(key, value)) {
     hub_log_warning("[STORAGE] REJECTED malformed %s| record\n", key);
@@ -1086,10 +1135,18 @@ bool hub_storage_put_record(hub_state_t *state, const char *key, const char *val
       if (bans_live_in(state, chan) >= ban_ceiling(chan))
         return false;
     }
+    bool is_s = key[0] == 'S' && !key[1];
+    if (is_s && in_active && !entry_active(e) &&
+        state->global_n_S_live >= MAX_POOL_SERVERS) {
+      hub_log_warning("[STORAGE] S| %s REJECTED (pool full: %d live servers)\n",
+                      e->value, MAX_POOL_SERVERS);
+      return false;
+    }
     bool was_active = entry_active(e);
     memcpy(e->value, norm, strlen(norm) + 1);
     e->timestamp = ts;
     if (key[0] == 'B' && was_active != in_active) gban_adjust(state, i, in_active ? 1 : -1);
+    if (is_s && was_active != in_active) state->global_n_S_live += in_active ? 1 : -1;
     return true;
   }
 
@@ -1109,6 +1166,11 @@ bool hub_storage_put_record(hub_state_t *state, const char *key, const char *val
       return false;
     }
   }
+  if (key[0] == 'S' && !key[1] && in_active && state->global_n_S_live >= MAX_POOL_SERVERS) {
+    hub_log_warning("[STORAGE] S| record REJECTED (pool full: %d live servers)\n",
+                    MAX_POOL_SERVERS);
+    return false;
+  }
   if (!global_room(state, key) && !(evict_oldest_tombstone(state, key) &&
                                     global_room(state, key))) {
     hub_log_warning("[STORAGE] %s| record REJECTED (max entries reached)\n", key);
@@ -1120,6 +1182,78 @@ bool hub_storage_put_record(hub_state_t *state, const char *key, const char *val
   e->timestamp = ts;
   e->last_used = 0;
   hub_global_note_new(state, state->global_entry_count - 1);
+  return true;
+}
+
+int hub_pool_eligible_count(const hub_state_t *state, const char *net_id) {
+  int n = 0;
+  for (int i = 0; i < state->global_entry_count; i++) {
+    const config_entry_t *e = &state->global_entries[i];
+    pool_srv_t s;
+    if (e->key[0] == 'S' && !e->key[1] && pool_srv_parse(e->value, &s) && !s.deleted &&
+        s.state == POOL_OK && strcmp(s.net_id, net_id) == 0)
+      n++;
+  }
+  return n;
+}
+
+bool hub_pool_bot_write(hub_state_t *state, const char *who, const char *data,
+                        bool hub_only, bool migrate_ok, char *out, size_t cap,
+                        time_t *out_ts) {
+  const char *bar = strrchr(data, '|');
+  char value[POOL_S_LINE_MAX];
+  if (!bar || (size_t)(bar - data) >= sizeof(value)) return false;
+  memcpy(value, data, (size_t)(bar - data));
+  value[bar - data] = '\0';
+  char *end = NULL;
+  long long ts = strtoll(bar + 1, &end, 10);
+  pool_srv_t in;
+  if (!end || *end || ts < 0 || !pool_srv_parse(value, &in)) {
+    hub_log_warning("[POOL] Ignored malformed S| record from %s\n", who);
+    return false;
+  }
+  /* Opt 'h': the pool is the console's, except a bot's one-time migration of
+   * its 2.5.3 s| lines (stamp 0, inside its POOL_MIGRATE_WINDOW; the caller
+   * decides migrate_ok).  Stamp 0 never beats anything held, so a migration
+   * only adds servers nobody knew of.  Removed with the migration in 2.5.5. */
+  if (hub_only && (ts != 0 || !migrate_ok)) {
+    hub_log_warning("[POOL] opt 'h' active: REJECTED bot-pushed S| record from %s "
+                    "(%s)\n", who, ts == 0 ? "its migration window is over"
+                                          : "the pool is managed on the hub console");
+    return false;
+  }
+  int i = hub_global_find(state, "S", value);
+  pool_srv_t cur;
+  memset(&cur, 0, sizeof(cur));
+  bool have = i >= 0 && pool_srv_parse(state->global_entries[i].value, &cur);
+  const bool migrated = ts == 0;
+  if (ts == 0) {
+    /* A migrated local server: never over anything held, a tombstone above
+     * all (plan D15). */
+    if (i >= 0 || in.deleted) return false;
+    ts = (long long)time(NULL);
+  }
+  pool_srv_t next;
+  if (have) {
+    next = cur;              /* weight, max, state, seen stay the admin's */
+    next.deleted = in.deleted;
+  } else {
+    if (in.deleted) return false;
+    next = in;
+    next.state = POOL_OK;    /* a bot cannot flag or disable an entry */
+    next.seen[0] = '\0';
+  }
+  if (have && next.deleted && !cur.deleted && cur.state == POOL_OK &&
+      hub_pool_eligible_count(state, cur.net_id) <= 1) {
+    hub_log_warning("[POOL] REJECTED %s deleting %s: the last usable server of network %s\n",
+                    who, cur.host, cur.net_id);
+    return false;
+  }
+  if (pool_srv_format(&next, out, cap) < 0) return false;
+  if (!hub_storage_put_record(state, "S", out, (time_t)ts)) return false;
+  *out_ts = (time_t)ts;
+  hub_log_info("[POOL] %s %s server %s (%s)%s\n", who, next.deleted ? "removed" : "added",
+               next.host, next.uuid, migrated ? ", migrated from its s| list" : "");
   return true;
 }
 

@@ -564,7 +564,7 @@ enum bk {
   B_NONE, B_ARG, B_PIPE, B_PEER_ADD, B_HUB_SHOW, B_CHAN_ADD, B_CHAN_SET,
   B_CHAN_OP, B_OPT_SET, B_LOG_SET, B_PURGE, B_HUB_SET, B_ACL, B_USER_LIST,
   B_USER_ADD, B_USER_SET, B_USER_MASK, B_UPG_RELEASES, B_UPG_HISTORY, B_UPG_KEEP, B_UPG_START, B_FIXED, B_LOCAL,
-  B_CHAN_MODES, B_BAN, B_NET_SET, B_USER_CHAN, B_CHAN_KICK
+  B_CHAN_MODES, B_BAN, B_NET_SET, B_USER_CHAN, B_CHAN_KICK, B_POOL
 };
 
 typedef struct {
@@ -631,6 +631,13 @@ static const cmd_def_t CMDS[] = {
   {"channel", "invite", CMD_ADMIN_INVITE_USER, B_CHAN_OP, 2, 0, CF_NONE, 0, NULL, "channel invite <#chan> <nick>", "have one opped bot invite a user", NULL},
   {"channel", "kick", CMD_ADMIN_KICK_USER, B_CHAN_KICK, 2, 0, CF_NONE, 0, NULL, "channel kick <#chan> <nick> [reason]", "have one opped bot kick a user (never a bot or authorised user)", NULL},
   {"channel", "ban", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "channel ban <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "the same as ban add: list a ban, and one opped bot sets it now", NULL},
+  {"server", "list", CMD_ADMIN_POOL, B_POOL, 0, 0, CF_NONE, 0, NULL, "server list", "the IRC servers every hub-managed bot dials from, and the bots on each", NULL},
+  {"server", "add", CMD_ADMIN_POOL, B_POOL, 1, 2, CF_NONE, 0, NULL, "server add <host[:port]> [weight=<1-100>] [max=<0-100>]", "add a server to the pool (or bring back a removed one)", NULL},
+  {"server", "set", CMD_ADMIN_POOL, B_POOL, 2, 3, CF_NONE, 0, NULL, "server set <host[:port]|uuid> weight=<1-100> max=<0-100> enabled=on|off", "change one server's weight, cap or whether bots use it", NULL},
+  {"server", "del", CMD_ADMIN_POOL, B_POOL, 1, 1, CF_YN, 0, NULL, "server del <host[:port]|uuid> [force]", "remove a server (asks y/N; the last usable one only with force)", NULL},
+  {"server", "clear", CMD_ADMIN_POOL, B_POOL, 1, 0, CF_NONE, 0, NULL, "server clear <host[:port]|uuid>", "undo a wrong-network flag", NULL},
+  {"network", "show", CMD_ADMIN_POOL, B_POOL, 0, 0, CF_NONE, 0, NULL, "network show", "the IRC network the bots check for, and how many servers are usable", NULL},
+  {"network", "set", CMD_ADMIN_POOL, B_POOL, 1, 1, CF_NONE, 0, NULL, "network set name=<NETWORK> alias=<a,b,...|->", "the NETWORK= name the bots check for, or other names to accept", NULL},
   {"ban", "list", CMD_ADMIN_BAN, B_BAN, 0, 1, CF_NONE, 0, NULL, "ban list [#chan|*]", "the network's listed bans (one channel, or * = every channel)", NULL},
   {"ban", "add", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; one opped bot sets it on the channel now (never on a bot or user)", NULL},
   {"ban", "del", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban del <#chan|*> <mask>", "remove a listed ban", NULL},
@@ -660,7 +667,9 @@ static const struct {
   {"bot", "registered bots"},      {"hub", "this hub and the hubs it links to"},
   {"log", "the hub log"},          {"acl", "IP allow / deny lists"},
   {"option", "network option flags"}, {"user", "admins and opers"},
-  {"channel", "managed channels"}, {"ban", "listed bans"},
+  {"channel", "managed channels"},
+  {"server", "the IRC server pool"}, {"network", "the IRC network"},
+  {"ban", "listed bans"},
   {"upgrade", "rolling upgrades"},
   {"display", "this session's screen"},
 };
@@ -686,6 +695,8 @@ static const struct {
   {"channel", "set", "c"}, {"channel", "op", "c"},    {"channel", "invite", "c"},
   {"channel", "kick", "c"}, {"channel", "ban", "c"},
   {"ban", "add", "c"},     {"ban", "del", "c"},
+  {"server", "add", "s"},  {"server", "set", "s"},    {"server", "del", "s"},
+  {"server", "clear", "s"}, {"network", "set", "s"},
   {"upgrade", "start", "u"}, {"upgrade", "abort", "u"}, {"upgrade", "forget", "u"},
   {"upgrade", "continue", "u"},
   {"upgrade", "keep", "u"},
@@ -714,6 +725,7 @@ static const char *flag_word(char f) {
   case 'c': return "channels";
   case 'h': return "hub";
   case 'o': return "opers";
+  case 's': return "servers";
   case 'u': return "upgrades";
   default:  return "?";
   }
@@ -966,6 +978,28 @@ static const struct {
    "ban add #ops *!*@203.0.113.7\nban add * *!*@*.badhost.example 1440 sticky open proxy"},
   {"ban", "del", "#chan|*\tas listed by ban list\nmask\tthe mask exactly as ban list shows it",
    "ban del #ops *!*@203.0.113.7"},
+  {"server", "list", NULL, "server list"},
+  {"network", "show", NULL, "network show"},
+  {"server", "add",
+   "host[:port]\tthe server; no port = 6667; 6697 is TLS\n"
+   "weight=\t1-100 (default 1): a weight-2 server takes twice the bots\n"
+   "max=\t0-100 (default 0, no cap): bots on it before others are preferred",
+   "server add irc.example.net\nserver add irc.example.net:6697 weight=2 max=20"},
+  {"server", "set",
+   "host[:port]|uuid\tas server list shows it\nweight=\t1-100\nmax=\t0-100 (0 = no cap)\n"
+   "enabled=\toff: no bot dials it (bots on it stay); on: back in use\n"
+   "force\twith enabled=off on the last usable server",
+   "server set irc.example.net weight=3\nserver set irc.example.net enabled=off"},
+  {"server", "del",
+   "host[:port]|uuid\tas server list shows it; bots on it stay until they disconnect\n"
+   "force\tneeded for the last usable server: without one no bot can reconnect",
+   "server del irc.old.example\nserver del irc.old.example force"},
+  {"server", "clear", "host[:port]|uuid\ta server flagged wrong network (server list)",
+   "server clear irc.example.net"},
+  {"network", "set",
+   "name=\tthe NETWORK= value the bots check (learned from the first bot that connects)\n"
+   "alias=\tother names accepted, comma separated (up to 8), or - for none",
+   "network set name=EFnet\nnetwork set alias=EFNet"},
   {"upgrade", "status", NULL, "upgrade status"},
   {"upgrade", "releases", NULL, "upgrade releases"},
   {"upgrade", "history", "run\tthe run, as upgrade history lists it, or the start of its id (4 or more characters)",
@@ -1922,6 +1956,25 @@ typedef struct {
 static int parse_tree(const char *tree, trow_t *out, int max);
 #define MAX_TROWS 1400
 
+/* A comma list of bot names for one event line, at most EVENT_NAMES_MAX
+ * names, then "+N more". */
+#define EVENT_NAMES_MAX 8
+typedef struct {
+  char s[320];
+} sb_line_t;
+
+static void sbl_name(sb_line_t *l, const char *name, int idx) {
+  size_t o = strlen(l->s);
+  if (idx < EVENT_NAMES_MAX)
+    snprintf(l->s + o, sizeof(l->s) - o, "%s%.40s", idx ? ", " : "", name);
+}
+
+/* " +N more" after the names when there were more than EVENT_NAMES_MAX. */
+static void sbl_more(sb_line_t *l, int n) {
+  size_t o = strlen(l->s);
+  if (n > EVENT_NAMES_MAX) snprintf(l->s + o, sizeof(l->s) - o, " +%d more", n - EVENT_NAMES_MAX);
+}
+
 /* What changed between two trees, as a line each (D14). */
 static void tree_events(console_ui_t *ui, const char *old, const char *cur) {
   static trow_t a[MAX_TROWS], b[MAX_TROWS];
@@ -1929,20 +1982,7 @@ static void tree_events(console_ui_t *ui, const char *old, const char *cur) {
   fmt_ctx_t c;
   char slog[128];
   ctx_init(ui, &c, FMT_MODE_NORMAL, slog, sizeof(slog));
-  char line[256];
-  /* other hubs up/down */
-  for (int j = 0; j < nb; j++) {
-    if (b[j].type != 'H' || b[j].depth < 1) continue;
-    for (int i = 0; i < na; i++) {
-      if (a[i].type != 'H' || strcmp(a[i].uuid, b[j].uuid) || strcmp(a[i].name, b[j].name)) continue;
-      if (a[i].online != b[j].online) {
-        usnprintf(line, sizeof(line), "%s hub %s %s", fmt_glyph(&c, b[j].online ? G_ON : G_WARN),
-                  b[j].name, b[j].online ? "is up" : "went down");
-        human_event(ui, line, b[j].online ? RL_DIM : RL_WARN);
-      }
-      break;
-    }
-  }
+  char line[512];
   /* bots in / out / moved: the hub is the nearest H row above */
   const char *hub_a[MAX_TROWS], *hub_b[MAX_TROWS];
   const char *h = "";
@@ -1955,8 +1995,61 @@ static void tree_events(console_ui_t *ui, const char *old, const char *cur) {
     if (b[j].type == 'H') h = b[j].name;
     hub_b[j] = h;
   }
+  /* other hubs up / down.  A hub out of reach takes its bots out of our
+   * tree, but they may still be on it: they are named with the hub as
+   * unseen, not as disconnected; a hub back brings its bots in one line. */
+  static bool came[MAX_TROWS], went[MAX_TROWS];
+  memset(came, 0, sizeof(came[0]) * (size_t)(nb > 0 ? nb : 1));
+  memset(went, 0, sizeof(went[0]) * (size_t)(na > 0 ? na : 1));
   for (int j = 0; j < nb; j++) {
-    if (b[j].type != 'B') continue;
+    if (b[j].type != 'H' || b[j].depth < 1) continue;
+    for (int i = 0; i < na; i++) {
+      if (a[i].type != 'H' || strcmp(a[i].uuid, b[j].uuid) || strcmp(a[i].name, b[j].name)) continue;
+      if (a[i].online != b[j].online) {
+        sb_line_t names = {0};
+        int n = 0;
+        if (b[j].online) {
+          for (int k = 0; k < nb; k++) {
+            if (b[k].type != 'B' || strcmp(hub_b[k], b[j].name)) continue;
+            int m = 0;
+            while (m < na && !(a[m].type == 'B' && !strcmp(a[m].uuid, b[k].uuid))) m++;
+            if (m < na) continue; /* it was in the tree already */
+            came[k] = true;
+            sbl_name(&names, b[k].name, n++);
+          }
+          sbl_more(&names, n);
+          if (n)
+            usnprintf(line, sizeof(line), "%s hub %s is back %s %d bot%s with it: %s",
+                      fmt_glyph(&c, G_ON), b[j].name, fmt_glyph(&c, G_DASH), n, n == 1 ? "" : "s",
+                      names.s);
+          else
+            usnprintf(line, sizeof(line), "%s hub %s is back", fmt_glyph(&c, G_ON), b[j].name);
+        } else {
+          for (int k = 0; k < na; k++) {
+            if (a[k].type != 'B' || strcmp(hub_a[k], a[i].name)) continue;
+            int m = 0;
+            while (m < nb && !(b[m].type == 'B' && !strcmp(b[m].uuid, a[k].uuid))) m++;
+            if (m < nb) continue; /* still in the tree (moved) */
+            went[k] = true;
+            sbl_name(&names, a[k].name, n++);
+          }
+          sbl_more(&names, n);
+          if (n)
+            usnprintf(line, sizeof(line),
+                      "%s hub %s out of reach (down, or split from us) %s %d bot%s behind it unseen: %s",
+                      fmt_glyph(&c, G_WARN), b[j].name, fmt_glyph(&c, G_DASH), n, n == 1 ? "" : "s",
+                      names.s);
+          else
+            usnprintf(line, sizeof(line), "%s hub %s out of reach (down, or split from us)",
+                      fmt_glyph(&c, G_WARN), b[j].name);
+        }
+        human_event(ui, line, b[j].online ? RL_DIM : RL_WARN);
+      }
+      break;
+    }
+  }
+  for (int j = 0; j < nb; j++) {
+    if (b[j].type != 'B' || came[j]) continue;
     int i = 0;
     while (i < na && !(a[i].type == 'B' && !strcmp(a[i].uuid, b[j].uuid))) i++;
     if (i == na) {
@@ -1970,7 +2063,7 @@ static void tree_events(console_ui_t *ui, const char *old, const char *cur) {
     }
   }
   for (int i = 0; i < na; i++) {
-    if (a[i].type != 'B') continue;
+    if (a[i].type != 'B' || went[i]) continue;
     int j = 0;
     while (j < nb && !(b[j].type == 'B' && !strcmp(b[j].uuid, a[i].uuid))) j++;
     if (j == nb) {
@@ -2303,7 +2396,7 @@ static void help_command(const fmt_ctx_t *c, flines_t *f, const cmd_def_t *d) {
   if (!strcmp(d->cmd, "user") && d->sub && (!strcmp(d->sub, "add") || !strcmp(d->sub, "set"))) {
     flines_add(f, RL_NORMAL, "");
     flines_add(f, RL_HEAD, " Admin flags: letter, name, what it lets the admin change");
-    static const char LETTERS[] = "abchou";
+    static const char LETTERS[] = USER_FLAG_LETTERS;
     char cmds[512];
     for (const char *p = LETTERS; *p; p++) {
       flag_cmds(*p, cmds, sizeof(cmds));
@@ -2878,6 +2971,78 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
         return false;
       }
       off += (size_t)k;
+    }
+    *outlen = off;
+    return true;
+  }
+  case B_POOL: {
+    /* server list/add/set/del/clear, network show/set (CMD_ADMIN_POOL) */
+    for (int i = 0; i < na; i++)
+      if (strchr(a[i], '|')) {
+        *why = "'|' is not allowed here";
+        return false;
+      }
+    if (!strcmp(c->cmd, "network")) {
+      if (!strcmp(c->sub, "show")) {
+        w = usnprintf(o, cap, "net");
+        break;
+      }
+      /* set name=<x> alias=<a,b>: one k=v list, an alias list's ',' as ';' */
+      size_t off = (size_t)usnprintf(o, cap, "netset|");
+      for (int i = 0; i < na; i++) {
+        if (!strchr(a[i], '=')) {
+          *why = "network set takes name=<NETWORK> and/or alias=<a,b,...>";
+          return false;
+        }
+        int k = usnprintf(o + off, cap - off, "%s", i ? "," : "");
+        off += (size_t)k;
+        for (const char *p = a[i]; *p && off + 1 < cap; p++) o[off++] = *p == ',' ? ';' : *p;
+        o[off] = '\0';
+      }
+      *outlen = off;
+      return true;
+    }
+    if (!strcmp(c->sub, "list")) {
+      w = usnprintf(o, cap, "list");
+      break;
+    }
+    if (strchr(a[0], ',')) {
+      *why = "one server: host[:port] or its uuid";
+      return false;
+    }
+    if (!strcmp(c->sub, "del")) {
+      bool force = na > 1 && !strcasecmp(a[1], "force");
+      if (na > 1 && !force) {
+        *why = "server del <host[:port]|uuid> [force]";
+        return false;
+      }
+      w = usnprintf(o, cap, "del|%s|%d", a[0], force ? 1 : 0);
+      break;
+    }
+    if (!strcmp(c->sub, "clear")) {
+      w = usnprintf(o, cap, "clear|%s", a[0]);
+      break;
+    }
+    /* add / set: host-or-uuid, then k=v words ("force" for set) */
+    size_t off = (size_t)usnprintf(o, cap, "%s|%s|", c->sub, a[0]);
+    int kvn = 0;
+    for (int i = 1; i < na; i++) {
+      bool force = !strcmp(c->sub, "set") && !strcasecmp(a[i], "force");
+      if (!force && (!strchr(a[i], '=') || strchr(a[i], ','))) {
+        *why = !strcmp(c->sub, "add") ? "server add <host[:port]> [weight=<1-100>] [max=<0-100>]"
+                                      : "server set <host[:port]|uuid> weight=<1-100> max=<0-100> enabled=on|off";
+        return false;
+      }
+      int k = usnprintf(o + off, cap - off, "%s%s", kvn++ ? "," : "", force ? "force=1" : a[i]);
+      if (k < 0 || (size_t)k >= cap - off) {
+        *why = "arguments too long";
+        return false;
+      }
+      off += (size_t)k;
+    }
+    if (!strcmp(c->sub, "set") && kvn == 0) {
+      *why = "server set <host[:port]|uuid> weight=<1-100> max=<0-100> enabled=on|off";
+      return false;
     }
     *outlen = off;
     return true;
@@ -3779,6 +3944,13 @@ static void run_line(console_ui_t *ui, const char *line) {
     usnprintf(q, sizeof(q), "Remove mask %s from %s? (y/N)", na > 2 ? ws.w[argi + 2] : "", a2);
   } else if (op == CMD_ADMIN_DEL_CHANNEL) {
     usnprintf(q, sizeof(q), "Remove %s from every bot? They part it. (y/N)", a1);
+  } else if (op == CMD_ADMIN_POOL && !strcmp(c->sub, "del")) {
+    if (!strcasecmp(a2, "force"))
+      usnprintf(q, sizeof(q), "Remove %s from the pool? If it is the last server, removing it "
+                "could take all bots off IRC. (y/N)", a1);
+    else
+      usnprintf(q, sizeof(q), "Remove %s from the pool? Bots on it stay until they disconnect. (y/N)",
+                a1);
   } else if (op == CMD_ADMIN_UPGRADE_STATUS && !strcmp(c->sub, "abort")) {
     usnprintf(q, sizeof(q), "Abort the running upgrade and roll back what it moved? (y/N)");
   } else if (op == CMD_ADMIN_UPGRADE_STATUS && !strcmp(c->sub, "forget")) {
@@ -3912,6 +4084,10 @@ static const arg_comp_t ARG_COMP[] = {
   {"user", "mask", 0, CK_WORDS, "add del"},
   {"channel", "set", 0, CK_WORDS, "default"},
   {"channel", "set", -1, CK_CHSET, NULL},
+  {"server", "add", -1, CK_WORDS, "weight= max="},
+  {"server", "set", -1, CK_WORDS, "weight= max= enabled=on enabled=off force"},
+  {"server", "del", 1, CK_WORDS, "force"},
+  {"network", "set", -1, CK_WORDS, "name= alias="},
   {"ban", "list", 0, CK_WORDS, "*"},
   {"ban", "add", 0, CK_WORDS, "*"},
   {"ban", "add", 2, CK_WORDS, "perm sticky"},
@@ -4057,7 +4233,7 @@ static int completions(console_ui_t *ui, int word_idx, char w[][64],
     for (int i = 0; i < NGROUPS; i++) ADD_CAND(GROUPS[i].name);
     return n;
   }
-  int kind = ac->kind;
+  enum ck kind = ac->kind;
   if (ac->kind == CK_WORDS || ac->kind == CK_CHSET || ac->kind == CK_NETSET ||
       ac->kind == CK_HUBSET) {
     const char *words = ac->kind == CK_WORDS ? ac->words

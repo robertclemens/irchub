@@ -1353,8 +1353,9 @@ static int mesh_find(const mnode_t *nodes, int n, const char *uuid) {
   return -1;
 }
 
-static void render_mesh(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
-  mnode_t nodes[64];
+/* Every hub a reply names: self / peer / hub records, then hubs only a link
+ * names.  Returns how many (at most 64). */
+static int mesh_nodes(const creply_t *rep, mnode_t nodes[64]) {
   int nn = 0;
   for (int i = 0; i < rep->n && nn < 64; i++) {
     const crec_t *r = &rep->r[i];
@@ -1372,6 +1373,117 @@ static void render_mesh(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out
     nodes[nn].name = rvs(r, "b_name") ? rv(r, "b_name") : rv(r, "b");
     nn++;
   }
+  return nn;
+}
+
+/* The hub layout as configured (every gossiped link, up or down) and how it
+ * stands now (the up links): `layout` names it, `split` says how the up
+ * links break it apart ("" when whole), `partial` the hubs that reported no
+ * links of their own (their side of the picture is missing).  Returns the
+ * number of parts the up links leave (1 = whole). */
+static int mesh_topology(const creply_t *rep, char *layout, size_t lcap, char *split,
+                         size_t scap, char *partial, size_t pcap) {
+  mnode_t nodes[64];
+  int nn = mesh_nodes(rep, nodes);
+  layout[0] = split[0] = partial[0] = '\0';
+  static bool conf[64][64], up[64][64];
+  bool reported[64] = {false};
+  memset(conf, 0, sizeof(conf));
+  memset(up, 0, sizeof(up));
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *r = &rep->r[i];
+    if (strcmp(r->type, "link")) continue;
+    int a = mesh_find(nodes, nn, rv(r, "a")), b = mesh_find(nodes, nn, rv(r, "b"));
+    if (a < 0 || b < 0 || a == b) continue;
+    reported[a] = true;
+    conf[a][b] = conf[b][a] = true;
+    if (rv(r, "state") && !strcmp(rv(r, "state"), "up")) up[a][b] = up[b][a] = true;
+  }
+  int deg[64] = {0}, edges = 0;
+  for (int a = 0; a < nn; a++)
+    for (int b = 0; b < nn; b++)
+      if (conf[a][b]) deg[a]++;
+  for (int a = 0; a < nn; a++) edges += deg[a];
+  edges /= 2;
+  /* connected as configured? (and the parts of the up links) */
+  int comp[64], parts = 0, cparts = 0;
+  for (int pass = 0; pass < 2; pass++) {
+    int seen[64], n = 0;
+    for (int i = 0; i < nn; i++) seen[i] = -1;
+    for (int s = 0; s < nn; s++) {
+      if (seen[s] >= 0) continue;
+      int q[64], qh = 0, qt = 0;
+      q[qt++] = s;
+      seen[s] = n;
+      while (qh < qt) {
+        int x = q[qh++];
+        for (int y = 0; y < nn; y++)
+          if (seen[y] < 0 && (pass ? up[x][y] : conf[x][y])) {
+            seen[y] = n;
+            q[qt++] = y;
+          }
+      }
+      n++;
+    }
+    if (pass) {
+      parts = n;
+      memcpy(comp, seen, sizeof(comp));
+    } else {
+      cparts = n;
+    }
+  }
+  int center = -1, d1 = 0, d2 = 0;
+  for (int a = 0; a < nn; a++) {
+    if (deg[a] == nn - 1) center = a;
+    d1 += deg[a] == 1;
+    d2 += deg[a] == 2;
+  }
+  if (nn < 2)
+    snprintf(layout, lcap, "a single hub");
+  else if (cparts > 1)
+    snprintf(layout, lcap, "%d hubs, not all linked as configured", nn);
+  else if (nn == 2)
+    snprintf(layout, lcap, "a pair of hubs");
+  else if (edges == nn * (nn - 1) / 2)
+    snprintf(layout, lcap, "full mesh of %d hubs", nn);
+  else if (edges == nn - 1 && center >= 0)
+    snprintf(layout, lcap, "star around %s", nodes[center].name);
+  else if (edges == nn - 1 && d1 == 2 && d2 == nn - 2)
+    snprintf(layout, lcap, "chain of %d hubs", nn);
+  else if (edges == nn - 1)
+    snprintf(layout, lcap, "tree of %d hubs", nn);
+  else if (edges == nn && d2 == nn)
+    snprintf(layout, lcap, "ring of %d hubs", nn);
+  else
+    snprintf(layout, lcap, "partial mesh of %d hubs", nn);
+  size_t o = 0;
+  int miss = 0;
+  for (int a = 0; a < nn; a++) {
+    if (reported[a]) continue;
+    if (miss < 2) {
+      int w = snprintf(partial + o, pcap - o, "%s%s", miss ? ", " : "", nodes[a].name);
+      if (w > 0 && (size_t)w < pcap - o) o += (size_t)w;
+    }
+    miss++;
+  }
+  if (miss > 2) snprintf(partial + o, pcap - o, " +%d", miss - 2);
+  if (parts > 1) {
+    o = (size_t)snprintf(split, scap, "split into %d parts:", parts);
+    for (int c = 0; c < parts && o < scap; c++)
+      for (int a = 0, first = 1; a < nn && o < scap; a++) {
+        if (comp[a] != c) continue;
+        int w = snprintf(split + o, scap - o, "%s%s", first ? (c ? " | " : " ") : " ", nodes[a].name);
+        if (w < 0 || (size_t)w >= scap - o) break;
+        o += (size_t)w;
+        first = 0;
+      }
+  }
+  return parts;
+}
+
+static void render_mesh(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  mnode_t nodes[64];
+  int nn = mesh_nodes(rep, nodes);
   if (nn < 2) return;
   /* Column heads: the first 5 characters of each name ("hub-" dropped: it
    * says nothing).  Names whose heads clash get their start plus their end,
@@ -1554,20 +1666,29 @@ static void render_peer_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
   if (!conf) return;
   flines_add(out, RL_NORMAL, "");
   render_mesh(ctx, rep, out);
-  /* health */
+  /* health: the layout, whether the up links hold it together, the issues */
   int issues = 0;
   for (int i = 0; i < rep->n; i++) issues += !strcmp(rep->r[i].type, "issue");
+  char layout[96], split[256], partial[96];
+  int parts = mesh_topology(rep, layout, sizeof(layout), split, sizeof(split), partial,
+                            sizeof(partial));
+  if (parts > 1) issues++;
   flines_add(out, RL_NORMAL, "");
   if (!issues) {
-    char h[96];
-    snprintf(h, sizeof(h), "%s healthy %s every configured link is up, no unknown hubs",
-             GL(G_ON), GL(G_DASH));
+    char h[192];
+    snprintf(h, sizeof(h), "%s healthy %s %s, every configured link up, no unknown hubs",
+             GL(G_ON), GL(G_DASH), layout);
     fmt_title(ctx, out, "Health", h);
+    if (partial[0])
+      line(out, RL_DIM, "  partial view: %s reported no links yet", partial);
     return;
   }
-  char h[48];
-  snprintf(h, sizeof(h), "%s %d issue%s", GL(G_WARN), issues, issues == 1 ? "" : "s");
+  char h[160];
+  snprintf(h, sizeof(h), "%s %d issue%s %s %s", GL(G_WARN), issues, issues == 1 ? "" : "s",
+           GL(G_DOT), layout);
   fmt_title(ctx, out, "Health", h);
+  if (parts > 1) line(out, RL_WARN, "  %s %s", GL(G_WARN), split);
+  if (partial[0]) line(out, RL_DIM, "  partial view: %s reported no links yet", partial);
   for (int i = 0; i < rep->n; i++) {
     const crec_t *r = &rep->r[i];
     if (strcmp(r->type, "issue")) continue;
@@ -1990,12 +2111,12 @@ static const char *const OPNAME[256] = {
  [0x74] = "CMD_CHAN_ELECT_DONE", [0x75] = "CMD_ADMIN_INVITE_USER",
  [0x76] = "CMD_ADMIN_CHAN_MODE", [0x77] = "CMD_ADMIN_CHAN_SET", [0x78] = "CMD_ADMIN_BAN",
  [0x79] = "CMD_ADMIN_NET_SET", [0x7A] = "CMD_ADMIN_SET_SSH", [0x7B] = "CMD_CHAN_EVENT", [0x7C] = "CMD_ADMIN_USER_ACCESS", [0x7D] = "CMD_USER_CHAN_REQUEST", [0x7E] = "CMD_USER_CHAN_RESULT", [0x7F] = "CMD_BOT_RETIRE", [0x80] = "CMD_BOT_RETIRE_ACK", [0x81] = "CMD_ADMIN_LIST_REVOKED", [0x82] = "CMD_ADMIN_PEER_REFS",
- [0x83] = "CMD_LINK_SEQ", [0x84] = "CMD_ADMIN_KICK_USER", [0x87] = "CMD_UPGRADE_HISTORY",
+ [0x83] = "CMD_LINK_SEQ", [0x84] = "CMD_ADMIN_KICK_USER", [0x85] = "CMD_POOL_VIEW", [0x86] = "CMD_SERVER_REPORT", [0x87] = "CMD_UPGRADE_HISTORY",
  [0x88] = "CMD_UPGRADE_STAGE", [0x89] = "CMD_UPGRADE_PROGRESS", [0x8A] = "CMD_UPGRADE_PLAN",
  [0x8B] = "CMD_CRON_SET", [0x8C] = "CMD_HUB_ROLLCALL", [0x8D] = "CMD_HUB_ROLLCALL_ACK", [0x8E] = "CMD_PRESENCE2",
  [0x8F] = "CMD_BOT_TREE_DELTA", [0x90] = "CMD_BOT_TREE_PULL", [0x91] = "CMD_CONFIG_DELTA",
  [0x92] = "CMD_CFG_RESYNC", [0x93] = "CMD_ADMIN_BOT_RESYNC", [0x94] = "CMD_SYNC_DIGEST",
- [0x95] = "CMD_CHAN_WHO",
+ [0x96] = "CMD_BOT_IRC_LINK", [0x97] = "CMD_ADMIN_POOL", [0x95] = "CMD_CHAN_WHO",
 };
 
 static unsigned long long rvu(const crec_t *r, const char *k) {
@@ -2058,8 +2179,128 @@ static void render_timers(const fmt_ctx_t *ctx, const creply_t *rep, const crec_
   flines_add(out, RL_NORMAL, "");
   fmt_title(ctx, out, "Maintenance timers",
             ld ? (rvi(ld, "dirty", 0) ? "config unsaved" : "config saved") : NULL);
-  tbl_render(ctx, out, &t);
+  /* As many JOB / EVERY / NEXT RUN blocks side by side as the width takes
+   * (TIMER_COLS_MAX), rows filled down each block first; one block is the
+   * plain table. */
+  int w[3] = {0, 0, 0};
+  for (int c = 0; c < 3; c++) {
+    w[c] = console_str_width(cols[c].head);
+    for (int r = 0; r < t.nr; r++) {
+      int cw = console_str_width(t.cells[r * 3 + c]);
+      if (cw > w[c]) w[c] = cw;
+    }
+  }
+  int bw = w[0] + 2 + w[1] + 2 + w[2], k = 1;
+  while (k < TIMER_COLS_MAX && k < t.nr &&
+         t.indent + (k + 1) * bw + k * TIMER_COL_GAP <= ctx->width)
+    k++;
+  if (k == 1) {
+    tbl_render(ctx, out, &t);
+    tbl_free(&t);
+    return;
+  }
+  int rows = (t.nr + k - 1) / k;
+  sb_t b = {0};
+  for (int r = -1; r < rows; r++) {
+    for (int blk = 0; blk < k; blk++) {
+      int idx = blk * rows + r;
+      if (r >= 0 && idx >= t.nr) break;
+      int x = t.indent + blk * (bw + TIMER_COL_GAP);
+      const char *const *cells =
+          r < 0 ? (const char *const[]){cols[0].head, cols[1].head, cols[2].head}
+                : (const char *const *)&t.cells[idx * 3];
+      sb_pad(&b, x);
+      sb_add(&b, cells[0]);
+      sb_pad(&b, x + w[0] + 2 + w[1] - console_str_width(cells[1]));
+      sb_add(&b, cells[1]);
+      sb_pad(&b, x + w[0] + 2 + w[1] + 2 + w[2] - console_str_width(cells[2]));
+      sb_add(&b, cells[2]);
+    }
+    sb_emit(&b, out, r < 0 ? RL_HEAD : RL_NORMAL);
+  }
+  sb_free(&b);
   tbl_free(&t);
+}
+
+/* ---- the stats sections, two side by side on a wide console ------------ */
+typedef struct {
+  char title[64];
+  int  role;                 /* the rows' role (RL_WARN: pool unusable)   */
+  int  n;
+  char label[12][16];
+  char value[12][24];
+} ssec_t;
+
+static void ssec_count(ssec_t *s, const char *label, unsigned long long v) {
+  if (s->n >= 12) return;
+  snprintf(s->label[s->n], sizeof(s->label[0]), "%s", label);
+  fmt_count(v, s->value[s->n], sizeof(s->value[0]));
+  s->n++;
+}
+
+static void ssec_text(ssec_t *s, const char *label, const char *v) {
+  if (s->n >= 12) return;
+  snprintf(s->label[s->n], sizeof(s->label[0]), "%s", label);
+  snprintf(s->value[s->n], sizeof(s->value[0]), "%s", v);
+  s->n++;
+}
+
+/* delta share and saved, as delta_kv */
+static void ssec_delta(ssec_t *s, const crec_t *r) {
+  unsigned long long full = rvu(r, "full"), delta = rvu(r, "delta");
+  unsigned long long of = rvu(r, "delta_of"), db = rvu(r, "delta_bytes");
+  char v[24];
+  snprintf(v, sizeof(v), "%llu%%", full + delta ? delta * 100 / (full + delta) : 0);
+  ssec_text(s, "delta share", v);
+  fmt_bytes(of > db ? of - db : 0, v, sizeof(v));
+  ssec_text(s, "saved", v);
+}
+
+/* One section as lines of at most STATS_COL_W cells: its title, then two
+ * "label  value" pairs a line, values right-aligned. */
+static int ssec_lines(const ssec_t *s, sb_t *lines, int max) {
+  int n = 0;
+  if (n < max) {
+    sb_add(&lines[n], " ");
+    sb_add(&lines[n++], s->title);
+  }
+  for (int i = 0; i < s->n && n < max; i += 2) {
+    sb_t *b = &lines[n++];
+    for (int j = i; j < i + 2 && j < s->n; j++) {
+      int x = 2 + (j - i) * (STATS_LABEL_W + STATS_VALUE_W + 4);
+      sb_pad(b, x);
+      sb_add(b, s->label[j]);
+      sb_pad(b, x + STATS_LABEL_W + STATS_VALUE_W - console_str_width(s->value[j]));
+      sb_add(b, s->value[j]);
+    }
+  }
+  return n;
+}
+
+static void render_stats_grid(const ssec_t *secs, int ns, flines_t *out) {
+  for (int p = 0; p < ns; p += 2) {
+    sb_t l[8] = {{0}}, r[8] = {{0}};
+    int nl = ssec_lines(&secs[p], l, 8), nr = p + 1 < ns ? ssec_lines(&secs[p + 1], r, 8) : 0;
+    int rows = nl > nr ? nl : nr;
+    sb_t b = {0};
+    for (int i = 0; i < rows; i++) {
+      if (i < nl) sb_add(&b, l[i].p);
+      if (i < nr) {
+        sb_pad(&b, STATS_COL_W);
+        sb_add(&b, r[i].p);
+      }
+      int role = i == 0 ? RL_HEAD
+                 : (i < nl && secs[p].role == RL_WARN) || (i < nr && secs[p + 1].role == RL_WARN)
+                     ? RL_WARN
+                     : RL_NORMAL;
+      sb_emit(&b, out, role);
+    }
+    sb_free(&b);
+    for (int i = 0; i < 8; i++) {
+      sb_free(&l[i]);
+      sb_free(&r[i]);
+    }
+  }
 }
 
 static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
@@ -2068,14 +2309,92 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
   snprintf(right, sizeof(right), "%s %s up %s", ctx->hubname && *ctx->hubname ? ctx->hubname : "hub",
            GL(G_DOT), up);
   fmt_title(ctx, out, "Hub statistics", right);
-  const crec_t *cfg = NULL, *sy = NULL, *ld = NULL, *p2 = NULL, *tr = NULL;
+  const crec_t *cfg = NULL, *sy = NULL, *ld = NULL, *p2 = NULL, *tr = NULL, *pl = NULL;
   for (int i = 0; i < rep->n; i++) {
     if (!strcmp(rep->r[i].type, "cfg")) cfg = &rep->r[i];
     if (!strcmp(rep->r[i].type, "tree")) tr = &rep->r[i];
     if (!strcmp(rep->r[i].type, "sync")) sy = &rep->r[i];
     if (!strcmp(rep->r[i].type, "p2")) p2 = &rep->r[i];
     if (!strcmp(rep->r[i].type, "load")) ld = &rep->r[i];
+    if (!strcmp(rep->r[i].type, "pool")) pl = &rep->r[i];
   }
+  if (ctx->width >= STATS_GRID_MIN) {
+    ssec_t secs[6];
+    int ns = 0;
+    memset(secs, 0, sizeof(secs));
+    if (cfg) {
+      ssec_t *s = &secs[ns++];
+      snprintf(s->title, sizeof(s->title), "Config pushes to bots");
+      ssec_count(s, "full", rv(cfg, "full") ? rvu(cfg, "full") : rvu(cfg, "sent"));
+      ssec_count(s, "delta", rvu(cfg, "delta"));
+      ssec_count(s, "skipped", rvu(cfg, "same"));
+      ssec_count(s, "lost", rvu(cfg, "lost"));
+      if (rv(cfg, "delta")) {
+        ssec_count(s, "pulls", rvu(cfg, "pull"));
+        ssec_delta(s, cfg);
+      }
+    }
+    if (tr) {
+      ssec_t *s = &secs[ns++];
+      snprintf(s->title, sizeof(s->title), "Bot tree pushes");
+      ssec_count(s, "full", rvu(tr, "full"));
+      ssec_count(s, "delta", rvu(tr, "delta"));
+      ssec_count(s, "pulls", rvu(tr, "pull"));
+      ssec_delta(s, tr);
+    }
+    if (sy) {
+      ssec_t *s = &secs[ns++];
+      snprintf(s->title, sizeof(s->title), "Sync frames from other hubs");
+      ssec_count(s, "frames", rvu(sy, "frames"));
+      ssec_count(s, "no-op", rvu(sy, "noop"));
+      ssec_count(s, "records", rvu(sy, "records"));
+      ssec_count(s, "applied", rvu(sy, "applied"));
+      if (rv(sy, "digests")) {
+        ssec_count(s, "digests", rvu(sy, "digests"));
+        ssec_count(s, "received", rvu(sy, "digests_in"));
+        ssec_count(s, "matched", rvu(sy, "matched"));
+        ssec_count(s, "repaired", rvu(sy, "repaired"));
+        ssec_count(s, "fallbacks", rvu(sy, "fallbacks"));
+      }
+    }
+    if (p2) {
+      ssec_t *s = &secs[ns++];
+      snprintf(s->title, sizeof(s->title), "%s",
+               rvi(p2, "ready", 0) ? "Presence v2" : "Presence v2 (waiting for a hub's record)");
+      ssec_count(s, "deltas", rvu(p2, "deltas"));
+      ssec_count(s, "snapshots", rvu(p2, "snaps"));
+      ssec_count(s, "held", rvu(p2, "held"));
+      ssec_count(s, "pulls", rvu(p2, "pulls"));
+      ssec_count(s, "relays", rvu(p2, "relays"));
+      ssec_count(s, "digest misses", rvu(p2, "miss"));
+      ssec_count(s, "heals", rvu(p2, "heals"));
+      ssec_count(s, "jumps", rvu(p2, "jumps"));
+      ssec_count(s, "bad", rvu(p2, "bad"));
+      ssec_count(s, "drops", rvu(p2, "drops"));
+    }
+    if (pl) {
+      ssec_t *s = &secs[ns++];
+      snprintf(s->title, sizeof(s->title), "Server pool");
+      ssec_count(s, "servers", rvu(pl, "servers"));
+      ssec_count(s, "usable", rvu(pl, "usable"));
+      ssec_count(s, "wrong net", rvu(pl, "wrongnet"));
+      ssec_count(s, "bots idle", rvu(pl, "idle"));
+      ssec_count(s, "reports", rvu(pl, "reports"));
+      ssec_count(s, "flagged", rvu(pl, "flagged"));
+      ssec_count(s, "views sent", rvu(pl, "views"));
+      s->role = rvu(pl, "usable") || !rvu(pl, "servers") ? RL_NORMAL : RL_WARN;
+    }
+    if (ld) {
+      ssec_t *s = &secs[ns++];
+      snprintf(s->title, sizeof(s->title), "Connections");
+      ssec_count(s, "total", rvu(ld, "clients"));
+      ssec_count(s, "bots", rvu(ld, "bots"));
+      ssec_count(s, "hubs", rvu(ld, "peers"));
+      ssec_count(s, "consoles", rvu(ld, "consoles"));
+      ssec_count(s, "authing", rvu(ld, "authing"));
+    }
+    render_stats_grid(secs, ns, out);
+  } else {
   sb_t b = {0};
   if (cfg) {
     /* A 2.5.3 hub answers sent= (all full) and no delta or pull. */
@@ -2136,6 +2455,19 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
     count_kv(&b, "drops", rvu(p2, "drops"), 80);
     sb_emit(&b, out, RL_NORMAL);
   }
+  if (pl) {
+    /* 2.5.4 server pool */
+    line(out, RL_HEAD, " Server pool");
+    count_kv(&b, "  servers", rvu(pl, "servers"), 0);
+    count_kv(&b, "usable", rvu(pl, "usable"), 24);
+    count_kv(&b, "wrong net", rvu(pl, "wrongnet"), 40);
+    count_kv(&b, "bots idle", rvu(pl, "idle"), 60);
+    sb_emit(&b, out, rvu(pl, "usable") || !rvu(pl, "servers") ? RL_NORMAL : RL_WARN);
+    count_kv(&b, "  reports", rvu(pl, "reports"), 0);
+    count_kv(&b, "flagged", rvu(pl, "flagged"), 24);
+    count_kv(&b, "views sent", rvu(pl, "views"), 40);
+    sb_emit(&b, out, RL_NORMAL);
+  }
   if (ld) {
     line(out, RL_HEAD, " Connections");
     count_kv(&b, "  total", rvu(ld, "clients"), 0);
@@ -2146,6 +2478,7 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
     sb_emit(&b, out, RL_NORMAL);
   }
   sb_free(&b);
+  }
   render_timers(ctx, rep, ld, out);
   flines_add(out, RL_NORMAL, "");
   fmt_title(ctx, out, "Traffic by message", "sorted by bytes");
@@ -2465,7 +2798,7 @@ static void user_access(const fmt_ctx_t *ctx, const crec_t *u, char *out, size_t
 static void flags_words(const char *flags, char *out, size_t cap) {
   static const struct { char f; const char *w; } W[] = {
     {'a', "full admin"}, {'b', "bots"}, {'c', "channels"}, {'h', "hub"}, {'o', "opers"},
-    {'u', "upgrades"}};
+    {'s', "servers"}, {'u', "upgrades"}};
   size_t o = 0;
   out[0] = '\0';
   for (const char *p = flags ? flags : ""; *p; p++)
@@ -3223,6 +3556,130 @@ static int ban_row_cmp(const void *pa, const void *pb) {
   if (c) return c;
   long long ta = rvi(a, "ts", 0), tb = rvi(b, "ts", 0);
   return ta < tb ? -1 : ta > tb ? 1 : 0;
+}
+
+/* ==========================================================================
+ * Server pool (server list / network show, 2.5.4)
+ * ========================================================================== */
+static int pool_row_cmp(const void *a, const void *b) {
+  const crec_t *x = *(const crec_t *const *)a, *y = *(const crec_t *const *)b;
+  int c = strcasecmp(rv(x, "host") ? rv(x, "host") : "", rv(y, "host") ? rv(y, "host") : "");
+  if (c) return c;
+  return (int)(rvi(x, "port", 0) - rvi(y, "port", 0));
+}
+
+static void pool_state_text(const crec_t *c, char *out, size_t cap) {
+  const char *st = rv(c, "state") ? rv(c, "state") : "?";
+  if (!strcmp(st, "wrongnet"))
+    snprintf(out, cap, "wrong network (%s)", rvs(c, "seen") ? rv(c, "seen") : "none named");
+  else if (!strcmp(st, "disabled")) snprintf(out, cap, "disabled");
+  else snprintf(out, cap, "ok");
+}
+
+static void render_pool_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  const crec_t *r = &rep->res;
+  long long count = rvi(r, "count", 0), usable = rvi(r, "usable", 0), idle = rvi(r, "idle", 0);
+  char right[160];
+  snprintf(right, sizeof(right), "%lld server%s %s %lld usable %s network %s", count,
+           count == 1 ? "" : "s", GL(G_DOT), usable, GL(G_DOT),
+           rvs(r, "name") ? rv(r, "name") : "(name not learned yet)");
+  fmt_title(ctx, out, "Servers", right);
+  const crec_t **rows = calloc((size_t)rep->n + 1, sizeof(*rows));
+  int nr = 0;
+  for (int i = 0; rows && i < rep->n; i++)
+    if (!strcmp(rep->r[i].type, "server")) rows[nr++] = &rep->r[i];
+  if (!nr) {
+    empty_note(out, "no servers: hub-managed bots cannot connect to IRC",
+               "server add <host[:port]>");
+    free(rows);
+    return;
+  }
+  qsort(rows, (size_t)nr, sizeof(*rows), pool_row_cmp);
+  static const col_t cols[] = {{"HOST", 'L', 1},   {"PORT", 'R', 1}, {"STATE", 'L', 1},
+                               {"BOTS", 'R', 1},   {"WEIGHT", 'R', 2}, {"MAX", 'R', 2},
+                               {"ADDED", 'L', 2}};
+  tbl_t t;
+  tbl_init(&t, cols, 7, -1, 1, 1);
+  for (int i = 0; i < nr; i++) {
+    const crec_t *c = rows[i];
+    char port[16], st[96], bots[32], wt[16], mx[16], when[64];
+    snprintf(port, sizeof(port), "%lld", rvi(c, "port", 0));
+    pool_state_text(c, st, sizeof(st));
+    long long up = rvi(c, "up", 0), conn = rvi(c, "connecting", 0);
+    if (conn) snprintf(bots, sizeof(bots), "%lld +%lld", up, conn);
+    else snprintf(bots, sizeof(bots), "%lld", up);
+    snprintf(wt, sizeof(wt), "%lld", rvi(c, "weight", 1));
+    if (rvi(c, "max", 0)) snprintf(mx, sizeof(mx), "%lld", rvi(c, "max", 0));
+    else snprintf(mx, sizeof(mx), "%s", GL(G_DASH));
+    when_ago(ctx, rvi(c, "ts", 0), when, sizeof(when));
+    const char *cells[7] = {rv(c, "host"), port, st, bots, wt, mx, when};
+    bool bad = rv(c, "state") && strcmp(rv(c, "state"), "ok") != 0;
+    tbl_row(ctx, &t, bad ? RL_WARN : RL_NORMAL, NULL, cells);
+  }
+  tbl_render(ctx, out, &t);
+  tbl_free(&t);
+  free(rows);
+  if (usable == 0)
+    warn(ctx, out, "no usable server: bots that disconnect cannot reconnect");
+  if (idle > 0) {
+    char w[96];
+    snprintf(w, sizeof(w), "%lld bot%s waiting for a usable server", idle, idle == 1 ? "" : "s");
+    warn(ctx, out, w);
+  }
+}
+
+static void render_pool_net(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  const crec_t *r = &rep->res;
+  fmt_title(ctx, out, "Network", rv(r, "net") ? rv(r, "net") : "main");
+  const int L = 9;
+  fmt_card_line(ctx, out, L, "name",
+                rvs(r, "name") ? rv(r, "name") : "(not learned yet: the first bot names it)",
+                RL_NORMAL);
+  fmt_card_line(ctx, out, L, "aliases", rvs(r, "aliases") ? rv(r, "aliases") : GL(G_DASH),
+                RL_NORMAL);
+  char v[96];
+  long long usable = rvi(r, "usable", 0), idle = rvi(r, "idle", 0);
+  snprintf(v, sizeof(v), "%lld usable", usable);
+  fmt_card_line(ctx, out, L, "servers", v, usable ? RL_NORMAL : RL_WARN);
+  snprintf(v, sizeof(v), "%lld waiting for a server", idle);
+  fmt_card_line(ctx, out, L, "idle", v, idle ? RL_WARN : RL_NORMAL);
+}
+
+static void render_pool_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  const crec_t *r = &rep->res;
+  const char *code = rep->code;
+  if (!strcmp(code, "pool.netset")) {
+    fmt_ok(ctx, "Network set", rvs(r, "name") ? rv(r, "name") : "(name not learned)", out);
+    if (rvs(r, "aliases")) {
+      char a[600];
+      snprintf(a, sizeof(a), "also accepted: %s", rv(r, "aliases"));
+      effect(ctx, out, a);
+    }
+    push_effects(ctx, r, out);
+    return;
+  }
+  char subj[300];
+  snprintf(subj, sizeof(subj), "%s:%lld", rv(r, "host") ? rv(r, "host") : "?", rvi(r, "port", 0));
+  const char *what = !strcmp(code, "pool.added")   ? (rvb(r, "revived") ? "Server back" : "Server added")
+                     : !strcmp(code, "pool.removed") ? "Server removed"
+                     : !strcmp(code, "pool.cleared") ? "Wrong-network flag cleared"
+                                                     : "Server set";
+  fmt_ok(ctx, what, subj, out);
+  if (!strcmp(code, "pool.removed")) {
+    effect(ctx, out, rvb(r, "last") ? "it was the last usable server: no bot can reconnect until one is added"
+                                    : "bots on it stay until they disconnect");
+  } else {
+    char st[96], ph[160];
+    pool_state_text(r, st, sizeof(st));
+    if (rvi(r, "max", 0))
+      snprintf(ph, sizeof(ph), "weight %lld %s max %lld %s %s", rvi(r, "weight", 1), GL(G_DOT),
+               rvi(r, "max", 0), GL(G_DOT), st);
+    else
+      snprintf(ph, sizeof(ph), "weight %lld %s no cap %s %s", rvi(r, "weight", 1), GL(G_DOT),
+               GL(G_DOT), st);
+    effect(ctx, out, ph);
+  }
+  push_effects(ctx, r, out);
 }
 
 static void render_ban_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
@@ -4348,6 +4805,9 @@ void fmt_reply(const fmt_ctx_t *ctx, const creply_t *rep, const char *words, fli
   else if (!strcmp(c, "channel.settings")) render_settings_table(ctx, rep, out, false);
   else if (!strcmp(c, "channel.mode")) render_channel_mode(ctx, rep, out);
   else if (!strcmp(c, "channel.set")) render_settings_change(ctx, rep, out);
+  else if (!strcmp(c, "pool.list")) render_pool_list(ctx, rep, out);
+  else if (!strcmp(c, "pool.net")) render_pool_net(ctx, rep, out);
+  else if (!strncmp(c, "pool.", 5)) render_pool_change(ctx, rep, out);
   else if (!strcmp(c, "ban.list")) render_ban_list(ctx, rep, out);
   else if (!strncmp(c, "ban.", 4)) render_ban_change(ctx, rep, out);
   else if (!strcmp(c, "network.settings")) render_settings_table(ctx, rep, out, true);

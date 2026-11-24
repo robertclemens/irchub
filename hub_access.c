@@ -411,6 +411,47 @@ bool hub_access_append(hub_state_t *state, char *buf, int cap, int *off,
   return true;
 }
 
+/* The uf|/uc| lines of a bot's config.  A bot older than POOL_MIN_BOT (pool
+ * false) knows no 's' flag: it would refuse the whole uf| and, replacing its
+ * table from the config, keep that admin with no flags at all (fail closed),
+ * so the letter is left out for it.  Bots never send other users' records
+ * back, so the stripped copy goes nowhere. */
+bool hub_access_append_bot(hub_state_t *state, char *buf, int cap, int *off, bool pool) {
+  if (pool) return hub_access_append(state, buf, cap, off, NULL, NULL);
+  for (int i = 0; i < state->uflag_record_count; i++) {
+    hub_uflag_record_t r = state->uflag_records[i];
+    char *s = strchr(r.flags, 's');
+    if (s) memmove(s, s + 1, strlen(s));
+    int w = hub_format_uflag(&r, buf + *off, (size_t)(cap - *off));
+    if (w < 0 || w >= cap - *off) return false;
+    *off += w;
+  }
+  for (int i = 0; i < state->uchan_record_count; i++) {
+    int w = hub_format_uchan(&state->uchan_records[i], buf + *off, (size_t)(cap - *off));
+    if (w < 0 || w >= cap - *off) return false;
+    *off += w;
+  }
+  return true;
+}
+
+void hub_access_sgrant_once(hub_state_t *state) {
+  if (state->sgrant_setting) return;
+  int n = 0;
+  for (int i = 0; i < state->uflag_record_count; i++) {
+    hub_uflag_record_t *r = &state->uflag_records[i];
+    if (!strchr(r->flags, 'b') || strchr(r->flags, 's') || strchr(r->flags, 'a')) continue;
+    char with[USER_FLAGS_MAX + 2], canon[USER_FLAGS_MAX + 1];
+    snprintf(with, sizeof(with), "%ss", r->flags);
+    if (!hub_uflags_canon(with, canon, sizeof(canon))) continue;
+    /* stamp + 1, not now: every hub that runs this writes the same record,
+     * and any later change by an admin (a -s above all) stays newer. */
+    if (hub_uflag_put(state, r->uuid, canon, r->timestamp + 1)) n++;
+  }
+  hub_gsetting_set(state, "sgrant", 1);
+  if (n) hub_log_info("[ACCESS] Gave the server flag +s to %d admin%s with +b (once)\n", n,
+                      n == 1 ? "" : "s");
+}
+
 /* ---- Console helpers (T4) ------------------------------------------------ */
 
 /* A user's live bindings as the console shows them: "*" when global, else

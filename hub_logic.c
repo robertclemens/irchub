@@ -2434,6 +2434,15 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
     return;
   }
 
+  /* The bot's first config may have gone out before its version was known:
+   * once it shows it takes the pool (or stops), it is owed one with (without)
+   * the N|/S| lines — a delta, since it already holds a base. */
+  if (hub_bot_version_takes_pool(client->bot_version) !=
+      hub_bot_version_takes_pool(version)) {
+    client->cfg_owed = true;
+    g_cfg_owed = true;
+  }
+
   bool changed = strcmp(client->bot_version, version) != 0 ||
                  strcmp(client->bot_server, server) != 0 ||
                  strcmp(client->bot_variant, variant) != 0 ||
@@ -2615,7 +2624,7 @@ static int roster_round(hub_state_t *state, long long gen, int total,
 
     char nick[MAX_NICK];
     bot_nick_from_config(state, c->id, nick, sizeof(nick));
-    char row[TREE_ROW_MAX + CRON_STATUS_MAX + 48];
+    char row[TREE_ROW_MAX + CRON_STATUS_MAX + 48 + 128]; /* + the i| line */
     /* 7th field: when the bot linked to this hub; 8th: the bot's address as
      * this hub sees it; 9th: its crontab status; 10th (phase 4): the bot's
      * link-order counter (a hub that predates any of them stops reading before
@@ -2630,6 +2639,15 @@ static int roster_round(hub_state_t *state, long long gen, int total,
                       c->bot_cron[0] ? c->bot_cron : "-",
                       (unsigned long long)c->bot_link_ord);
     if (rl <= 0 || rl >= (int)sizeof(row)) continue; /* unrepresentable row */
+    /* Server pool: the IRC link's entry and state, on the row's heels so a
+     * chunk never splits the two (an older hub skips the i| tag). */
+    if (c->bot_irc_link[0]) {
+      int il = snprintf(row + rl, sizeof(row) - (size_t)rl, "i|%s|%s|%s|%s|\n", c->id,
+                        POOL_DEFAULT_NET, c->bot_irc_entry[0] ? c->bot_irc_entry : "-",
+                        c->bot_irc_link);
+      if (il > 0 && il < (int)sizeof(row) - rl) rl += il;
+      else row[rl] = '\0';
+    }
 
     if (offset + rl >= (int)sizeof(frame) && rows > 0) { /* full: flush */
       if (send) roster_send_to_peers(state, frame, offset, NULL, NULL, only);
@@ -2914,6 +2932,24 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
       continue;
     }
     if (strncmp(line, "k|", 2) == 0) continue; /* capabilities: every hub answers a roll call */
+    if (strncmp(line, "i|", 2) == 0) {
+      /* Server pool: a bot's IRC link, right after its b| row (upserted above). */
+      if (!hub_uuid[0] || strcmp(hub_uuid, "-") == 0) continue;
+      char bu[64] = "", ent[POOL_UUID_LEN + 2] = "", lk[POOL_LINK_WORD_MAX + 2] = "";
+      if (!wire_field(line + 2, 0, bu, sizeof(bu)) || !wire_field(line + 2, 2, ent, sizeof(ent)) ||
+          !wire_field(line + 2, 3, lk, sizeof(lk)))
+        continue;
+      if (!hub_pool_link_word_ok(lk) || (strcmp(ent, "-") != 0 && strlen(ent) != POOL_UUID_LEN))
+        continue;
+      for (int r = 0; r < state->roster_count; r++) {
+        bot_roster_t *e = &state->roster[r];
+        if (strcmp(e->bot_uuid, bu) != 0 || strcmp(e->hub_uuid, hub_uuid) != 0) continue;
+        roster_clean(e->irc_entry, sizeof(e->irc_entry), strcmp(ent, "-") ? ent : "");
+        snprintf(e->irc_link, sizeof(e->irc_link), "%s", lk);
+        break;
+      }
+      continue;
+    }
     if (strncmp(line, "l|", 2) == 0) {
       /* The origin's peer links, first chunk of a round only: the list
        * replaces what we had, so a link it dropped disappears. */
@@ -3722,6 +3758,54 @@ static int peer_version_level(hub_state_t *state, const hub_client_t *c) {
   return hub_update_version_cmp(ver, MESH_MIN_VERSION) >= 0 ? 2 : 1;
 }
 
+static const char *peer_version_str(hub_state_t *state, const hub_client_t *c);
+
+bool hub_bot_version_takes_pool(const char *version) {
+  return version && version[0] && hub_update_version_cmp(version, POOL_MIN_BOT) >= 0;
+}
+
+/* Whether peer c takes server pool N|/S| sync lines (POOL_MIN_HUB).  An older
+ * hub reads an unknown sync key as "uuid|key|..." and stores a phantom bot
+ * named "N" or "S", so those lines never reach it. */
+static bool peer_takes_pool(hub_state_t *state, const hub_client_t *c) {
+  const char *v = peer_version_str(state, c);
+  return v[0] && hub_update_version_cmp(v, POOL_MIN_HUB) >= 0;
+}
+
+bool hub_peer_takes_pool(hub_state_t *state, const hub_client_t *c) {
+  return peer_takes_pool(state, c);
+}
+
+/* N|, S|, the hs|sgrant marker and a bot's pm| (b|<uuid>|pm|...): new in
+ * POOL_MIN_HUB. */
+static bool line_is_pool(const char *l) {
+  return ((l[0] == 'N' || l[0] == 'S') && l[1] == '|') || strncmp(l, "hs|sgrant|", 10) == 0 ||
+         (l[0] == 'b' && l[1] == '|' && strlen(l) > 2 + 36 + 4 &&
+          strncmp(l + 2 + 36, "|pm|", 4) == 0);
+}
+
+/* `payload` without its N|/S| lines, malloc'd; NULL when it has none (send
+ * it as it is) or on OOM (*oom set). */
+static char *strip_pool_lines(const char *payload, bool *oom) {
+  *oom = false;
+  bool any = line_is_pool(payload);
+  for (const char *p = strchr(payload, '\n'); p && !any; p = strchr(p + 1, '\n'))
+    any = line_is_pool(p + 1);
+  if (!any) return NULL;
+  size_t n = strlen(payload);
+  char *out = malloc(n + 1);
+  if (!out) { *oom = true; return NULL; }
+  size_t o = 0;
+  for (const char *l = payload; *l;) {
+    const char *e = strchr(l, '\n');
+    size_t len = e ? (size_t)(e - l) + 1 : strlen(l);
+    if (!line_is_pool(l)) { memcpy(out + o, l, len); o += len; }
+    l += len;
+  }
+  out[o] = '\0';
+  return out;
+}
+
 /* One sync payload onto peer c's queue.  Held, not sent, while c's version
  * is not known: hub_peer_sync_release sends the full state once it is. */
 void hub_peer_enqueue_sync(hub_state_t *state, hub_client_t *c, uint8_t op, lane_t lane,
@@ -3730,6 +3814,16 @@ void hub_peer_enqueue_sync(hub_state_t *state, hub_client_t *c, uint8_t op, lane
   if (level < 2) {
     if (level == 0) c->sync_held = true;
     return;
+  }
+  char *stripped = NULL;
+  if (!peer_takes_pool(state, c)) {
+    bool oom;
+    stripped = strip_pool_lines(payload, &oom);
+    if (oom) {
+      hub_log_error("[MESH] OOM filtering a sync for %s; not sent\n", c->ip);
+      return;
+    }
+    if (stripped) payload = stripped;
   }
   int len = (int)strlen(payload);
   if (len > 0) {
@@ -3743,6 +3837,7 @@ void hub_peer_enqueue_sync(hub_state_t *state, hub_client_t *c, uint8_t op, lane
       }
     }
   }
+  free(stripped);
 }
 
 /* Peer c's roster just named a current version: everything held while it
@@ -4114,6 +4209,39 @@ static void config_push_sync(hub_state_t *state, char *buf, int *off,
   buf[*off] = '\0';
 }
 
+/* A bot's migration of its 2.5.3 s| list (stamp-0 S| lines, sent once on its
+ * first pool-aware link): the first such line stamps pm|<now> on the bot,
+ * mesh-wide; under opt 'h' its lines are taken for POOL_MIGRATE_WINDOW after
+ * that, never later (2.5.5 ends this opt 'h' exception).  False also for a
+ * bot with no record. */
+static bool pool_migrate_gate(hub_state_t *state, const hub_client_t *client, char *buf,
+                              int *off, int *updates) {
+  bot_config_t *b = bot_by_uuid(state, client->id);
+  if (!b) return false;
+  const config_entry_t *pm = bot_entry_rec(b, "pm");
+  time_t now = time(NULL);
+  if (!pm) {
+    char v[24];
+    snprintf(v, sizeof(v), "%lld", (long long)now);
+    long long ts = (long long)hub_lww_next_ts(0);
+    if (!hub_storage_update_entry(state, client->id, "pm", v, "", "", (time_t)ts)) return false;
+    (*updates)++;
+    config_push_sync(state, buf, off, client->fd, "b|%s|pm|%s|%lld\n", client->id, v, ts);
+    hub_log_info("[POOL] %s is migrating its s| list to the pool\n",
+                 hub_who_client(state, client));
+    return true;
+  }
+  long long window = POOL_MIGRATE_WINDOW;
+#ifdef IRC_TEST_HOOKS
+  /* A sandbox cannot wait 5 minutes to see a second offer refused. */
+  const char *hook = getenv("IRCHUB_TEST_POOL_MIGRATE_WINDOW");
+  if (hook && atoi(hook) > 0) window = atoi(hook);
+#endif
+  char *end = NULL;
+  long long first = strtoll(pm->value, &end, 10);
+  return end && !*end && first <= (long long)now && (long long)now - first <= window;
+}
+
 /* The v| protocol a config push carries (0 when unreadable), -1 when it has
  * no v| line. */
 static long push_proto(const char *payload) {
@@ -4352,6 +4480,24 @@ static void process_bot_config_push(hub_state_t *state, hub_client_t *client,
                            "B|%s|%lld\n", bval, bts);
         }
       }
+    } else if (type == 'S') {
+      /* Server pool entry (plan §4): hub_pool_bot_write holds the rules.  A
+       * stamp-0 line is the bot's migration of its s| list: pool_migrate_gate
+       * marks the first one (pm|) and says whether opt 'h' still takes it. */
+      char sval[POOL_S_LINE_MAX];
+      time_t sts = 0;
+      const char *sbar = strrchr(data, '|');
+      bool migrate_ok = sbar && strcmp(sbar + 1, "0") == 0 &&
+                        pool_migrate_gate(state, client, sync_buffer, &sync_offset, &updates);
+      if (hub_pool_bot_write(state, hub_who_client(state, client), data, hub_only_mutations,
+                             migrate_ok, sval, sizeof(sval), &sts)) {
+        updates++;
+        config_push_sync(state, sync_buffer, &sync_offset, client->fd, "S|%s|%lld\n", sval,
+                         (long long)sts);
+      }
+    } else if (type == 'N') {
+      hub_log_warning("[HUB] Ignored bot-pushed 'N' record from %s (console only)\n",
+                      hub_who_client(state, client));
     } else if (type == 'C' || type == 'D') {
       /* Channel settings and network defaults are written by the console only. */
       hub_log_warning("[HUB] Ignored bot-pushed '%c' record from %s (console only)\n",
@@ -4627,14 +4773,17 @@ static bool is_global_key(const char *key) {
           strcmp(key, "p") == 0 ||
           /* 2.4.5: channel settings, network defaults, bans */
           strcmp(key, "C") == 0 || strcmp(key, "D") == 0 ||
-          strcmp(key, "B") == 0);
+          strcmp(key, "B") == 0 ||
+          /* 2.5.4: server pool network / server entry */
+          strcmp(key, "N") == 0 || strcmp(key, "S") == 0);
 }
 
 // Helper: Store global entry directly without re-formatting (value is already combined)
 static bool store_global_entry_raw(hub_state_t *state, const char *key,
                                    const char *value, time_t ts) {
-  /* C|, D|, B|: one validator, one LWW, one set of ceilings. */
-  if (strcmp(key, "C") == 0 || strcmp(key, "D") == 0 || strcmp(key, "B") == 0)
+  /* C|, D|, B|, N|, S|: one validator, one LWW, one set of ceilings. */
+  if (strcmp(key, "C") == 0 || strcmp(key, "D") == 0 || strcmp(key, "B") == 0 ||
+      strcmp(key, "N") == 0 || strcmp(key, "S") == 0)
     return hub_storage_put_record(state, key, value, ts);
 
   int i = hub_global_find(state, key, value);
@@ -5261,7 +5410,8 @@ static void process_peer_sync(hub_state_t *state, char *payload,
           if (stored) {
             updates++;
             /* seen/t are hub-side metadata; bots don't consume them */
-            if (strcmp(key, "seen") != 0 && strcmp(key, "t") != 0)
+            if (strcmp(key, "seen") != 0 && strcmp(key, "t") != 0 &&
+                strcmp(key, "pm") != 0)
               bot_push_updates++;
 
             if (sync_cap - (size_t)fwd_offset > 1200) {
@@ -7239,6 +7389,278 @@ static bool admin_set_ssh(hub_state_t *state, hub_client_t *client, const char *
 }
 
 /* ban: list|<#c|*|""> | add|<#c|*>|<mask>|<min|perm>|<sticky 0/1>|<reason> | del|<#c|*>|<mask> */
+/* ---- server pool console (CMD_ADMIN_POOL, 2.5.4) ----------------------- */
+
+/* "k=v,k=v": the value of `key` into out; true if present. */
+static bool pool_kv(const char *list, const char *key, char *out, size_t cap) {
+  size_t kl = strlen(key);
+  for (const char *p = list; p && *p;) {
+    const char *e = strchr(p, ',');
+    size_t n = e ? (size_t)(e - p) : strlen(p);
+    if (n > kl && strncmp(p, key, kl) == 0 && p[kl] == '=') {
+      size_t vl = n - kl - 1;
+      if (vl >= cap) vl = cap - 1;
+      memcpy(out, p + kl + 1, vl);
+      out[vl] = '\0';
+      return true;
+    }
+    p = e ? e + 1 : NULL;
+  }
+  return false;
+}
+
+/* Every k of "k=v,..." is one of `allowed` (space separated). */
+static bool pool_kv_known(const char *list, const char *allowed) {
+  for (const char *p = list; p && *p;) {
+    const char *e = strchr(p, ',');
+    size_t n = e ? (size_t)(e - p) : strlen(p);
+    const char *eq = memchr(p, '=', n);
+    if (!eq || eq == p) return false;
+    char k[16];
+    size_t kl = (size_t)(eq - p);
+    if (kl >= sizeof(k)) return false;
+    memcpy(k, p, kl);
+    k[kl] = '\0';
+    bool ok = false;
+    for (const char *a = allowed; *a && !ok;) {
+      const char *sp = strchr(a, ' ');
+      size_t al = sp ? (size_t)(sp - a) : strlen(a);
+      ok = al == kl && strncmp(a, k, kl) == 0;
+      a = sp ? sp + 1 : a + al;
+    }
+    if (!ok) return false;
+    p = e ? e + 1 : NULL;
+  }
+  return true;
+}
+
+static bool pool_num(const char *v, int lo, int hi, int *out) {
+  unsigned long n;
+  if (!hub_parse_uint(v, (unsigned long)hi, &n) || (int)n < lo) return false;
+  *out = (int)n;
+  return true;
+}
+
+static void pool_rec_kv(reply_t *r, const pool_srv_t *s) {
+  reply_kv(r, "uuid", s->uuid);
+  reply_kv(r, "host", s->host);
+  reply_kvi(r, "port", s->port);
+  reply_kvi(r, "weight", s->weight);
+  reply_kvi(r, "max", s->max);
+  reply_kv(r, "state", pool_state_name(s->state));
+  if (s->seen[0]) reply_kv(r, "seen", s->seen);
+}
+
+static bool pool_effects(hub_state_t *state, hub_client_t *client, reply_t *r) {
+  reply_kvi(r, "bots", local_bot_count(state));
+  reply_kvi(r, "peers", linked_peer_count(state));
+  return send_reply(state, client, r);
+}
+
+static bool admin_pool(hub_state_t *state, hub_client_t *client, const char *payload) {
+  char sub[8] = "", what[POOL_HOST_MAX + 16] = "", kv[256] = "";
+  if (!payload || !wire_field(payload, 0, sub, sizeof(sub)))
+    return admin_err(state, client, "pool.usage", "server list, add, set, del or clear", "help server");
+  wire_field(payload, 1, what, sizeof(what));
+  wire_field(payload, 2, kv, sizeof(kv));
+  reply_t r;
+  pool_net_t net;
+  time_t net_ts;
+  hub_pool_net_get(state, POOL_DEFAULT_NET, &net, &net_ts);
+
+  if (!strcmp(sub, "list")) {
+    static char view[(MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_VIEW_LINE_MAX + 16];
+    int vl = hub_pool_view_text(state, view, sizeof(view));
+    if (vl < 0) view[0] = '\0';
+    reply_init(&r);
+    reply_ok(&r, "pool.list");
+    reply_kv(&r, "net", net.net_id);
+    reply_kv(&r, "name", net.name);
+    reply_kvi(&r, "usable", hub_pool_eligible_count(state, POOL_DEFAULT_NET));
+    reply_kvi(&r, "idle", hub_pool_idle_bots(state));
+    int count = 0;
+    for (int i = 0; i < state->global_entry_count; i++) {
+      pool_srv_t s;
+      const config_entry_t *e = &state->global_entries[i];
+      count += e->key[0] == 'S' && !e->key[1] && pool_srv_parse(e->value, &s) && !s.deleted;
+    }
+    reply_kvi(&r, "count", count); /* before the records: a kv after one lands in it */
+    for (int i = 0; i < state->global_entry_count; i++) {
+      const config_entry_t *e = &state->global_entries[i];
+      pool_srv_t s;
+      if (e->key[0] != 'S' || e->key[1] || !pool_srv_parse(e->value, &s) || s.deleted) continue;
+      int up = 0, conn = 0;
+      char needle[POOL_UUID_LEN + 4];
+      snprintf(needle, sizeof(needle), "E|%s|", s.uuid);
+      const char *at = strstr(view, needle);
+      if (at) sscanf(at + strlen(needle), "%d|%d", &up, &conn);
+      reply_rec(&r, "server");
+      pool_rec_kv(&r, &s);
+      reply_kvi(&r, "up", up);
+      reply_kvi(&r, "connecting", conn);
+      reply_kvi(&r, "ts", (long long)e->timestamp);
+    }
+    return send_reply(state, client, &r);
+  }
+
+  if (!strcmp(sub, "net")) {
+    reply_init(&r);
+    reply_ok(&r, "pool.net");
+    reply_kv(&r, "net", net.net_id);
+    reply_kv(&r, "name", net.name);
+    reply_kv(&r, "aliases", net.aliases);
+    reply_kvi(&r, "usable", hub_pool_eligible_count(state, POOL_DEFAULT_NET));
+    reply_kvi(&r, "idle", hub_pool_idle_bots(state));
+    reply_kvi(&r, "ts", (long long)net_ts);
+    return send_reply(state, client, &r);
+  }
+
+  if (!strcmp(sub, "netset")) {
+    const char *k = what; /* netset|<k=v,...> */
+    if (!k[0] || !pool_kv_known(k, "name alias"))
+      return admin_err(state, client, "pool.usage", "network set name=<NETWORK> or alias=<a,b,...>",
+                       "help network set");
+    char nv[POOL_NET_NAME_MAX + 2], v[sizeof(net.aliases)];
+    if (pool_kv(k, "name", nv, sizeof(nv))) {
+      if (!pool_net_name_ok(nv))
+        return admin_err(state, client, "pool.bad_value",
+                         "a network name is 1-64 printable characters, no '|' or ','", NULL);
+      memcpy(net.name, nv, strlen(nv) + 1);
+    }
+    if (pool_kv(k, "alias", v, sizeof(v))) {
+      /* the aliases ride the k=v list's own ','; the UI sends them with ';' */
+      for (char *q = v; *q; q++)
+        if (*q == ';') *q = ',';
+      if (!strcmp(v, "-")) v[0] = '\0';
+      memcpy(net.aliases, v, strlen(v) + 1);
+      char probe[POOL_N_LINE_MAX];
+      if (pool_net_format(&net, probe, sizeof(probe)) < 0)
+        return admin_err(state, client, "pool.bad_value",
+                         "aliases: up to 8 network names, comma separated (- for none)", NULL);
+    }
+    net.deleted = false;
+    if (!hub_pool_net_put(state, &net))
+      return admin_err(state, client, "pool.bad_value", "not a valid network record", NULL);
+    reply_init(&r);
+    reply_ok(&r, "pool.netset");
+    reply_kv(&r, "net", net.net_id);
+    reply_kv(&r, "name", net.name);
+    reply_kv(&r, "aliases", net.aliases);
+    return pool_effects(state, client, &r);
+  }
+
+  if (!what[0])
+    return admin_err(state, client, "pool.usage", "name a server: host[:port] or its uuid",
+                     "help server");
+
+  if (!strcmp(sub, "add")) {
+    pool_srv_t s;
+    memset(&s, 0, sizeof(s));
+    if (!pool_hostport_parse(what, s.host, sizeof(s.host), &s.port))
+      return admin_err(state, client, "pool.bad_host", "not a host[:port]", "server add irc.example.net:6697");
+    if (kv[0] && !pool_kv_known(kv, "weight max"))
+      return admin_err(state, client, "pool.usage", "server add <host[:port]> [weight=<1-100>] [max=<0-100>]",
+                       "help server add");
+    snprintf(s.net_id, sizeof(s.net_id), "%s", POOL_DEFAULT_NET);
+    pool_srv_uuid(s.net_id, s.host, s.port, s.uuid);
+    pool_srv_t cur;
+    bool have = hub_pool_srv_get(state, s.uuid, &cur);
+    if (have && !cur.deleted)
+      return admin_err(state, client, "pool.exists", "that server is already in the pool",
+                       "server set to change it");
+    s.weight = have ? cur.weight : 1;
+    s.max = have ? cur.max : 0;
+    char v[16];
+    if (pool_kv(kv, "weight", v, sizeof(v)) && !pool_num(v, 1, POOL_WEIGHT_MAX, &s.weight))
+      return admin_err(state, client, "pool.bad_value", "weight is 1 to 100", NULL);
+    if (pool_kv(kv, "max", v, sizeof(v)) && !pool_num(v, 0, POOL_MAX_MAX, &s.max))
+      return admin_err(state, client, "pool.bad_value", "max is 0 (none) to 100", NULL);
+    s.state = POOL_OK;
+    if (!hub_pool_srv_put(state, &s))
+      return admin_err(state, client, "pool.full", "the pool is full (64 servers)", "server del one first");
+    hub_pool_strikes_clear(s.uuid);
+    reply_init(&r);
+    reply_ok(&r, "pool.added");
+    pool_rec_kv(&r, &s);
+    reply_kvb(&r, "revived", have);
+    return pool_effects(state, client, &r);
+  }
+
+  pool_srv_t s;
+  if (!hub_pool_find(state, what, &s) || s.deleted)
+    return admin_err(state, client, "pool.not_found", "no such server in the pool", "server list");
+
+  if (!strcmp(sub, "set")) {
+    if (!kv[0] || !pool_kv_known(kv, "weight max enabled"))
+      return admin_err(state, client, "pool.usage",
+                       "server set <host[:port]|uuid> weight=<1-100> max=<0-100> enabled=on|off",
+                       "help server set");
+    char v[16];
+    if (pool_kv(kv, "weight", v, sizeof(v)) && !pool_num(v, 1, POOL_WEIGHT_MAX, &s.weight))
+      return admin_err(state, client, "pool.bad_value", "weight is 1 to 100", NULL);
+    if (pool_kv(kv, "max", v, sizeof(v)) && !pool_num(v, 0, POOL_MAX_MAX, &s.max))
+      return admin_err(state, client, "pool.bad_value", "max is 0 (none) to 100", NULL);
+    if (pool_kv(kv, "enabled", v, sizeof(v))) {
+      if (strcmp(v, "on") && strcmp(v, "off"))
+        return admin_err(state, client, "pool.bad_value", "enabled is on or off", NULL);
+      bool off = !strcmp(v, "off");
+      if (off && s.state == POOL_OK &&
+          hub_pool_eligible_count(state, s.net_id) <= 1 && !strstr(kv, "force=1")) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "%.180s is the last usable server of network %s: disabling it "
+                 "could take all bots off IRC", s.host, s.net_id);
+        return admin_err(state, client, "pool.last", msg,
+                         "add another server first, or repeat with force");
+      }
+      if (off) s.state = POOL_DISABLED;
+      else if (s.state == POOL_DISABLED) s.state = POOL_OK;
+    }
+    if (!hub_pool_srv_put(state, &s))
+      return admin_err(state, client, "pool.bad_value", "not a valid server record", NULL);
+    reply_init(&r);
+    reply_ok(&r, "pool.set");
+    pool_rec_kv(&r, &s);
+    return pool_effects(state, client, &r);
+  }
+
+  if (!strcmp(sub, "clear")) {
+    if (s.state != POOL_WRONGNET)
+      return admin_err(state, client, "pool.not_flagged", "that server is not flagged wrong network",
+                       "server list");
+    s.state = POOL_OK;
+    s.seen[0] = '\0';
+    if (!hub_pool_srv_put(state, &s))
+      return admin_err(state, client, "pool.bad_value", "not a valid server record", NULL);
+    hub_pool_strikes_clear(s.uuid);
+    reply_init(&r);
+    reply_ok(&r, "pool.cleared");
+    pool_rec_kv(&r, &s);
+    return pool_effects(state, client, &r);
+  }
+
+  if (!strcmp(sub, "del")) {
+    bool force = !strcmp(kv, "1");
+    bool last = s.state == POOL_OK && hub_pool_eligible_count(state, s.net_id) <= 1;
+    if (last && !force) {
+      char msg[320];
+      snprintf(msg, sizeof(msg), "%.180s is the last usable server of network %s: removing it "
+               "could take all bots off IRC", s.host, s.net_id);
+      return admin_err(state, client, "pool.last", msg,
+                       "add another server first, or repeat with force");
+    }
+    s.deleted = true;
+    if (!hub_pool_srv_put(state, &s))
+      return admin_err(state, client, "pool.bad_value", "not a valid server record", NULL);
+    hub_pool_strikes_clear(s.uuid);
+    reply_init(&r);
+    reply_ok(&r, "pool.removed");
+    pool_rec_kv(&r, &s);
+    reply_kvb(&r, "last", last);
+    return pool_effects(state, client, &r);
+  }
+  return admin_err(state, client, "pool.usage", "server list, add, set, del or clear", "help server");
+}
+
 static bool admin_ban(hub_state_t *state, hub_client_t *client, const char *payload) {
   char sub[8], chan[MAX_CHAN] = "", cname[MAX_CHAN] = "*", mask[BAN_MASK_MAX + 8];
   if (!payload || !wire_field(payload, 0, sub, sizeof(sub)))
@@ -7368,6 +7790,8 @@ static bool mf_payload_mutates(int cmd, const char *payload) {
     return payload && strchr(payload, '|') != NULL;
   case CMD_ADMIN_BAN:
     return !payload || strncmp(payload, "list", 4) != 0;
+  case CMD_ADMIN_POOL:
+    return !payload || (strcmp(payload, "list") != 0 && strcmp(payload, "net") != 0);
   case CMD_ADMIN_NET_SET:
     return payload && payload[0];
   default:
@@ -7433,6 +7857,8 @@ static char admin_flag_needed(hub_state_t *state, const hub_user_record_t *me, i
   case CMD_ADMIN_CHAN_MODE:       case CMD_ADMIN_CHAN_SET:
   case CMD_ADMIN_BAN:
     return mf_payload_mutates(cmd, payload) ? 'c' : 0;
+  case CMD_ADMIN_POOL:
+    return mf_payload_mutates(cmd, payload) ? 's' : 0;
   case CMD_ADMIN_UPGRADE_NET:
     return 'u';
   case CMD_ADMIN_UPGRADE_STATUS:
@@ -7585,6 +8011,7 @@ static const char *admin_flag_word(char f) {
   case 'c': return "channels";
   case 'h': return "hub";
   case 'o': return "opers";
+  case 's': return "servers";
   case 'u': return "upgrades";
   default:  return "?";
   }
@@ -8682,6 +9109,8 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     return admin_chan_set(state, client, payload);
   case CMD_ADMIN_BAN:
     return admin_ban(state, client, payload);
+  case CMD_ADMIN_POOL:
+    return admin_pool(state, client, payload);
   case CMD_ADMIN_NET_SET:
     return admin_net_set(state, client, payload);
   case CMD_ADMIN_SET_SSH:
@@ -8956,6 +9385,25 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     reply_kvu(&r, "delta_bytes", st->tree_delta_bytes);
     reply_kvu(&r, "delta_of", st->tree_delta_of);
     reply_kvu(&r, "pull", st->tree_pull);
+    {
+      /* server pool: live entries, usable ones, flagged ones, bots waiting */
+      int live = 0, flagged = 0;
+      for (int i = 0; i < state->global_entry_count; i++) {
+        pool_srv_t ps;
+        const config_entry_t *ge = &state->global_entries[i];
+        if (ge->key[0] != 'S' || ge->key[1] || !pool_srv_parse(ge->value, &ps) || ps.deleted) continue;
+        live++;
+        flagged += ps.state == POOL_WRONGNET;
+      }
+      reply_rec(&r, "pool");
+      reply_kvi(&r, "servers", live);
+      reply_kvi(&r, "usable", hub_pool_eligible_count(state, POOL_DEFAULT_NET));
+      reply_kvi(&r, "wrongnet", flagged);
+      reply_kvi(&r, "idle", hub_pool_idle_bots(state));
+      reply_kvu(&r, "reports", st->pool_reports);
+      reply_kvu(&r, "flagged", st->pool_flagged);
+      reply_kvu(&r, "views", st->pool_views);
+    }
     reply_rec(&r, "sync");
     reply_kvu(&r, "frames", st->sync_frames);
     reply_kvu(&r, "noop", st->sync_noop);
@@ -9919,9 +10367,10 @@ static bool send_cmd_to_bot_after_config(hub_state_t *state, hub_client_t *bot,
   return m && peer_enqueue(bot, m);
 }
 
+/* A bot's own request: unban / invite / key, and (2.5.4, with a rid) op. */
 static bool chan_kind_valid(const char *kind) {
   return strcmp(kind, "unban") == 0 || strcmp(kind, "invite") == 0 ||
-         strcmp(kind, "key") == 0;
+         strcmp(kind, "key") == 0 || strcmp(kind, "op") == 0;
 }
 
 static int add_pending_chan_request(hub_state_t *state, const char *request_id,
@@ -10057,20 +10506,46 @@ static void chan_request_dispatch(hub_state_t *state, const char *request_id,
           kind, channel, request_id, told);
 }
 
+/* The answer to a bot's own request (rid set): CMD_USER_CHAN_RESULT
+ * rid|ok|detail, rid|none|detail or rid|denied|detail. */
+static void chan_own_answer(hub_state_t *state, hub_client_t *client, const char *rid,
+                            const char *status, const char *detail) {
+  if (!rid || !rid[0]) return;
+  char res[256];
+  snprintf(res, sizeof(res), "%s|%s|%s", rid, status, detail);
+  send_cmd_to_bot(state, client, CMD_USER_CHAN_RESULT, res);
+}
+
 static void process_chan_request(hub_state_t *state, hub_client_t *client,
                                  char *payload) {
-  /* Payload from a bot is only `kind|channel`; everything that could be
-   * forged is resolved here from the authenticated bot's own records. */
-  char kind[8], channel[MAX_CHAN];
-  if (sscanf(payload, "%7[^|]|%64s", kind, channel) != 2 ||
-      !chan_kind_valid(kind)) {
+  /* Payload from a bot: `kind|channel`, or (2.5.4) `kind|channel|rid`, the
+   * rid asking for an answer.  Everything that could be forged is resolved
+   * here from the authenticated bot's own records. */
+  char kind[8] = "", channel[MAX_CHAN] = "", rid[USER_CHAN_RID_MAX + 1] = "";
+  int nf = payload ? mf_field_count(payload) : 0;
+  if ((nf != 2 && nf != 3) || !wire_field(payload, 0, kind, sizeof(kind)) ||
+      !wire_field(payload, 1, channel, sizeof(channel)) ||
+      (nf == 3 && !wire_field(payload, 2, rid, sizeof(rid))) || !chan_kind_valid(kind)) {
     hub_log_warning("[HUB] Invalid CHAN_REQUEST payload from %s\n", hub_who_client(state, client));
     return;
   }
-  if (channel[0] != '#' && channel[0] != '&') {
+  for (const char *p = rid; *p; p++)
+    if (!isalnum((unsigned char)*p) && *p != '-') {
+      hub_log_warning("[HUB] CHAN_REQUEST from %s: bad request id\n",
+                      hub_who_client(state, client));
+      return;
+    }
+  /* op is the 2.5.4 election form only: a bot sends it with a rid */
+  if (strcmp(kind, "op") == 0 && !rid[0]) {
+    hub_log_warning("[HUB] CHAN_REQUEST op from %s without a request id\n",
+                    hub_who_client(state, client));
+    return;
+  }
+  if ((channel[0] != '#' && channel[0] != '&') || strchr(channel, ' ') || strchr(channel, ',')) {
     hub_log_warning("[HUB] CHAN_REQUEST from %s for non-channel '%s'\n",
                     hub_who_client(state, client),
             channel);
+    chan_own_answer(state, client, rid, "denied", "not a channel");
     return;
   }
 
@@ -10084,11 +10559,13 @@ static void process_chan_request(hub_state_t *state, hub_client_t *client,
   if (strcmp(kind, "unban") == 0 && hostmask[0] == '\0') {
     hub_log_warning("[HUB] No hostmask for %s — cannot service unban for %s\n",
             hub_who_client(state, client), channel);
+    chan_own_answer(state, client, rid, "none", "no hostmask on file");
     return;
   }
-  if (strcmp(kind, "invite") == 0 && nick[0] == '\0') {
-    hub_log_warning("[HUB] No nick for %s — cannot service invite for %s\n",
-            hub_who_client(state, client), channel);
+  if ((strcmp(kind, "invite") == 0 || strcmp(kind, "op") == 0) && nick[0] == '\0') {
+    hub_log_warning("[HUB] No nick for %s — cannot service %s for %s\n",
+            hub_who_client(state, client), kind, channel);
+    chan_own_answer(state, client, rid, "none", "no nick on file");
     return;
   }
 
@@ -10096,8 +10573,18 @@ static void process_chan_request(hub_state_t *state, hub_client_t *client,
                channel);
 
   /* One bot answers it (CMD_CHAN_PROBE). */
-  if (!ce_start(state, kind, channel, client->id, nick, hostmask, NULL))
+  chan_elect_t *e = ce_start(state, kind, channel, client->id, nick, hostmask, NULL);
+  if (!e) {
     hub_log_warning("[CHANREQ] Election table full — dropping %s for %s\n", kind, channel);
+    chan_own_answer(state, client, rid, "none", "too many channel requests in flight");
+    return;
+  }
+  if (rid[0]) {
+    e->reply_fd = client->fd;
+    e->reply_serial = client->conn_serial;
+    e->reply_own = true;
+    snprintf(e->reply_rid, sizeof(e->reply_rid), "%s", rid);
+  }
 }
 
 /* A bot answering a request (today only `key`).  Route it to the requester if
@@ -10545,7 +11032,22 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
         c->conn_serial != e->reply_serial)
       continue;
     char res[256];
-    if (bitch)
+    if (e->reply_own) {
+      /* a bot's own request: ok / denied (policy: no ~B2 around it) / none
+       * (nobody on any hub could: the bot may ask over IRC) */
+      if (ok)
+        snprintf(res, sizeof(res), "%s|ok|%s by %.31s on %.63s", e->reply_rid,
+                 ce_kind_word(e->kind), by_nick && by_nick[0] ? by_nick : by_uuid, hub_name);
+      else if (bitch)
+        snprintf(res, sizeof(res), "%s|denied|not authorised on %.64s and +bitch is on",
+                 e->reply_rid, e->channel);
+      else {
+        char why[160];
+        ce_reasons(e, why, sizeof(why));
+        snprintf(res, sizeof(res), "%s|none|no bot could: %d asked on %d hub%s%s%.120s",
+                 e->reply_rid, asked, hubs, hubs == 1 ? "" : "s", why[0] ? "; " : "", why);
+      }
+    } else if (bitch)
       snprintf(res, sizeof(res), "%s|fail|not authorised on %.64s and +bitch is on",
                e->reply_rid, e->channel);
     else if (ok)
@@ -10895,8 +11397,10 @@ static void process_user_chan_request(hub_state_t *state, hub_client_t *client,
   if (strcmp(kind, "op") != 0 && strcmp(kind, "invite") != 0 && strcmp(kind, "unban") != 0)
     UCR_FAIL("unknown request");
   if (!hub_uchan_name_ok(chan) || strcmp(chan, "*") == 0) UCR_FAIL("not a channel");
+  /* the mask is the person's live identity, never a pattern: the bot that
+   * acts checks the nick against it, and an unban matches bans to it */
   if (!uchan_field_ok(nick, sizeof(nick)) || !uchan_field_ok(mask, sizeof(mask)) ||
-      !strchr(mask, '!') || !strchr(mask, '@'))
+      !strchr(mask, '!') || !strchr(mask, '@') || !hub_hostmask_literal(mask))
     UCR_FAIL("bad nick or hostmask");
   const hub_user_record_t *u = NULL;
   for (int i = 0; i < state->user_record_count && !u; i++)
@@ -11297,6 +11801,7 @@ static bool console_admin_op(int cmd) {
   case CMD_ADMIN_INVITE_USER:     case CMD_ADMIN_KICK_USER:
   case CMD_ADMIN_CHAN_MODE:       case CMD_ADMIN_CHAN_SET:
   case CMD_ADMIN_BAN:             case CMD_ADMIN_NET_SET:
+  case CMD_ADMIN_POOL:
   case CMD_ADMIN_SET_SSH:
   case CMD_ADMIN_UPGRADE_NET:     case CMD_ADMIN_UPGRADE_STATUS:
   case CMD_ADMIN_BOT_RESYNC:
@@ -11341,6 +11846,7 @@ static bool hub_admin_cmd_mutates_config(int cmd) {
   case CMD_ADMIN_CHAN_SET:
   case CMD_ADMIN_BAN:
   case CMD_ADMIN_NET_SET:
+  case CMD_ADMIN_POOL:
     return true;
   default:
     return false;
@@ -12326,9 +12832,18 @@ static void hub_upgrade_note_result(hub_state_t *state, const char *payload) {
    * own ABORT — is logged and dropped: a finished node must never be turned
    * back into a failure by noise (run 83aac614's eb04). */
   if (node->state != UPG_NODE_COMMITTED) {
-    hub_log_info("[UPGRADE] %s reports %s (%s) while %s — ignored%s%s\n", hub_who(state, 0, uuid),
-                 status, ver, upgrade_node_state_name(node->state),
-                 detail[0] ? ": " : "", detail);
+    /* A node already finished: most often a restarted hub's RESULT sent
+     * again on another link (UPGRADE_RESULT_RESEND) — a copy, not news. */
+    bool settled = node->state == UPG_NODE_DONE || node->state == UPG_NODE_FAILED ||
+                   node->state == UPG_NODE_UNABLE;
+    if (settled)
+      hub_log_debug("[UPGRADE] %s reports %s (%s) while %s — ignored%s%s\n",
+                    hub_who(state, 0, uuid), status, ver, upgrade_node_state_name(node->state),
+                    detail[0] ? ": " : "", detail);
+    else
+      hub_log_info("[UPGRADE] %s reports %s (%s) while %s — ignored%s%s\n",
+                   hub_who(state, 0, uuid), status, ver, upgrade_node_state_name(node->state),
+                   detail[0] ? ": " : "", detail);
     return;
   }
   /* "back": a follower saw this bot return on the target; it is not done
@@ -15388,8 +15903,14 @@ void hub_upgrade_report_pending(hub_state_t *state, hub_client_t *peer) {
   }
   char id[64], want[64], want_variant[16];
   if (!hub_update_take_pending(id, sizeof(id), want, sizeof(want), want_variant,
-                               sizeof(want_variant)))
+                               sizeof(want_variant))) {
+    /* Already reported: the same RESULT on this link too, for a while. */
+    if (state->upgrade_installed_id[0] && state->upgrade_report_status[0] &&
+        time(NULL) < state->upgrade_report_until)
+      hub_upgrade_answer_result(state, peer, state->upgrade_installed_id,
+                                state->upgrade_report_status, state->upgrade_report_detail);
     return;
+  }
   snprintf(state->upgrade_installed_id, sizeof(state->upgrade_installed_id), "%s", id);
   bool ok = hub_update_version_cmp(HUB_VERSION, want) == 0 &&
             (!want_variant[0] ||
@@ -15402,8 +15923,13 @@ void hub_upgrade_report_pending(hub_state_t *state, hub_client_t *peer) {
   else if (!hub_update_failback_note(detail, sizeof(detail)))
     snprintf(detail, sizeof(detail), "wanted %s%s%s", want,
              want_variant[0] ? "/" : "", want_variant);
-  hub_upgrade_answer_result(state, peer, id, ok ? "ok" : "version-mismatch",
-                            ok ? "" : detail);
+  snprintf(state->upgrade_report_status, sizeof(state->upgrade_report_status), "%s",
+           ok ? "ok" : "version-mismatch");
+  snprintf(state->upgrade_report_detail, sizeof(state->upgrade_report_detail), "%s",
+           ok ? "" : detail);
+  state->upgrade_report_until = time(NULL) + UPGRADE_RESULT_RESEND;
+  hub_upgrade_answer_result(state, peer, id, state->upgrade_report_status,
+                            state->upgrade_report_detail);
 }
 
 /* CMD_ADMIN_UPGRADE_STATUS "": the run this hub drives (or drove last), the
@@ -16092,6 +16618,17 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     process_bot_presence(state, client, payload);
     break;
 
+  case CMD_SERVER_REPORT:
+    hub_pool_server_report(state, client, payload);
+    break;
+
+  case CMD_BOT_IRC_LINK:
+    if (hub_pool_irc_link(state, client, payload)) {
+      hub_roster_mark_dirty(state, true);
+      hub_presence_event(state);
+    }
+    break;
+
   case CMD_BOT_TREE_PULL:
     /* Phase 5: the bot's tree diverged from a delta — send it the whole one. */
     hub_tree_pull(state, client);
@@ -16498,6 +17035,7 @@ static void send_config_to_bot(hub_state_t *state, hub_client_t *client,
   // Use the new payload generator that combines Global + Bot-specific
   // and omits "b|uuid|" prefix for correct bot parsing
   hub_generate_bot_payload(state, client->id,
+                           hub_bot_version_takes_pool(client->bot_version),
                            payload, MAX_CONFIG_PAYLOAD);
 
   int len = (int)strlen(payload);
@@ -17025,6 +17563,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                                     cmd == CMD_PEER_BCAST);
                 else
                   client->sync_held = true;
+              } else if (cmd == CMD_SERVER_REPORT) {
+                hub_pool_peer_report(state, client, payload_ptr);
               } else if (cmd == CMD_MESH_STATE) {
                 process_mesh_state(state, client, payload_ptr);
               } else if (cmd == CMD_PRESENCE2) {

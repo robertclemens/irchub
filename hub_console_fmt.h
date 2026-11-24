@@ -58,6 +58,15 @@ typedef struct {
 void flines_add(flines_t *o, int role, const char *text);
 void flines_free(flines_t *o);
 
+/* Stats view (tab 5): from STATS_GRID_MIN cells the sections go two side by
+ * side, each STATS_COL_W wide; the timers take up to TIMER_COLS_MAX blocks. */
+#define STATS_GRID_MIN 104
+#define STATS_COL_W    52
+#define STATS_LABEL_W  13
+#define STATS_VALUE_W  9
+#define TIMER_COLS_MAX 3
+#define TIMER_COL_GAP  4
+
 /* What a renderer needs to know about the session. */
 typedef struct {
   int         width;       /* cells                                       */
