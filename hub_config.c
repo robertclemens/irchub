@@ -283,6 +283,8 @@ void hub_config_write(hub_state_t *state) {
 
   SAFE_WRITE("port|%d\n", state->port);
   SAFE_WRITE("bind_ip|%s\n", state->bind_ip[0] ? state->bind_ip : "127.0.0.1");
+  if (state->public_ip[0])
+    SAFE_WRITE("public|%s|%lld\n", state->public_ip, (long long)state->public_ip_at);
   SAFE_WRITE("uuid|%s\n", state->hub_uuid[0] ? state->hub_uuid : "");
   SAFE_WRITE("hub_name|%s\n", state->hub_friendly_name[0] ? state->hub_friendly_name : "");
   /* Persist Lamport seq so it survives restart and stays monotonic. */
@@ -796,6 +798,14 @@ static bool config_load(hub_state_t *state, const char *password) {
         snprintf(state->bind_ip, sizeof(state->bind_ip), "%s", v);
       } else if (strcmp(k, "uuid") == 0) {
         snprintf(state->hub_uuid, sizeof(state->hub_uuid), "%s", v);
+      } else if (strcmp(k, "public") == 0) {
+        /* public|<ip>|<ts>: only ever a looked-up global IPv4 address */
+        char ip[64] = "";
+        long long at = 0;
+        if (sscanf(v, "%63[^|]|%lld", ip, &at) >= 1 && hub_pubip_is_global(ip)) {
+          snprintf(state->public_ip, sizeof(state->public_ip), "%s", ip);
+          state->public_ip_at = (time_t)(at > 0 ? at : 0);
+        }
       } else if (strcmp(k, "hub_name") == 0) {
         // Only update if value is non-empty to prevent blanking out existing name
         if (v && v[0]) {

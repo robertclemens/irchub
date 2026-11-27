@@ -759,12 +759,21 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid, bool pool,
       break;
     offset += written;
   }
-  /* No N| stored yet: the default (name not learned, split_wait 0), stamp 0 so
-   * any real record beats it. */
+  /* No N| stored yet: the default (name not learned, split_wait 0, the
+   * default pace gap), stamp 0 so any real record beats it. */
   if (pool && !have_default_net) {
     written = snprintf(buffer + offset, (size_t)(max_len - offset),
-                       "N|" POOL_DEFAULT_NET "|" POOL_DEFAULT_NET "|||0|add|0\n");
+                       "N|" POOL_DEFAULT_NET "|" POOL_DEFAULT_NET "|||0|%d|add|0\n",
+                       hub_pool_default_pace());
     if (written > 0 && written < (max_len - offset)) offset += written;
+  }
+  /* R|: this bot's server order (hub_pool.c), stamp 0: computed, not stored. */
+  if (pool) {
+    const char *ord = hub_pool_order_line(state, uuid);
+    if (ord) {
+      written = snprintf(buffer + offset, (size_t)(max_len - offset), "R|%s|0\n", ord);
+      if (written > 0 && written < (max_len - offset)) offset += written;
+    }
   }
   // K|: what the bots saw on IRC, after the c| lines it hangs off.
   hub_learned_append(state, buffer, max_len, &offset);
@@ -836,6 +845,27 @@ void hub_generate_bot_payload(hub_state_t *state, const char *uuid, bool pool,
       }
       break;
     }
+  }
+
+  /* hm|<ts>|<mask>: the bot's own mask as this hub holds it ("-" = none).
+   * Its join gate waits for this to carry the mask its 352 showed, so the
+   * other bots know it before it joins.  ts first: a nick may hold '|'. */
+  {
+    const config_entry_t *own = NULL;
+    for (int i = 0; i < state->bot_count && !own; i++) {
+      if (strcmp(state->bots[i].uuid, uuid) != 0) continue;
+      for (int j = 0; j < state->bots[i].entry_count; j++)
+        if (strcmp(state->bots[i].entries[j].key, "h") == 0) {
+          own = &state->bots[i].entries[j];
+          break;
+        }
+      break;
+    }
+    written = snprintf(buffer + offset, (size_t)(max_len - offset), "hm|%ld|%s\n",
+                       own ? (long)own->timestamp : 0L,
+                       own && own->value[0] ? own->value : "-");
+    if (written < 0 || written >= (max_len - offset)) return;
+    offset += written;
   }
 
   // 3. Add OTHER bots as trusted-bot lines (for offline peer operation):

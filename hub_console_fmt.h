@@ -66,10 +66,17 @@ void flines_free(flines_t *o);
 #define STATS_VALUE_W  9
 #define TIMER_COLS_MAX 3
 #define TIMER_COL_GAP  4
+/* Traffic by message: one column while the whole page fits the view's
+ * height; two-up (TRAFFIC_COL_GAP apart) only when it would not, the view is
+ * wide enough for two copies of the table and it has at least
+ * TRAFFIC_SPLIT_MIN opcodes.  Line mode (height 0) always one column. */
+#define TRAFFIC_SPLIT_MIN 8
+#define TRAFFIC_COL_GAP   4
 
 /* What a renderer needs to know about the session. */
 typedef struct {
   int         width;       /* cells                                       */
+  int         height;      /* rows a view shows at once; 0 = unbounded    */
   bool        ascii;
   long long   now;         /* Unix seconds                                */
   const char *admin, *ip, *hubname;

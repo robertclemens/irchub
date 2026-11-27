@@ -1,12 +1,18 @@
-/* pool_rec.h — server pool records N| and S| (2.5.4).
+/* pool_rec.h — server pool records N|, S| and R| (2.5.4).
  *
  * Byte-identical in irchub and ircbot (like cfg_delta.[ch] and
  * glob_overlap.[ch]).  Plan: irchub/docs/plans/2026-10-29_server_pool_plan.md
  * §3.  Pure apart from SHA-256 (OpenSSL EVP): no I/O, no globals.
  *
  * Stored value (the line minus its "N|"/"S|" tag and its trailing |<ts>):
- *   N: <net_id>|<label>|<name>|<aliases csv>|<split_wait min>|<add|del>
+ *   N: <net_id>|<label>|<name>|<aliases csv>|<split_wait min>|<pace_gap s>|<add|del>
  *   S: <uuid>|<net_id>|<host>|<port>|<weight>|<max>|<state>|<seen>|<add|del>
+ *   R: <gen 8 hex>|<slot>|<slots>|<pace_gap s>|<uuid>,<uuid>,...
+ *      slot (0-based) of slots = the bots of one origin with this first
+ *      server; with slots > 1 a dial waits for a second t where
+ *      t % (slots * pace_gap) == slot * pace_gap (one host, one clock)
+ *      a bot's server order, computed by the hubs (never stored on a hub,
+ *      cached by the bot; server order plan 2026-11-24)
  *
  * An S| uuid is derived, never chosen: the first 16 bytes of
  * SHA-256(<net_id> "|" <key>) with the RFC 9562 version-8 / variant bits set,
@@ -26,6 +32,10 @@
 #define POOL_NET_ALIASES     8    /* aliases per network                  */
 #define POOL_NET_ALIASES_MAX (POOL_NET_ALIASES * (POOL_NET_NAME_MAX + 1))
 #define POOL_SPLIT_WAIT_MAX  1440 /* minutes                              */
+#define POOL_PACE_GAP_DEFAULT 15  /* s between two dials of one server     */
+#define POOL_PACE_GAP_MAX    600  /* s; 0 = no pacing                     */
+#define POOL_ORDER_MAX       64   /* servers in one R| order              */
+#define POOL_ORDER_SLOTS_MAX 1000 /* bots in one slot group               */
 #define POOL_HOST_MAX        253
 #define POOL_WEIGHT_MAX      100
 #define POOL_MAX_MAX         100  /* soft cap on bots per entry; 0 = none */
@@ -37,10 +47,12 @@
  * separators + newline, rounded up. */
 #define POOL_N_LINE_MAX \
   (2 + POOL_NET_ID_MAX + POOL_NET_LABEL_MAX + POOL_NET_NAME_MAX + \
-   POOL_NET_ALIASES_MAX + 4 + 3 + 20 + 16)
+   POOL_NET_ALIASES_MAX + 4 + 3 + 3 + 20 + 16)
 #define POOL_S_LINE_MAX \
   (2 + POOL_UUID_LEN + POOL_NET_ID_MAX + POOL_HOST_MAX + 5 + 3 + 4 + 8 + \
    POOL_NET_NAME_MAX + 3 + 20 + 16)
+#define POOL_R_LINE_MAX \
+  (2 + 8 + 4 + 4 + 3 + 4 + POOL_ORDER_MAX * (POOL_UUID_LEN + 1) + 20 + 16)
 
 typedef enum { POOL_OK = 0, POOL_WRONGNET, POOL_DISABLED } pool_state_t;
 
@@ -50,6 +62,7 @@ typedef struct {
   char name[POOL_NET_NAME_MAX + 1];
   char aliases[POOL_NET_ALIASES_MAX + 1];
   int split_wait;
+  int pace_gap;              /* 0..POOL_PACE_GAP_MAX           */
   bool deleted;
 } pool_net_t;
 
@@ -64,6 +77,15 @@ typedef struct {
   char seen[POOL_NET_NAME_MAX + 1]; /* NETWORK= that flagged it */
   bool deleted;
 } pool_srv_t;
+
+typedef struct {
+  unsigned int gen;        /* FNV-1a 32 of the rest of the value          */
+  int slot;                /* 0..slots-1                                 */
+  int slots;               /* 1..POOL_ORDER_SLOTS_MAX                    */
+  int gap;                 /* the network's pace gap                     */
+  int n;                   /* 1..POOL_ORDER_MAX                          */
+  char ids[POOL_ORDER_MAX][POOL_UUID_LEN + 1];
+} pool_order_t;
 
 /* A net_id: 1..POOL_NET_ID_MAX of [a-z0-9-]. */
 bool pool_net_id_ok(const char *s);
@@ -86,6 +108,12 @@ bool pool_srv_parse(const char *value, pool_srv_t *out);
  * did not fit or the record is invalid. */
 int pool_net_format(const pool_net_t *n, char *buf, size_t cap);
 int pool_srv_format(const pool_srv_t *s, char *buf, size_t cap);
+
+/* R| values.  Format fills o->gen from the rest and returns the length or
+ * -1; parse refuses a gen that does not match, a repeated or malformed id,
+ * and an empty order.  `out` may be NULL. */
+int pool_order_format(pool_order_t *o, char *buf, size_t cap);
+bool pool_order_parse(const char *value, pool_order_t *out);
 
 /* ASCII case-insensitive match of `network` against a network's name and
  * aliases.  An empty name matches nothing (the caller decides "not learned"). */

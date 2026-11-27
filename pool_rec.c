@@ -1,4 +1,4 @@
-/* pool_rec.c — server pool records N| and S| (2.5.4).  See pool_rec.h.
+/* pool_rec.c — server pool records N|, S| and R| (2.5.4).  See pool_rec.h.
  * Byte-identical in irchub and ircbot. */
 #include "pool_rec.h"
 
@@ -165,11 +165,11 @@ bool pool_net_parse(const char *value, pool_net_t *out) {
   char buf[POOL_N_LINE_MAX];
   char *f[POOL_FIELDS_MAX];
   pool_net_t n;
-  if (!value || !split_fields(value, 6, buf, sizeof(buf), f)) return false;
+  if (!value || !split_fields(value, 7, buf, sizeof(buf), f)) return false;
   if (!pool_net_id_ok(f[0]) || !text_ok(f[1], POOL_NET_LABEL_MAX)) return false;
   if (f[2][0] && !pool_net_name_ok(f[2])) return false;
   if (!aliases_ok(f[3]) || !num_ok(f[4], POOL_SPLIT_WAIT_MAX, &n.split_wait) ||
-      !op_parse(f[5], &n.deleted))
+      !num_ok(f[5], POOL_PACE_GAP_MAX, &n.pace_gap) || !op_parse(f[6], &n.deleted))
     return false;
   if (out) {
     snprintf(n.net_id, sizeof(n.net_id), "%s", f[0]);
@@ -206,8 +206,8 @@ bool pool_srv_parse(const char *value, pool_srv_t *out) {
 }
 
 int pool_net_format(const pool_net_t *n, char *buf, size_t cap) {
-  int w = snprintf(buf, cap, "%s|%s|%s|%s|%d|%s", n->net_id, n->label, n->name,
-                   n->aliases, n->split_wait, n->deleted ? "del" : "add");
+  int w = snprintf(buf, cap, "%s|%s|%s|%s|%d|%d|%s", n->net_id, n->label, n->name,
+                   n->aliases, n->split_wait, n->pace_gap, n->deleted ? "del" : "add");
   if (w < 0 || (size_t)w >= cap || !pool_net_parse(buf, NULL)) return -1;
   return w;
 }
@@ -263,4 +263,95 @@ bool pool_hostport_parse(const char *in, char *host, size_t hcap, int *port) {
   *port = POOL_DEFAULT_PORT;
   if (colon && (!num_ok(colon + 1, 65535, port) || *port == 0)) return false;
   return pool_host_ok(host);
+}
+
+/* ---- R| ------------------------------------------------------------------ */
+
+static unsigned int fnv32(const char *s, size_t n) {
+  unsigned int h = 2166136261u;
+  for (size_t i = 0; i < n; i++) {
+    h ^= (unsigned char)s[i];
+    h *= 16777619u;
+  }
+  return h;
+}
+
+static bool uuid_shape(const char *s, size_t n) {
+  if (n != POOL_UUID_LEN) return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    bool dash = i == 8 || i == 13 || i == 18 || i == 23;
+    if (dash ? c != '-' : !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+  }
+  return true;
+}
+
+/* "<slot>|<slots>|<gap>|<ids>" of o into buf; its length or -1. */
+static int order_body(const pool_order_t *o, char *buf, size_t cap) {
+  if (o->n < 1 || o->n > POOL_ORDER_MAX || o->slots < 1 || o->slots > POOL_ORDER_SLOTS_MAX ||
+      o->slot < 0 || o->slot >= o->slots ||
+      o->gap < 0 || o->gap > POOL_PACE_GAP_MAX)
+    return -1;
+  int w = snprintf(buf, cap, "%d|%d|%d|", o->slot, o->slots, o->gap);
+  if (w < 0 || (size_t)w >= cap) return -1;
+  size_t off = (size_t)w;
+  for (int i = 0; i < o->n; i++) {
+    if (!uuid_shape(o->ids[i], strlen(o->ids[i]))) return -1;
+    for (int j = 0; j < i; j++)
+      if (strcmp(o->ids[i], o->ids[j]) == 0) return -1;
+    w = snprintf(buf + off, cap - off, "%s%s", i ? "," : "", o->ids[i]);
+    if (w < 0 || (size_t)w >= cap - off) return -1;
+    off += (size_t)w;
+  }
+  return (int)off;
+}
+
+int pool_order_format(pool_order_t *o, char *buf, size_t cap) {
+  char body[POOL_R_LINE_MAX];
+  int bl = order_body(o, body, sizeof(body));
+  if (bl < 0) return -1;
+  o->gen = fnv32(body, (size_t)bl);
+  int w = snprintf(buf, cap, "%08x|%s", o->gen, body);
+  if (w < 0 || (size_t)w >= cap) return -1;
+  return w;
+}
+
+bool pool_order_parse(const char *value, pool_order_t *out) {
+  static pool_order_t o; /* ~2.4 KB: off the stack */
+  char buf[POOL_R_LINE_MAX];
+  char *f[POOL_FIELDS_MAX];
+  if (!value || !split_fields(value, 5, buf, sizeof(buf), f)) return false;
+  if (strlen(f[0]) != 8) return false;
+  unsigned int gen = 0;
+  for (int i = 0; i < 8; i++) {
+    char c = f[0][i];
+    int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+    if (d < 0) return false;
+    gen = gen << 4 | (unsigned int)d;
+  }
+  memset(&o, 0, sizeof(o));
+  if (!num_ok(f[1], POOL_ORDER_SLOTS_MAX, &o.slot) ||
+      !num_ok(f[2], POOL_ORDER_SLOTS_MAX, &o.slots) || !num_ok(f[3], POOL_PACE_GAP_MAX, &o.gap))
+    return false;
+  const char *p = f[4];
+  while (*p) {
+    const char *c = strchr(p, ',');
+    size_t n = c ? (size_t)(c - p) : strlen(p);
+    if (o.n >= POOL_ORDER_MAX || !uuid_shape(p, n)) return false;
+    memcpy(o.ids[o.n], p, n);
+    o.ids[o.n][n] = '\0';
+    for (int j = 0; j < o.n; j++)
+      if (strcmp(o.ids[j], o.ids[o.n]) == 0) return false;
+    o.n++;
+    if (!c) break;
+    p = c + 1;
+    if (!*p) return false; /* trailing ',' */
+  }
+  if (o.n < 1) return false;
+  char body[POOL_R_LINE_MAX];
+  int bl = order_body(&o, body, sizeof(body));
+  if (bl < 0 || fnv32(body, (size_t)bl) != gen) return false;
+  o.gen = gen;
+  if (out) *out = o;
+  return true;
 }

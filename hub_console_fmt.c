@@ -985,6 +985,62 @@ static void render_bot_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
   free(v);
 }
 
+/* "1st", "2nd", "3rd", "4th", "11th" ... */
+static const char *ordinal(int n, char *buf, size_t cap) {
+  int t = n % 100, u = n % 10;
+  const char *sfx = (t >= 11 && t <= 13) ? "th" : u == 1 ? "st" : u == 2 ? "nd" : u == 3 ? "rd" : "th";
+  snprintf(buf, cap, "%d%s", n, sfx);
+  return buf;
+}
+
+/* bot show's channels: the j| tokens drawn as "@#a  #b  #c (out: banned)",
+ * wrapped at the card's value column. */
+static void bot_chans_lines(const fmt_ctx_t *ctx, flines_t *out, int label_w, const char *list) {
+  int col = 2 + label_w + 2, room = ctx->width - col;
+  if (room < 20) room = 20;
+  if (!list) return;
+  sb_t b = {0};
+  bool first_line = true, any = false;
+  const char *p = list;
+  while (*p) {
+    const char *end = strchr(p, ',');
+    size_t tl = end ? (size_t)(end - p) : strlen(p);
+    char tok[CHAN_STATE_MAX], cell[CHAN_STATE_MAX + 24];
+    if (tl >= sizeof(tok)) break;
+    memcpy(tok, p, tl);
+    tok[tl] = '\0';
+    if (tok[0] == '~') {
+      snprintf(cell, sizeof(cell), "+%s more", tok + 1);
+    } else if (tok[0] == '-') {
+      char *colon = strchr(tok, ':');
+      if (colon) *colon = '\0';
+      snprintf(cell, sizeof(cell), "%s (out: %s)", tok + 1, colon ? colon + 1 : "?");
+    } else {
+      snprintf(cell, sizeof(cell), "%s", tok);
+    }
+    int cw = console_str_width(cell);
+    if (any && b.w - col + 2 + cw > room) {
+      sb_emit(&b, out, RL_NORMAL);
+      first_line = false;
+      any = false;
+    }
+    if (!any) {
+      if (b.w == 0) {
+        sb_add(&b, "  ");
+        if (first_line) sb_add(&b, "channels");
+        sb_pad(&b, col);
+      }
+    } else {
+      sb_add(&b, "  ");
+    }
+    sb_add(&b, cell);
+    any = true;
+    p += tl + (end ? 1 : 0);
+  }
+  if (any) sb_emit(&b, out, RL_NORMAL);
+  sb_free(&b);
+}
+
 static void render_bot_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
   const crec_t *r = NULL, *u = NULL;
   for (int i = 0; i < rep->n; i++) {
@@ -999,6 +1055,13 @@ static void render_bot_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
   fmt_title(ctx, out, title, right);
   const int L = 12;
   fmt_card_line(ctx, out, L, "uuid", rv(r, "uuid"), RL_NORMAL);
+  const char *mask = rvs(r, "mask") ? rv(r, "mask") : NULL;
+  if (mask) {
+    snprintf(v, sizeof(v), "%s%s", mask, on ? "" : " (last known)");
+    fmt_card_line(ctx, out, L, "usermask", v, on ? RL_NORMAL : RL_DIM);
+  } else {
+    fmt_card_line(ctx, out, L, "usermask", "not known yet (the bot has not been on IRC)", RL_DIM);
+  }
   if (on) {
     sb_t s = {0};
     sb_add(&s, rvs(r, "ver") ? rv(r, "ver") : "unknown version");
@@ -1011,8 +1074,20 @@ static void render_bot_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
     }
     fmt_card_line(ctx, out, L, "version", s.p, RL_NORMAL);
     sb_free(&s);
-    fmt_card_line(ctx, out, L, "irc server", rvs(r, "server") ? rv(r, "server") : GL(G_DASH),
-                  RL_NORMAL);
+    sb_t is = {0};
+    sb_add(&is, rvs(r, "server") ? rv(r, "server") : GL(G_DASH));
+    if (rvs(r, "network")) sb_addf(&is, " (%s)", rv(r, "network"));
+    if (rvs(r, "link")) sb_addf(&is, " %s %s", GL(G_DOT), rv(r, "link"));
+    if (rvi(r, "place", 0) > 0 && rvi(r, "of", 0) > 0) {
+      char ord[16];
+      sb_addf(&is, " %s %s of %lld in its order", GL(G_DOT),
+              ordinal((int)rvi(r, "place", 0), ord, sizeof(ord)), rvi(r, "of", 0));
+    }
+    fmt_card_line(ctx, out, L, "irc server", is.p, RL_NORMAL);
+    sb_free(&is);
+    const char *chans = rvs(r, "chans") ? rv(r, "chans") : NULL;
+    if (chans) bot_chans_lines(ctx, out, L, chans);
+    else fmt_card_line(ctx, out, L, "channels", "not reported yet", RL_DIM);
     sb_reset(&s);
     bool local = rv(r, "hub") && !strcmp(rv(r, "hub"), "local");
     sb_addf(&s, "%s%s", rvs(r, "hub_name") ? rv(r, "hub_name") : GL(G_DASH),
@@ -1030,6 +1105,7 @@ static void render_bot_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
     fmt_card_line(ctx, out, L, "hub", "not connected to any hub", RL_DIM);
   }
   fmt_card_line(ctx, out, L, "key", rvs(r, "fp") ? rv(r, "fp") : "(no key)", RL_NORMAL);
+  if (rvs(r, "cron")) fmt_card_line(ctx, out, L, "cron", rv(r, "cron"), RL_NORMAL);
   bot_last_seen(ctx, r, v, sizeof(v));
   fmt_card_line(ctx, out, L, "last seen", v, RL_NORMAL);
   if (rvb(r, "auth") && rvi(r, "auth_ts", 0) > 0) {
@@ -1050,7 +1126,8 @@ static void render_bot_show(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
   }
   static const char *const known[] = {"uuid", "nick", "online", "ver", "base", "started",
                                       "server", "hub", "hub_uuid", "hub_name", "ip", "since",
-                                      "fp", "seen", "auth", "auth_ts", NULL};
+                                      "fp", "seen", "auth", "auth_ts", "mask", "network",
+                                      "link", "place", "of", "chans", "cron", NULL};
   unknown_keys(ctx, out, r, known, L);
   if (rvs(r, "hub_uuid")) fmt_card_line(ctx, out, L, "hub uuid", rv(r, "hub_uuid"), RL_DIM);
 }
@@ -1628,8 +1705,9 @@ static void render_peer_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
     const crec_t *r = &rep->r[i];
     if (strcmp(r->type, "self")) continue;
     char addr[96], bots[16], link[64], upt[32], cron[16];
-    snprintf(addr, sizeof(addr), "%s:%lld", rv(r, "bind_ip") ? rv(r, "bind_ip") : "?",
-             rvi(r, "port", 0));
+    /* the address others dial: the looked-up public one before a bind */
+    const char *ip = rvs(r, "public") ? rv(r, "public") : rv(r, "bind_ip");
+    snprintf(addr, sizeof(addr), "%s:%lld", ip ? ip : "?", rvi(r, "port", 0));
     snprintf(bots, sizeof(bots), "%lld", rvi(r, "bots", 0));
     snprintf(link, sizeof(link), "%s this hub", GL(G_DOT));
     span_since(ctx, rvi(r, "started", 0), upt, sizeof(upt));
@@ -1810,6 +1888,13 @@ static void render_hub_show(const fmt_ctx_t *ctx, const crec_t *h, flines_t *out
   else
     snprintf(v, sizeof(v), "%s:%lld", rv(h, "bind_ip") ? rv(h, "bind_ip") : "?", rvi(h, "port", 0));
   fmt_card_line(ctx, out, L, "listening", v, RL_NORMAL);
+  if (rvs(h, "public")) {
+    char a2[64];
+    fmt_when(rvi(h, "public_at", 0), ctx->now, a2, sizeof(a2));
+    snprintf(v, sizeof(v), "%s:%lld %s looked up %s", rv(h, "public"),
+             rvi(h, "port", 0), GL(G_DOT), a2);
+    fmt_card_line(ctx, out, L, "public", v, RL_NORMAL);
+  }
   /* the 88-character key on one unbroken line (D10) */
   fmt_card_line(ctx, out, L, "public key", rvs(h, "key") ? rv(h, "key") : GL(G_DASH), RL_NORMAL);
   fmt_card_line(ctx, out, L, "key", rvs(h, "fp") ? rv(h, "fp") : GL(G_DASH), RL_NORMAL);
@@ -1838,7 +1923,7 @@ static void render_hub_show(const fmt_ctx_t *ctx, const crec_t *h, flines_t *out
            GL(G_ELL), GL(G_DOT));
   fmt_card_line(ctx, out, L, "give to", v, RL_DIM);
   static const char *const known[] = {"name", "uuid", "ver", "base", "started", "bind_ip", "port",
-                                      "pending_bind_ip", "pending_port", "key", "fp", "ssh_fp",
+                                      "pending_bind_ip", "pending_port", "public", "public_at", "key", "fp", "ssh_fp",
                                       "peers_up", "peers", "hubs_up", "hubs", "bots_here",
                                       "bots_online", "bots", "autopurge", "log_file", "log_console", "log_size", NULL};
   unknown_keys(ctx, out, h, known, L);
@@ -2111,13 +2196,23 @@ static const char *const OPNAME[256] = {
  [0x74] = "CMD_CHAN_ELECT_DONE", [0x75] = "CMD_ADMIN_INVITE_USER",
  [0x76] = "CMD_ADMIN_CHAN_MODE", [0x77] = "CMD_ADMIN_CHAN_SET", [0x78] = "CMD_ADMIN_BAN",
  [0x79] = "CMD_ADMIN_NET_SET", [0x7A] = "CMD_ADMIN_SET_SSH", [0x7B] = "CMD_CHAN_EVENT", [0x7C] = "CMD_ADMIN_USER_ACCESS", [0x7D] = "CMD_USER_CHAN_REQUEST", [0x7E] = "CMD_USER_CHAN_RESULT", [0x7F] = "CMD_BOT_RETIRE", [0x80] = "CMD_BOT_RETIRE_ACK", [0x81] = "CMD_ADMIN_LIST_REVOKED", [0x82] = "CMD_ADMIN_PEER_REFS",
- [0x83] = "CMD_LINK_SEQ", [0x84] = "CMD_ADMIN_KICK_USER", [0x85] = "CMD_POOL_VIEW", [0x86] = "CMD_SERVER_REPORT", [0x87] = "CMD_UPGRADE_HISTORY",
+ [0x83] = "CMD_LINK_SEQ", [0x84] = "CMD_ADMIN_KICK_USER", [0x86] = "CMD_SERVER_REPORT", [0x87] = "CMD_UPGRADE_HISTORY",
  [0x88] = "CMD_UPGRADE_STAGE", [0x89] = "CMD_UPGRADE_PROGRESS", [0x8A] = "CMD_UPGRADE_PLAN",
  [0x8B] = "CMD_CRON_SET", [0x8C] = "CMD_HUB_ROLLCALL", [0x8D] = "CMD_HUB_ROLLCALL_ACK", [0x8E] = "CMD_PRESENCE2",
  [0x8F] = "CMD_BOT_TREE_DELTA", [0x90] = "CMD_BOT_TREE_PULL", [0x91] = "CMD_CONFIG_DELTA",
  [0x92] = "CMD_CFG_RESYNC", [0x93] = "CMD_ADMIN_BOT_RESYNC", [0x94] = "CMD_SYNC_DIGEST",
- [0x96] = "CMD_BOT_IRC_LINK", [0x97] = "CMD_ADMIN_POOL", [0x95] = "CMD_CHAN_WHO",
+ [0x96] = "CMD_BOT_IRC_LINK", [0x97] = "CMD_ADMIN_POOL", [0x98] = "CMD_BOT_MOVE", [0x99] = "CMD_CHAN_ELECT_END", [0x9A] = "CMD_BOT_CHAN_STATE", [0x9B] = "CMD_BOT_HUB_MOVE", [0x9C] = "CMD_ADMIN_BOT_MOVE", [0x95] = "CMD_CHAN_WHO",
 };
+
+/* The NAME cell for a stats "code" (0x%02X).  Every opcode a supported
+ * version sends is in OPNAME; anything else (a retired value, a test's probe,
+ * a hostile peer) is "unknown": match it by its code. */
+static const char *stats_op_name(const char *code) {
+  char *end = NULL;
+  unsigned long op = code ? strtoul(code, &end, 16) : 256;
+  if (!code || end == code || op > 255 || !OPNAME[op]) return "unknown";
+  return OPNAME[op];
+}
 
 static unsigned long long rvu(const crec_t *r, const char *k) {
   const char *v = rv(r, k);
@@ -2310,7 +2405,9 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
            GL(G_DOT), up);
   fmt_title(ctx, out, "Hub statistics", right);
   const crec_t *cfg = NULL, *sy = NULL, *ld = NULL, *p2 = NULL, *tr = NULL, *pl = NULL;
+  const crec_t *el = NULL;
   for (int i = 0; i < rep->n; i++) {
+    if (!strcmp(rep->r[i].type, "elect")) el = &rep->r[i];
     if (!strcmp(rep->r[i].type, "cfg")) cfg = &rep->r[i];
     if (!strcmp(rep->r[i].type, "tree")) tr = &rep->r[i];
     if (!strcmp(rep->r[i].type, "sync")) sy = &rep->r[i];
@@ -2319,7 +2416,7 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
     if (!strcmp(rep->r[i].type, "pool")) pl = &rep->r[i];
   }
   if (ctx->width >= STATS_GRID_MIN) {
-    ssec_t secs[6];
+    ssec_t secs[7];
     int ns = 0;
     memset(secs, 0, sizeof(secs));
     if (cfg) {
@@ -2381,8 +2478,18 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
       ssec_count(s, "bots idle", rvu(pl, "idle"));
       ssec_count(s, "reports", rvu(pl, "reports"));
       ssec_count(s, "flagged", rvu(pl, "flagged"));
-      ssec_count(s, "views sent", rvu(pl, "views"));
+      ssec_count(s, "orders computed", rvu(pl, "orders"));
       s->role = rvu(pl, "usable") || !rvu(pl, "servers") ? RL_NORMAL : RL_WARN;
+    }
+    if (el) {
+      ssec_t *s = &secs[ns++];
+      snprintf(s->title, sizeof(s->title), "Channel requests");
+      ssec_count(s, "in flight", rvu(el, "in_flight"));
+      ssec_count(s, "slots", rvu(el, "slots"));
+      ssec_count(s, "started", rvu(el, "started"));
+      ssec_count(s, "batched", rvu(el, "batched"));
+      ssec_count(s, "refused", rvu(el, "refused"));
+      ssec_count(s, "ended early", rvu(el, "ended"));
     }
     if (ld) {
       ssec_t *s = &secs[ns++];
@@ -2465,7 +2572,18 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
     sb_emit(&b, out, rvu(pl, "usable") || !rvu(pl, "servers") ? RL_NORMAL : RL_WARN);
     count_kv(&b, "  reports", rvu(pl, "reports"), 0);
     count_kv(&b, "flagged", rvu(pl, "flagged"), 24);
-    count_kv(&b, "views sent", rvu(pl, "views"), 40);
+    count_kv(&b, "orders computed", rvu(pl, "orders"), 40);
+    sb_emit(&b, out, RL_NORMAL);
+  }
+  if (el) {
+    line(out, RL_HEAD, " Channel requests");
+    count_kv(&b, "  in flight", rvu(el, "in_flight"), 0);
+    count_kv(&b, "slots", rvu(el, "slots"), 24);
+    count_kv(&b, "started", rvu(el, "started"), 40);
+    sb_emit(&b, out, RL_NORMAL);
+    count_kv(&b, "  batched", rvu(el, "batched"), 0);
+    count_kv(&b, "refused", rvu(el, "refused"), 24);
+    count_kv(&b, "ended early", rvu(el, "ended"), 40);
     sb_emit(&b, out, RL_NORMAL);
   }
   if (ld) {
@@ -2505,37 +2623,121 @@ static void render_stats(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *ou
   }
   static const col_t cols[] = {{"OPCODE", 'L', 1}, {"NAME", 'L', 1}, {"IN FRAMES", 'R', 1},
                                {"IN BYTES", 'R', 1}, {"OUT FRAMES", 'R', 2}, {"OUT BYTES", 'R', 2}};
-  tbl_t t;
-  tbl_init(&t, cols, 6, -1, 1, 1);
-  unsigned long long tot[4] = {0, 0, 0, 0};
-  for (int k = 0; k < n; k++) {
-    const crec_t *r = &rep->r[ix[k]];
-    const char *code = rv(r, "code") ? rv(r, "code") : "?";
-    unsigned long op = strtoul(code, NULL, 16);
-    const char *name = op < 256 && OPNAME[op] ? OPNAME[op] : "?";
-    unsigned long long v[4] = {rvu(r, "rx_f"), rvu(r, "rx_b"), rvu(r, "tx_f"), rvu(r, "tx_b")};
-    char c[4][32];
-    for (int q = 0; q < 4; q++) {
-      tot[q] += v[q];
-      if (q % 2) fmt_bytes(v[q], c[q], sizeof(c[q]));
-      else fmt_count(v[q], c[q], sizeof(c[q]));
-    }
-    const char *cells[6] = {code, name, c[0], c[1], c[2], c[3]};
-    tbl_row(ctx, &t, RL_NORMAL, NULL, cells);
-  }
-  if (n) {
-    char c[4][32];
-    for (int q = 0; q < 4; q++) {
-      if (q % 2) fmt_bytes(tot[q], c[q], sizeof(c[q]));
-      else fmt_count(tot[q], c[q], sizeof(c[q]));
-    }
-    const char *cells[6] = {"total", " ", c[0], c[1], c[2], c[3]};
-    tbl_row(ctx, &t, RL_HEAD, NULL, cells);
-    tbl_render(ctx, out, &t);
-  } else {
+  if (!n) {
     empty_note(out, "no traffic yet", NULL);
+    free(ix);
+    return;
   }
+  /* The rows once, as text: the table is laid out one-up or two-up below. */
+  char (*cell)[6][40] = calloc((size_t)n + 1, sizeof(*cell));
+  if (!cell) {
+    free(ix);
+    return;
+  }
+  unsigned long long tot[4] = {0, 0, 0, 0};
+  for (int k = 0; k <= n; k++) {
+    unsigned long long v[4];
+    if (k < n) {
+      const crec_t *r = &rep->r[ix[k]];
+      const char *code = rv(r, "code") ? rv(r, "code") : "?";
+      snprintf(cell[k][0], sizeof(cell[k][0]), "%s", code);
+      snprintf(cell[k][1], sizeof(cell[k][1]), "%s", stats_op_name(code));
+      v[0] = rvu(r, "rx_f");
+      v[1] = rvu(r, "rx_b");
+      v[2] = rvu(r, "tx_f");
+      v[3] = rvu(r, "tx_b");
+      for (int q = 0; q < 4; q++) tot[q] += v[q];
+    } else {
+      snprintf(cell[k][0], sizeof(cell[k][0]), "total");
+      snprintf(cell[k][1], sizeof(cell[k][1]), " ");
+      memcpy(v, tot, sizeof(v));
+    }
+    for (int q = 0; q < 4; q++) {
+      if (q % 2) fmt_bytes(v[q], cell[k][2 + q], sizeof(cell[k][2 + q]));
+      else fmt_count(v[q], cell[k][2 + q], sizeof(cell[k][2 + q]));
+    }
+  }
+  /* Rows [a, b) as one table; with_total adds the total row. */
+#define TRAFFIC_TABLE(T, a, b, with_total)                                        \
+  do {                                                                           \
+    tbl_init(&(T), cols, 6, -1, 1, 1);                                           \
+    for (int k_ = (a); k_ < (b); k_++) {                                         \
+      const char *c_[6] = {cell[k_][0], cell[k_][1], cell[k_][2],                \
+                           cell[k_][3], cell[k_][4], cell[k_][5]};               \
+      tbl_row(ctx, &(T), RL_NORMAL, NULL, c_);                                   \
+    }                                                                            \
+    if (with_total) {                                                            \
+      const char *c_[6] = {cell[n][0], cell[n][1], cell[n][2],                   \
+                           cell[n][3], cell[n][4], cell[n][5]};                  \
+      tbl_row(ctx, &(T), RL_HEAD, NULL, c_);                                     \
+    }                                                                            \
+  } while (0)
+  /* One-up width: the widest line of the whole table laid out in one row. */
+  tbl_t t;
+  TRAFFIC_TABLE(t, 0, n, true);
+  fmt_ctx_t wide_ctx = *ctx;
+  wide_ctx.width = 1 << 14;
+  flines_t one = {0};
+  tbl_render(&wide_ctx, &one, &t);
+  int w1 = 0;
+  for (int i = 0; i < one.n; i++) {
+    int w = console_str_width(one.v[i].text);
+    if (w > w1) w1 = w;
+  }
+  /* the page so far plus the one-up table: two-up only past the view */
+  int one_up = one.n;
+  flines_free(&one);
+  if (n >= TRAFFIC_SPLIT_MIN && ctx->height > 0 && out->n + one_up > ctx->height &&
+      ctx->width >= 2 * w1 + TRAFFIC_COL_GAP) {
+    /* Two-up: down the left half, then down the right; the total ends the
+     * right one.  Each half is laid out at its own one-up width. */
+    int h = (n + 2) / 2; /* the left takes the odd row, the right the total */
+    tbl_t tleft, tright;
+    TRAFFIC_TABLE(tleft, 0, h, false);
+    TRAFFIC_TABLE(tright, h, n, true);
+    fmt_ctx_t half = *ctx;
+    half.width = w1;
+    flines_t L = {0}, R = {0};
+    tbl_render(&half, &L, &tleft);
+    tbl_render(&half, &R, &tright);
+    int lw = 0;
+    for (int i = 0; i < L.n; i++) {
+      int w = console_str_width(L.v[i].text);
+      if (w > lw) lw = w;
+    }
+    sb_t b = {0};
+    int rows = L.n > R.n ? L.n : R.n;
+    for (int i = 0; i < rows; i++) {
+      /* a line has one style: a left row and a right row that differ (an
+       * opcode beside the bold total) go on lines of their own, the right
+       * one under its column */
+      if (i < L.n && i < R.n && L.v[i].role != R.v[i].role) {
+        sb_add(&b, L.v[i].text);
+        sb_emit(&b, out, L.v[i].role);
+        sb_pad(&b, lw + TRAFFIC_COL_GAP);
+        sb_add(&b, R.v[i].text);
+        sb_emit(&b, out, R.v[i].role);
+        continue;
+      }
+      if (i < L.n) sb_add(&b, L.v[i].text);
+      if (i < R.n) {
+        sb_pad(&b, lw + TRAFFIC_COL_GAP);
+        sb_add(&b, R.v[i].text);
+      }
+      int role = i < L.n ? L.v[i].role : i < R.n ? R.v[i].role : RL_NORMAL;
+      sb_emit(&b, out, role);
+    }
+    sb_free(&b);
+    flines_free(&L);
+    flines_free(&R);
+    tbl_free(&tleft);
+    tbl_free(&tright);
+  } else {
+    tbl_render(ctx, out, &t);
+  }
+#undef TRAFFIC_TABLE
   tbl_free(&t);
+  free(cell);
   free(ix);
 }
 
@@ -3595,24 +3797,25 @@ static void render_pool_list(const fmt_ctx_t *ctx, const creply_t *rep, flines_t
     return;
   }
   qsort(rows, (size_t)nr, sizeof(*rows), pool_row_cmp);
-  static const col_t cols[] = {{"HOST", 'L', 1},   {"PORT", 'R', 1}, {"STATE", 'L', 1},
-                               {"BOTS", 'R', 1},   {"WEIGHT", 'R', 2}, {"MAX", 'R', 2},
-                               {"ADDED", 'L', 2}};
+  static const col_t cols[] = {{"HOST", 'L', 1},   {"PORT", 'R', 1},   {"STATE", 'L', 1},
+                               {"BOTS", 'R', 1},   {"FIRST", 'R', 1},  {"WEIGHT", 'R', 2},
+                               {"MAX", 'R', 2},    {"ADDED", 'L', 2}};
   tbl_t t;
-  tbl_init(&t, cols, 7, -1, 1, 1);
+  tbl_init(&t, cols, 8, -1, 1, 1);
   for (int i = 0; i < nr; i++) {
     const crec_t *c = rows[i];
-    char port[16], st[96], bots[32], wt[16], mx[16], when[64];
+    char port[16], st[96], bots[32], first[16], wt[16], mx[16], when[64];
     snprintf(port, sizeof(port), "%lld", rvi(c, "port", 0));
     pool_state_text(c, st, sizeof(st));
     long long up = rvi(c, "up", 0), conn = rvi(c, "connecting", 0);
     if (conn) snprintf(bots, sizeof(bots), "%lld +%lld", up, conn);
     else snprintf(bots, sizeof(bots), "%lld", up);
+    snprintf(first, sizeof(first), "%lld", rvi(c, "assigned", 0));
     snprintf(wt, sizeof(wt), "%lld", rvi(c, "weight", 1));
     if (rvi(c, "max", 0)) snprintf(mx, sizeof(mx), "%lld", rvi(c, "max", 0));
     else snprintf(mx, sizeof(mx), "%s", GL(G_DASH));
     when_ago(ctx, rvi(c, "ts", 0), when, sizeof(when));
-    const char *cells[7] = {rv(c, "host"), port, st, bots, wt, mx, when};
+    const char *cells[8] = {rv(c, "host"), port, st, bots, first, wt, mx, when};
     bool bad = rv(c, "state") && strcmp(rv(c, "state"), "ok") != 0;
     tbl_row(ctx, &t, bad ? RL_WARN : RL_NORMAL, NULL, cells);
   }
@@ -3638,11 +3841,100 @@ static void render_pool_net(const fmt_ctx_t *ctx, const creply_t *rep, flines_t 
   fmt_card_line(ctx, out, L, "aliases", rvs(r, "aliases") ? rv(r, "aliases") : GL(G_DASH),
                 RL_NORMAL);
   char v[96];
+  long long pace = rvi(r, "pace", 0);
+  if (pace > 0)
+    snprintf(v, sizeof(v), "%lld s between two dials of one server from one host", pace);
+  else
+    snprintf(v, sizeof(v), "off");
+  fmt_card_line(ctx, out, L, "pace", v, RL_NORMAL);
   long long usable = rvi(r, "usable", 0), idle = rvi(r, "idle", 0);
   snprintf(v, sizeof(v), "%lld usable", usable);
   fmt_card_line(ctx, out, L, "servers", v, usable ? RL_NORMAL : RL_WARN);
   snprintf(v, sizeof(v), "%lld waiting for a server", idle);
   fmt_card_line(ctx, out, L, "idle", v, idle ? RL_WARN : RL_NORMAL);
+}
+
+/* server order: one row per bot, its first server and where it is now. */
+static void render_pool_order(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  int nr = 0, off = 0;
+  for (int i = 0; i < rep->n; i++)
+    if (!strcmp(rep->r[i].type, "order")) {
+      nr++;
+      off += rvb(&rep->r[i], "off");
+    }
+  char right[160];
+  long long pace = rvi(&rep->res, "pace", 0);
+  if (pace > 0)
+    snprintf(right, sizeof(right), "%d bot%s %s %d off their first %s pace %lld s", nr,
+             nr == 1 ? "" : "s", GL(G_DOT), off, GL(G_DOT), pace);
+  else
+    snprintf(right, sizeof(right), "%d bot%s %s %d off their first %s pace off", nr,
+             nr == 1 ? "" : "s", GL(G_DOT), off, GL(G_DOT));
+  fmt_title(ctx, out, "Server order", right);
+  if (!nr) {
+    empty_note(out, "no orders yet: the hubs give every bot one once the pool has a server",
+               "server add <host[:port]>");
+    return;
+  }
+  static const col_t cols[] = {{"BOT", 'L', 1},   {"FIRST", 'L', 1}, {"SLOT", 'R', 2},
+                               {"NOW ON", 'L', 1}, {"UUID", 'L', 3}};
+  tbl_t t;
+  tbl_init(&t, cols, 5, -1, 1, 1);
+  for (int i = 0; i < rep->n; i++) {
+    const crec_t *c = &rep->r[i];
+    if (strcmp(c->type, "order")) continue;
+    char first[300], slot[32], on[300];
+    if (rvs(c, "first"))
+      snprintf(first, sizeof(first), "%s:%lld", rv(c, "first"), rvi(c, "first_port", 0));
+    else
+      snprintf(first, sizeof(first), "%s", GL(G_DASH));
+    if (rvi(c, "slots", 1) > 1)
+      snprintf(slot, sizeof(slot), "%lld of %lld", rvi(c, "slot", 0) + 1, rvi(c, "slots", 1));
+    else
+      snprintf(slot, sizeof(slot), "%s", GL(G_DASH));
+    const char *link = rv(c, "link") ? rv(c, "link") : "";
+    if (rvs(c, "on") && !strcmp(link, "up"))
+      snprintf(on, sizeof(on), "%s:%lld", rv(c, "on"), rvi(c, "on_port", 0));
+    else
+      snprintf(on, sizeof(on), "%s", link[0] ? link : "not linked here");
+    const char *cells[5] = {rvs(c, "nick") ? rv(c, "nick") : GL(G_DASH), first, slot, on,
+                            rv(c, "uuid")};
+    tbl_row(ctx, &t, rvb(c, "off") ? RL_WARN : RL_NORMAL, NULL, cells);
+  }
+  tbl_render(ctx, out, &t);
+  tbl_free(&t);
+}
+
+static void render_pool_rebalance(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
+  const crec_t *r = &rep->res;
+  const char *st = rv(r, "state") ? rv(r, "state") : "";
+  long long off = rvi(r, "off", 0), bots = rvi(r, "bots", 0);
+  char line[200];
+  snprintf(line, sizeof(line), "%lld of %lld bot%s off their first server", off, bots,
+           bots == 1 ? "" : "s");
+  if (!strcmp(st, "started")) {
+    fmt_ok(ctx, "Rebalance started", line, out);
+    effect(ctx, out, "moving them in waves: at most 5 bots and a quarter of those up at once, "
+                     "one per host");
+  } else if (!strcmp(st, "balanced")) {
+    fmt_ok(ctx, "Nothing to move", "every bot up is on its first server", out);
+  } else if (!strcmp(st, "stopped")) {
+    fmt_ok(ctx, "Rebalance stopped", line, out);
+  } else if (!strcmp(st, "idle")) {
+    fmt_ok(ctx, "No rebalance running", line, out);
+  } else {
+    fmt_title(ctx, out, "Rebalance", !strcmp(st, "running") ? "running" : "preview");
+    const int L = 7;
+    fmt_card_line(ctx, out, L, "off", line, off ? RL_WARN : RL_NORMAL);
+    if (!strcmp(st, "running")) {
+      char m[96];
+      snprintf(m, sizeof(m), "%lld moved in %lld wave%s", rvi(r, "moved", 0), rvi(r, "waves", 0),
+               rvi(r, "waves", 0) == 1 ? "" : "s");
+      fmt_card_line(ctx, out, L, "so far", m, RL_NORMAL);
+    } else if (off) {
+      hint(out, "server rebalance force");
+    }
+  }
 }
 
 static void render_pool_change(const fmt_ctx_t *ctx, const creply_t *rep, flines_t *out) {
@@ -3655,6 +3947,13 @@ static void render_pool_change(const fmt_ctx_t *ctx, const creply_t *rep, flines
       snprintf(a, sizeof(a), "also accepted: %s", rv(r, "aliases"));
       effect(ctx, out, a);
     }
+    char pc[80];
+    long long pace = rvi(r, "pace", 0);
+    if (pace > 0)
+      snprintf(pc, sizeof(pc), "pace %lld s", pace);
+    else
+      snprintf(pc, sizeof(pc), "pace off");
+    effect(ctx, out, pc);
     push_effects(ctx, r, out);
     return;
   }
@@ -4807,6 +5106,8 @@ void fmt_reply(const fmt_ctx_t *ctx, const creply_t *rep, const char *words, fli
   else if (!strcmp(c, "channel.set")) render_settings_change(ctx, rep, out);
   else if (!strcmp(c, "pool.list")) render_pool_list(ctx, rep, out);
   else if (!strcmp(c, "pool.net")) render_pool_net(ctx, rep, out);
+  else if (!strcmp(c, "pool.order")) render_pool_order(ctx, rep, out);
+  else if (!strcmp(c, "pool.rebalance")) render_pool_rebalance(ctx, rep, out);
   else if (!strncmp(c, "pool.", 5)) render_pool_change(ctx, rep, out);
   else if (!strcmp(c, "ban.list")) render_ban_list(ctx, rep, out);
   else if (!strncmp(c, "ban.", 4)) render_ban_change(ctx, rep, out);

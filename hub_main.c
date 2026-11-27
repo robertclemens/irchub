@@ -1,5 +1,6 @@
 #include "hub_uhist.h"
 #include "hub_console.h"
+#include "cli_fmt.h"
 #if defined(__GLIBC__)
 #include <malloc.h>   /* for mallopt(); glibc-only, guarded like its use in main() */
 #endif
@@ -528,7 +529,8 @@ static void hub_maintenance(hub_state_t *state) {
      * refreshed, and push the tree to bots when it changed.  All volatile —
      * see the CMD_BOT_PRESENCE block in hub.h. */
     hub_presence_tick(state, now);
-    hub_pool_view_tick(state, now); /* server pool load to the bots */
+    hub_pool_order_tick(state, now); /* the bots' server orders */
+    hub_rebalance_tick(state, now);  /* server rebalance force waves */
 
     /* Rolling network upgrade: one step per tick (no-op unless running). */
     hub_upgrade_tick(state, now);
@@ -538,6 +540,9 @@ static void hub_maintenance(hub_state_t *state) {
 
     /* Hub roll calls (the upgrade gates): end the ones whose wait ran out. */
     hub_rollcall_tick(state, now);
+
+    /* This hub's public address: at start, then daily (never blocks). */
+    hub_pubip_tick(state, now);
 
     /* Expired bans: one `del` per ban, self-throttled to BAN_SWEEP_INTERVAL. */
     hub_bans_sweep(state, now);
@@ -1071,6 +1076,35 @@ static bool instance_dir_enter(char *exe, size_t exe_len) {
     return true;
 }
 
+/* -setup: can this hub listen on ip:port?  A throwaway socket bound and
+ * listened like the real listener, then closed.  why gets the reason. */
+static bool setup_test_bind(const char *ip, int port, char *why, size_t cap) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) {
+        snprintf(why, cap, "not an IPv4 address");
+        return false;
+    }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        snprintf(why, cap, "%s", strerror(errno));
+        return false;
+    }
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    bool ok = bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0 && listen(fd, 1) == 0;
+    int e = errno;
+    close(fd);
+    if (ok) return true;
+    if (e == EADDRINUSE) snprintf(why, cap, "port %d is already in use", port);
+    else if (e == EADDRNOTAVAIL) snprintf(why, cap, "%s is not an address of this host", ip);
+    else if (e == EACCES) snprintf(why, cap, "ports below 1024 need privileges");
+    else snprintf(why, cap, "%s", strerror(e));
+    return false;
+}
+
 /* -setup: read a user's public key — the pasted 88-char key, or a path to
  * their .public.b64 — show its fingerprint and confirm.  False on EOF. */
 static bool setup_read_pubkey(const char *who, char out[COMBINED_KEY_B64 + 1]) {
@@ -1078,21 +1112,16 @@ static bool setup_read_pubkey(const char *who, char out[COMBINED_KEY_B64 + 1]) {
         char in[PATH_MAX];
         unsigned char raw[COMBINED_KEY_LEN];
         out[0] = '\0';
-        printf("Public key for '%s' (paste the 88 chars, or a path to the "
-               ".public.b64): ", who);
-        fflush(stdout);
-        if (!fgets(in, sizeof(in), stdin)) return false;
-        in[strcspn(in, "\r\n")] = '\0';
+        cli_ask("public key", in, sizeof(in));
+        if (feof(stdin)) return false;
         if (in[0] == '\0') {
-            printf("A public key is required (run ./keygen %s on the admin's "
-                   "machine).\n", who);
+            cli_err("a public key is required: run ./keygen %s on the admin's machine", who);
             continue;
         }
         /* Private and public key files have the same shape; refuse a keygen
          * private file by name before it gets published in the a| record. */
         if (strstr(in, ".private.")) {
-            printf("That is a PRIVATE key file — it stays with the admin. "
-                   "Use the matching .public.b64.\n");
+            cli_err("that is a PRIVATE key file: it stays with the admin; give the .public.b64");
             continue;
         }
         if (hub_crypto_pubkey_b64_decode(in, raw)) {
@@ -1106,20 +1135,37 @@ static bool setup_read_pubkey(const char *who, char out[COMBINED_KEY_B64 + 1]) {
                 line[strcspn(line, " \t\r\n")] = '\0';
             }
             if (!line[0] || !hub_crypto_pubkey_b64_decode(line, raw)) {
-                printf("Not an 88-char public key%s. Use the .public.b64 — "
-                       "never the .private.b64.\n", f ? " in that file" : "");
+                cli_err("not an 88-char public key%s (the .public.b64, never the .private.b64)",
+                        f ? " in that file" : "");
                 continue;
             }
             memcpy(out, line, COMBINED_KEY_B64);
         }
         out[COMBINED_KEY_B64] = '\0';
-        char fp[KEY_FP_LEN + 1], yn[16] = {0};
+        char fp[KEY_FP_LEN + 1];
         hub_crypto_key_fingerprint(raw, fp);
-        printf("  Key fingerprint: %s — use this key? (Y/n): ", fp);
-        fflush(stdout);
-        if (!fgets(yn, sizeof(yn), stdin)) return false;
-        if (yn[0] != 'n' && yn[0] != 'N') return true;
+        cli_kv("fingerprint", "%s", fp);
+        if (cli_ask_yes("use this key?", true)) return true;
+        if (feof(stdin)) return false;
     }
+}
+
+/* The two lines other nodes paste, from -setup's summary and -id.  The
+ * address is the looked-up public one, else a specific bind (a wildcard
+ * tells nobody). */
+static void print_paste_lines(const hub_state_t *state, const char *pub_b64) {
+    const char *dial = hub_dial_address(state);
+    const char *ip = dial ? dial : "<this-hub's-address>";
+    const char *name = state->hub_friendly_name[0] ? state->hub_friendly_name : "-";
+    cli_skv("other hubs", "paste on the console of EACH hub that links to this one:");
+    printf("\n   hub add %s %d %s %s %s\n\n", ip, state->port, state->hub_uuid, name, pub_b64);
+    cli_note("Hub links are not shared through the mesh: every hub this one links "
+             "with needs this line, and this hub needs a hub add for each of them.");
+    cli_skv("bots", "paste on IRC (or give to ircbot -setup):");
+    printf("\n   +hub %s:%d %s\n\n", ip, state->port, pub_b64);
+    if (state->public_ip[0])
+        cli_note("%s is this host's public address; hubs and bots on the same LAN "
+                 "can dial its LAN address instead.", state->public_ip);
 }
 
 /* -id: print this hub's name, uuid, public key and fingerprints — what
@@ -1160,19 +1206,19 @@ static int run_identity(hub_state_t *state, char *password) {
     char fp[KEY_FP_LEN + 1], ssh_fp[80];
     hub_crypto_key_fingerprint(pub64, fp);
     console_ssh_fingerprint(pub64, ssh_fp, sizeof(ssh_fp));
-    /* bind_ip is what the mesh is told to dial; a wildcard tells nobody. */
     bool wild = !state->bind_ip[0] || strcmp(state->bind_ip, "0.0.0.0") == 0;
-    const char *ip = wild ? "<this-hub's-address>" : state->bind_ip;
-    const char *name = state->hub_friendly_name[0] ? state->hub_friendly_name : "-";
-    printf("Hub name:        %s\n", name);
-    printf("Hub UUID:        %s\n", state->hub_uuid);
-    printf("Hub public key:  %s\n", pub_b64);
-    printf("Key fingerprint: %s\n", fp);
-    printf("SSH host key:    ssh-ed25519 %s\n", ssh_fp);
-    printf("Listening:       %s:%d\n", wild ? "0.0.0.0" : state->bind_ip, state->port);
-    printf("Other hubs:      hub add %s %d %s %s %s\n", ip, state->port,
-           state->hub_uuid, name, pub_b64);
-    printf("Bots:            +hub %s:%d %s\n", ip, state->port, pub_b64);
+    cli_header("irchub", HUB_VERSION, "identity");
+    printf("\n");
+    cli_skv("name", "%s", state->hub_friendly_name[0] ? state->hub_friendly_name : "-");
+    cli_skv("uuid", "%s", state->hub_uuid);
+    cli_skv("listening", "%s:%d", wild ? "0.0.0.0" : state->bind_ip, state->port);
+    /* -id is offline and read-only: the address the running hub last looked up */
+    cli_skv("public", "%s", state->public_ip[0] ? state->public_ip : "(not looked up yet)");
+    cli_skv("public key", "%s", pub_b64);
+    cli_skv("fingerprint", "%s", fp);
+    cli_skv("host key", "ssh-ed25519 %s", ssh_fp);
+    print_paste_lines(state, pub_b64);
+    cli_rule();
     free(pub_b64);
     return 0;
 }
@@ -1298,221 +1344,266 @@ int main(int argc, char *argv[]) {
     }
 
     if (setup_mode) {
-        int ch;
-
-        printf("--- Setup ---\n");
-
-        printf("Port: ");
-        if (scanf("%d", &state.port) != 1) return 1;
-        while ((ch = getchar()) != '\n' && ch != EOF);
-
-        printf("Bind IP (default 0.0.0.0): ");
-        fflush(stdout);
-        {
-            char bind_buf[65];
-            memset(bind_buf, 0, sizeof(bind_buf));
-            if (fgets(bind_buf, sizeof(bind_buf), stdin)) {
-                bind_buf[strcspn(bind_buf, "\n")] = 0;
-            }
-            if (bind_buf[0] == 0) {
-                snprintf(state.bind_ip, sizeof(state.bind_ip), "0.0.0.0");
-            } else {
-                snprintf(state.bind_ip, sizeof(state.bind_ip), "%.*s",
-                         (int)(sizeof(state.bind_ip) - 1), bind_buf);
-            }
-        }
-
+        cli_header("irchub", HUB_VERSION, "setup");
+        cli_note("No %s here yet: these steps write one, encrypted with a config password.",
+                 HUB_CONFIG_FILE);
+        char admin_name[64], admin_pub_b64[COMBINED_KEY_B64 + 1], admin_uuid[37];
+        char pub_b64_keep[COMBINED_KEY_B64 + 1], id_fp[KEY_FP_LEN + 1], sshfp[80];
         for (;;) {
-            char name_buf[128];
-            printf("Friendly Name (A-Z a-z 0-9 . _ -, max 63): ");
-            fflush(stdout);
-            if (!fgets(name_buf, sizeof(name_buf), stdin)) {
-                fprintf(stderr, "No hub name given.\n");
-                return 1;
-            }
-            if (!strchr(name_buf, '\n') && strlen(name_buf) == sizeof(name_buf) - 1) {
-                int drain;
-                while ((drain = getchar()) != '\n' && drain != EOF) {}
-                printf("Invalid name: longer than 63 characters.\n");
-                continue;
-            }
-            name_buf[strcspn(name_buf, "\r\n")] = 0;
-            if (hub_name_valid(name_buf)) {
-                memcpy(state.hub_friendly_name, name_buf, strlen(name_buf) + 1);
-                break;
-            }
-            printf("Invalid name: it is written into config lines and hub "
-                   "handshakes, so 1-63 letters, digits, '.', '_' or '-'.\n");
-        }
+            int step = 0;
+            /* a restart (no at the summary) begins from nothing */
+            state.user_record_count = 0;
+            state.mask_record_count = 0;
+            memset(admin_name, 0, sizeof(admin_name));
+            memset(admin_pub_b64, 0, sizeof(admin_pub_b64));
+            pub_b64_keep[0] = id_fp[0] = sshfp[0] = '\0';
 
-        generate_uuid_v4(state.hub_uuid, sizeof(state.hub_uuid));
-        printf("Generated UUID: %s\n", state.hub_uuid);
-
-        {
-            char cfg_pass1[MAX_PASS], cfg_pass2[MAX_PASS];
-            do {
-                read_pass_hidden("Config Password: ", cfg_pass1, sizeof(cfg_pass1));
-                if (!cfg_pass1[0]) {
-                    printf("Password cannot be empty.\n");
+            cli_step(++step, "Listening");
+            cli_note("bind ip: one IPv4 address of this host to listen on, or empty for "
+                     "0.0.0.0 (every address).  Both are test-bound before going on.");
+            for (;;) {
+                char port_buf[16];
+                cli_ask("port", port_buf, sizeof(port_buf));
+                if (feof(stdin)) return 1;
+                char *end = NULL;
+                long v = strtol(port_buf, &end, 10);
+                if (!(port_buf[0] && end && *end == '\0' && v > 0 && v < 65536)) {
+                    cli_err("a port is 1-65535");
                     continue;
                 }
-                read_pass_hidden("Confirm Config Password: ", cfg_pass2, sizeof(cfg_pass2));
-                if (strcmp(cfg_pass1, cfg_pass2) != 0) {
-                    printf("Passwords do not match. Try again.\n");
+                state.port = (int)v;
+                char bind_buf[sizeof(state.bind_ip)];
+                memset(bind_buf, 0, sizeof(bind_buf));
+                cli_ask("bind ip (empty = 0.0.0.0)", bind_buf, sizeof(bind_buf));
+                if (feof(stdin)) return 1;
+                struct in_addr ba;
+                if (bind_buf[0] && inet_pton(AF_INET, bind_buf, &ba) != 1) {
+                    cli_err("not an IPv4 address (a.b.c.d), or leave it empty for 0.0.0.0");
+                    continue;
                 }
-            } while (!cfg_pass1[0] || strcmp(cfg_pass1, cfg_pass2) != 0);
-            hub_set_config_pass(&state, cfg_pass1);
-            secure_wipe(cfg_pass1, sizeof(cfg_pass1));
-            secure_wipe(cfg_pass2, sizeof(cfg_pass2));
-        }
-
-        /* Per-hub independent keypair (no shared-keypair mesh).
-         * Generate fresh; export only the public key.  The private key stays
-         * inside the encrypted .irchub.cnf — no plaintext hub_private.b64
-         * file is dumped any more. */
-        {
-            unsigned char priv64[64], pub64[64];
-            printf("\n[*] Generating per-hub Curve25519 keypair (Ed25519 + X25519)...\n");
-            if (!hub_crypto_generate_combined_keypair(priv64, pub64)) {
-                printf("Key generation failed.\n");
-                return 1;
-            }
-            hub_crypto_split_combined(priv64, state.hub_ed25519_priv, state.hub_x25519_priv);
-            hub_crypto_split_combined(pub64,  state.hub_ed25519_pub,  state.hub_x25519_pub);
-            state.hub_keys_loaded = true;
-
-            char *pub_b64 = base64_encode(pub64, 64);
-            secure_wipe(priv64, 64);
-            if (pub_b64) {
-                /* Dump the public key only.  The private key is persisted
-                 * inside the AES-256-GCM encrypted .irchub.cnf. */
-                int pfd = open("hub_public.b64",
-                               O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (pfd >= 0) {
-                    FILE *fpu = fdopen(pfd, "w");
-                    if (fpu) { fprintf(fpu, "%s", pub_b64); fclose(fpu); }
-                    else close(pfd);
+                snprintf(state.bind_ip, sizeof(state.bind_ip), "%s",
+                         bind_buf[0] ? bind_buf : "0.0.0.0");
+                char why[160];
+                if (!setup_test_bind(state.bind_ip, state.port, why, sizeof(why))) {
+                    cli_err("cannot listen on %s:%d: %s", state.bind_ip, state.port, why);
+                    continue;
                 }
-                printf("[+] Public key saved to: hub_public.b64\n");
-                printf("[+] Public key: %s\n\n", pub_b64);
-                printf("    ┌─────────────────────────────────────────────────┐\n");
-                printf("    │ Save this public key + this hub's UUID.         │\n");
-                printf("    │   - Bots adding this hub need its ip:port and   │\n");
-                printf("    │     public key (ircbot -setup asks for both).   │\n");
-                printf("    │   - Other hubs adding this hub need the         │\n");
-                printf("    │     UUID + ip:port + pubkey (console: hub add). │\n");
-                printf("    │ The hub's PRIVATE key never leaves this machine │\n");
-                printf("    │ (stored encrypted inside .irchub.cnf).          │\n");
-                printf("    └─────────────────────────────────────────────────┘\n");
-                free(pub_b64);
+                cli_ok("%s:%d is free%s", state.bind_ip, state.port,
+                       bind_buf[0] ? "" : " (0.0.0.0: every address of this host)");
+                break;
             }
-            printf("[+] Curve25519 keypair generated.\n");
+
+            /* What other hubs and bots should dial.  Display only: it fills the
+             * paste lines below, and the running hub looks it up again at every
+             * start and daily (public| in the config). */
+            cli_step(++step, "Public address");
+            cli_note("Looked up over DNS (OpenDNS, then Google, then Cloudflare).");
             {
-                /* What ssh shows admins on their first login to the console. */
-                char sshfp[80];
-                console_ssh_fingerprint(state.hub_ed25519_pub, sshfp, sizeof(sshfp));
-                printf("[+] SSH console host key: ssh-ed25519 %s\n", sshfp);
-                printf("    Admins check it on first connect (keygen --ssh-fingerprint\n");
-                printf("    hub_public.b64 prints the same line).\n");
-                printf("[+] ./irchub -id prints this hub's uuid and keys again at any time.\n");
-            }
-        }
-        (void)ch;
-
-        /* Admin user setup — creates the first a| and m| records.  Admins
-         * have no password: the operator generates the admin's keypair on the
-         * admin's own machine (keygen <name>) and imports only the PUBLIC key
-         * here.  The hub never sees or prints a user's private key. */
-        printf("\n--- First Admin Setup ---\n");
-        printf("This creates the first named admin, who can log into the hub's SSH\n");
-        printf("console and command bots over IRC. Admins sign in with a Curve25519 key,\n");
-        printf("not a password: on the admin's own machine run\n");
-        printf("    ./keygen <name>      (irchub/bin/keygen or ircbot/utils/keygen)\n");
-        printf("keep the <ts>_<name>.private.b64 there (chmod 600), and give this\n");
-        printf("wizard the <ts>_<name>.public.b64.\n\n");
-        {
-            char bot_admin_name[64] = {0};
-
-            /* Name */
-            while (bot_admin_name[0] == '\0') {
-                printf("Admin friendly name (no spaces, e.g. admin): ");
-                fflush(stdout);
-                if (!fgets(bot_admin_name, sizeof(bot_admin_name), stdin)) break;
-                bot_admin_name[strcspn(bot_admin_name, "\n")] = '\0';
-                if (strchr(bot_admin_name, ' ') || strchr(bot_admin_name, '|')) {
-                    printf("Name cannot contain spaces or '|'. Try again.\n");
-                    bot_admin_name[0] = '\0';
+                int src = -1;
+                if (hub_pubip_lookup(state.public_ip, sizeof(state.public_ip), &src)) {
+                    state.public_ip_at = time(NULL);
+                    cli_ok("%s (%s)", state.public_ip,
+                           src >= 0 ? hub_pubip_source_name(src) : "test hook");
+                } else {
+                    state.public_ip[0] = '\0';
+                    state.public_ip_at = 0;
+                    cli_note("no answer: the lines below show <this-hub's-address>; the "
+                             "running hub tries again at start (hub show prints it).");
                 }
             }
-            if (!bot_admin_name[0]) {
-                fprintf(stderr, "No admin name given; setup aborted.\n");
-                return 1;
+
+            cli_step(++step, "Name");
+            cli_note("Shown on every console and in the mesh; 1-63 letters, digits, '.', '_' "
+                     "or '-'.");
+            for (;;) {
+                char name_buf[128];
+                cli_ask("name", name_buf, sizeof(name_buf));
+                if (feof(stdin)) {
+                    cli_err("no hub name given");
+                    return 1;
+                }
+                if (strlen(name_buf) > 63) {
+                    cli_err("longer than 63 characters");
+                    continue;
+                }
+                if (hub_name_valid(name_buf)) {
+                    memcpy(state.hub_friendly_name, name_buf, strlen(name_buf) + 1);
+                    break;
+                }
+                cli_err("it is written into config lines and hub handshakes: 1-63 letters, "
+                        "digits, '.', '_' or '-'");
             }
 
-            /* Public key: pasted, or a path to the .public.b64 */
-            char admin_pub_b64[COMBINED_KEY_B64 + 1] = {0};
-            if (!setup_read_pubkey(bot_admin_name, admin_pub_b64)) {
-                fprintf(stderr, "No public key given; setup aborted.\n");
+            cli_step(++step, "Config password");
+            {
+                char cfg_pass1[MAX_PASS], cfg_pass2[MAX_PASS];
+                for (;;) {
+                    cli_ask_secret("password", cfg_pass1, sizeof(cfg_pass1));
+                    cli_ask_secret("confirm", cfg_pass2, sizeof(cfg_pass2));
+                    bool same = cfg_pass1[0] && strcmp(cfg_pass1, cfg_pass2) == 0;
+                    if (same) {
+                        cli_ok("the passwords match");
+                        break;
+                    }
+                    if (feof(stdin)) return 1;
+                    cli_err("the passwords do not match, or are empty: again");
+                }
+                hub_set_config_pass(&state, cfg_pass1);
+                secure_wipe(cfg_pass1, sizeof(cfg_pass1));
+                secure_wipe(cfg_pass2, sizeof(cfg_pass2));
+            }
+
+            /* Per-hub independent keypair (no shared-keypair mesh).
+             * Generate fresh; export only the public key.  The private key stays
+             * inside the encrypted .irchub.cnf — no plaintext hub_private.b64
+             * file is dumped any more. */
+            cli_step(++step, "Identity (generated here, Curve25519)");
+            generate_uuid_v4(state.hub_uuid, sizeof(state.hub_uuid));
+            {
+                unsigned char priv64[64], pub64[64];
+                if (!hub_crypto_generate_combined_keypair(priv64, pub64)) {
+                    cli_err("key generation failed");
+                    return 1;
+                }
+                hub_crypto_split_combined(priv64, state.hub_ed25519_priv, state.hub_x25519_priv);
+                hub_crypto_split_combined(pub64,  state.hub_ed25519_pub,  state.hub_x25519_pub);
+                state.hub_keys_loaded = true;
+                hub_crypto_key_fingerprint(pub64, id_fp);
+
+                char *pub_b64 = base64_encode(pub64, 64);
+                secure_wipe(priv64, 64);
+                if (pub_b64) {
+                    snprintf(pub_b64_keep, sizeof(pub_b64_keep), "%s", pub_b64);
+                    /* Dump the public key only.  The private key is persisted
+                     * inside the AES-256-GCM encrypted .irchub.cnf. */
+                    int pfd = open("hub_public.b64",
+                                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (pfd >= 0) {
+                        FILE *fpu = fdopen(pfd, "w");
+                        if (fpu) { fprintf(fpu, "%s", pub_b64); fclose(fpu); }
+                        else close(pfd);
+                    }
+                    free(pub_b64);
+                }
+                /* What ssh shows admins on their first login to the console. */
+                console_ssh_fingerprint(state.hub_ed25519_pub, sshfp, sizeof(sshfp));
+                cli_kv("uuid", "%s", state.hub_uuid);
+                cli_kv("public key", "%s", pub_b64_keep);
+                cli_kv("fingerprint", "%s", id_fp);
+                cli_kv("host key", "ssh-ed25519 %s", sshfp);
+                cli_note("The public key is also in hub_public.b64; the private key never "
+                         "leaves this machine (it is stored encrypted in %s).  ./irchub -id "
+                         "prints all of this again at any time.", HUB_CONFIG_FILE);
+            }
+
+            /* Admin user setup — creates the first a| and m| records.  Admins
+             * have no password: the operator generates the admin's keypair on the
+             * admin's own machine (keygen <name>) and imports only the PUBLIC key
+             * here.  The hub never sees or prints a user's private key. */
+            cli_step(++step, "First admin");
+            cli_note("The first named admin can log in to this hub's SSH console and command "
+                     "bots over IRC.  Admins sign in with a Curve25519 key, not a password: on "
+                     "the admin's own machine run ./keygen <name> (irchub/bin/keygen or "
+                     "ircbot/utils/keygen), keep the <ts>_<name>.private.b64 there (chmod 600) "
+                     "and give the <ts>_<name>.public.b64 here.");
+            while (admin_name[0] == '\0') {
+                cli_ask("name", admin_name, sizeof(admin_name));
+                if (feof(stdin)) break;
+                if (strchr(admin_name, ' ') || strchr(admin_name, '|')) {
+                    cli_err("a name with no spaces or '|' (e.g. admin)");
+                    admin_name[0] = '\0';
+                }
+            }
+            if (!admin_name[0]) {
+                cli_err("no admin name given: setup stopped");
+                return 1;
+            }
+            if (!setup_read_pubkey(admin_name, admin_pub_b64)) {
+                cli_err("no public key given: setup stopped");
                 return 1;
             }
 
             /* Generate UUID and create the user record */
-            char new_uuid[37];
-            generate_uuid_v4(new_uuid, sizeof(new_uuid));
+            generate_uuid_v4(admin_uuid, sizeof(admin_uuid));
             time_t now = time(NULL);
-
             if (state.user_record_count < MAX_HUB_USER_RECORDS) {
                 hub_user_record_t *u = &state.user_records[state.user_record_count++];
                 memset(u, 0, sizeof(*u));
-                snprintf(u->uuid,       sizeof(u->uuid),       "%s", new_uuid);
-                snprintf(u->name,       sizeof(u->name),       "%s", bot_admin_name);
+                snprintf(u->uuid,       sizeof(u->uuid),       "%s", admin_uuid);
+                snprintf(u->name,       sizeof(u->name),       "%s", admin_name);
                 snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", admin_pub_b64);
                 u->has_pubkey = true;
                 u->type = 'a'; u->is_active = true; u->timestamp = now;
             }
 
-            /* Collect usermasks in a loop */
+            cli_note("Usermasks the admin is known by on IRC (e.g. nick!*@*.example.com); an "
+                     "empty line ends the list, at least one.");
             int masks_added = 0;
-            printf("\nEnter usermasks for this admin (e.g. nick!*@*.example.com).\n");
-            printf("Press Enter with no mask when done (at least one required).\n\n");
             while (state.mask_record_count < MAX_HUB_USER_MASKS) {
-                char mask_buf[MAX_MASK_LEN] = {0};
-                printf("Usermask %d%s: ", masks_added + 1,
-                       masks_added == 0 ? " (required)" : " (or Enter to finish)");
-                fflush(stdout);
-                if (!fgets(mask_buf, sizeof(mask_buf), stdin)) break;
-                mask_buf[strcspn(mask_buf, "\n")] = '\0';
+                char mask_buf[MAX_MASK_LEN] = {0}, label[24];
+                snprintf(label, sizeof(label), "usermask %d", masks_added + 1);
+                cli_ask(label, mask_buf, sizeof(mask_buf));
+                if (feof(stdin)) break;
                 if (mask_buf[0] == '\0') {
                     if (masks_added == 0) {
-                        printf("At least one usermask is required.\n");
+                        cli_err("at least one usermask");
                         continue;
                     }
                     break;
                 }
                 if (!strchr(mask_buf, '!') || !strchr(mask_buf, '@')) {
-                    printf("Invalid — mask must contain '!' and '@'. Try again.\n");
+                    cli_err("a usermask holds '!' and '@' (nick!user@host)");
                     continue;
                 }
                 hub_mask_record_t *m = &state.mask_records[state.mask_record_count++];
                 memset(m, 0, sizeof(*m));
-                snprintf(m->uuid, sizeof(m->uuid), "%s", new_uuid);
+                snprintf(m->uuid, sizeof(m->uuid), "%s", admin_uuid);
                 snprintf(m->mask, sizeof(m->mask), "%s", mask_buf);
                 m->is_active = true; m->timestamp = now;
                 masks_added++;
             }
 
-            printf("[+] Admin '%s' created with %d usermask(s), UUID %s\n",
-                   bot_admin_name, masks_added, new_uuid);
-            printf("    Their SSH key:     <ts>_%s_ed25519 (keygen writes it with the IRC key)\n",
-                   bot_admin_name);
-            printf("    then log in with:  ssh -i <ts>_%s_ed25519 -p <hub port> %s@<hub>\n",
-                   bot_admin_name, bot_admin_name);
+            /* The summary: every answer, and what to paste elsewhere. */
+            cli_summary("Summary");
+            cli_skv("name", "%s", state.hub_friendly_name);
+            cli_skv("listening", "%s:%d%s", state.bind_ip, state.port,
+                    strcmp(state.bind_ip, "0.0.0.0") == 0 ? " (every address)" : "");
+            cli_skv("public", "%s", state.public_ip[0] ? state.public_ip : "(not found)");
+            cli_skv("uuid", "%s", state.hub_uuid);
+            cli_skv("key", "%s", id_fp);
+            cli_skv("host key", "ssh-ed25519 %s", sshfp);
+            {
+                unsigned char raw[COMBINED_KEY_LEN];
+                char fp[KEY_FP_LEN + 1] = "";
+                if (hub_crypto_pubkey_b64_decode(admin_pub_b64, raw))
+                    hub_crypto_key_fingerprint(raw, fp);
+                cli_skv("admin", "%s %s key %s", admin_name, cli_g(CLI_G_DOT), fp[0] ? fp : "?");
+            }
+            for (int i = 0; i < state.mask_record_count; i++)
+                cli_skv(i == 0 ? "usermasks" : "", "%s", state.mask_records[i].mask);
+            cli_skv("admin login", "ssh -i <ts>_%s_ed25519 -p %d %s@%s", admin_name,
+                    state.port, admin_name,
+                    hub_dial_address(&state) ? hub_dial_address(&state) : "<this hub>");
+            print_paste_lines(&state, pub_b64_keep);
+            cli_rule();
+            if (cli_ask_yes("write " HUB_CONFIG_FILE "?", true)) break;
+            if (feof(stdin)) return 1;
+            cli_note("Starting over.");
+            secure_wipe(state.hub_ed25519_priv, 32);
+            secure_wipe(state.hub_x25519_priv,  32);
+            secure_wipe(state.config_pass, sizeof(state.config_pass));
         }
 
         hub_config_write(&state);
         secure_wipe(state.config_pass, sizeof(state.config_pass));
         hub_config_key_forget(&state);
-        printf("Done.\n");
+        printf("\n");
+        cli_ok("wrote %s and hub_public.b64", HUB_CONFIG_FILE);
+        cli_kv("next", "./irchub -p, then ./irchub");
+        cli_note("-p writes a machine-bound password file, so the hub starts without typing "
+                 "the password; ./irchub alone asks for it.  The admin's SSH key is the "
+                 "<ts>_%s_ed25519 keygen wrote with the IRC key.", admin_name);
+        printf("\n");
 
         secure_wipe(state.hub_ed25519_priv, 32);
         secure_wipe(state.hub_x25519_priv,  32);
@@ -1522,25 +1613,30 @@ int main(int argc, char *argv[]) {
     /* -p: create/replace .irchub.pass from an interactive password prompt */
     if (passfile_mode) {
         char pass1[MAX_PASS], pass2[MAX_PASS];
+        cli_header("irchub", HUB_VERSION, "password file");
+        cli_note("%s holds the config password, bound to this machine, so the hub starts "
+                 "without typing it.", HUB_PASS_FILE);
+        printf("\n");
         do {
-            read_pass_hidden("Config Password: ",         pass1, sizeof(pass1));
+            cli_ask_secret("password", pass1, sizeof(pass1));
             if (!pass1[0]) {
-                fprintf(stderr, "Password cannot be empty.\n");
+                cli_err("the password cannot be empty");
                 return 1;
             }
-            read_pass_hidden("Confirm Config Password: ", pass2, sizeof(pass2));
-            if (strcmp(pass1, pass2) != 0)
-                printf("Passwords do not match. Try again.\n");
+            cli_ask_secret("confirm", pass2, sizeof(pass2));
+            if (strcmp(pass1, pass2) != 0) cli_err("the passwords do not match: again");
         } while (strcmp(pass1, pass2) != 0);
 
         bool ok = passfile_create(HUB_PASS_FILE, pass1);
         secure_wipe(pass1, sizeof(pass1));
         secure_wipe(pass2, sizeof(pass2));
         if (ok) {
-            printf("Saved: %s (0600, machine-bound)\n", HUB_PASS_FILE);
+            cli_ok("wrote %s (0600, bound to this machine)", HUB_PASS_FILE);
+            cli_kv("next", "./irchub");
+            printf("\n");
             return 0;
         }
-        fprintf(stderr, "Failed to create %s.\n", HUB_PASS_FILE);
+        cli_err("could not write %s", HUB_PASS_FILE);
         return 1;
     }
 

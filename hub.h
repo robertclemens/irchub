@@ -149,6 +149,10 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * burst (a mass reconnect sends two per bot, and each reaches every hub), the
  * bots get one push per this many seconds, carrying the latest state. */
 #define BOT_CONFIG_PUSH_COALESCE 1
+/* A bot's first config on a link waits for its presence (the version says
+ * whether it takes the pool's N|/S|/R| lines), at most this many seconds:
+ * one full config with the pool instead of a pool-less one plus a delta. */
+#define CFG_FIRST_HOLD 2
 #define MAX_RECENT_PURGES 64
 #define PURGE_DEDUP_WINDOW 3600          // seconds an id'd purge is remembered
 #define PURGE_ID_HEX 16                  // PURGE|<cutoff>|<id>: 8 random bytes, hex
@@ -448,6 +452,13 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  *              is a reserved slot, always 0 and never read)
  *   ELECT_DO   hub->hub  eid|hub_uuid|elect
  *   ELECT_DONE hub->hub  eid|hub_uuid|hub_name|bot_uuid|bot_nick|status|detail
+ *   ELECT_END  hub->hub  eid  (2.5.4: the origin's election is over; every
+ *              hub frees its copy and passes it on once)
+ * A batched own-op election (2.5.4, docs/plans/2026-11-24_elect_batch_plan.md)
+ * serves several bots' own op at once: DO / DONE ids are <eid>.<target bot
+ * uuid>, ELECT_DO adds a 4th field "uuid,uuid,..." (the targets still
+ * waiting), the picked hub sends ELECT_DONE <eid>.<uuid> per target and then
+ * one plain ELECT_DONE (ok: all served, fail: some left).
  * kind = op / invite / unban / key / mode / kick / ban; requester = a bot
  * uuid, or ADMIN.  kick: nick = the target, hostmask = the reason (may be
  * empty).  ban: hostmask = the mask, nick empty on the hubs and "*" in DO
@@ -460,6 +471,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define CMD_CHAN_ELECT_ACK   0x72
 #define CMD_CHAN_ELECT_DO    0x73
 #define CMD_CHAN_ELECT_DONE  0x74
+#define CMD_CHAN_ELECT_END   0x99
 /* 2.5.4 `channel who` (docs/plans/2026-11-21_channel_who_plan.md): election
  * kind "who" -- any bot in the channel whose WHO list is complete answers,
  * ops not needed.  The picked bot sends its view as CHAN_WHO chunks ahead of
@@ -485,15 +497,15 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * Gossiped hub <-> hub as a roster i| line after the bot's b| row (2.5.3 hubs
  * skip unknown roster tags). */
 #define CMD_BOT_IRC_LINK     0x96
-/* Hub -> bot (pool bots only), volatile: the load on each pool entry, one
- *   E|<entry_uuid>|<up>|<connecting>\n
- * per live entry.  up counts the bots on the entry's real servers (two names
- * for one server share it).  Built from this hub's bots and the roster, sent
- * on change at most every POOL_VIEW_GAP s, whole each time. */
-#define CMD_POOL_VIEW        0x85
-#define POOL_VIEW_GAP        2
+/* 0x85: reserved (an unreleased load view, replaced by the R| order). */
 #define POOL_VIEW_LINE_MAX   (POOL_UUID_LEN + 32)
 #define POOL_LINK_WORD_MAX   11
+/* CMD_BOT_CHAN_STATE (bot show's channels line): comma-separated tokens, one
+ * per managed channel: `@#a` opped, `%#a` halfop, `+#a` voiced, `#a` in,
+ * `-#a:<why>` out (CHAN_STATE_WHYS), a final `~N` = N more that did not fit.
+ * Validated whole (hub_chan_state_ok); carried in the roster as `j|`. */
+#define CHAN_STATE_MAX       1024
+#define CHAN_STATE_WHYS      "joining banned invite key full disabled kicked gate noirc"
 #define CHAN_WHO_MAX         32768  /* joined body: 500 nicks + topic + key  */
 #define CHAN_WHO_TOPIC_MAX   512    /* the bots keep a topic to this          */
 #define CMD_ADMIN_INVITE_USER 0x75 // Admin: invite a user (nick|#chan)
@@ -612,6 +624,17 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * dropped past CFG_RESYNC_TTL; the admin request carries the bot alone. */
 #define CMD_CFG_RESYNC         0x92  /* Hub <-> Hub: resync one bot or all      */
 #define CMD_ADMIN_BOT_RESYNC   0x93  /* Admin -> Hub: "<nick|uuid|all>"         */
+/* `server rebalance force` (2.5.4): move one bot onto the first server of its
+ * order.  Hub <-> hub flood "<id>|<ts>|<bot uuid>" (deduplicated by id,
+ * dropped past CFG_RESYNC_TTL, only to peers that take the pool); the bot's
+ * own hub sends it the frame with its own uuid, and the bot reconnects
+ * there unless it is on it already. */
+#define CMD_BOT_MOVE           0x98  /* Hub <-> Hub, Hub -> Bot                 */
+#define CMD_BOT_CHAN_STATE     0x9A  /* Bot -> Hub: its channels (bot show)      */
+#define CMD_BOT_HUB_MOVE       0x9B  /* Hub -> Bot: dial this pinned hub next    */
+#define CMD_ADMIN_BOT_MOVE     0x9C  /* console: bot move <bot> hub|server <to>  */
+#define REBALANCE_WAVE_MAX     5     /* bots moved at once (and <= a quarter)   */
+#define REBALANCE_WAVE_WAIT    120   /* s a wave may take before the next      */
 /* Console -> hub (2.5.4): the server pool.  list | add|<hp>|<k=v,...> |
  * set|<what>|<k=v,...> | del|<what>|<0|1 force> | clear|<what> | net |
  * netset|<k=v,...>.  The changing forms need +s. */
@@ -676,7 +699,24 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * HOLD_MAX + PROBE + MESH + DO + HUB_WAIT stays within CHAN_ELECT_TTL. */
 #define CHAN_ELECT_SETTLE     10
 #define CHAN_ELECT_HOLD_MAX   10
-#define MAX_CHAN_ELECTIONS    16
+/* Every hub holds a copy of every election it relays, so the table is the
+ * mesh's elections in flight, not this hub's: 16 filled on a 10-hub net
+ * (nightly 2026-11-24).  ~25 KB each.  A relay with nothing to do frees
+ * its copy CHAN_ELECT_MESH_WAIT s after its answer (ce_tick). */
+#define MAX_CHAN_ELECTIONS    64
+/* A bot's own request (op / invite / key / unban) may take a slot only while
+ * fewer than MAX_CHAN_ELECTIONS - CHAN_ELECT_RESERVE are in flight: the rest
+ * stay free for console and person requests (2026-11-24). */
+#define CHAN_ELECT_RESERVE    16
+/* Own-op batching: an origin op election gathers the local bots' own op
+ * requests for its channel CHAN_ELECT_BATCH_WAIT s before it probes, up to
+ * CHAN_ELECT_BATCH_MAX bots; only when every hub known runs
+ * CHAN_ELECT_BATCH_MIN_HUB (which also gates ELECT_END). */
+#define CHAN_ELECT_BATCH_WAIT 1
+#define CHAN_ELECT_BATCH_MAX  32
+#define CHAN_ELECT_BATCH_MIN_HUB "2.5.4"
+/* "Election table full": one warning, then a count every this many s. */
+#define CHAN_ELECT_FULL_LOG   60
 #define CHAN_ELECT_REASON_MAX 48
 
 /* --- Network-wide upgrade coordination (console-initiated rolling upgrade).
@@ -1062,6 +1102,7 @@ typedef struct {
 #define USER_LINE_MAX     384    /* a|/o|: uuid+name+COMBINED_KEY_B64+stamps */
 #define MASK_LINE_MAX     352    /* m|: uuid+MAX_MASK_LEN */
 #define BLINE_MAX         448    /* b|<mask>|<uuid>|<pubkey>|<ts> trusted-bot line */
+#define HM_LINE_MAX       (3 + 20 + 1 + MAX_MASK_LEN + 1) /* hm|<ts>|<mask>\n, own mask */
 #define PEER_LINE_MAX     256    /* peer|/opt| sync lines */
 #define UF_LINE_MAX       96     /* uf|<uuid>|<flags>|<ts> */
 #define UC_LINE_MAX       160    /* uc|<uuid>|<chan>|add/del|<ts> */
@@ -1128,7 +1169,8 @@ typedef struct {
 #define MAX_POOL_TOMBS      64
 #define POOL_RECORDS_MAX \
   ( MAX_NETWORKS * POOL_N_LINE_MAX + \
-    (MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_S_LINE_MAX )
+    (MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_S_LINE_MAX + \
+    POOL_R_LINE_MAX )  /* a bot's R| order (in its payload only) */
 /* The oldest hub a peer must run to be sent N|/S| sync lines, and the oldest
  * bot sent them in its config.  A 2.5.3 hub reads an unknown sync key as a
  * per-bot line and creates a phantom bot "S"/"N". */
@@ -1165,6 +1207,7 @@ typedef struct { int rep; int live; } global_ban_slot_t;
     USER_ACCESS_RECORDS_MAX                + \
     BOT_SYNC_FIELDS      * BOT_FIELD_LINE  + \
     MAX_BOTS             * BLINE_MAX       + \
+    HM_LINE_MAX                                + \
     MODES_RECORDS_MAX                          + \
     POOL_RECORDS_MAX                           + \
     PAYLOAD_SLACK )
@@ -1831,7 +1874,8 @@ typedef struct {
    * link uses and its state ("connecting"/"up"/"down"/"idle", "" = unknown). */
   char   bot_irc_entry[POOL_UUID_LEN + 1];
   char   bot_irc_link[12];
-  bool   pool_view_sent;   /* had the current CMD_POOL_VIEW */
+  char   bot_irc_network[POOL_NET_NAME_MAX + 1]; /* 005 NETWORK= (IRC_LINK 4th field) */
+  char   bot_chan_state[CHAN_STATE_MAX];          /* CMD_BOT_CHAN_STATE, "" = none   */
   char   bot_variant[ROSTER_VARIANT_MAX + 1]; /* "c" / "rs", "" = unreported */
   char   bot_cron[CRON_STATUS_MAX + 1];       /* "" = unreported */
   int    cron_sent;                           /* last CMD_CRON_SET + 1, 0 = none */
@@ -1863,6 +1907,10 @@ typedef struct {
   size_t        cfg_next_len;
   bool          cfg_queued;
   bool          cfg_owed;
+  /* CFG_FIRST_HOLD: when the first config was held (0 = not held), and
+   * whether the hold is over (a config may go out). */
+  time_t        cfg_hold_at;
+  bool          cfg_hold_done;
   /* Hash-first anti-entropy (CMD_SYNC_DIGEST), for a peer link: rounds sent
    * (every SYNC_DIGEST_FULL_EVERY-th is full), the kinds that differed in
    * consecutive rounds and how many times, and the last stuck warning. */
@@ -1933,8 +1981,10 @@ typedef enum {
   CE_MESH_WAIT,  /* origin: flooded, collecting the other hubs' answers  */
   CE_MESH_DO,    /* origin: one hub was handed the action               */
   CE_ACKED,      /* relay: answered the origin, routing DO/DONE now     */
-  CE_HOLD        /* origin: its mesh view is still settling (restart or
+  CE_HOLD,       /* origin: its mesh view is still settling (restart or
                     relink); asks the mesh once it has, CHAN_ELECT_HOLD_MAX */
+  CE_GATHER      /* origin, batched own op: collecting the local bots' own op
+                    requests for CHAN_ELECT_BATCH_WAIT s before the probe   */
 } chan_elect_phase_t;
 
 typedef struct {
@@ -1953,10 +2003,23 @@ typedef struct {
   bool tried;
 } chan_elect_hub_t;
 
+/* One bot a batched own-op election serves.  st: p waiting, d handed to the
+ * current bot / hub, o opped, x denied (+bitch).  reply_fd -1 on a relay. */
+typedef struct {
+  char   uuid[64];
+  char   nick[MAX_NICK];
+  char   hostmask[MAX_MASK_LEN];
+  char   rid[USER_CHAN_RID_MAX + 1];
+  int    reply_fd;
+  uint64_t reply_serial;
+  char   st;
+} chan_elect_target_t;
+
 typedef struct {
   bool   active;
   char   id[64];
   bool   origin;
+  bool   flooded;                        /* origin: ELECT_FWD went out      */
   int    from_fd;
   uint64_t from_serial;                  /* from_fd's conn_serial         */
   int    admin_fd;
@@ -1994,6 +2057,10 @@ typedef struct {
   /* kind "who", origin only: the CHAN_WHO chunks joined (hub_chanwho.c;
    * freed by ce_release) */
   chanwho_acc_t who;
+  /* a batched own op (heap, CHAN_ELECT_BATCH_MAX; freed by ce_release); NULL
+   * for every other election.  tg[0] is the requester above. */
+  chan_elect_target_t *tg;
+  int    tg_n;
 } chan_elect_t;
 
 /* One roll call (see CMD_HUB_ROLLCALL).  As the asking hub: the hubs it waits
@@ -2035,6 +2102,8 @@ typedef struct {
   uint64_t p2_stamp;                      /* arrival order vs presence v2 records */
   char   irc_entry[POOL_UUID_LEN + 1];    /* pool: the entry its IRC link uses (i|) */
   char   irc_link[12];                    /* pool: connecting / up / down / idle    */
+  char   irc_network[POOL_NET_NAME_MAX + 1]; /* i| field 4: the server's NETWORK=     */
+  char   chan_state[CHAN_STATE_MAX];      /* j|: the bot's channels (bot show)       */
 } bot_roster_t;
 
 /* One peer link a hub reports in its roster gossip (an l| line): a peer it is
@@ -2166,7 +2235,7 @@ typedef struct {
   uint64_t cfg_pull;      /* CMD_CONFIG_PULLs served (a bot's hash check)   */
   uint64_t pool_reports;  /* CMD_SERVER_REPORTs taken in (server pool)       */
   uint64_t pool_flagged;  /* entries this hub flagged wrong network          */
-  uint64_t pool_views;    /* CMD_POOL_VIEW frames queued to bots             */
+  uint64_t pool_orders;   /* server-order recomputes that changed an order   */
   uint64_t tree_full;     /* whole bot trees queued (CMD_BOT_TREE)          */
   uint64_t tree_full_bytes;
   uint64_t tree_delta;    /* tree row deltas queued (CMD_BOT_TREE_DELTA)    */
@@ -2182,6 +2251,10 @@ typedef struct {
   uint64_t sd_match;      /* ... of which matched: nothing to repair        */
   uint64_t sd_kinds;      /* kinds that differed and were exchanged         */
   uint64_t sd_full;       /* whole-state fallbacks (stuck or malformed)     */
+  uint64_t el_started;    /* channel-request elections this hub held a copy of */
+  uint64_t el_batched;    /* own op requests that joined a batch instead     */
+  uint64_t el_refused;    /* ... refused: the table was full                */
+  uint64_t el_ended;      /* relay copies freed by ELECT_END                */
 } hub_stats_t;
 /* One per process (the daemon is single-threaded); defined in hub_logic.c. */
 extern hub_stats_t g_hub_stats;
@@ -2194,6 +2267,11 @@ typedef struct {
    * since take effect on the next start (the console's "pending"). */
   char listen_ip[64];
   int listen_port;
+  /* This hub's public IPv4 address as the DNS "what is my address" servers
+   * see it (hub_pubip.c): looked up at -setup, every start and daily, kept
+   * as public|<ip>|<ts>.  Display and advice only; never set by hand. */
+  char public_ip[64];
+  time_t public_ip_at;
   char hub_uuid[64];         // This hub's UUID
   char hub_friendly_name[64]; // This hub's friendly name
   /* /proc/self/exe — the binary an upgrade replaces, and the one
@@ -2975,9 +3053,26 @@ void hub_pool_peer_report(hub_state_t *state, hub_client_t *peer, const char *pa
 bool hub_peer_takes_pool(hub_state_t *state, const hub_client_t *c);
 /* CMD_BOT_IRC_LINK: store the bot's link state; true when it changed. */
 bool hub_pool_irc_link(hub_state_t *state, hub_client_t *client, const char *payload);
+bool hub_chan_state_ok(const char *s);
+bool hub_bot_chan_state(hub_state_t *state, hub_client_t *client, const char *payload);
 bool hub_pool_link_word_ok(const char *w);
-/* Once a second: send CMD_POOL_VIEW to the pool bots when it changed. */
-void hub_pool_view_tick(hub_state_t *state, time_t now);
+/* Once a second: recompute the bots' server orders when their inputs changed
+ * (debounced) and owe every bot a config push when one did; the R| line of a
+ * bot (NULL when none). */
+void hub_pool_order_tick(hub_state_t *state, time_t now);
+/* The pace gap of a network with no N| stored (POOL_PACE_GAP_DEFAULT; test
+ * hook IRCHUB_TEST_POOL_PACE). */
+int hub_pool_default_pace(void);
+const char *hub_pool_order_line(const hub_state_t *state, const char *bot_uuid);
+bool hub_pool_order_first(const char *bot_uuid, char *first, size_t cap, int *slot, int *slots);
+bool hub_pool_order_place(const char *bot_uuid, const char *entry, int *place, int *of);
+int hub_pool_order_first_count(const char *srv_uuid);
+int hub_pool_order_bots(char (*uuids)[64], int max);
+const char *hub_pool_bot_link(const hub_state_t *state, const char *bot_uuid, char *entry,
+                              size_t cap);
+void hub_pool_bot_origin(const hub_state_t *state, const char *bot_uuid, char *out, size_t cap);
+/* `server rebalance force` driver (hub_logic.c), once a second. */
+void hub_rebalance_tick(hub_state_t *state, time_t now);
 /* The console: the view text (E| lines), bots idle for want of a server, an
  * entry by uuid or host[:port], a network's N| (default when none stored). */
 int hub_pool_view_text(hub_state_t *state, char *out, size_t cap);
@@ -3127,6 +3222,20 @@ bool hub_upgrade_marker_write(const char *upgrade_id, const char *target_ver,
  * config line carries, so a peer can never split or inject a config line. */
 bool hub_upgrade_plan_field_ok(const char *s);
 void hub_rollcall_tick(hub_state_t *state, time_t now);
+
+/* hub_pubip.c — public address lookup (OpenDNS, Google, Cloudflare). */
+#define PUBIP_SOURCES 3
+#define PUBIP_REFRESH 86400 /* a good answer is looked up again daily */
+#define PUBIP_RETRY 3600    /* after every server failed */
+bool hub_pubip_lookup(char *out, size_t cap, int *src);
+void hub_pubip_tick(hub_state_t *state, time_t now);
+bool hub_pubip_parse(int i, unsigned short id, const unsigned char *b, size_t n,
+                     char *out, size_t cap);
+bool hub_pubip_is_global(const char *ip);
+const char *hub_pubip_source_name(int i);
+/* The address other nodes should dial, for printouts: the public one when
+ * known, else a specific bind address, else NULL (a wildcard tells nobody). */
+const char *hub_dial_address(const hub_state_t *state);
 /* Reads and removes the hand-off marker hub_update_commit() left behind. */
 bool hub_update_take_pending(char *id_out, size_t id_size, char *ver_out,
                              size_t ver_size, char *variant_out,

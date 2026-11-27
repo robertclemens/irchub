@@ -27,7 +27,7 @@ OBJ_DIR = $(BUILD_DIR)/obj
 
 # Source files
 # One line: tools (the testnet) read this variable with a single-line match.
-HUB_SOURCES = hub_main.c cfg_delta.c sync_digest.c pool_rec.c hub_pool.c elf_needs.c hub_config.c hub_crypto.c hub_logic.c hub_storage.c hub_access.c hub_revoke.c hub_uhist.c hub_presence2.c hub_chanwho.c hub_modes.c hub_connlimits.c glob_overlap.c hub_update.c hub_reply.c hub_console.c hub_console_ui.c hub_console_fmt.c hub_console_core.c
+HUB_SOURCES = hub_main.c cli_fmt.c cfg_delta.c sync_digest.c pool_rec.c hub_pool.c elf_needs.c hub_config.c hub_pubip.c hub_crypto.c hub_logic.c hub_storage.c hub_access.c hub_revoke.c hub_uhist.c hub_presence2.c hub_chanwho.c hub_modes.c hub_connlimits.c glob_overlap.c hub_update.c hub_reply.c hub_console.c hub_console_ui.c hub_console_fmt.c hub_console_core.c
 
 # Object files
 HUB_OBJECTS = $(HUB_SOURCES:%.c=$(OBJ_DIR)/%.o)
@@ -82,6 +82,13 @@ endif
 # without the upgrade feature: every entry point in hub_update.c then reports it
 # unavailable instead of falling back to anything.
 CFLAGS += -DHAVE_CURL
+
+# make TEST_HOOKS=1: compile in the IRC_TEST_HOOKS environment overrides
+# (the testnet's and the README demo's, e.g. IRCHUB_TEST_PUBIP).  Never for a
+# release: mkreleases.py refuses a hooked binary.
+ifdef TEST_HOOKS
+CFLAGS += -DIRC_TEST_HOOKS
+endif
 
 # OpenSSL includes (adjust if needed)
 INCLUDES = -I/usr/include -I/usr/local/include
@@ -270,7 +277,7 @@ $(OBJ_DIR)/bcrypt_pbkdf.o: bcrypt_pbkdf.c bcrypt_pbkdf.h
 # Object Files
 # ============================================================================
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c hub.h cfg_delta.h sync_digest.h elf_needs.h pool_rec.h
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c hub.h cfg_delta.h sync_digest.h elf_needs.h pool_rec.h cli_fmt.h
 	@echo "Compiling $<..."
 	@$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 

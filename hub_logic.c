@@ -12,6 +12,7 @@
 #include <strings.h>
 #include <sys/select.h>
 
+static void cfg_hold_release(hub_state_t *state, hub_client_t *client);
 static void send_config_to_bot(hub_state_t *state, hub_client_t *client,
                                bool force);
 static void hub_broadcast_config_to_bots(hub_state_t *state, const char *config_line);
@@ -36,6 +37,20 @@ hub_stats_t g_hub_stats;
 
 static bool bot_takes_cfg_deltas(const hub_client_t *c);
 static int cfg_resync_local(hub_state_t *state, const char *target);
+/* `server rebalance force` (server order plan §7): the waves this hub drives. */
+typedef struct {
+  bool active;
+  int waves, moved;
+  char wave[REBALANCE_WAVE_MAX][64];
+  int wn;
+  time_t wave_at;
+  char by[64];
+  char done[MAX_BOTS][64]; /* moved once already: never again this run */
+  int ndone;
+} rebalance_t;
+static rebalance_t g_rebal;
+static bool rebalance_off_first(const hub_state_t *state, const char *uuid, char *cur, size_t ccap,
+                                char *first, size_t fcap);
 static int cfg_resync_flood(hub_state_t *state, hub_client_t *skip, const char *payload);
 static void process_peer_cfg_resync(hub_state_t *state, hub_client_t *peer, const char *payload);
 static void process_sync_digest(hub_state_t *state, hub_client_t *peer, const char *payload);
@@ -43,6 +58,8 @@ static void cfg_hex(const unsigned char h[32], char out[CFGD_HASH_HEX + 1]);
 
 /* Some bot's config frame was lost since the last flush (cfg_owed). */
 static bool g_cfg_owed;
+/* Bots whose first config is held for their presence (CFG_FIRST_HOLD). */
+static int g_cfg_holds;
 
 /* A config push that never reaches its bot must not stand as "sent", or the
  * next identical broadcast would be skipped and the bot left behind.  Nor may
@@ -695,6 +712,10 @@ static bool hub_rollup_note_result(hub_state_t *state, const char *payload);
 static bool hub_upgrade_result_relay(hub_state_t *state, hub_client_t *from,
                                      const char *payload);
 static bool hub_rollup_forget(hub_state_t *state, const char *why);
+static bool ce_batch_join(hub_state_t *state, hub_client_t *client, const char *channel,
+                          const char *nick, const char *hostmask, const char *rid);
+static bool ce_batch_ok(hub_state_t *state);
+static int ce_in_flight(const hub_state_t *state);
 static chan_elect_t *ce_start(hub_state_t *state, const char *kind, const char *channel,
                               const char *requester, const char *nick, const char *hostmask,
                               const hub_client_t *admin);
@@ -2436,8 +2457,10 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
 
   /* The bot's first config may have gone out before its version was known:
    * once it shows it takes the pool (or stops), it is owed one with (without)
-   * the N|/S| lines — a delta, since it already holds a base. */
-  if (hub_bot_version_takes_pool(client->bot_version) !=
+   * the N|/S| lines — a delta, since it already holds a base.  A held first
+   * config (CFG_FIRST_HOLD) has not gone out: it is sent below instead. */
+  bool held = client->cfg_hold_at && !client->cfg_hold_done;
+  if (!held && hub_bot_version_takes_pool(client->bot_version) !=
       hub_bot_version_takes_pool(version)) {
     client->cfg_owed = true;
     g_cfg_owed = true;
@@ -2450,6 +2473,7 @@ static void process_bot_presence(hub_state_t *state, hub_client_t *client,
                  client->bot_link_ord != (uint64_t)link_ord;
   client->bot_link_ord = (uint64_t)link_ord;
   snprintf(client->bot_version, sizeof(client->bot_version), "%s", version);
+  if (held) cfg_hold_release(state, client);
   snprintf(client->bot_server, sizeof(client->bot_server), "%s", server);
   snprintf(client->bot_variant, sizeof(client->bot_variant), "%s", variant);
   if (strcmp(client->bot_cron, cron) != 0) {
@@ -2624,7 +2648,8 @@ static int roster_round(hub_state_t *state, long long gen, int total,
 
     char nick[MAX_NICK];
     bot_nick_from_config(state, c->id, nick, sizeof(nick));
-    char row[TREE_ROW_MAX + CRON_STATUS_MAX + 48 + 128]; /* + the i| line */
+    /* + the i| and j| riders */
+    char row[TREE_ROW_MAX + CRON_STATUS_MAX + 48 + 128 + POOL_NET_NAME_MAX + CHAN_STATE_MAX + 48];
     /* 7th field: when the bot linked to this hub; 8th: the bot's address as
      * this hub sees it; 9th: its crontab status; 10th (phase 4): the bot's
      * link-order counter (a hub that predates any of them stops reading before
@@ -2642,10 +2667,16 @@ static int roster_round(hub_state_t *state, long long gen, int total,
     /* Server pool: the IRC link's entry and state, on the row's heels so a
      * chunk never splits the two (an older hub skips the i| tag). */
     if (c->bot_irc_link[0]) {
-      int il = snprintf(row + rl, sizeof(row) - (size_t)rl, "i|%s|%s|%s|%s|\n", c->id,
+      int il = snprintf(row + rl, sizeof(row) - (size_t)rl, "i|%s|%s|%s|%s|%s|\n", c->id,
                         POOL_DEFAULT_NET, c->bot_irc_entry[0] ? c->bot_irc_entry : "-",
-                        c->bot_irc_link);
+                        c->bot_irc_link, c->bot_irc_network[0] ? c->bot_irc_network : "-");
       if (il > 0 && il < (int)sizeof(row) - rl) rl += il;
+      else row[rl] = '\0';
+    }
+    /* bot show's channels line (an older hub skips the j| tag) */
+    if (c->bot_chan_state[0]) {
+      int jl = snprintf(row + rl, sizeof(row) - (size_t)rl, "j|%s|%s|\n", c->id, c->bot_chan_state);
+      if (jl > 0 && jl < (int)sizeof(row) - rl) rl += jl;
       else row[rl] = '\0';
     }
 
@@ -2935,7 +2966,7 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
     if (strncmp(line, "i|", 2) == 0) {
       /* Server pool: a bot's IRC link, right after its b| row (upserted above). */
       if (!hub_uuid[0] || strcmp(hub_uuid, "-") == 0) continue;
-      char bu[64] = "", ent[POOL_UUID_LEN + 2] = "", lk[POOL_LINK_WORD_MAX + 2] = "";
+      char bu[64] = "", ent[POOL_UUID_LEN + 2] = "", lk[POOL_LINK_WORD_MAX + 1] = "";
       if (!wire_field(line + 2, 0, bu, sizeof(bu)) || !wire_field(line + 2, 2, ent, sizeof(ent)) ||
           !wire_field(line + 2, 3, lk, sizeof(lk)))
         continue;
@@ -2946,8 +2977,31 @@ static void process_bot_roster(hub_state_t *state, hub_client_t *from,
         if (strcmp(e->bot_uuid, bu) != 0 || strcmp(e->hub_uuid, hub_uuid) != 0) continue;
         roster_clean(e->irc_entry, sizeof(e->irc_entry), strcmp(ent, "-") ? ent : "");
         snprintf(e->irc_link, sizeof(e->irc_link), "%s", lk);
+        /* field 4 (2.5.4): NETWORK=; absent or bad reads as unknown */
+        char nw[POOL_NET_NAME_MAX + 1] = ""; /* wire_field refuses a longer field */
+        bool has_nw = wire_field(line + 2, 4, nw, sizeof(nw)) && strcmp(nw, "-") != 0 &&
+                      pool_net_name_ok(nw);
+        snprintf(e->irc_network, sizeof(e->irc_network), "%s", has_nw ? nw : "");
         break;
       }
+      continue;
+    }
+    if (strncmp(line, "j|", 2) == 0) {
+      /* bot show's channels line, right after its b| row */
+      if (!hub_uuid[0] || strcmp(hub_uuid, "-") == 0) continue;
+      char bu[64] = "";
+      char *list = malloc(CHAN_STATE_MAX + 2);
+      if (!list) continue;
+      if (wire_field(line + 2, 0, bu, sizeof(bu)) &&
+          wire_field(line + 2, 1, list, CHAN_STATE_MAX + 2) && hub_chan_state_ok(list)) {
+        for (int r = 0; r < state->roster_count; r++) {
+          bot_roster_t *e = &state->roster[r];
+          if (strcmp(e->bot_uuid, bu) != 0 || strcmp(e->hub_uuid, hub_uuid) != 0) continue;
+          snprintf(e->chan_state, sizeof(e->chan_state), "%s", list);
+          break;
+        }
+      }
+      free(list);
       continue;
     }
     if (strncmp(line, "l|", 2) == 0) {
@@ -4152,7 +4206,31 @@ static void broadcast_full_config_to_all_bots(hub_state_t *state) {
 
 static void send_owed_bot_config(hub_state_t *state, time_t now);
 
+/* End a bot's first-config hold: the config goes out now (full). */
+static void cfg_hold_release(hub_state_t *state, hub_client_t *client) {
+  if (client->cfg_hold_done) return;
+  client->cfg_hold_done = true;
+  client->cfg_hold_at = 0;
+  send_config_to_bot(state, client, true);
+}
+
 void hub_flush_bot_config(hub_state_t *state, time_t now) {
+  if (g_cfg_holds > 0) {
+    /* recounted here: a held bot that dropped its link leaves no count */
+    int held = 0;
+    for (int i = 0; i < state->client_count; i++) {
+      hub_client_t *c = state->clients[i];
+      if (c->type != CLIENT_BOT || !c->cfg_hold_at || c->cfg_hold_done) continue;
+      if (now - c->cfg_hold_at < CFG_FIRST_HOLD) {
+        held++;
+        continue;
+      }
+      hub_log_debug("[HUB] %s sent no presence within %d s: config sent without it\n",
+                    hub_who_client(state, c), CFG_FIRST_HOLD);
+      cfg_hold_release(state, c);
+    }
+    g_cfg_holds = held;
+  }
   if (now - state->last_bot_config_push < BOT_CONFIG_PUSH_COALESCE) return;
   if (state->bot_config_pending) {
     send_owed_bot_config(state, now); /* every bot, owed ones included */
@@ -5905,8 +5983,9 @@ static int network_hubs(hub_state_t *state, int *up) {
 }
 
 /* bot|uuid|nick|online|ver|base|started|server|hub|hub_uuid|hub_name|ip|
- *     since|fp|seen|auth|auth_ts — every field the hub has for one bot.
- *     started is the bot's own start (uptime), since its link to its hub. */
+ *     since|fp|seen|auth|auth_ts|mask|network|link|place|of|chans — every
+ *     field the hub has for one bot.  started is the bot's own start
+ *     (uptime), since its link to its hub; mask the stored h (also offline). */
 static void reply_bot(hub_state_t *state, reply_t *r, const bot_config_t *b) {
   const config_entry_t *n = bot_entry_rec(b, "n");
   hub_client_t *c = local_bot_client(state, b->uuid);
@@ -5921,6 +6000,20 @@ static void reply_bot(hub_state_t *state, reply_t *r, const bot_config_t *b) {
   reply_kv(r, "uuid", b->uuid);
   if (n && n->value[0]) reply_kv(r, "nick", n->value);
   reply_kvb(r, "online", c || e);
+  const config_entry_t *h = bot_entry_rec(b, "h");
+  if (h && h->value[0]) reply_kv(r, "mask", h->value);
+  const char *net = c ? c->bot_irc_network : e ? e->irc_network : "";
+  const char *link = c ? c->bot_irc_link : e ? e->irc_link : "";
+  const char *ent = c ? c->bot_irc_entry : e ? e->irc_entry : "";
+  const char *chans = c ? c->bot_chan_state : e ? e->chan_state : "";
+  if (net[0]) reply_kv(r, "network", net);
+  if (link[0]) reply_kv(r, "link", link);
+  int place = 0, of = 0;
+  if (hub_pool_order_place(b->uuid, ent, &place, &of)) {
+    reply_kvi(r, "place", place);
+    reply_kvi(r, "of", of);
+  }
+  if (chans[0]) reply_kv(r, "chans", chans);
   if (c) {
     if (c->bot_version[0]) reply_kv(r, "ver", c->bot_version);
     if (c->bot_variant[0]) reply_kv(r, "base", c->bot_variant);
@@ -6042,6 +6135,33 @@ static bool configured_peer_uuid(const hub_state_t *state, const char *uuid) {
   return false;
 }
 
+/* a and b are configured with each other, by either one's reported links. */
+static bool mesh_pair_linked(hub_state_t *state, const char *a, const char *b) {
+  const char *ab[2][2] = {{a, b}, {b, a}};
+  for (int k = 0; k < 2; k++) {
+    const mesh_hub_t *mh = mesh_hub_find(state, ab[k][0]);
+    if (!mh || !mh->have_links) continue;
+    for (int l = 0; l < mh->link_count; l++)
+      if (strcmp(mh->links[l].uuid, ab[k][1]) == 0) return true;
+  }
+  return false;
+}
+
+/* This hub and its configured peers are a full mesh of 3 or more: only then
+ * is a hub one of them links to, but this hub has not configured, a stray
+ * (Robert 2026-11-24).  On a ring, chain, star or tree it is the layout. */
+static bool configured_full_mesh(hub_state_t *state) {
+  if (state->peer_count < 2) return false;
+  for (int i = 0; i < state->peer_count; i++) {
+    if (!state->peers[i].uuid[0]) return false;
+    for (int j = i + 1; j < state->peer_count; j++)
+      if (state->peers[j].uuid[0] &&
+          !mesh_pair_linked(state, state->peers[i].uuid, state->peers[j].uuid))
+        return false;
+  }
+  return true;
+}
+
 /* link|a|b|b_name|state: every link a hub reported (its roster gossip), and
  * this hub's own; a pair nobody reported is "unknown" by its absence. */
 static void reply_links_of(hub_state_t *state, reply_t *r, const char *uuid) {
@@ -6071,6 +6191,143 @@ static void refs_hub_name(const char *name, const char *uuid, char *out, size_t 
  * holds its key (others: the bot's other hubs, by name, or ?<addr> for one
  * this hub has no key for) and botunrep|uuid|nick for bots that sent no list.
  * Read only. */
+/* Does the bot's hl| hub list hold this hub key (addr/fp,addr/fp...)? */
+static bool bot_hl_has(const bot_config_t *b, const unsigned char ed_pub[32]) {
+  const config_entry_t *hl = bot_entry_rec(b, "hl");
+  if (!hl || !hub_hublist_valid(hl->value)) return false;
+  char fp[HL_FP_LEN + 1];
+  hub_crypto_hl_fp(ed_pub, fp);
+  size_t fl = strlen(fp);
+  for (const char *p = hl->value; *p;) {
+    const char *end = strchr(p, ',');
+    if (!end) end = p + strlen(p);
+    const char *slash = memchr(p, '/', (size_t)(end - p));
+    if (slash && (size_t)(end - slash - 1) == fl && memcmp(slash + 1, fp, fl) == 0) return true;
+    p = *end ? end + 1 : end;
+  }
+  return false;
+}
+
+/* bot move <bot> hub <hub> | server <server>: payload bot|kind|target.  Run
+ * on the bot's home hub, like bot kick (a console elsewhere is told where it
+ * is).  hub: the target must be in the bot's own hl| list (a pinned key) and
+ * linked; the bot is sent that hub's Ed25519 key (CMD_BOT_HUB_MOVE) and dials
+ * it next, its IRC link kept.  server: a usable pool entry; CMD_BOT_MOVE
+ * <bot>|<entry> moves its IRC link there now. */
+static bool admin_bot_move(hub_state_t *state, hub_client_t *client, const char *payload) {
+  char sel[64] = "", kind[16] = "", to[272] = "", msg[256];
+  if (!payload || sscanf(payload, "%63[^|]|%15[^|]|%271[^|]", sel, kind, to) != 3 ||
+      (strcmp(kind, "hub") != 0 && strcmp(kind, "server") != 0))
+    return admin_err(state, client, "bot.usage", "say which bot, hub or server, and where",
+                     "bot move <bot> hub <hub>  |  bot move <bot> server <host[:port]>");
+  bot_config_t *b = bot_by_uuid(state, sel);
+  if (b && !b->is_active) b = NULL;
+  for (int i = 0; !b && i < state->bot_count; i++) {
+    const config_entry_t *n = bot_entry_rec(&state->bots[i], "n");
+    if (state->bots[i].is_active && n && strcasecmp(n->value, sel) == 0) b = &state->bots[i];
+  }
+  if (!b) {
+    snprintf(msg, sizeof(msg), "no registered bot is called or has the uuid \"%.64s\"", sel);
+    return admin_err(state, client, "bot.not_found", msg, "bot list");
+  }
+  char nick[MAX_NICK] = "";
+  bot_nick_from_config(state, b->uuid, nick, sizeof(nick));
+  const char *who = nick[0] ? nick : b->uuid;
+  hub_client_t *c = local_bot_client(state, b->uuid);
+  if (!c) {
+    const bot_roster_t *e = roster_best(state, b->uuid);
+    snprintf(msg, sizeof(msg), "%.64s is not connected to this hub", who);
+    reply_t r;
+    reply_init(&r);
+    if (e) {
+      char hint[160];
+      snprintf(hint, sizeof(hint), "it is on %.64s: move it there", e->hub_name);
+      reply_err(&r, "bot.not_local", msg, hint);
+      reply_kv(&r, "hub_name", e->hub_name);
+    } else {
+      reply_err(&r, "bot.offline", msg, "bot show");
+    }
+    return send_reply(state, client, &r);
+  }
+  reply_t r;
+  reply_init(&r);
+  if (strcmp(kind, "hub") == 0) {
+    int pi = peer_find(state, to);
+    bool self = strcasecmp(to, hub_display_name(state)) == 0 || strcmp(to, state->hub_uuid) == 0;
+    if (self) {
+      snprintf(msg, sizeof(msg), "%.64s is already on this hub", who);
+      reply_err(&r, "bot.move_refused", msg, NULL);
+      return send_reply(state, client, &r);
+    }
+    if (pi < 0) {
+      snprintf(msg, sizeof(msg), "no hub %.64s: none with that uuid or name", to);
+      return admin_err(state, client, "peer.not_found", msg, "hub list");
+    }
+    hub_peer_config_t *p = &state->peers[pi];
+    const char *why = !p->has_pubkey              ? "this hub holds no key for it"
+                      : !bot_hl_has(b, p->ed_pub) ? "it is not in the bot's hub list"
+                      : !peer_client(state, p)    ? "it is not linked"
+                                                  : NULL;
+    if (why) {
+      snprintf(msg, sizeof(msg), "%.64s cannot move to %.64s: %s", who,
+               p->friendly_name[0] ? p->friendly_name : to, why);
+      reply_err(&r, "bot.move_refused", msg, "hub list");
+      return send_reply(state, client, &r);
+    }
+    char *k = base64_encode(p->ed_pub, ED25519_KEY_LEN);
+    if (!k) return admin_err(state, client, "bot.move_refused", "out of memory", NULL);
+    queued_msg_t *m = queued_msg_new(CMD_BOT_HUB_MOVE, LANE_URGENT, (const unsigned char *)k,
+                                     (int)strlen(k));
+    free(k);
+    if (!m || !peer_enqueue(c, m)) {
+      if (m) queued_msg_free(m);
+      return admin_err(state, client, "bot.move_refused", "the bot's link is full", NULL);
+    }
+    hub_log_info("[HUB] %s: moving bot %s to hub %s\n", hub_who_client(state, client), who,
+                 p->friendly_name[0] ? p->friendly_name : p->uuid);
+    reply_ok(&r, "bot.moved");
+    reply_kv(&r, "bot", who);
+    reply_kv(&r, "kind", "hub");
+    reply_kv(&r, "from", hub_display_name(state));
+    reply_kv(&r, "to", p->friendly_name[0] ? p->friendly_name : p->uuid);
+    return send_reply(state, client, &r);
+  }
+  pool_srv_t s;
+  if (!hub_pool_find(state, to, &s) || s.deleted) {
+    snprintf(msg, sizeof(msg), "no server %.64s in the pool", to);
+    return admin_err(state, client, "server.not_found", msg, "server list");
+  }
+  if (s.state != POOL_OK || !hub_bot_version_takes_pool(c->bot_version)) {
+    snprintf(msg, sizeof(msg), "%.64s cannot move to %.64s: %s", who, s.host,
+             s.state != POOL_OK ? "that server is not usable" : "the bot takes no server pool");
+    reply_err(&r, "bot.move_refused", msg, "server list");
+    return send_reply(state, client, &r);
+  }
+  if (strcmp(c->bot_irc_entry, s.uuid) == 0 && strcmp(c->bot_irc_link, "up") == 0) {
+    snprintf(msg, sizeof(msg), "%.64s is already on %.64s", who, s.host);
+    reply_err(&r, "bot.move_refused", msg, NULL);
+    return send_reply(state, client, &r);
+  }
+  char pl[sizeof(c->id) + POOL_UUID_LEN + 2];
+  snprintf(pl, sizeof(pl), "%s|%s", c->id, s.uuid);
+  queued_msg_t *m = queued_msg_new(CMD_BOT_MOVE, LANE_URGENT, (const unsigned char *)pl,
+                                   (int)strlen(pl));
+  if (!m || !peer_enqueue(c, m)) {
+    if (m) queued_msg_free(m);
+    return admin_err(state, client, "bot.move_refused", "the bot's link is full", NULL);
+  }
+  hub_log_info("[HUB] %s: moving bot %s to server %s:%d\n", hub_who_client(state, client), who,
+               s.host, s.port);
+  char where[POOL_HOST_MAX + 16];
+  snprintf(where, sizeof(where), "%s:%d", s.host, s.port);
+  reply_ok(&r, "bot.moved");
+  reply_kv(&r, "bot", who);
+  reply_kv(&r, "kind", "server");
+  reply_kv(&r, "to", where);
+  reply_kv(&r, "note", "moved now; the server order may move it back at a rebalance");
+  return send_reply(state, client, &r);
+}
+
 static bool admin_peer_refs(hub_state_t *state, hub_client_t *client, const char *sel) {
   int ti = sel && sel[0] ? peer_find(state, sel) : -1;
   if (ti < 0) {
@@ -6265,6 +6522,7 @@ static bool admin_list_peers(hub_state_t *state, hub_client_t *client,
   reply_kvi(&r, "bots", local_bot_count(state));
   reply_kv(&r, "bind_ip", state->bind_ip[0] ? state->bind_ip : "0.0.0.0");
   reply_kvi(&r, "port", state->port);
+  if (state->public_ip[0]) reply_kv(&r, "public", state->public_ip);
   if (hub_update_cron_status()[0]) reply_kv(&r, "cron", hub_update_cron_status());
   {
     unsigned char pub64[64];
@@ -6317,7 +6575,8 @@ static bool admin_list_peers(hub_state_t *state, hub_client_t *client,
     reply_kvi(&r, "port", p->port);
     if (p->link_down_at > 0) reply_kvi(&r, "since", (long long)p->link_down_at);
   }
-  for (int i = 0; i < state->peer_count; i++) {
+  bool full = configured_full_mesh(state);
+  for (int i = 0; i < state->peer_count && full; i++) {
     const hub_peer_config_t *p = &state->peers[i];
     if (!p->uuid[0] || !peer_client(state, p)) continue;
     const mesh_hub_t *mh = mesh_hub_find(state, p->uuid);
@@ -6702,6 +6961,10 @@ static bool admin_hub_show(hub_state_t *state, hub_client_t *client) {
     reply_kv(&r, "pending_bind_ip", bind);
   if (state->listen_port && state->listen_port != state->port)
     reply_kvi(&r, "pending_port", state->port);
+  if (state->public_ip[0]) {
+    reply_kv(&r, "public", state->public_ip);
+    if (state->public_ip_at > 0) reply_kvi(&r, "public_at", (long long)state->public_ip_at);
+  }
   reply_kv(&r, "key", pub_b64);
   reply_kv(&r, "fp", fp);
   reply_kv(&r, "ssh_fp", ssh_fp);
@@ -7458,7 +7721,7 @@ static bool pool_effects(hub_state_t *state, hub_client_t *client, reply_t *r) {
 }
 
 static bool admin_pool(hub_state_t *state, hub_client_t *client, const char *payload) {
-  char sub[8] = "", what[POOL_HOST_MAX + 16] = "", kv[256] = "";
+  char sub[16] = "", what[POOL_HOST_MAX + 16] = "", kv[256] = "";
   if (!payload || !wire_field(payload, 0, sub, sizeof(sub)))
     return admin_err(state, client, "pool.usage", "server list, add, set, del or clear", "help server");
   wire_field(payload, 1, what, sizeof(what));
@@ -7498,6 +7761,7 @@ static bool admin_pool(hub_state_t *state, hub_client_t *client, const char *pay
       pool_rec_kv(&r, &s);
       reply_kvi(&r, "up", up);
       reply_kvi(&r, "connecting", conn);
+      reply_kvi(&r, "assigned", hub_pool_order_first_count(s.uuid));
       reply_kvi(&r, "ts", (long long)e->timestamp);
     }
     return send_reply(state, client, &r);
@@ -7509,6 +7773,7 @@ static bool admin_pool(hub_state_t *state, hub_client_t *client, const char *pay
     reply_kv(&r, "net", net.net_id);
     reply_kv(&r, "name", net.name);
     reply_kv(&r, "aliases", net.aliases);
+    reply_kvi(&r, "pace", net.pace_gap);
     reply_kvi(&r, "usable", hub_pool_eligible_count(state, POOL_DEFAULT_NET));
     reply_kvi(&r, "idle", hub_pool_idle_bots(state));
     reply_kvi(&r, "ts", (long long)net_ts);
@@ -7517,8 +7782,9 @@ static bool admin_pool(hub_state_t *state, hub_client_t *client, const char *pay
 
   if (!strcmp(sub, "netset")) {
     const char *k = what; /* netset|<k=v,...> */
-    if (!k[0] || !pool_kv_known(k, "name alias"))
-      return admin_err(state, client, "pool.usage", "network set name=<NETWORK> or alias=<a,b,...>",
+    if (!k[0] || !pool_kv_known(k, "name alias pace"))
+      return admin_err(state, client, "pool.usage",
+                       "network set name=<NETWORK>, alias=<a,b,...> or pace=<0-600>",
                        "help network set");
     char nv[POOL_NET_NAME_MAX + 2], v[sizeof(net.aliases)];
     if (pool_kv(k, "name", nv, sizeof(nv))) {
@@ -7538,6 +7804,10 @@ static bool admin_pool(hub_state_t *state, hub_client_t *client, const char *pay
         return admin_err(state, client, "pool.bad_value",
                          "aliases: up to 8 network names, comma separated (- for none)", NULL);
     }
+    char pv[16];
+    if (pool_kv(k, "pace", pv, sizeof(pv)) && !pool_num(pv, 0, POOL_PACE_GAP_MAX, &net.pace_gap))
+      return admin_err(state, client, "pool.bad_value",
+                       "pace is 0 to 600 seconds (0 = no pacing)", NULL);
     net.deleted = false;
     if (!hub_pool_net_put(state, &net))
       return admin_err(state, client, "pool.bad_value", "not a valid network record", NULL);
@@ -7546,7 +7816,96 @@ static bool admin_pool(hub_state_t *state, hub_client_t *client, const char *pay
     reply_kv(&r, "net", net.net_id);
     reply_kv(&r, "name", net.name);
     reply_kv(&r, "aliases", net.aliases);
+    reply_kvi(&r, "pace", net.pace_gap);
     return pool_effects(state, client, &r);
+  }
+
+  if (!strcmp(sub, "order")) {
+    /* order|[nick|uuid]: every bot's order (first server, slot), or one's */
+    static char ids[MAX_BOTS][64];
+    int n = hub_pool_order_bots(ids, MAX_BOTS);
+    reply_init(&r);
+    reply_ok(&r, "pool.order");
+    reply_kvi(&r, "pace", net.pace_gap);
+    int shown = 0;
+    for (int i = 0; i < n; i++) {
+      const bot_config_t *b = bot_by_uuid(state, ids[i]);
+      const config_entry_t *ne = b ? bot_entry_rec(b, "n") : NULL;
+      const char *nick = ne ? ne->value : NULL;
+      if (what[0] && strcmp(what, ids[i]) != 0 && !(nick && !strcasecmp(nick, what))) continue;
+      char first[POOL_UUID_LEN + 1], cur[POOL_UUID_LEN + 1];
+      int slot = 0, slots = 1;
+      if (!hub_pool_order_first(ids[i], first, sizeof(first), &slot, &slots)) continue;
+      const char *w = hub_pool_bot_link(state, ids[i], cur, sizeof(cur));
+      pool_srv_t fs, cs;
+      bool have_f = hub_pool_srv_get(state, first, &fs);
+      bool have_c = cur[0] && hub_pool_srv_get(state, cur, &cs);
+      reply_rec(&r, "order");
+      reply_kv(&r, "uuid", ids[i]);
+      reply_kv(&r, "nick", nick ? nick : "");
+      if (have_f) {
+        reply_kv(&r, "first", fs.host);
+        reply_kvi(&r, "first_port", fs.port);
+      }
+      reply_kvi(&r, "slot", slot);
+      reply_kvi(&r, "slots", slots);
+      reply_kv(&r, "link", w);
+      if (have_c) {
+        reply_kv(&r, "on", cs.host);
+        reply_kvi(&r, "on_port", cs.port);
+      }
+      reply_kvi(&r, "off", strcmp(w, "up") == 0 && cur[0] && strcmp(cur, first) != 0);
+      shown++;
+    }
+    if (what[0] && !shown)
+      return admin_err(state, client, "pool.no_order", "no server order for that bot",
+                       "server order");
+    return send_reply(state, client, &r);
+  }
+
+  if (!strcmp(sub, "rebalance")) {
+    /* rebalance|[force|stop]: preview, start the waves, or stop them */
+    static char ids[MAX_BOTS][64];
+    int n = hub_pool_order_bots(ids, MAX_BOTS), off = 0;
+    for (int i = 0; i < n; i++) {
+      char cur[POOL_UUID_LEN + 1], first[POOL_UUID_LEN + 1];
+      off += rebalance_off_first(state, ids[i], cur, sizeof(cur), first, sizeof(first));
+    }
+    reply_init(&r);
+    if (!strcmp(what, "stop")) {
+      bool was = g_rebal.active;
+      g_rebal.active = false;
+      g_rebal.wn = 0;
+      reply_ok(&r, "pool.rebalance");
+      reply_kv(&r, "state", was ? "stopped" : "idle");
+    } else if (!strcmp(what, "force")) {
+      if (g_rebal.active)
+        return admin_err(state, client, "pool.rebalancing", "a rebalance is already running here",
+                         "server rebalance stop");
+      memset(&g_rebal, 0, sizeof(g_rebal));
+      if (off) {
+        g_rebal.active = true;
+        snprintf(g_rebal.by, sizeof(g_rebal.by), "%s", mf_admin_name(client));
+        hub_log_info("[POOL] Rebalance started by %s: %d bot%s off their first server\n",
+                     g_rebal.by, off, off == 1 ? "" : "s");
+      }
+      reply_ok(&r, "pool.rebalance");
+      reply_kv(&r, "state", off ? "started" : "balanced");
+    } else if (!what[0]) {
+      reply_ok(&r, "pool.rebalance");
+      reply_kv(&r, "state", g_rebal.active ? "running" : "preview");
+    } else {
+      return admin_err(state, client, "pool.usage", "server rebalance [force|stop]",
+                       "help server rebalance");
+    }
+    reply_kvi(&r, "off", off);
+    reply_kvi(&r, "bots", n);
+    reply_kvi(&r, "pace", net.pace_gap);
+    if (g_rebal.active) {
+      reply_kvi(&r, "moved", g_rebal.moved);
+      reply_kvi(&r, "waves", g_rebal.waves);
+    }
+    return send_reply(state, client, &r);
   }
 
   if (!what[0])
@@ -7791,7 +8150,9 @@ static bool mf_payload_mutates(int cmd, const char *payload) {
   case CMD_ADMIN_BAN:
     return !payload || strncmp(payload, "list", 4) != 0;
   case CMD_ADMIN_POOL:
-    return !payload || (strcmp(payload, "list") != 0 && strcmp(payload, "net") != 0);
+    /* read-only: list, net, order|<who>, the rebalance preview */
+    return !payload || (strcmp(payload, "list") != 0 && strcmp(payload, "net") != 0 &&
+                        strncmp(payload, "order|", 6) != 0 && strcmp(payload, "rebalance|") != 0);
   case CMD_ADMIN_NET_SET:
     return payload && payload[0];
   default:
@@ -7830,7 +8191,7 @@ static char admin_flag_needed(hub_state_t *state, const hub_user_record_t *me, i
   switch (cmd) {
   case CMD_ADMIN_CREATE_BOT:      case CMD_ADMIN_DEL:
   case CMD_ADMIN_DISCONNECT_BOT:  case CMD_ADMIN_REKEY_BOT:
-  case CMD_ADMIN_BOT_RESYNC:
+  case CMD_ADMIN_BOT_RESYNC:      case CMD_ADMIN_BOT_MOVE:
     return 'b';
   case CMD_ADMIN_NET_SET:
     if (payload && strncmp(payload, "hubcron|", 8) == 0) return 'h';
@@ -8386,6 +8747,9 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
     return send_reply(state, client, &r);
   }
 
+  case CMD_ADMIN_BOT_MOVE:
+    return admin_bot_move(state, client, payload);
+
   case CMD_ADMIN_DISCONNECT_BOT: {
     if (!payload || !payload[0])
       return admin_err(state, client, "bot.usage", "say which bot", "bot kick <uuid>");
@@ -8644,6 +9008,13 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       snprintf(msg, sizeof(msg), "uuid already registered (%.63s)",
                n && n->value[0] ? n->value : "no nick");
       return admin_err(state, client, "bot.exists", msg, "bot list");
+    }
+    /* the table holds deleted bots' tombstones too: a full one used to answer
+     * bot.added and store nothing (100-bot run, 2026-11-24) */
+    if (state->bot_count >= MAX_BOTS) {
+      snprintf(msg, sizeof(msg), "this network already holds %d bots, the most it can", MAX_BOTS);
+      return admin_err(state, client, "bot.full", msg,
+                       "bot del a bot first (hub purge now removes deleted bots' tombstones)");
     }
     hub_state_add_bot_memory(state, uuid_in, nick, pubkey_in);
     state->config_dirty = true;
@@ -9402,8 +9773,15 @@ static bool handle_admin_command(hub_state_t *state, hub_client_t *client,
       reply_kvi(&r, "idle", hub_pool_idle_bots(state));
       reply_kvu(&r, "reports", st->pool_reports);
       reply_kvu(&r, "flagged", st->pool_flagged);
-      reply_kvu(&r, "views", st->pool_views);
+      reply_kvu(&r, "orders", st->pool_orders);
     }
+    reply_rec(&r, "elect");
+    reply_kvi(&r, "in_flight", ce_in_flight(state));
+    reply_kvi(&r, "slots", MAX_CHAN_ELECTIONS);
+    reply_kvu(&r, "started", st->el_started);
+    reply_kvu(&r, "batched", st->el_batched);
+    reply_kvu(&r, "refused", st->el_refused);
+    reply_kvu(&r, "ended", st->el_ended);
     reply_rec(&r, "sync");
     reply_kvu(&r, "frames", st->sync_frames);
     reply_kvu(&r, "noop", st->sync_noop);
@@ -10572,10 +10950,17 @@ static void process_chan_request(hub_state_t *state, hub_client_t *client,
   hub_log_info("[HUB] CHAN_REQUEST %s from %s for %s\n", kind, hub_who_client(state, client),
                channel);
 
+  /* Own op, every hub new enough: one election serves every local bot that
+   * asks within CHAN_ELECT_BATCH_WAIT s (a new channel: all of them). */
+  if (strcmp(kind, "op") == 0 && rid[0] && ce_batch_ok(state)) {
+    if (!ce_batch_join(state, client, channel, nick, hostmask, rid))
+      chan_own_answer(state, client, rid, "none", "too many channel requests in flight");
+    return;
+  }
+
   /* One bot answers it (CMD_CHAN_PROBE). */
   chan_elect_t *e = ce_start(state, kind, channel, client->id, nick, hostmask, NULL);
   if (!e) {
-    hub_log_warning("[CHANREQ] Election table full — dropping %s for %s\n", kind, channel);
     chan_own_answer(state, client, rid, "none", "too many channel requests in flight");
     return;
   }
@@ -10742,13 +11127,70 @@ static chan_elect_t *ce_find(hub_state_t *state, const char *id) {
   return NULL;
 }
 
-/* End an election: the slot is free and a `who` answer's buffer goes. */
+/* End an election: the slot is free and a `who` answer's buffer and a
+ * batch's targets go. */
 static void ce_release(chan_elect_t *e) {
   chanwho_reset(&e->who);
+  free(e->tg);
+  e->tg = NULL;
+  e->tg_n = 0;
   e->active = false;
 }
 
-static chan_elect_t *ce_alloc(hub_state_t *state) {
+static int ce_in_flight(const hub_state_t *state) {
+  int n = 0;
+  for (int i = 0; i < MAX_CHAN_ELECTIONS; i++) n += state->chan_elections[i].active;
+  return n;
+}
+
+/* A bot's own request: the requester is neither the console nor a person. */
+static bool ce_own_requester(const hub_state_t *state, const char *requester) {
+  if (!requester[0] || strcmp(requester, "ADMIN") == 0) return false;
+  for (int i = 0; i < state->user_record_count; i++)
+    if (strcmp(state->user_records[i].uuid, requester) == 0) return false;
+  return true;
+}
+
+/* "Election table full": the first refusal is logged, the rest are counted
+ * and logged as one line every CHAN_ELECT_FULL_LOG s (ce_full_flush). */
+static time_t g_ce_full_at;
+static unsigned g_ce_full_n;
+
+static void ce_full_flush(time_t now) {
+  if (g_ce_full_n == 0 || now - g_ce_full_at < CHAN_ELECT_FULL_LOG) return;
+  hub_log_warning("[CHANREQ] Election table full: %u more request(s) refused in the last %d s\n",
+                  g_ce_full_n, CHAN_ELECT_FULL_LOG);
+  g_ce_full_n = 0;
+  g_ce_full_at = now;
+}
+
+static void ce_full_note(const hub_state_t *state, bool own, const char *kind,
+                         const char *channel) {
+  time_t now = time(NULL);
+  g_hub_stats.el_refused++;
+  if (g_ce_full_at && now - g_ce_full_at < CHAN_ELECT_FULL_LOG) {
+    g_ce_full_n++;
+    return;
+  }
+  g_ce_full_at = now;
+  if (own)
+    hub_log_warning("[CHANREQ] Election table full (%d in flight, %d kept for the console): "
+                    "refused %s for %s; further refusals are counted\n",
+                    ce_in_flight(state), CHAN_ELECT_RESERVE, kind, channel);
+  else
+    hub_log_warning("[CHANREQ] Election table full (%d in flight): refused %s for %s; "
+                    "further refusals are counted\n",
+                    ce_in_flight(state), kind, channel);
+}
+
+/* A free slot, or NULL (logged).  A bot's own request leaves the last
+ * CHAN_ELECT_RESERVE slots to the console and to persons. */
+static chan_elect_t *ce_alloc(hub_state_t *state, bool own, const char *kind,
+                              const char *channel) {
+  if (own && ce_in_flight(state) >= MAX_CHAN_ELECTIONS - CHAN_ELECT_RESERVE) {
+    ce_full_note(state, own, kind, channel);
+    return NULL;
+  }
   for (int i = 0; i < MAX_CHAN_ELECTIONS; i++)
     if (!state->chan_elections[i].active) {
       chan_elect_t *e = &state->chan_elections[i];
@@ -10756,9 +11198,52 @@ static chan_elect_t *ce_alloc(hub_state_t *state) {
       memset(e, 0, sizeof(*e));
       e->from_fd = e->admin_fd = e->reply_fd = -1;
       e->created = e->phase_at = time(NULL);
+      g_hub_stats.el_started++;
       return e;
     }
+  ce_full_note(state, own, kind, channel);
   return NULL;
+}
+
+/* A hub version that takes ELECT_END and batched own-op elections. */
+static bool ce_version_new(const char *v) {
+  return v && v[0] && hub_update_version_cmp(v, CHAN_ELECT_BATCH_MIN_HUB) >= 0;
+}
+
+/* Every hub this one knows (gossip and its own links) runs
+ * CHAN_ELECT_BATCH_MIN_HUB or newer: only then may own op be batched. */
+static bool ce_batch_ok(hub_state_t *state) {
+  for (int j = 0; j < state->mesh_hub_count; j++)
+    if (strcmp(state->mesh_hubs[j].uuid, state->hub_uuid) != 0 &&
+        !ce_version_new(state->mesh_hubs[j].version))
+      return false;
+  for (int i = 0; i < state->client_count; i++) {
+    const hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_HUB && c->authenticated && !ce_version_new(peer_version_str(state, c)))
+      return false;
+  }
+  return true;
+}
+
+/* A known hub's version from gossip ("" when unknown). */
+static const char *ce_hub_version(const hub_state_t *state, const char *uuid) {
+  for (int j = 0; j < state->mesh_hub_count; j++)
+    if (strcmp(state->mesh_hubs[j].uuid, uuid) == 0) return state->mesh_hubs[j].version;
+  return "";
+}
+
+/* ELECT_END to every 2.5.4+ peer except `skip`, once per election (the seen
+ * ring, key "end:<eid>"). */
+static void ce_end_send(hub_state_t *state, const char *id, const hub_client_t *skip) {
+  char key[SEEN_FORWARD_ID_MAX];
+  snprintf(key, sizeof(key), "end:%s", id);
+  if (op_forward_seen_check_and_add(state, key)) return;
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c != skip && c->type == CLIENT_HUB && c->authenticated &&
+        ce_version_new(peer_version_str(state, c)))
+      peer_send_urgent(state, c, CMD_CHAN_ELECT_END, id);
+  }
 }
 
 /* A uniformly drawn index below n (n > 0). */
@@ -10794,6 +11279,122 @@ static int ce_count(const chan_elect_t *e, char st) {
   return n;
 }
 
+/* The batch target `uuid`, or NULL. */
+static chan_elect_target_t *ce_target(const chan_elect_t *e, const char *uuid) {
+  for (int i = 0; i < e->tg_n; i++)
+    if (strcmp(e->tg[i].uuid, uuid) == 0) return &e->tg[i];
+  return NULL;
+}
+
+static int ce_tg_count(const chan_elect_t *e, char st) {
+  int n = 0;
+  for (int i = 0; i < e->tg_n; i++) n += e->tg[i].st == st;
+  return n;
+}
+
+static void ce_done_up_id(hub_state_t *state, chan_elect_t *e, const char *id,
+                          const char *bot_uuid, const char *bot_nick, const char *status,
+                          const char *detail);
+static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
+                      const char *by_uuid, const char *by_nick, const char *hub_name,
+                      const char *detail);
+static void ce_local_exhausted(hub_state_t *state, chan_elect_t *e);
+
+/* Tell batch target t its answer: rid|status|detail to its bot (origin). */
+static void ce_tg_answer(hub_state_t *state, const chan_elect_target_t *t, const char *status,
+                         const char *detail) {
+  for (int i = 0; t->reply_fd >= 0 && i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_BOT || !c->authenticated || c->fd != t->reply_fd ||
+        c->conn_serial != t->reply_serial)
+      continue;
+    char res[256];
+    snprintf(res, sizeof(res), "%s|%s|%s", t->rid, status, detail);
+    send_cmd_to_bot(state, c, CMD_USER_CHAN_RESULT, res);
+    return;
+  }
+}
+
+/* Target t was served by bot `by` (ok) or refused for +bitch (!ok): the
+ * origin answers its bot, a relay reports it toward the origin. */
+static void ce_tg_served(hub_state_t *state, chan_elect_t *e, chan_elect_target_t *t, bool ok,
+                         const char *by_uuid, const char *by_nick, const char *hub_name,
+                         const char *detail) {
+  t->st = ok ? 'o' : 'x';
+  if (!e->origin) {
+    char sub[sizeof(e->id) + sizeof(t->uuid) + 1];
+    snprintf(sub, sizeof(sub), "%s.%s", e->id, t->uuid);
+    ce_done_up_id(state, e, sub, by_uuid, by_nick, ok ? "ok" : "fail", ok ? detail : "bitch");
+    return;
+  }
+  char d[200];
+  if (ok)
+    snprintf(d, sizeof(d), "op by %.31s on %.63s", by_nick && by_nick[0] ? by_nick : by_uuid,
+             hub_name);
+  else
+    snprintf(d, sizeof(d), "not authorised on %.64s and +bitch is on", e->channel);
+  ce_tg_answer(state, t, ok ? "ok" : "denied", d);
+}
+
+/* Hand every waiting target to one ready local bot: one CHAN_DO each, id
+ * <eid>.<target>.  False when no ready bot is left. */
+static bool ce_try_local_batch(hub_state_t *state, chan_elect_t *e) {
+  for (;;) {
+    int ready = ce_count(e, 'y');
+    if (ready == 0) return false;
+    int k = ce_pick(ready);
+    chan_elect_bot_t *b = NULL;
+    for (int i = 0; i < e->bot_n; i++)
+      if (e->bots[i].st == 'y' && k-- == 0) {
+        b = &e->bots[i];
+        break;
+      }
+    if (!b) return false;
+    b->st = 't';
+    hub_client_t *c = ce_bot(state, b->uuid);
+    int sent = 0;
+    for (int i = 0; c && i < e->tg_n; i++) {
+      chan_elect_target_t *t = &e->tg[i];
+      if (t->st != 'p') continue;
+      char act[MAX_MASK_LEN + 320];
+      snprintf(act, sizeof(act), "%s.%s|op|%s|%s|%s|%s", e->id, t->uuid, e->channel, t->uuid,
+               t->nick, t->hostmask);
+      if (!send_cmd_to_bot(state, c, CMD_CHAN_DO, act)) break;
+      t->st = 'd';
+      sent++;
+    }
+    if (sent == 0) {
+      snprintf(b->reason, sizeof(b->reason), "unreachable");
+      continue;
+    }
+    snprintf(e->doing, sizeof(e->doing), "%s", b->uuid);
+    e->phase = CE_LOCAL_DO;
+    e->phase_at = time(NULL);
+    return true;
+  }
+}
+
+/* Nothing left to hand out: the origin ends, a relay reports "all served". */
+static void ce_batch_complete(hub_state_t *state, chan_elect_t *e) {
+  if (e->origin) {
+    ce_finish(state, e, "ok", NULL, NULL, NULL, NULL);
+    return;
+  }
+  ce_done_up_id(state, e, e->id, "", "", "ok", "batch done");
+  e->doing[0] = '\0';
+  e->phase = CE_ACKED;
+  e->phase_at = time(NULL);
+}
+
+/* A batch's next step: done, the next ready local bot, or the mesh. */
+static void ce_batch_next(hub_state_t *state, chan_elect_t *e) {
+  if (ce_tg_count(e, 'p') == 0 && ce_tg_count(e, 'd') == 0) {
+    ce_batch_complete(state, e);
+    return;
+  }
+  if (!ce_try_local_batch(state, e)) ce_local_exhausted(state, e);
+}
+
 /* Ask every local bot except the requester. */
 static void ce_probe_local(hub_state_t *state, chan_elect_t *e) {
   char probe[64 + 8 + MAX_CHAN + 4];
@@ -10803,6 +11404,7 @@ static void ce_probe_local(hub_state_t *state, chan_elect_t *e) {
     hub_client_t *c = state->clients[i];
     if (c->type != CLIENT_BOT || !c->authenticated) continue;
     if (strcmp(c->id, e->requester) == 0) continue; /* it cannot help itself */
+    if (ce_target(e, c->id)) continue;               /* nor can a batch's bots */
     chan_elect_bot_t *b = &e->bots[e->bot_n++];
     snprintf(b->uuid, sizeof(b->uuid), "%s", c->id);
     bot_nick_from_config(state, c->id, b->nick, sizeof(b->nick));
@@ -10815,6 +11417,7 @@ static void ce_probe_local(hub_state_t *state, chan_elect_t *e) {
 
 /* Hand the action to one ready local bot.  False when none is left. */
 static bool ce_try_local(hub_state_t *state, chan_elect_t *e) {
+  if (e->tg) return ce_try_local_batch(state, e);
   for (;;) {
     int ready = ce_count(e, 'y');
     if (ready == 0) return false;
@@ -10990,9 +11593,39 @@ static void process_chan_who(hub_state_t *state, hub_client_t *client, const cha
 /* The origin's end of an election: answer the console that asked, log, and
  * free the slot.  status: "ok" (one bot did it), "bitch" (refused, D12),
  * anything else = nobody could. */
+/* A batched own op ends at the origin: every target still waiting gets
+ * none (its bot may ask over IRC), one summary line, ELECT_END. */
+static void ce_batch_finish(hub_state_t *state, chan_elect_t *e) {
+  int asked = e->bot_n, hubs = 1;
+  for (int i = 0; i < e->hub_n; i++) {
+    asked += e->hubs[i].asked;
+    hubs++;
+  }
+  char why[160], d[256];
+  ce_reasons(e, why, sizeof(why));
+  snprintf(d, sizeof(d), "no bot could: %d asked on %d hub%s%s%.120s", asked, hubs,
+           hubs == 1 ? "" : "s", why[0] ? "; " : "", why);
+  int left = 0;
+  for (int i = 0; i < e->tg_n; i++)
+    if (e->tg[i].st == 'p' || e->tg[i].st == 'd') {
+      ce_tg_answer(state, &e->tg[i], "none", d);
+      left++;
+    }
+  hub_log_info("[CHANREQ] own op for %d bot%s on %s (id:%s): %d opped, %d refused (+bitch), "
+               "%d left to ask over IRC\n",
+               e->tg_n, e->tg_n == 1 ? "" : "s", e->channel, e->id, ce_tg_count(e, 'o'),
+               ce_tg_count(e, 'x'), left);
+  if (e->flooded) ce_end_send(state, e->id, NULL);
+  ce_release(e);
+}
+
 static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
                       const char *by_uuid, const char *by_nick, const char *hub_name,
                       const char *detail) {
+  if (e->tg) {
+    ce_batch_finish(state, e);
+    return;
+  }
   int asked = e->bot_n, hubs = 1;
   for (int i = 0; i < e->hub_n; i++) {
     asked += e->hubs[i].asked;
@@ -11187,6 +11820,7 @@ static void ce_finish(hub_state_t *state, chan_elect_t *e, const char *status,
       }
     }
   }
+  if (e->flooded) ce_end_send(state, e->id, NULL); /* the relays free their copies */
   ce_release(e);
 }
 
@@ -11196,12 +11830,18 @@ static void ce_up(hub_state_t *state, chan_elect_t *e, uint8_t cmd, const char *
   if (p) peer_send_urgent(state, p, cmd, payload);
 }
 
-static void ce_done_up(hub_state_t *state, chan_elect_t *e, const char *bot_uuid,
-                       const char *bot_nick, const char *status, const char *detail) {
+static void ce_done_up_id(hub_state_t *state, chan_elect_t *e, const char *id,
+                          const char *bot_uuid, const char *bot_nick, const char *status,
+                          const char *detail) {
   char buf[512];
-  snprintf(buf, sizeof(buf), "%s|%s|%s|%s|%s|%s|%s", e->id, state->hub_uuid,
+  snprintf(buf, sizeof(buf), "%s|%s|%s|%s|%s|%s|%s", id, state->hub_uuid,
            hub_display_name(state), bot_uuid, bot_nick, status, detail);
   ce_up(state, e, CMD_CHAN_ELECT_DONE, buf);
+}
+
+static void ce_done_up(hub_state_t *state, chan_elect_t *e, const char *bot_uuid,
+                       const char *bot_nick, const char *status, const char *detail) {
+  ce_done_up_id(state, e, e->id, bot_uuid, bot_nick, status, detail);
 }
 
 /* Origin, nobody local can: the next hub with a ready bot, else nobody.  A
@@ -11210,6 +11850,15 @@ static void ce_done_up(hub_state_t *state, chan_elect_t *e, const char *bot_uuid
  * means busy or gone, and the old fan-out skipped +bitch (D12). */
 static void ce_try_hub(hub_state_t *state, chan_elect_t *e) {
   int ready = 0;
+  /* a batch goes only to a hub that reads its target list */
+  for (int i = 0; i < e->hub_n; i++)
+    if (e->tg && !ce_version_new(ce_hub_version(state, e->hubs[i].uuid))) e->hubs[i].tried = true;
+  for (int i = 0; i < e->tg_n; i++)
+    if (e->tg[i].st == 'd') e->tg[i].st = 'p'; /* the last hub's leftovers */
+  if (e->tg && ce_tg_count(e, 'p') == 0) {
+    ce_finish(state, e, "ok", NULL, NULL, NULL, NULL);
+    return;
+  }
   for (int i = 0; i < e->hub_n; i++)
     if (!e->hubs[i].tried && e->hubs[i].ready > 0) ready++;
   if (ready > 0) {
@@ -11219,9 +11868,18 @@ static void ce_try_hub(hub_state_t *state, chan_elect_t *e) {
       if (h->tried || h->ready <= 0 || k-- != 0) continue;
       h->tried = true;
       hub_client_t *p = ce_peer(state, h->fd, h->serial);
-      char buf[160];
-      snprintf(buf, sizeof(buf), "%s|%s|elect", e->id, h->uuid);
+      char buf[160 + CHAN_ELECT_BATCH_MAX * 65];
+      int n = snprintf(buf, sizeof(buf), "%s|%s|elect", e->id, h->uuid);
+      bool first = true;
+      for (int j = 0; e->tg && j < e->tg_n && n > 0 && (size_t)n < sizeof(buf); j++) {
+        if (e->tg[j].st != 'p') continue;
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%c%s", first ? '|' : ',',
+                      e->tg[j].uuid);
+        first = false;
+      }
       if (!p || !peer_send_urgent(state, p, CMD_CHAN_ELECT_DO, buf)) break;
+      for (int j = 0; j < e->tg_n; j++)
+        if (e->tg[j].st == 'p') e->tg[j].st = 'd';
       snprintf(e->doing, sizeof(e->doing), "%s", h->uuid);
       e->phase = CE_MESH_DO;
       e->phase_at = time(NULL);
@@ -11262,7 +11920,8 @@ static bool ce_mesh_settling(const hub_state_t *state, time_t now) {
 static bool ce_new_local_bot(const hub_state_t *state, const chan_elect_t *e) {
   for (int i = 0; i < state->client_count; i++) {
     const hub_client_t *c = state->clients[i];
-    if (c->type != CLIENT_BOT || !c->authenticated || strcmp(c->id, e->requester) == 0)
+    if (c->type != CLIENT_BOT || !c->authenticated || strcmp(c->id, e->requester) == 0 ||
+        ce_target(e, c->id))
       continue;
     bool asked = false;
     for (int j = 0; j < e->bot_n && !asked; j++) asked = strcmp(e->bots[j].uuid, c->id) == 0;
@@ -11305,16 +11964,17 @@ static void ce_local_exhausted(hub_state_t *state, chan_elect_t *e) {
     if (c->type == CLIENT_HUB && c->authenticated)
       peer_send_urgent(state, c, CMD_CHAN_ELECT_FWD, fwd);
   }
+  e->flooded = true;
   e->phase = CE_MESH_WAIT;
   e->phase_at = time(NULL);
 }
 
 /* Start an election on this hub (the origin).  admin: the console owed the
  * answer, or NULL.  False when the table is full (nothing was sent). */
-static chan_elect_t *ce_start(hub_state_t *state, const char *kind, const char *channel,
-                              const char *requester, const char *nick, const char *hostmask,
-                              const hub_client_t *admin) {
-  chan_elect_t *e = ce_alloc(state);
+static chan_elect_t *ce_start_x(hub_state_t *state, const char *kind, const char *channel,
+                                const char *requester, const char *nick, const char *hostmask,
+                                const hub_client_t *admin, bool gather) {
+  chan_elect_t *e = ce_alloc(state, ce_own_requester(state, requester), kind, channel);
   if (!e) return NULL;
   if (strcmp(kind, "key") == 0) {
     char rid[64];
@@ -11336,10 +11996,60 @@ static chan_elect_t *ce_start(hub_state_t *state, const char *kind, const char *
   snprintf(e->requester, sizeof(e->requester), "%s", requester);
   snprintf(e->nick, sizeof(e->nick), "%s", nick ? nick : "");
   snprintf(e->hostmask, sizeof(e->hostmask), "%s", hostmask ? hostmask : "");
+  if (gather) {
+    e->phase = CE_GATHER;
+    e->phase_at = time(NULL);
+    hub_log_debug("[CHANREQ] Election %s: own op on %s, gathering %d s\n", e->id, channel,
+                  CHAN_ELECT_BATCH_WAIT);
+    return e;
+  }
   ce_probe_local(state, e);
   hub_log_debug("[CHANREQ] Election %s: %s %s on %s, %d local bot(s) asked\n", e->id, kind,
                 e->nick[0] ? e->nick : requester, channel, e->bot_n);
   return e;
+}
+
+static chan_elect_t *ce_start(hub_state_t *state, const char *kind, const char *channel,
+                              const char *requester, const char *nick, const char *hostmask,
+                              const hub_client_t *admin) {
+  return ce_start_x(state, kind, channel, requester, nick, hostmask, admin, false);
+}
+
+/* A local bot's own op: into the batch gathering for that channel, else a
+ * new one.  False when the table is full. */
+static bool ce_batch_join(hub_state_t *state, hub_client_t *client, const char *channel,
+                          const char *nick, const char *hostmask, const char *rid) {
+  chan_elect_t *e = NULL;
+  for (int i = 0; i < MAX_CHAN_ELECTIONS && !e; i++) {
+    chan_elect_t *x = &state->chan_elections[i];
+    if (x->active && x->origin && x->tg && x->phase == CE_GATHER &&
+        strcasecmp(x->channel, channel) == 0 &&
+        (x->tg_n < CHAN_ELECT_BATCH_MAX || ce_target(x, client->id)))
+      e = x;
+  }
+  bool fresh = !e;
+  if (fresh) {
+    e = ce_start_x(state, "op", channel, client->id, nick, hostmask, NULL, true);
+    if (!e) return false;
+    e->tg = calloc(CHAN_ELECT_BATCH_MAX, sizeof(*e->tg));
+    if (!e->tg) {
+      ce_release(e);
+      return false;
+    }
+  }
+  chan_elect_target_t *t = ce_target(e, client->id);
+  if (!t) {
+    t = &e->tg[e->tg_n++];
+    if (!fresh) g_hub_stats.el_batched++;
+  }
+  snprintf(t->uuid, sizeof(t->uuid), "%s", client->id);
+  snprintf(t->nick, sizeof(t->nick), "%s", nick);
+  snprintf(t->hostmask, sizeof(t->hostmask), "%s", hostmask);
+  snprintf(t->rid, sizeof(t->rid), "%s", rid);
+  t->reply_fd = client->fd;
+  t->reply_serial = client->conn_serial;
+  t->st = 'p';
+  return true;
 }
 
 /* A field of a person's request: 1..max-1 bytes, no blank, '|' or control. */
@@ -11460,10 +12170,35 @@ static void process_chan_done(hub_state_t *state, hub_client_t *client,
   wire_field(payload, 0, id, sizeof(id));
   wire_field(payload, 1, status, sizeof(status));
   wire_tail(payload, 2, detail, sizeof(detail));
+  char *dot = strchr(id, '.'); /* a batch: <eid>.<target uuid> */
+  if (dot) *dot++ = '\0';
   chan_elect_t *e = id[0] ? ce_find(state, id) : NULL;
   if (!e || e->phase != CE_LOCAL_DO || strcmp(e->doing, client->id) != 0) return;
+  if ((dot != NULL) != (e->tg != NULL)) return;
   char clean[96];
   roster_clean(clean, sizeof(clean), detail);
+  if (dot) {
+    chan_elect_target_t *t = ce_target(e, dot);
+    if (!t || t->st != 'd') return;
+    char bn[MAX_NICK] = "";
+    for (int i = 0; i < e->bot_n; i++)
+      if (strcmp(e->bots[i].uuid, client->id) == 0) snprintf(bn, sizeof(bn), "%s", e->bots[i].nick);
+    if (strcmp(status, "ok") == 0)
+      ce_tg_served(state, e, t, true, client->id, bn, hub_display_name(state), clean);
+    else if (strcmp(status, "fail") == 0 && ce_final_fail(e, clean))
+      ce_tg_served(state, e, t, false, client->id, bn, hub_display_name(state), clean);
+    else {
+      t->st = 'p'; /* the next ready bot gets it */
+      for (int i = 0; i < e->bot_n; i++)
+        if (strcmp(e->bots[i].uuid, client->id) == 0)
+          roster_clean(e->bots[i].reason, sizeof(e->bots[i].reason), clean[0] ? clean : "failed");
+    }
+    if (ce_tg_count(e, 'd') == 0) {
+      e->doing[0] = '\0';
+      ce_batch_next(state, e);
+    }
+    return;
+  }
   chan_elect_bot_t *b = NULL;
   for (int i = 0; i < e->bot_n; i++)
     if (strcmp(e->bots[i].uuid, client->id) == 0) b = &e->bots[i];
@@ -11517,9 +12252,15 @@ static void process_chan_elect_fwd(hub_state_t *state, hub_client_t *client,
   if (t <= 0 || age > CHAN_ELECT_TTL || age < -CHAN_ELECT_TTL) return;
   if (op_forward_seen_check_and_add(state, id)) return; /* another path got here first */
 
-  chan_elect_t *e = ce_alloc(state);
+  chan_elect_t *e = ce_alloc(state, ce_own_requester(state, requester), kind, channel);
   if (!e) {
-    hub_log_warning("[CHANREQ] Election table full — not answering %s\n", id);
+    /* logged; the origin hears no answer from us, but the hubs behind us
+     * still get the question */
+    for (int i = 0; i < state->client_count; i++) {
+      hub_client_t *c = state->clients[i];
+      if (c->type == CLIENT_HUB && c->authenticated && c != client)
+        peer_send_urgent(state, c, CMD_CHAN_ELECT_FWD, payload);
+    }
     return;
   }
   /* A key travels home as CHAN_REPLY through the pending table, hop by hop. */
@@ -11593,6 +12334,39 @@ static void process_chan_elect_do(hub_state_t *state, hub_client_t *client,
     return;
   }
   if (strcmp(mode, "elect") != 0) return;
+  /* a batch: the targets still waiting, as bot uuids; their nick and mask
+   * come from our own copy of each bot's record */
+  char list[CHAN_ELECT_BATCH_MAX * 65 + 1] = "";
+  wire_field(payload, 3, list, sizeof(list));
+  if (list[0]) {
+    free(e->tg);
+    e->tg_n = 0;
+    e->tg = calloc(CHAN_ELECT_BATCH_MAX, sizeof(*e->tg));
+    if (!e->tg) {
+      ce_local_exhausted(state, e);
+      return;
+    }
+    for (char *tok = strtok(list, ","); tok && e->tg_n < CHAN_ELECT_BATCH_MAX;
+         tok = strtok(NULL, ",")) {
+      if (strlen(tok) >= sizeof(e->tg[0].uuid) || strspn(tok, "0123456789abcdefABCDEF-") != strlen(tok) ||
+          ce_target(e, tok))
+        continue;
+      chan_elect_target_t *t = &e->tg[e->tg_n];
+      snprintf(t->uuid, sizeof(t->uuid), "%s", tok);
+      hub_bot_entry(state, tok, "n", t->nick, sizeof(t->nick));
+      hub_bot_entry(state, tok, "h", t->hostmask, sizeof(t->hostmask));
+      if (!t->nick[0]) continue; /* not a bot we know */
+      t->reply_fd = -1;
+      t->st = 'p';
+      e->tg_n++;
+    }
+    if (e->tg_n == 0) {
+      ce_local_exhausted(state, e);
+      return;
+    }
+    ce_batch_next(state, e);
+    return;
+  }
   if (!ce_try_local(state, e)) ce_local_exhausted(state, e);
 }
 
@@ -11609,6 +12383,8 @@ static void process_chan_elect_done(hub_state_t *state, hub_client_t *client,
   wire_field(payload, 4, nick, sizeof(nick));
   wire_field(payload, 5, status, sizeof(status));
   wire_tail(payload, 6, detail, sizeof(detail));
+  char *dot = strchr(id, '.'); /* a batch target's own report */
+  if (dot) *dot++ = '\0';
   chan_elect_t *e = id[0] ? ce_find(state, id) : NULL;
   if (!e) return;
   if (!e->origin) {
@@ -11616,17 +12392,47 @@ static void process_chan_elect_done(hub_state_t *state, hub_client_t *client,
     return;
   }
   if (e->phase != CE_MESH_DO || strcmp(e->doing, hub) != 0) return;
+  if ((dot != NULL) && !e->tg) return;
   char cn[64], cb[64], ck[MAX_NICK], cd[96];
   roster_clean(cn, sizeof(cn), name[0] ? name : hub);
   roster_clean(cb, sizeof(cb), bot);
   roster_clean(ck, sizeof(ck), nick);
   roster_clean(cd, sizeof(cd), detail);
+  if (dot) {
+    chan_elect_target_t *t = ce_target(e, dot);
+    if (!t || t->st != 'd') return;
+    if (strcmp(status, "ok") == 0)
+      ce_tg_served(state, e, t, true, cb, ck, cn, cd);
+    else if (strcmp(status, "fail") == 0 && ce_final_fail(e, cd))
+      ce_tg_served(state, e, t, false, cb, ck, cn, cd);
+    else
+      t->st = 'p';
+    return;
+  }
+  if (e->tg) { /* that hub is through: the next one for what is left */
+    ce_try_hub(state, e);
+    return;
+  }
   if (strcmp(status, "ok") == 0)
     ce_finish(state, e, "ok", cb, ck, cn, cd);
   else if (strcmp(status, "fail") == 0 && ce_final_fail(e, cd))
     ce_finish(state, e, cd, cb, ck, cn, cd);
   else
     ce_try_hub(state, e);
+}
+
+/* ELECT_END: eid.  The origin's election is over: free our copy (a relay's;
+ * the origin freed its own) and pass it on once. */
+static void process_chan_elect_end(hub_state_t *state, hub_client_t *client,
+                                   const char *payload) {
+  char id[64] = "";
+  if (!wire_field(payload, 0, id, sizeof(id)) || !id[0] || strchr(id, '.')) return;
+  chan_elect_t *e = ce_find(state, id);
+  if (e && !e->origin) {
+    ce_release(e);
+    g_hub_stats.el_ended++;
+  }
+  ce_end_send(state, id, client);
 }
 
 /* Console entry point: apply a channel's stored modes once (kind "mode").
@@ -11652,6 +12458,7 @@ void hub_chan_elect_forget_admin(hub_state_t *state, const hub_client_t *c) {
 
 /* Drive every election one step.  Runs on every maintenance pass. */
 void hub_chan_elect_tick(hub_state_t *state, time_t now) {
+  ce_full_flush(now);
   for (int i = 0; i < MAX_CHAN_ELECTIONS; i++) {
     chan_elect_t *e = &state->chan_elections[i];
     if (!e->active) continue;
@@ -11687,7 +12494,19 @@ void hub_chan_elect_tick(hub_state_t *state, time_t now) {
         if (strcmp(e->bots[j].uuid, e->doing) == 0)
           snprintf(e->bots[j].reason, sizeof(e->bots[j].reason), "no answer");
       e->doing[0] = '\0';
+      if (e->tg) {
+        for (int j = 0; j < e->tg_n; j++)
+          if (e->tg[j].st == 'd') e->tg[j].st = 'p';
+        ce_batch_next(state, e);
+        break;
+      }
       if (!ce_try_local(state, e)) ce_local_exhausted(state, e);
+      break;
+    case CE_GATHER:
+      if (now - e->phase_at < CHAN_ELECT_BATCH_WAIT) break;
+      ce_probe_local(state, e);
+      hub_log_debug("[CHANREQ] Election %s: own op for %d bot(s) on %s, %d local bot(s) asked\n",
+                    e->id, e->tg_n, e->channel, e->bot_n);
       break;
     case CE_MESH_WAIT: {
       /* every other hub we know of, or that any answer says exists */
@@ -11707,6 +12526,12 @@ void hub_chan_elect_tick(hub_state_t *state, time_t now) {
       ce_try_hub(state, e);
       break;
     case CE_ACKED:
+      /* A relay with no ready bot that routed no other hub's answer is never
+       * handed the action and has nothing to route: free its copy once the
+       * other hubs' answers can no longer arrive through it. */
+      if (!e->origin && e->hub_n == 0 && ce_count(e, 'y') == 0 && e->doing[0] == '\0' &&
+          now - e->phase_at >= CHAN_ELECT_MESH_WAIT)
+        ce_release(e);
       break;
     }
   }
@@ -11775,6 +12600,7 @@ static bool console_admin_op(int cmd) {
   switch (cmd) {
   case CMD_ADMIN_LIST_FULL:       case CMD_ADMIN_LIST_SUMMARY:
   case CMD_ADMIN_LIST_REVOKED:    case CMD_ADMIN_CREATE_BOT:
+  case CMD_ADMIN_BOT_MOVE:
   case CMD_ADMIN_DEL:             case CMD_ADMIN_DISCONNECT_BOT:
   case CMD_ADMIN_REKEY_BOT:       case CMD_ADMIN_LIST_PEERS:
   case CMD_ADMIN_ADD_PEER:        case CMD_ADMIN_DEL_PEER:
@@ -13074,6 +13900,133 @@ static int cfg_resync_flood(hub_state_t *state, hub_client_t *skip, const char *
       told++;
   }
   return told;
+}
+
+/* ---- server rebalance (server order plan §7) ----------------------------- */
+
+/* CMD_BOT_MOVE to our bot `uuid` (a pool bot): true when it was ours. */
+static bool bot_move_local(hub_state_t *state, const char *uuid) {
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type != CLIENT_BOT || !c->authenticated || c->superseded || c->retiring ||
+        strcmp(c->id, uuid) != 0 || !hub_bot_version_takes_pool(c->bot_version))
+      continue;
+    /* the bot's own uuid: a frame with an empty payload never reaches its dispatch */
+    queued_msg_t *m = queued_msg_new(CMD_BOT_MOVE, LANE_URGENT, (const unsigned char *)c->id,
+                                     (int)strlen(c->id));
+    if (m && !peer_enqueue(c, m)) queued_msg_free(m);
+    return true;
+  }
+  return false;
+}
+
+static void bot_move_flood(hub_state_t *state, hub_client_t *skip, const char *payload) {
+  for (int i = 0; i < state->client_count; i++) {
+    hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_HUB && c->authenticated && c != skip && peer_takes_pool(state, c))
+      peer_send_urgent(state, c, CMD_BOT_MOVE, payload);
+  }
+}
+
+/* Move one bot, wherever it is linked. */
+static void bot_move(hub_state_t *state, const char *uuid) {
+  if (bot_move_local(state, uuid)) return;
+  char id[40], payload[160];
+  generate_uuid_v4(id, sizeof(id));
+  snprintf(payload, sizeof(payload), "%s|%lld|%s", id, (long long)time(NULL), uuid);
+  op_forward_seen_check_and_add(state, id);
+  bot_move_flood(state, NULL, payload);
+}
+
+static void process_peer_bot_move(hub_state_t *state, hub_client_t *peer, const char *payload) {
+  char id[64] = "", ts[24] = "", target[64] = "";
+  if (!wire_field(payload, 0, id, sizeof(id)) || !wire_field(payload, 1, ts, sizeof(ts)) ||
+      !wire_field(payload, 2, target, sizeof(target)) || !id[0] ||
+      !hub_upgrade_plan_field_ok(id) || !uuid_valid(target)) {
+    hub_log_warning("[HUB] Malformed BOT_MOVE from peer %s\n", peer->ip);
+    return;
+  }
+  long long t = atoll(ts);
+  long long age = t > 0 ? (long long)time(NULL) - t : 0;
+  if (t <= 0 || age > CFG_RESYNC_TTL || age < -CFG_RESYNC_TTL) return;
+  if (op_forward_seen_check_and_add(state, id)) return;
+  if (!bot_move_local(state, target)) bot_move_flood(state, peer, payload);
+}
+
+/* The driver: the bots off their first server, moved in waves of at most
+ * REBALANCE_WAVE_MAX (and a quarter of the bots up), one per origin; the next
+ * wave when every bot of the last is up again (or REBALANCE_WAVE_WAIT) and a
+ * pace gap has passed.  Only the hub where it was typed drives it; it ends
+ * there with that hub. */
+
+/* A bot up on IRC on an entry that is not its first: true, and both. */
+static bool rebalance_off_first(const hub_state_t *state, const char *uuid, char *cur, size_t ccap,
+                                char *first, size_t fcap) {
+  if (!hub_pool_order_first(uuid, first, fcap, NULL, NULL)) return false;
+  const char *w = hub_pool_bot_link(state, uuid, cur, ccap);
+  return strcmp(w, "up") == 0 && cur[0] && strcmp(cur, first) != 0;
+}
+
+static int rebalance_up_count(const hub_state_t *state) {
+  static char ids[MAX_BOTS][64];
+  int n = hub_pool_order_bots(ids, MAX_BOTS), up = 0;
+  char e[POOL_UUID_LEN + 1];
+  for (int i = 0; i < n; i++) up += strcmp(hub_pool_bot_link(state, ids[i], e, sizeof(e)), "up") == 0;
+  return up;
+}
+
+void hub_rebalance_tick(hub_state_t *state, time_t now) {
+  rebalance_t *rb = &g_rebal;
+  if (!rb->active) return;
+  pool_net_t net;
+  time_t nts;
+  hub_pool_net_get(state, POOL_DEFAULT_NET, &net, &nts);
+  if (rb->wn) {
+    /* back = up on its first server again */
+    bool back = true;
+    for (int i = 0; i < rb->wn && back; i++) {
+      char cur[POOL_UUID_LEN + 1], first[POOL_UUID_LEN + 1];
+      back = !rebalance_off_first(state, rb->wave[i], cur, sizeof(cur), first, sizeof(first)) &&
+             strcmp(hub_pool_bot_link(state, rb->wave[i], cur, sizeof(cur)), "up") == 0;
+    }
+    long long since = (long long)(now - rb->wave_at);
+    if (since < net.pace_gap || since < 2 || (!back && since < REBALANCE_WAVE_WAIT)) return;
+    rb->wn = 0;
+  }
+  static char ids[MAX_BOTS][64];
+  int n = hub_pool_order_bots(ids, MAX_BOTS);
+  int size = rebalance_up_count(state) / 4;
+  if (size < 1) size = 1;
+  if (size > REBALANCE_WAVE_MAX) size = REBALANCE_WAVE_MAX;
+  char origins[REBALANCE_WAVE_MAX][MAX_MASK_LEN];
+  for (int i = 0; i < n && rb->wn < size; i++) {
+    char cur[POOL_UUID_LEN + 1], first[POOL_UUID_LEN + 1], org[MAX_MASK_LEN];
+    if (!rebalance_off_first(state, ids[i], cur, sizeof(cur), first, sizeof(first))) continue;
+    bool again = false;
+    for (int k = 0; k < rb->ndone && !again; k++) again = strcmp(rb->done[k], ids[i]) == 0;
+    if (again) continue; /* moved once and still off: its first is not taking it */
+    hub_pool_bot_origin(state, ids[i], org, sizeof(org));
+    bool dup = false;
+    for (int k = 0; k < rb->wn && !dup; k++) dup = org[0] && strcmp(origins[k], org) == 0;
+    if (dup) continue;
+    snprintf(origins[rb->wn], sizeof(origins[0]), "%s", org);
+    memcpy(rb->wave[rb->wn++], ids[i], sizeof(rb->wave[0]));
+  }
+  if (!rb->wn) {
+    hub_log_info("[POOL] Rebalance by %s done: %d bot%s moved in %d wave%s\n", rb->by, rb->moved,
+                 rb->moved == 1 ? "" : "s", rb->waves, rb->waves == 1 ? "" : "s");
+    rb->active = false;
+    return;
+  }
+  for (int i = 0; i < rb->wn; i++) {
+    hub_log_info("[POOL] Rebalance wave %d: moving %s to its first server\n", rb->waves + 1,
+                 hub_who(state, 'b', rb->wave[i]));
+    bot_move(state, rb->wave[i]);
+    if (rb->ndone < MAX_BOTS) memcpy(rb->done[rb->ndone++], rb->wave[i], sizeof(rb->done[0]));
+  }
+  rb->moved += rb->wn;
+  rb->waves++;
+  rb->wave_at = now;
 }
 
 /* CMD_CFG_RESYNC from a peer: resync our matching bots, pass it on. */
@@ -16629,6 +17582,15 @@ static void process_bot_command(hub_state_t *state, hub_client_t *client,
     }
     break;
 
+  case CMD_BOT_CHAN_STATE:
+    if (hub_bot_chan_state(state, client, payload)) {
+      hub_roster_mark_dirty(state, true);
+      hub_presence_event(state);
+    } else if (!hub_chan_state_ok(payload)) {
+      hub_log_debug("[HUB] Malformed channel state from %s dropped\n", hub_who_client(state, client));
+    }
+    break;
+
   case CMD_BOT_TREE_PULL:
     /* Phase 5: the bot's tree diverged from a delta — send it the whole one. */
     hub_tree_pull(state, client);
@@ -17023,6 +17985,19 @@ static void cfg_hex(const unsigned char h[32], char out[CFGD_HASH_HEX + 1]) {
  * moves only when a frame is written (cfg_frame_written). */
 static void send_config_to_bot(hub_state_t *state, hub_client_t *client,
                                bool force) {
+  /* The first config of a link waits for the bot's version (CFG_FIRST_HOLD):
+   * released by its presence or by hub_flush_bot_config. */
+  if (!client->cfg_hold_done) {
+    if (!client->bot_version[0]) {
+      if (!client->cfg_hold_at) {
+        client->cfg_hold_at = time(NULL);
+        g_cfg_holds++;
+      }
+      return;
+    }
+    client->cfg_hold_done = true;
+    client->cfg_hold_at = 0;
+  }
   /* Change 5: heap the generation buffer — a full config can exceed MAX_BUFFER
    * at scale and is too large for the stack.  MAX_CONFIG_PAYLOAD is a hard
    * upper bound (see hub.h), so hub_generate_bot_payload never truncates. */
@@ -17592,6 +18567,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 process_peer_upgrade_forget(state, client, payload_ptr);
               } else if (cmd == CMD_CFG_RESYNC) {
                 process_peer_cfg_resync(state, client, payload_ptr);
+              } else if (cmd == CMD_BOT_MOVE) {
+                process_peer_bot_move(state, client, payload_ptr);
               } else if (cmd == CMD_SYNC_DIGEST) {
                 process_sync_digest(state, client, payload_ptr);
               } else if (cmd == CMD_HUB_ROLLCALL) {
@@ -17614,6 +18591,8 @@ bool hub_handle_client_data(hub_state_t *state, hub_client_t *client) {
                 process_chan_elect_do(state, client, payload_ptr);
               } else if (cmd == CMD_CHAN_ELECT_DONE) {
                 process_chan_elect_done(state, client, payload_ptr);
+              } else if (cmd == CMD_CHAN_ELECT_END) {
+                process_chan_elect_end(state, client, payload_ptr);
               } else if (cmd == CMD_CHAN_WHO) {
                 process_chan_who(state, client, payload_ptr);
               } else if (cmd == CMD_UPGRADE_PREPARE) {

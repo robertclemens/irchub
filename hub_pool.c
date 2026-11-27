@@ -7,6 +7,8 @@
  * wrongnet. */
 #include "hub.h"
 
+#include <openssl/evp.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -22,6 +24,32 @@ typedef struct {
   time_t at[POOL_STRIKE_BOTS];
 } pool_strikes_t;
 static pool_strikes_t g_strikes[MAX_POOL_SERVERS];
+
+/* Volatile: the NETWORK= a "linked" report last warned about, per entry, so
+ * the warning is logged once per name (once more after a restart).  Not the
+ * record's seen field: that holds a wrongnet entry's name only. */
+typedef struct {
+  char uuid[POOL_UUID_LEN + 1];
+  char net[POOL_NET_NAME_MAX + 1];
+} pool_linked_t;
+static pool_linked_t g_linked[MAX_POOL_SERVERS];
+
+/* true when this entry was already noted linked under this name; else notes it */
+static bool linked_noted(const char *uuid, const char *network) {
+  pool_linked_t *slot = NULL;
+  for (int i = 0; i < MAX_POOL_SERVERS; i++) {
+    if (strcmp(g_linked[i].uuid, uuid) == 0) {
+      if (strcmp(g_linked[i].net, network) == 0) return true;
+      slot = &g_linked[i];
+      break;
+    }
+    if (!slot && !g_linked[i].uuid[0]) slot = &g_linked[i];
+  }
+  if (!slot) slot = &g_linked[0]; /* full: more entries than the pool holds */
+  snprintf(slot->uuid, sizeof(slot->uuid), "%s", uuid);
+  snprintf(slot->net, sizeof(slot->net), "%s", network);
+  return false;
+}
 
 static void announce(hub_state_t *state, const char *key, const char *value, time_t ts) {
   char line[POOL_N_LINE_MAX + POOL_S_LINE_MAX];
@@ -41,7 +69,20 @@ static void net_get(const hub_state_t *state, const char *net_id, pool_net_t *ou
   memset(out, 0, sizeof(*out));
   snprintf(out->net_id, sizeof(out->net_id), "%s", net_id);
   snprintf(out->label, sizeof(out->label), "%s", net_id);
+  out->pace_gap = hub_pool_default_pace();
   *ts = 0;
+}
+
+/* The pace gap of a network with no N| stored. */
+int hub_pool_default_pace(void) {
+#ifdef IRC_TEST_HOOKS
+  /* A testnet has every bot on one host and one server: a 15 s gap per slot
+   * would hold its tenth bot off IRC for two minutes. */
+  const char *hook = getenv("IRCHUB_TEST_POOL_PACE");
+  if (hook && hook[0] >= '0' && hook[0] <= '9' && atoi(hook) <= POOL_PACE_GAP_MAX)
+    return atoi(hook);
+#endif
+  return POOL_PACE_GAP_DEFAULT;
 }
 
 bool hub_pool_net_put(hub_state_t *state, const pool_net_t *n) {
@@ -167,6 +208,19 @@ static void report_apply(hub_state_t *state, int from_fd, bool local, const char
     if (pool_net_matches(&net, network)) strikes_clear(uuid);
     return;
   }
+  if (strcmp(kind, "linked") == 0) {
+    /* NETWORK= is not ours, but a trusted bot on a verified server proved the
+     * link (ircbot netproof_*): usable, and the admin is told how to make it
+     * plain.  Noted once per name, never a strike. */
+    if (!local || !network[0] || pool_net_matches(&net, network)) return;
+    strikes_clear(uuid);
+    if (!linked_noted(uuid, network))
+      hub_log_warning("[POOL] Server %s (%s) says NETWORK=%s, but %s proved it linked to %s; "
+                      "to accept that name: network set alias=%s%s%s\n",
+                      s.host, uuid, network, who, net.name, net.aliases,
+                      net.aliases[0] ? "," : "", network);
+    return;
+  }
   if (strcmp(kind, "wrongnet") != 0 && strcmp(kind, "unverified") != 0) return;
   if (!net.name[0] || s.state != POOL_OK) return; /* nothing to be wrong against */
   if (network[0] && pool_net_matches(&net, network)) return; /* a stale report */
@@ -263,14 +317,80 @@ bool hub_pool_irc_link(hub_state_t *state, hub_client_t *client, const char *pay
     return false;
   for (const char *q = f[1]; *q; q++)
     if (!((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f') || *q == '-')) return false;
+  /* 4th field (2.5.4): the server's NETWORK=, "-" while unknown; a bad one
+   * reads as unknown, the rest of the report still counts. */
+  const char *net = nf == 4 && strcmp(f[3], "-") != 0 && pool_net_name_ok(f[3]) ? f[3] : "";
   const char *ent = strcmp(f[1], "-") == 0 ? "" : f[1];
-  bool changed = strcmp(client->bot_irc_entry, ent) != 0 || strcmp(client->bot_irc_link, f[2]) != 0;
+  bool changed = strcmp(client->bot_irc_entry, ent) != 0 || strcmp(client->bot_irc_link, f[2]) != 0 ||
+                 strcmp(client->bot_irc_network, net) != 0;
   snprintf(client->bot_irc_entry, sizeof(client->bot_irc_entry), "%s", ent);
   snprintf(client->bot_irc_link, sizeof(client->bot_irc_link), "%s", f[2]);
+  snprintf(client->bot_irc_network, sizeof(client->bot_irc_network), "%s", net);
   return changed;
 }
 
-/* ---- CMD_POOL_VIEW (plan §5.3) ----------------------------------------- */
+/* One channel name as RFC 2812 has it: a # & + ! start, then no NUL, BEL,
+ * CR, LF, space, ',' or ':' (and no other control byte here), < MAX_CHAN. */
+static bool chan_name_ok(const char *s, size_t n) {
+  if (n < 2 || n >= MAX_CHAN || !strchr("#&+!", s[0])) return false;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c <= 0x20 || c == 0x7f || c == ',' || c == ':') return false;
+  }
+  return true;
+}
+
+/* CMD_BOT_CHAN_STATE / j|: every token valid or the list is refused whole. */
+bool hub_chan_state_ok(const char *s) {
+  size_t n = s ? strlen(s) : 0;
+  if (!s || n >= CHAN_STATE_MAX) return false;
+  const char *p = s;
+  while (*p) {
+    const char *end = strchr(p, ',');
+    size_t tl = end ? (size_t)(end - p) : strlen(p);
+    if (tl == 0) return false;
+    if (p[0] == '~') { /* the tail: N more, last token only */
+      if (end || tl < 2 || tl > 6) return false;
+      for (size_t i = 1; i < tl; i++)
+        if (p[i] < '0' || p[i] > '9') return false;
+    } else if (p[0] == '-') {
+      const char *colon = memchr(p, ':', tl);
+      if (!colon || !chan_name_ok(p + 1, (size_t)(colon - p - 1))) return false;
+      size_t wl = tl - (size_t)(colon - p) - 1;
+      char why[16];
+      if (wl == 0 || wl >= sizeof(why)) return false;
+      memcpy(why, colon + 1, wl);
+      why[wl] = '\0';
+      bool known = false;
+      for (const char *w = CHAN_STATE_WHYS; *w && !known;) {
+        size_t l = strcspn(w, " ");
+        known = l == wl && memcmp(w, why, wl) == 0;
+        w += l + (w[l] == ' ');
+      }
+      if (!known) return false;
+    } else {
+      size_t skip = (p[0] == '@' || p[0] == '%') ? 1 : 0;
+      /* '+' is voice only when a channel name follows; "+chan" alone is a
+       * +channel the bot is in */
+      if (!skip && p[0] == '+' && tl > 2 && strchr("#&+!", p[1])) skip = 1;
+      if (!chan_name_ok(p + skip, tl - skip)) return false;
+    }
+    p += tl + (end ? 1 : 0);
+    if (end && !*p) return false; /* a trailing comma */
+  }
+  return true;
+}
+
+bool hub_bot_chan_state(hub_state_t *state, hub_client_t *client, const char *payload) {
+  (void)state;
+  if (client->type != CLIENT_BOT || !client->authenticated || !hub_chan_state_ok(payload))
+    return false;
+  if (strcmp(client->bot_chan_state, payload) == 0) return false;
+  snprintf(client->bot_chan_state, sizeof(client->bot_chan_state), "%s", payload);
+  return true;
+}
+
+/* ---- the load view: who is on which entry (console server list) ------- */
 
 typedef struct {
   char bot[64];
@@ -360,31 +480,401 @@ static int view_build(hub_state_t *state, char *out, size_t cap) {
   return (int)off;
 }
 
-void hub_pool_view_tick(hub_state_t *state, time_t now) {
-  static time_t last_sent;
-  static unsigned char last_hash[32];
-  static char text[(MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_VIEW_LINE_MAX + 16];
-  if (now - last_sent < POOL_VIEW_GAP) return;
-  int len = view_build(state, text, sizeof(text));
-  if (len < 0) return;
-  unsigned char h[32];
-  EVP_Digest(text, (size_t)len, h, NULL, EVP_sha256(), NULL);
-  bool changed = memcmp(h, last_hash, sizeof(h)) != 0;
-  for (int i = 0; i < state->client_count; i++) {
-    hub_client_t *c = state->clients[i];
-    if (c->type != CLIENT_BOT || !c->authenticated || c->retiring ||
-        !hub_bot_version_takes_pool(c->bot_version))
+/* ---- server order (plan 2026-11-24_server_order_plan.md) ----------------
+ *
+ * Every hub computes every bot's server order from replicated config only:
+ * the usable S| entries of POOL_DEFAULT_NET (weight, max), the active bots
+ * and the host of each bot's published hostmask (its origin: what the IRC
+ * server sees), and the network's pace gap.  The same input gives the same
+ * orders on every hub, so no hub asks another anything.
+ *
+ *  rank   weighted rendezvous: a server's score for a bot is the highest of
+ *         its `weight` hashes H(bot|server#k) (k = 0 is H(bot|server)), so
+ *         a server is a bot's best with odds in proportion to its weight.
+ *  first  bots in uuid order take their best server that no earlier bot of
+ *         the same origin took first and that is under its share
+ *         (ceil(bots * w / W), capped by max); a sibling-free server beats
+ *         one under its share.
+ *  rest   position by position: the best server not yet in the order that
+ *         no earlier sibling holds at that position, so siblings that lose
+ *         their servers together fall back to different ones.
+ *  slot   siblings that share a first server take turns: slot k of m dials
+ *         only at a second t with t % (m * pace_gap) == k * pace_gap (one
+ *         host, one clock), so two never dial it closer than the gap.
+ *
+ * A bot dials in that order (ircbot pool.c); a new order never moves a
+ * connected bot, it applies at its next connect. */
+
+#define ORDER_DEBOUNCE 2 /* s an input must hold still before a recompute */
+
+typedef struct {
+  char uuid[POOL_UUID_LEN + 1];
+  int weight, max;
+} ord_srv_t;
+
+typedef struct {
+  char uuid[64];
+  char origin[MAX_MASK_LEN];
+  int first;                      /* index into the servers                 */
+  int n;
+  unsigned char pos[MAX_POOL_SERVERS];
+  uint64_t score[MAX_POOL_SERVERS];
+} ord_bot_t;
+
+typedef struct {
+  char uuid[64];
+  char line[POOL_R_LINE_MAX];
+} ord_out_t;
+
+static ord_out_t g_orders[MAX_BOTS];
+static int g_order_count;
+static uint64_t g_order_input;
+static time_t g_order_input_at;
+static bool g_order_dirty = true;
+
+static uint64_t fnv64(uint64_t h, const char *s) {
+  for (; *s; s++) {
+    h ^= (unsigned char)*s;
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+/* The bot's rendezvous hash of one (server, k) - the first 8 bytes of
+ * SHA-256("<bot>|<server>") for k = 0, of "<bot>|<server>#<k>" above.  The
+ * same input the bot's own hrw() used for its view-less order. */
+static uint64_t ord_hash(const char *bot, const char *srv, int k) {
+  char in[160];
+  int n = k ? snprintf(in, sizeof(in), "%s|%s#%d", bot, srv, k)
+            : snprintf(in, sizeof(in), "%s|%s", bot, srv);
+  unsigned char h[EVP_MAX_MD_SIZE];
+  unsigned int hl = 0;
+  if (n < 0 || (size_t)n >= sizeof(in) || !EVP_Digest(in, (size_t)n, h, &hl, EVP_sha256(), NULL) ||
+      hl < 8)
+    return 0;
+  uint64_t v = 0;
+  for (int i = 0; i < 8; i++) v = (v << 8) | h[i];
+  return v;
+}
+
+/* The host of a "nick!ident@host" mask, lower-cased; "" without one. */
+static void ord_origin(const char *mask, char *out, size_t cap) {
+  out[0] = '\0';
+  const char *at = mask ? strrchr(mask, '@') : NULL;
+  if (!at || !at[1]) return;
+  size_t n = 0;
+  for (const char *p = at + 1; *p && n + 1 < cap; p++)
+    out[n++] = (*p >= 'A' && *p <= 'Z') ? (char)(*p - 'A' + 'a') : *p;
+  out[n] = '\0';
+}
+
+static int ord_srv_cmp(const void *a, const void *b) {
+  return strcmp(((const ord_srv_t *)a)->uuid, ((const ord_srv_t *)b)->uuid);
+}
+static int ord_bot_cmp(const void *a, const void *b) {
+  return strcmp(((const ord_bot_t *)a)->uuid, ((const ord_bot_t *)b)->uuid);
+}
+
+/* The inputs, sorted; their digest.  Returns the bot count. */
+static int ord_inputs(const hub_state_t *state, ord_srv_t *srv, int *nsrv, ord_bot_t *bots,
+                      int *gap, uint64_t *digest) {
+  int ns = 0, nb = 0;
+  for (int i = 0; i < state->global_entry_count && ns < MAX_POOL_SERVERS; i++) {
+    const config_entry_t *e = &state->global_entries[i];
+    pool_srv_t s;
+    if (e->key[0] != 'S' || e->key[1] || !pool_srv_parse(e->value, &s) || s.deleted ||
+        s.state != POOL_OK || strcmp(s.net_id, POOL_DEFAULT_NET) != 0)
       continue;
-    /* everyone on a change; a bot that has not had this view yet anyway */
-    if (!changed && c->pool_view_sent) continue;
-    queued_msg_t *m = queued_msg_new(CMD_POOL_VIEW, LANE_DELTA, (const unsigned char *)text, len);
-    if (m && peer_enqueue(c, m)) {
-      c->pool_view_sent = true;
-      g_hub_stats.pool_views++;
+    memcpy(srv[ns].uuid, s.uuid, sizeof(srv[ns].uuid));
+    srv[ns].weight = s.weight > 0 ? s.weight : 1;
+    srv[ns].max = s.max;
+    ns++;
+  }
+  qsort(srv, (size_t)ns, sizeof(srv[0]), ord_srv_cmp);
+  for (int i = 0; i < state->bot_count && nb < MAX_BOTS; i++) {
+    const bot_config_t *b = &state->bots[i];
+    if (!b->is_active || strlen(b->uuid) != POOL_UUID_LEN) continue;
+    memset(&bots[nb], 0, sizeof(bots[nb]));
+    snprintf(bots[nb].uuid, sizeof(bots[nb].uuid), "%s", b->uuid);
+    for (int j = 0; j < b->entry_count; j++)
+      if (strcmp(b->entries[j].key, "h") == 0)
+        ord_origin(b->entries[j].value, bots[nb].origin, sizeof(bots[nb].origin));
+    nb++;
+  }
+  qsort(bots, (size_t)nb, sizeof(bots[0]), ord_bot_cmp);
+  pool_net_t net;
+  time_t ts;
+  net_get(state, POOL_DEFAULT_NET, &net, &ts);
+  *gap = net.pace_gap;
+  uint64_t h = 14695981039346656037ULL;
+  char num[48];
+  snprintf(num, sizeof(num), "g%d\n", *gap);
+  h = fnv64(h, num);
+  for (int i = 0; i < ns; i++) {
+    snprintf(num, sizeof(num), "|%d|%d\n", srv[i].weight, srv[i].max);
+    h = fnv64(fnv64(h, srv[i].uuid), num);
+  }
+  for (int i = 0; i < nb; i++) h = fnv64(fnv64(fnv64(h, bots[i].uuid), "|"), bots[i].origin);
+  *nsrv = ns;
+  *digest = h;
+  return nb;
+}
+
+/* Two bots of one origin.  A bot with no published mask is its own. */
+static bool ord_siblings(const ord_bot_t *a, const ord_bot_t *b) {
+  return a->origin[0] && strcmp(a->origin, b->origin) == 0;
+}
+
+static void ord_compute(const ord_srv_t *srv, int ns, ord_bot_t *bots, int nb) {
+  /* rank: each bot's servers by score, best first (ties: server uuid). */
+  for (int b = 0; b < nb; b++) {
+    uint64_t sc[MAX_POOL_SERVERS];
+    for (int s = 0; s < ns; s++) {
+      uint64_t best = 0;
+      for (int k = 0; k < srv[s].weight; k++) {
+        uint64_t v = ord_hash(bots[b].uuid, srv[s].uuid, k);
+        if (v > best) best = v;
+      }
+      sc[s] = best;
+    }
+    /* rank[] = server indexes by score; insertion sort, ns <= 64 */
+    int rank[MAX_POOL_SERVERS];
+    for (int s = 0; s < ns; s++) {
+      int j = s;
+      while (j > 0 && sc[rank[j - 1]] < sc[s]) {
+        rank[j] = rank[j - 1];
+        j--;
+      }
+      rank[j] = s; /* equal scores keep uuid order: srv[] is sorted */
+    }
+    for (int s = 0; s < ns; s++) {
+      bots[b].pos[s] = (unsigned char)rank[s];
+      bots[b].score[s] = sc[rank[s]];
+    }
+    bots[b].n = 0;
+  }
+  long long wsum = 0;
+  for (int s = 0; s < ns; s++) wsum += srv[s].weight;
+  int load[MAX_POOL_SERVERS] = {0}, cap[MAX_POOL_SERVERS];
+  for (int s = 0; s < ns; s++) {
+    /* the exact share ceil(nb * w / W), at least 1: a new order moves no
+     * connected bot, so a tight bound costs nothing */
+    long long c = wsum > 0 ? ((long long)nb * srv[s].weight + wsum - 1) / wsum : nb;
+    if (c < 1) c = 1;
+    if (srv[s].max > 0 && c > srv[s].max) c = srv[s].max;
+    cap[s] = (int)c;
+  }
+  /* first: rank order, preferring (no sibling, under cap) > (no sibling) >
+   * (under cap) > best. */
+  for (int b = 0; b < nb; b++) {
+    int pick[4] = {-1, -1, -1, -1};
+    for (int r = 0; r < ns; r++) {
+      int s = bots[b].pos[r];
+      bool sib = false;
+      for (int o = 0; o < b && !sib; o++)
+        sib = ord_siblings(&bots[o], &bots[b]) && bots[o].first == s;
+      bool under = load[s] < cap[s];
+      int cls = !sib && under ? 0 : !sib ? 1 : under ? 2 : 3;
+      if (pick[cls] < 0) pick[cls] = s;
+    }
+    int f = pick[0] >= 0 ? pick[0] : pick[1] >= 0 ? pick[1] : pick[2] >= 0 ? pick[2] : pick[3];
+    bots[b].first = f;
+    load[f]++;
+  }
+  /* the order: first, then position by position */
+  for (int b = 0; b < nb; b++) {
+    unsigned char out[MAX_POOL_SERVERS];
+    bool used[MAX_POOL_SERVERS] = {false};
+    out[0] = (unsigned char)bots[b].first;
+    used[bots[b].first] = true;
+    for (int p = 1; p < ns; p++) {
+      /* free of every earlier sibling at p > free of the siblings that share
+       * this bot's order so far (they lose their servers together) > any */
+      int take = -1, mid = -1, any = -1;
+      for (int r = 0; r < ns && take < 0; r++) {
+        int s = bots[b].pos[r];
+        if (used[s]) continue;
+        if (any < 0) any = s;
+        bool held = false, close = false;
+        for (int o = 0; o < b; o++) {
+          if (!ord_siblings(&bots[o], &bots[b]) || bots[o].n <= p || bots[o].pos[p] != s) continue;
+          held = true;
+          if (memcmp(bots[o].pos, out, (size_t)p) == 0) close = true;
+        }
+        if (!held) take = s;
+        else if (!close && mid < 0) mid = s;
+      }
+      if (take < 0) take = mid >= 0 ? mid : any;
+      out[p] = (unsigned char)take;
+      used[take] = true;
+    }
+    /* pos[] is reused as the final order (earlier bots' finals are read
+     * above through n > p) */
+    memcpy(bots[b].pos, out, (size_t)ns);
+    bots[b].n = ns;
+  }
+}
+
+/* Recompute when the inputs changed and held still; true when any order
+ * changed (the caller pushes configs). */
+static bool ord_refresh(hub_state_t *state, time_t now) {
+  static ord_srv_t srv[MAX_POOL_SERVERS];
+  static ord_bot_t bots[MAX_BOTS];
+  int ns = 0, gap = 0;
+  uint64_t digest = 0;
+  int nb = ord_inputs(state, srv, &ns, bots, &gap, &digest);
+  if (digest != g_order_input) {
+    g_order_input = digest;
+    g_order_input_at = now;
+    g_order_dirty = true;
+    return false;
+  }
+  if (!g_order_dirty || now - g_order_input_at < ORDER_DEBOUNCE) return false;
+  g_order_dirty = false;
+  bool changed = false;
+  static ord_out_t next[MAX_BOTS];
+  int nn = 0;
+  if (ns > 0) {
+    ord_compute(srv, ns, bots, nb);
+    for (int b = 0; b < nb; b++) {
+      static pool_order_t o;
+      memset(&o, 0, sizeof(o));
+      o.gap = gap;
+      int slot = 0, slots = 0;
+      for (int x = 0; x < nb; x++) {
+        bool same = x == b || (ord_siblings(&bots[x], &bots[b]) && bots[x].pos[0] == bots[b].pos[0]);
+        slots += same;
+        slot += same && x < b;
+      }
+      o.slot = slot;
+      o.slots = slots > POOL_ORDER_SLOTS_MAX ? POOL_ORDER_SLOTS_MAX : slots;
+      if (o.slot >= o.slots) o.slot = o.slots - 1;
+      o.n = bots[b].n > POOL_ORDER_MAX ? POOL_ORDER_MAX : bots[b].n;
+      for (int p = 0; p < o.n; p++)
+        memcpy(o.ids[p], srv[bots[b].pos[p]].uuid, sizeof(o.ids[p]));
+      memcpy(next[nn].uuid, bots[b].uuid, sizeof(next[nn].uuid)); /* both [64] */
+      if (pool_order_format(&o, next[nn].line, sizeof(next[nn].line)) < 0) continue;
+      nn++;
     }
   }
-  memcpy(last_hash, h, sizeof(h));
-  last_sent = now;
+  /* changed = a bot's line differs (or appeared/went) */
+  if (nn != g_order_count) changed = true;
+  for (int i = 0; i < nn && !changed; i++)
+    changed = strcmp(next[i].uuid, g_orders[i].uuid) != 0 ||
+              strcmp(next[i].line, g_orders[i].line) != 0;
+  if (changed) {
+    memcpy(g_orders, next, sizeof(next[0]) * (size_t)nn);
+    g_order_count = nn;
+    g_hub_stats.pool_orders++;
+    hub_log_debug("[POOL] Server orders recomputed: %d bot%s over %d server%s\n", nn,
+                  nn == 1 ? "" : "s", ns, ns == 1 ? "" : "s");
+  }
+  return changed;
+}
+
+void hub_pool_order_tick(hub_state_t *state, time_t now) {
+  static time_t last;
+  if (now == last) return;
+  last = now;
+  if (ord_refresh(state, now)) state->bot_config_pending = true;
+}
+
+/* A bot's order as computed: its first server and its slot of slots.  False
+ * when it has none. */
+bool hub_pool_order_first(const char *bot_uuid, char *first, size_t cap, int *slot, int *slots) {
+  for (int i = 0; i < g_order_count; i++) {
+    if (strcmp(g_orders[i].uuid, bot_uuid) != 0) continue;
+    static pool_order_t o;
+    if (!pool_order_parse(g_orders[i].line, &o)) return false;
+    snprintf(first, cap, "%s", o.ids[0]);
+    if (slot) *slot = o.slot;
+    if (slots) *slots = o.slots;
+    return true;
+  }
+  return false;
+}
+
+/* Where a pool entry sits in a bot's computed order: *place 1-based, *of
+ * the order's length.  False when the bot has no order or the entry is not
+ * in it (bot show: "1st of 3 in its order"). */
+bool hub_pool_order_place(const char *bot_uuid, const char *entry, int *place, int *of) {
+  if (!entry || !entry[0]) return false;
+  for (int i = 0; i < g_order_count; i++) {
+    if (strcmp(g_orders[i].uuid, bot_uuid) != 0) continue;
+    static pool_order_t o;
+    if (!pool_order_parse(g_orders[i].line, &o)) return false;
+    for (int k = 0; k < o.n; k++)
+      if (strcmp(o.ids[k], entry) == 0) {
+        *place = k + 1;
+        *of = o.n;
+        return true;
+      }
+    return false;
+  }
+  return false;
+}
+
+/* How many bots have this server first. */
+int hub_pool_order_first_count(const char *srv_uuid) {
+  int n = 0;
+  for (int i = 0; i < g_order_count; i++) {
+    /* "<gen>|<slot>|<slots>|<gap>|<first>,..." */
+    const char *p = g_orders[i].line;
+    for (int bars = 0; *p && bars < 4; p++) bars += *p == '|';
+    n += strncmp(p, srv_uuid, POOL_UUID_LEN) == 0;
+  }
+  return n;
+}
+
+/* A bot's IRC link as this hub knows it (its own bot, else the roster): the
+ * link word ("" = unknown) and the entry it is on. */
+const char *hub_pool_bot_link(const hub_state_t *state, const char *bot_uuid, char *entry,
+                              size_t cap) {
+  entry[0] = '\0';
+  for (int i = 0; i < state->client_count; i++) {
+    const hub_client_t *c = state->clients[i];
+    if (c->type == CLIENT_BOT && c->authenticated && !c->retiring && strcmp(c->id, bot_uuid) == 0) {
+      snprintf(entry, cap, "%s", c->bot_irc_entry);
+      return c->bot_irc_link;
+    }
+  }
+  const char *word = "";
+  time_t at = 0;
+  for (int i = 0; i < state->roster_count; i++) {
+    const bot_roster_t *r = &state->roster[i];
+    if (strcmp(r->bot_uuid, bot_uuid) != 0 || r->reported_at < at) continue;
+    at = r->reported_at;
+    snprintf(entry, cap, "%s", r->irc_entry);
+    word = r->irc_link;
+  }
+  return word;
+}
+
+/* The bot's origin as the order uses it (the host of its h| mask). */
+void hub_pool_bot_origin(const hub_state_t *state, const char *bot_uuid, char *out, size_t cap) {
+  out[0] = '\0';
+  for (int i = 0; i < state->bot_count; i++) {
+    const bot_config_t *b = &state->bots[i];
+    if (strcmp(b->uuid, bot_uuid) != 0) continue;
+    for (int j = 0; j < b->entry_count; j++)
+      if (strcmp(b->entries[j].key, "h") == 0) ord_origin(b->entries[j].value, out, cap);
+    return;
+  }
+}
+
+/* The bots with an order, in uuid order (for the console and rebalance). */
+int hub_pool_order_bots(char (*uuids)[64], int max) {
+  int n = 0;
+  for (int i = 0; i < g_order_count && n < max; i++)
+    memcpy(uuids[n++], g_orders[i].uuid, sizeof(uuids[0]));
+  return n;
+}
+
+const char *hub_pool_order_line(const hub_state_t *state, const char *bot_uuid) {
+  (void)state;
+  for (int i = 0; i < g_order_count; i++)
+    if (strcmp(g_orders[i].uuid, bot_uuid) == 0) return g_orders[i].line;
+  return NULL;
 }
 
 int hub_pool_view_text(hub_state_t *state, char *out, size_t cap) {

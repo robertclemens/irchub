@@ -590,6 +590,7 @@ static const cmd_def_t CMDS[] = {
   {"bot", "add", CMD_ADMIN_CREATE_BOT, B_PIPE, 3, 0, CF_NONE, 0, NULL, "bot add <nick> <uuid> <key>", "register a bot from the identity its -setup printed", "uuid and key: run ./ircbot -id on the bot's host"},
   {"bot", "del", CMD_ADMIN_DEL, B_ARG, 1, 0, CF_YN, PRE_BOT_DEL, NULL, "bot del <uuid|nick>", "delete a bot everywhere for good (asks y/N; wipes its config and stops it)", NULL},
   {"bot", "kick", CMD_ADMIN_DISCONNECT_BOT, B_ARG, 1, 0, CF_YN, PRE_BOT_KICK, NULL, "bot kick <uuid|nick>", "drop its connection to this hub (asks y/N; it reconnects)", NULL},
+  {"bot", "move", CMD_ADMIN_BOT_MOVE, B_PIPE, 3, 0, CF_NONE, 0, NULL, "bot move <uuid|nick> hub|server <to>", "move a bot to another of its hubs, or its IRC link to another pool server", "run it on the bot's hub; hub list shows where bots are"},
   {"bot", "rekey", CMD_ADMIN_REKEY_BOT, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot rekey <uuid>", "how to rekey a bot (only the bot can)", NULL},
   {"bot", "resync", CMD_ADMIN_BOT_RESYNC, B_ARG, 1, 0, CF_NONE, 0, NULL, "bot resync <uuid|nick|all>", "send a bot (or every bot) its whole config again, from whichever hub it is on", NULL},
   {"bot", "tree", CMD_CONSOLE, B_FIXED, 0, 0, CF_NONE, 0, "get|tree", "bot tree", "every hub and bot as a tree", NULL},
@@ -636,8 +637,10 @@ static const cmd_def_t CMDS[] = {
   {"server", "set", CMD_ADMIN_POOL, B_POOL, 2, 3, CF_NONE, 0, NULL, "server set <host[:port]|uuid> weight=<1-100> max=<0-100> enabled=on|off", "change one server's weight, cap or whether bots use it", NULL},
   {"server", "del", CMD_ADMIN_POOL, B_POOL, 1, 1, CF_YN, 0, NULL, "server del <host[:port]|uuid> [force]", "remove a server (asks y/N; the last usable one only with force)", NULL},
   {"server", "clear", CMD_ADMIN_POOL, B_POOL, 1, 0, CF_NONE, 0, NULL, "server clear <host[:port]|uuid>", "undo a wrong-network flag", NULL},
+  {"server", "order", CMD_ADMIN_POOL, B_POOL, 0, 1, CF_NONE, 0, NULL, "server order [nick|uuid]", "the server order the hubs gave each bot: its first server, where it is now", NULL},
+  {"server", "rebalance", CMD_ADMIN_POOL, B_POOL, 0, 1, CF_NONE, 0, NULL, "server rebalance [force|stop]", "how many bots are off their first server; force moves them there in waves", NULL},
   {"network", "show", CMD_ADMIN_POOL, B_POOL, 0, 0, CF_NONE, 0, NULL, "network show", "the IRC network the bots check for, and how many servers are usable", NULL},
-  {"network", "set", CMD_ADMIN_POOL, B_POOL, 1, 1, CF_NONE, 0, NULL, "network set name=<NETWORK> alias=<a,b,...|->", "the NETWORK= name the bots check for, or other names to accept", NULL},
+  {"network", "set", CMD_ADMIN_POOL, B_POOL, 1, 2, CF_NONE, 0, NULL, "network set name=<NETWORK> alias=<a,b,...|-> pace=<0-600>", "the NETWORK= name the bots check for, other names to accept, the pace gap", NULL},
   {"ban", "list", CMD_ADMIN_BAN, B_BAN, 0, 1, CF_NONE, 0, NULL, "ban list [#chan|*]", "the network's listed bans (one channel, or * = every channel)", NULL},
   {"ban", "add", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; one opped bot sets it on the channel now (never on a bot or user)", NULL},
   {"ban", "del", CMD_ADMIN_BAN, B_BAN, 2, 0, CF_NONE, 0, NULL, "ban del <#chan|*> <mask>", "remove a listed ban", NULL},
@@ -683,6 +686,7 @@ static const struct {
 } CMD_FLAGS[] = {
   {"bot", "add", "b"},
   {"bot", "del", "b"},     {"bot", "kick", "b"},      {"bot", "rekey", "b"},
+  {"bot", "move", "b"},
   {"bot", "resync", "b"},
   {"bot", "set", "b"},
   {"hub", "add", "h"},     {"hub", "del", "h"},       {"hub", "set", "h"},
@@ -696,7 +700,7 @@ static const struct {
   {"channel", "kick", "c"}, {"channel", "ban", "c"},
   {"ban", "add", "c"},     {"ban", "del", "c"},
   {"server", "add", "s"},  {"server", "set", "s"},    {"server", "del", "s"},
-  {"server", "clear", "s"}, {"network", "set", "s"},
+  {"server", "clear", "s"}, {"network", "set", "s"},  {"server", "rebalance", "s"},
   {"upgrade", "start", "u"}, {"upgrade", "abort", "u"}, {"upgrade", "forget", "u"},
   {"upgrade", "continue", "u"},
   {"upgrade", "keep", "u"},
@@ -785,6 +789,11 @@ static const struct {
   {"bot", "kick", "uuid|nick\ta connected bot's uuid or its nick (Tab completes both); asks y/N; "
    "it reconnects",
    "bot kick alpha\nbot kick " EX_UUID},
+  {"bot", "move", "uuid|nick\ta bot connected to this hub (Tab completes both)\n"
+   "hub|server\thub: another hub in the bot's own hub list (a key it pinned); server: a "
+   "usable server of the pool\n"
+   "to\tthe hub's name or uuid, or the server's host[:port]",
+   "bot move alpha hub hub2\nbot move alpha server irc2.example.net:6667"},
   {"bot", "rekey", "uuid\tthe bot's uuid; prints how to rekey it on its host",
    "bot rekey " EX_UUID},
   {"bot", "resync", "uuid|nick|all\tthe bot's uuid or its nick (Tab completes both), or all.  "
@@ -979,6 +988,13 @@ static const struct {
   {"ban", "del", "#chan|*\tas listed by ban list\nmask\tthe mask exactly as ban list shows it",
    "ban del #ops *!*@203.0.113.7"},
   {"server", "list", NULL, "server list"},
+  {"server", "order", "nick|uuid\tone bot (Tab completes); without it every bot",
+   "server order\nserver order bunny_"},
+  {"server", "rebalance",
+   "force\tmove the bots that are off their first server there, a few at a time: at most 5 bots and a quarter of those up per wave, one "
+   "per host, the next wave when they are back and the pace gap has passed\n"
+   "stop\tstop the waves this hub drives",
+   "server rebalance\nserver rebalance force"},
   {"network", "show", NULL, "network show"},
   {"server", "add",
    "host[:port]\tthe server; no port = 6667; 6697 is TLS\n"
@@ -998,8 +1014,9 @@ static const struct {
    "server clear irc.example.net"},
   {"network", "set",
    "name=\tthe NETWORK= value the bots check (learned from the first bot that connects)\n"
-   "alias=\tother names accepted, comma separated (up to 8), or - for none",
-   "network set name=EFnet\nnetwork set alias=EFNet"},
+   "alias=\tother names accepted, comma separated (up to 8), or - for none\n"
+   "pace=\ts between two dials of one server from one host (default 15, 0 = off)",
+   "network set name=EFnet\nnetwork set alias=EFNet\nnetwork set pace=30"},
   {"upgrade", "status", NULL, "upgrade status"},
   {"upgrade", "releases", NULL, "upgrade releases"},
   {"upgrade", "history", "run\tthe run, as upgrade history lists it, or the start of its id (4 or more characters)",
@@ -2991,7 +3008,7 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
       size_t off = (size_t)usnprintf(o, cap, "netset|");
       for (int i = 0; i < na; i++) {
         if (!strchr(a[i], '=')) {
-          *why = "network set takes name=<NETWORK> and/or alias=<a,b,...>";
+          *why = "network set takes name=<NETWORK>, alias=<a,b,...> and/or pace=<0-600>";
           return false;
         }
         int k = usnprintf(o + off, cap - off, "%s", i ? "," : "");
@@ -3004,6 +3021,20 @@ static bool build_payload(console_ui_t *ui, const cmd_def_t *c, const words_t *w
     }
     if (!strcmp(c->sub, "list")) {
       w = usnprintf(o, cap, "list");
+      break;
+    }
+    if (!strcmp(c->sub, "order")) {
+      w = usnprintf(o, cap, "order|%s", na > 0 ? a[0] : "");
+      break;
+    }
+    if (!strcmp(c->sub, "rebalance")) {
+      const char *word = na > 0 ? a[0] : "";
+      if (word[0] && strcasecmp(word, "force") && strcasecmp(word, "stop")) {
+        *why = "server rebalance [force|stop]";
+        return false;
+      }
+      w = usnprintf(o, cap, "rebalance|%s", !strcasecmp(word, "force") ? "force"
+                                             : !strcasecmp(word, "stop") ? "stop" : "");
       break;
     }
     if (strchr(a[0], ',')) {
@@ -4059,8 +4090,11 @@ typedef struct {
 static const arg_comp_t ARG_COMP[] = {
   {"help", NULL, 0, CK_GROUP, NULL},
   {"bot", "show", 0, CK_BOT_NICK, NULL},
+  {"server", "order", 0, CK_BOT_NICK, NULL},
   {"bot", "del", 0, CK_BOT_NICK, NULL},
   {"bot", "kick", 0, CK_BOT_ON, NULL},
+  {"bot", "move", 0, CK_BOT_ON, NULL},
+  {"bot", "move", 1, CK_WORDS, "hub server"},
   {"bot", "rekey", 0, CK_BOT, NULL},
   {"bot", "resync", 0, CK_BOT_NICK, "all"},
   {"bot", "set", 0, CK_WORDS, "flood ignoretime sendq cron"},
@@ -4087,7 +4121,7 @@ static const arg_comp_t ARG_COMP[] = {
   {"server", "add", -1, CK_WORDS, "weight= max="},
   {"server", "set", -1, CK_WORDS, "weight= max= enabled=on enabled=off force"},
   {"server", "del", 1, CK_WORDS, "force"},
-  {"network", "set", -1, CK_WORDS, "name= alias="},
+  {"network", "set", -1, CK_WORDS, "name= alias= pace="},
   {"ban", "list", 0, CK_WORDS, "*"},
   {"ban", "add", 0, CK_WORDS, "*"},
   {"ban", "add", 2, CK_WORDS, "perm sticky"},
@@ -5142,7 +5176,12 @@ static void scroll_view(console_ui_t *ui, int dir) {
   if (v == V_CONSOLE || v == V_LOG) {
     const sback_t *sb = &ui->sb[v];
     int W = ui->cols;   /* close enough for paging */
+    long long floor_line = sb_floor(ui, v, W, H);
+    /* From where the pane is drawn: an anchor the ring has since rolled
+     * past (lines dropped while scrolled up) is shown at the floor, and
+     * paging from below sb->first would stop before moving at all. */
     long long s = sb_bottom(ui, v);
+    if (s < floor_line) s = floor_line;
     int moved = 0;
     while (moved < H - 1) {
       long long ns = s + dir;
@@ -5157,7 +5196,6 @@ static void scroll_view(console_ui_t *ui, int dir) {
       const sline_t *l = sb_get(sb, s);
       if (sb_visible(ui, v, l)) moved += wrap_rows(l->text, W);
     }
-    long long floor_line = sb_floor(ui, v, W, H);
     ui->anchor[v] = s < floor_line ? floor_line : s;
   } else {
     /* A one-page view has nowhere to go; a longer one stops at its last page. */
@@ -5186,6 +5224,7 @@ static void view_rows(console_ui_t *ui, int view, const char *text, int W,
     ctx_init(ui, &c, FMT_MODE_VIEW, slog, sizeof(slog));
     c.ascii = ui->ascii;
     c.width = W;
+    c.height = H;
     if (view == V_UPG && ui->upg_sel_id[0]) c.upg_sel = ui->upg_sel_id;
     fmt_reply(&c, &rep, view == V_UPG ? "upgrade status" : "hub stats", &f);
     creply_free(&rep);
